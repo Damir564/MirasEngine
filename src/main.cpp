@@ -3,6 +3,7 @@
 #include <volk.h>
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
+#define VKB_DISABLE_DEBUG_BREAK
 #include <VkBootstrap.h>
 #include <vk_mem_alloc.h>
 #include <filesystem>
@@ -10,13 +11,13 @@
 #include <glm/glm.hpp>
 
 struct Vertex {
-	glm::vec2 position;
+	glm::vec3 position;
 };
 
 std::vector<Vertex> vertices = {
-	Vertex{{ 0.0f, -0.5f }},
-	Vertex{{ 0.5f,  0.5f }},
-	Vertex{{-0.5f,  0.5f }},
+	Vertex{{0.0f, -0.5f, 0.0f}},
+	Vertex{{0.5f,  0.5f, 0.0f}},
+	Vertex{{-0.5f, 0.5f, 0.0f}},
 };
 
 class VertexBuffer {
@@ -33,8 +34,8 @@ public:
 		bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
 		VmaAllocationCreateInfo allocInfo{};
+		allocInfo.usage = VMA_MEMORY_USAGE_CPU_TO_GPU;  // Changed to CPU_TO_GPU
 		allocInfo.requiredFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-		allocInfo.preferredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
 		allocInfo.flags = VMA_ALLOCATION_CREATE_MAPPED_BIT; // auto-mapped
 
 		VkBuffer rawBuffer;
@@ -52,9 +53,10 @@ public:
 	}
 
 	~VertexBuffer() {
-		if (m_buffer && m_allocation) {
-			vmaDestroyBuffer(m_allocator, VkBuffer(m_buffer), m_allocation);
-		}
+		cleanup();
+		//if (m_buffer && m_allocation) {
+		//	vmaDestroyBuffer(m_allocator, VkBuffer(m_buffer), m_allocation);
+		//}
 	}
 
 	// Disable copy (unique ownership)
@@ -146,6 +148,7 @@ int main()
 
 	if (!window) {
 		std::cerr << "SDL_CreateWindow failed: " << SDL_GetError() << "\n";
+		SDL_Quit();
 		return -1;
 	}
 
@@ -154,6 +157,8 @@ int main()
 	// ------------------------
 	if (volkInitialize() != VK_SUCCESS) {
 		std::cerr << "volkInitialize failed\n";
+		SDL_DestroyWindow(window);
+		SDL_Quit();
 		return -1;
 	}
 	vk::detail::defaultDispatchLoaderDynamic.init(vkGetInstanceProcAddr);
@@ -165,6 +170,8 @@ int main()
 	const char* const* instance_extensions = SDL_Vulkan_GetInstanceExtensions(&count_instance_extensions);
 	if (instance_extensions == NULL) {
 		std::cerr << "SDL_Vulkan_GetInstanceExtensions failed\n";
+		SDL_DestroyWindow(window);
+		SDL_Quit();
 		return -1;
 	}
 
@@ -178,14 +185,17 @@ int main()
 	vkb::InstanceBuilder builder;
 	auto instRet = builder
 		.set_app_name("SDL3 Vulkan App")
-		.require_api_version(1, 4, 0)
-		.use_default_debug_messenger()
+		.require_api_version(1, 3, 0)
+		.set_minimum_instance_version(1, 3)
+		// .use_default_debug_messenger()
 		.enable_extensions(extensions)
 		// .enable_extension(VK_EXT_SHADER_OBJECT_EXTENSION_NAME)
 		.build();
 
 	if (!instRet) {
 		std::cerr << "Failed to create instance: " << instRet.error().message() << "\n";
+		SDL_DestroyWindow(window);
+		SDL_Quit();
 		return -1;
 	}
 
@@ -201,6 +211,9 @@ int main()
 	VkSurfaceKHR surfaceVk;
 	if (!SDL_Vulkan_CreateSurface(window, instance, nullptr, &surfaceVk)) {
 		std::cerr << "Failed to create Vulkan surface\n";
+		vkb::destroy_instance(vkbInstance);
+		SDL_DestroyWindow(window);
+		SDL_Quit();
 		return -1;
 	}
 	vk::SurfaceKHR surface(surfaceVk);
@@ -209,6 +222,7 @@ int main()
 	// 5. Select physical device and create logical device
 	// ------------------------
 	VkPhysicalDeviceShaderObjectFeaturesEXT shaderObjectFeatures{};
+	shaderObjectFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_OBJECT_FEATURES_EXT;
 	shaderObjectFeatures.shaderObject = VK_TRUE;
 
 	VkPhysicalDeviceVulkan13Features features13{};
@@ -219,30 +233,46 @@ int main()
 
 	vkb::PhysicalDeviceSelector selector{ vkbInstance };
 	auto physRet = selector
-		.set_minimum_version(1, 4)
+		.set_minimum_version(1, 3)
 		.add_required_extension(vk::EXTShaderObjectExtensionName)
+		.add_required_extension_features(shaderObjectFeatures)
 		.set_required_features_13(features13)
 		.set_surface(surface)
 		.select();
 
 	if (!physRet) {
 		std::cerr << "Failed to select physical device: " << physRet.error().message() << "\n";
+		vkb::destroy_surface(vkbInstance, surface);
+		vkb::destroy_instance(vkbInstance);
+		SDL_DestroyWindow(window);
+		SDL_Quit();
 		return -1;
 	}
 
 
 	vkb::PhysicalDevice vkbPhys = physRet.value();
-	vk::PhysicalDevice physicalDevice(vkbPhys.physical_device);
+
+	if (!vkbPhys.are_extension_features_present(shaderObjectFeatures)) {
+		std::cout << "no" << "\n";
+	}
 
 	vkb::DeviceBuilder deviceBuilder{ vkbPhys };
 	auto deviceRet = deviceBuilder
-		// .add_pNext(&shaderObjectFeatures)
 		.build();
 
 	if (!deviceRet) {
 		std::cerr << "Failed to create device: " << deviceRet.error().message() << "\n";
+		vkb::destroy_surface(vkbInstance, surface);
+		vkb::destroy_instance(vkbInstance);
+		SDL_DestroyWindow(window);
+		SDL_Quit();
 		return -1;
 	}
+
+	if (!vkbPhys.is_extension_present(VK_EXT_SHADER_OBJECT_EXTENSION_NAME)) {
+		throw std::runtime_error("Shader Object not supported");
+	}
+	vk::PhysicalDevice physicalDevice(vkbPhys.physical_device);
 
 	vkb::Device vkbDevice = deviceRet.value();
 	VkDevice vkDevice = vkbDevice.device;
@@ -261,10 +291,16 @@ int main()
 	allocatorInfo.device = device;
 	allocatorInfo.instance = instance;
 	allocatorInfo.pVulkanFunctions = &vulkanFunctions;
+	allocatorInfo.vulkanApiVersion = vk::ApiVersion13;
 
 	VmaAllocator allocator;
 	if (vmaCreateAllocator(&allocatorInfo, &allocator) != VK_SUCCESS) {
 		std::cerr << "Failed to create VMA allocator\n";
+		vkb::destroy_device(vkbDevice);
+		vkb::destroy_surface(vkbInstance, surface);
+		vkb::destroy_instance(vkbInstance);
+		SDL_DestroyWindow(window);
+		SDL_Quit();
 		return -1;
 	}
 
@@ -283,6 +319,12 @@ int main()
 		.build();
 	if (!swap_ret) {
 		std::cerr << "Failed to create Swapchain\n";
+		vmaDestroyAllocator(allocator);
+		vkb::destroy_device(vkbDevice);
+		vkb::destroy_surface(vkbInstance, surface);
+		vkb::destroy_instance(vkbInstance);
+		SDL_DestroyWindow(window);
+		SDL_Quit();
 		return -1;
 	}
 	vkb::Swapchain vkbSwapchain = swap_ret.value();	
@@ -292,14 +334,29 @@ int main()
 	auto imagesRet = vkbSwapchain.get_images();
 	if (!imagesRet) {
 		std::cerr << "Failed to get swapchain images\n";
+		vmaDestroyAllocator(allocator);
+		vkb::destroy_swapchain(vkbSwapchain);
+		vkb::destroy_device(vkbDevice);
+		vkb::destroy_surface(vkbInstance, surface);
+		vkb::destroy_instance(vkbInstance);
+		SDL_DestroyWindow(window);
+		SDL_Quit();
 		return -1;
 	}
 	std::vector<VkImage> swapchainImages = imagesRet.value();
 	uint32_t swapchainImageCount = static_cast<uint32_t>(swapchainImages.size());
 	const int MAX_FRAMES_IN_FLIGHT = swapchainImageCount;
+	// const int MAX_FRAMES_IN_FLIGHT = 2;
 	auto viewsRet = vkbSwapchain.get_image_views();
 	if (!viewsRet) {
 		std::cerr << "Failed to get swapchain image views\n";
+		vmaDestroyAllocator(allocator);
+		vkb::destroy_swapchain(vkbSwapchain);
+		vkb::destroy_device(vkbDevice);
+		vkb::destroy_surface(vkbInstance, surface);
+		vkb::destroy_instance(vkbInstance);
+		SDL_DestroyWindow(window);
+		SDL_Quit();
 		return -1;
 	}
 	std::vector<VkImageView> swapchainImageViews = viewsRet.value();
@@ -327,7 +384,9 @@ int main()
 		auto allocatedCommandBuffers = device.allocateCommandBuffersUnique(allocInfo);
 		std::vector<vk::UniqueCommandBuffer> commandBuffers = std::move(allocatedCommandBuffers.value);
 
-		// ------ ------- --------- Semaphores and Fences
+		// ------------------------
+		// 12. Semaphores and Fences
+		// ------------------------
 		std::vector<vk::UniqueSemaphore> imageAvailableSemaphores(MAX_FRAMES_IN_FLIGHT);
 		std::vector<vk::UniqueSemaphore> renderFinishedSemaphores(MAX_FRAMES_IN_FLIGHT);
 		
@@ -341,16 +400,55 @@ int main()
 			inFlightFences[i] = device.createFenceUnique(fenceInfo).value;
 		}
 
-		uint32_t currentFrame = 0;
+		// ------------------------
+		// 13. Create Vertex Buffer
+		// ------------------------
+		std::unique_ptr<VertexBuffer> vertexBuffer;
+		try {
+			vertexBuffer = std::make_unique<VertexBuffer>(allocator, device, vertices);
+		}
+		catch (const std::exception& e) {
+			std::cerr << "Failed to create vertex buffer: " << e.what() << "\n";
+			vmaDestroyAllocator(allocator);
+			vkb::destroy_swapchain(vkbSwapchain);
+			vkb::destroy_device(vkbDevice);
+			vkb::destroy_surface(vkbInstance, surface);
+			vkb::destroy_instance(vkbInstance);
+			SDL_DestroyWindow(window);
+			SDL_Quit();
+			return -1;
+		}
 
 		// ------------------------
-		// Accessing shaders data
+		// 14. Load Shaders
 		// ------------------------
-		auto vertCode = loadSpirv("shaders/triangle.vert.spv");
-		auto fragCode = loadSpirv("shaders/triangle.frag.spv");
+		std::vector<uint32_t> vertCode, fragCode;
+		try {
+			vertCode = loadSpirv("shaders/triangle.vert.spv");
+			fragCode = loadSpirv("shaders/triangle.frag.spv");
 
-		std::cout << "Vertex SPIR-V words: " << vertCode.size() << "\n";
-		std::cout << "Fragment SPIR-V words: " << fragCode.size() << "\n";
+			std::cout << "Vertex SPIR-V words: " << vertCode.size() << "\n";
+			std::cout << "Fragment SPIR-V words: " << fragCode.size() << "\n";
+		} catch (const std::exception& e) {
+			std::cerr << "Failed to load shaders: " << e.what() << "\n";
+			vmaDestroyAllocator(allocator);
+			vkb::destroy_swapchain(vkbSwapchain);
+			vkb::destroy_device(vkbDevice);
+			vkb::destroy_surface(vkbInstance, surface);
+			vkb::destroy_instance(vkbInstance);
+			SDL_DestroyWindow(window);
+			SDL_Quit();
+			return -1;
+		}
+		// ------------------------
+		// 16. Create Pipeline Layout
+		// ------------------------
+		vk::PushConstantRange pcRange{};
+		pcRange.stageFlags = vk::ShaderStageFlagBits::eVertex;
+		pcRange.offset = 0;
+		pcRange.size = sizeof(glm::vec2);
+
+
 
 		// shader create info
 		vk::ShaderCreateInfoEXT vertInfo{};
@@ -360,7 +458,9 @@ int main()
 			.setCodeType(vk::ShaderCodeTypeEXT::eSpirv)
 			.setCodeSize(vertCode.size() * sizeof(vertCode.front()))
 			.setPCode(vertCode.data())
-			.setPName("main");
+			.setPName("main")
+			.setPushConstantRangeCount(1)
+			.setPPushConstantRanges(&pcRange);
 
 		vk::ShaderCreateInfoEXT fragInfo{};
 		fragInfo.setStage(vk::ShaderStageFlagBits::eFragment)
@@ -368,13 +468,35 @@ int main()
 			.setCodeType(vk::ShaderCodeTypeEXT::eSpirv)
 			.setCodeSize(fragCode.size() * sizeof(uint32_t))
 			.setPCode(fragCode.data())
-			.setPName("main");
+			.setPName("main")
+			.setPushConstantRangeCount(1)
+			.setPPushConstantRanges(&pcRange);
 
-		// create shader objects
-		auto vertShader = device.createShaderEXT(vertInfo).value;
-		auto fragShader = device.createShaderEXT(fragInfo).value;
+		vk::ShaderEXT vertShader, fragShader;
+		vertShader = device.createShaderEXT(vertInfo).value;
+		fragShader = device.createShaderEXT(fragInfo).value;
 
+
+		vk::PipelineLayoutCreateInfo layoutInfo{};
+		layoutInfo.setPushConstantRanges(pcRange);
 		// arrays for binding shaders
+		vk::PipelineLayout pipelineLayout;
+		try {
+			pipelineLayout = device.createPipelineLayout(layoutInfo).value;
+		}
+		catch (const std::exception& e) {
+			std::cerr << "Failed to create pipeline layout: " << e.what() << "\n";
+			device.destroyShaderEXT(vertShader);
+			device.destroyShaderEXT(fragShader);
+			vmaDestroyAllocator(allocator);
+			vkb::destroy_swapchain(vkbSwapchain);
+			vkb::destroy_device(vkbDevice);
+			vkb::destroy_surface(vkbInstance, surface);
+			vkb::destroy_instance(vkbInstance);
+			SDL_DestroyWindow(window);
+			SDL_Quit();
+			return -1;
+		}
 		vk::ShaderStageFlagBits stages[] = {
 			vk::ShaderStageFlagBits::eVertex,
 			vk::ShaderStageFlagBits::eFragment
@@ -385,53 +507,17 @@ int main()
 			fragShader
 		};
 
-		vk::VertexInputBindingDescription bindingDesc{};
-		bindingDesc.binding = 0;
-		bindingDesc.stride = sizeof(Vertex);
-		bindingDesc.inputRate = vk::VertexInputRate::eVertex;
-
-		vk::VertexInputAttributeDescription attrDesc{};
-		attrDesc.binding = 0;
-		attrDesc.location = 0; // matches shader location
-		attrDesc.format = vk::Format::eR32G32Sfloat;
-		attrDesc.offset = offsetof(Vertex, position);
-
-		vk::PipelineVertexInputStateCreateInfo vertexInputInfo{};
-		vertexInputInfo.vertexBindingDescriptionCount = 1;
-		vertexInputInfo.pVertexBindingDescriptions = &bindingDesc;
-		vertexInputInfo.vertexAttributeDescriptionCount = 1;
-		vertexInputInfo.pVertexAttributeDescriptions = &attrDesc;
-
-		// Add pushConstantsRange
-
-		vk::PushConstantRange pcRange{};
-		pcRange.stageFlags = vk::ShaderStageFlagBits::eVertex;
-		pcRange.offset = 0;
-		pcRange.size = sizeof(glm::vec2); // vec2
-
-		vk::PipelineLayoutCreateInfo layoutInfo{};
-		layoutInfo.setPushConstantRanges(pcRange);
-
-		vk::PipelineLayout pipelineLayout =
-			device.createPipelineLayout(layoutInfo).value;
-
-		vk::PipelineDynamicStateCreateInfo pipelineDynamicStateCreateInfo{};
-
-		vk::GraphicsPipelineCreateInfo pipelineInfo{};
-		pipelineInfo.setLayout(pipelineLayout);
-		pipelineInfo.setPVertexInputState(&vertexInputInfo);
-		pipelineInfo.setPDynamicState(&pipelineDynamicStateCreateInfo);
-
-		// variables
-		glm::vec2 posOffsets = { -0.5f, -0.2f }; // move triangle
-		VertexBuffer vertexBuffer(allocator, device, vertices);
 
 		// ------------------------
-		// 8. Main loop (empty)
+		// 8. Main loop
 		// ------------------------
 		bool running = true;
 		SDL_Event event;
-		//uint32_t currentFrame = 0;
+		uint32_t currentFrame = 0;
+
+		// Push constant data
+		glm::vec2 posOffsets = { 0.0f, 0.0f }; // Start at center
+
 		while (running) {
 			while (SDL_PollEvent(&event)) {
 				if (event.type == SDL_EVENT_QUIT) running = false;
@@ -439,10 +525,10 @@ int main()
 
 			vk::SwapchainKHR swapchainHPP(vkbSwapchain.swapchain);
 
-			uint32_t imageIndex = 0;
-
 			(void)device.waitForFences(inFlightFences[currentFrame].get(), VK_TRUE, UINT64_MAX);
 			(void)device.resetFences(inFlightFences[currentFrame].get());
+
+			uint32_t imageIndex = 0;
 			
 			vk::Result result = device.acquireNextImageKHR(
 				swapchainHPP,             // swapchain
@@ -461,7 +547,7 @@ int main()
 			vk::CommandBuffer cmd = commandBuffers[currentFrame].get();
 			(void)cmd.reset();
 			(void)cmd.begin({ vk::CommandBufferUsageFlagBits::eOneTimeSubmit });
-			vk::DeviceSize offset = 0;
+
 			// Transition the swapchain image from UNDEFINED to COLOR_ATTACHMENT_OPTIMAL
 			vk::ImageMemoryBarrier2 layoutBarrier;
 			layoutBarrier.setSrcStageMask(vk::PipelineStageFlagBits2::eColorAttachmentOutput)
@@ -476,6 +562,8 @@ int main()
 			vk::DependencyInfo depInfo;
 			depInfo.setImageMemoryBarriers(layoutBarrier);
 			cmd.pipelineBarrier2(depInfo);
+
+			// Begin rendering
 			vk::ClearValue clearColor(vk::ClearColorValue(std::array<float, 4>{0.0f, 0.2f, 1.0f, 1.0f}));
 
 			vk::RenderingAttachmentInfo colorAttachment{};
@@ -492,31 +580,72 @@ int main()
 
 			cmd.beginRendering(renderInfo);
 
+			// Bind shaders and draw
 			cmd.bindShadersEXT(2, stages, shaders);
 			cmd.setPrimitiveTopology(vk::PrimitiveTopology::eTriangleList);
-			cmd.bindVertexBuffers(0, 1, &vertexBuffer.getBuffer(), &offset);
+
+			// Bind vertex buffer
+			vk::DeviceSize offset = 0;
+			// cmd.bindVertexBuffers(0, 1, &vertexBuffer->getBuffer(), &offset);
+			
 			cmd.pushConstants<glm::vec2>(
 				pipelineLayout,
 				vk::ShaderStageFlagBits::eVertex,
 				0,
 				posOffsets
 			);
-			cmd.setViewport(0, vk::Viewport{ 0, 0, 1280.f, 720.f, 0.f, 1.f });
-			cmd.setScissor(0, vk::Rect2D{ {0,0},{1280,720} });
+
+			const vk::Viewport viewport{ 0, 0, 1280.f, 720.f, 0.f, 1.f };
+			const vk::Rect2D rect{ {0,0},{1280,720} };
+			cmd.setViewport(0, viewport);
+			cmd.setScissor(0, rect);
+			cmd.setRasterizerDiscardEnable(false);
+			cmd.setCullMode(vk::CullModeFlagBits::eNone);
+			cmd.setFrontFace(vk::FrontFace::eCounterClockwise);
+			cmd.setStencilTestEnable(false);
+			cmd.setDepthTestEnable(false);
+			cmd.setDepthWriteEnable(false);
+			cmd.setDepthBiasEnable(false);
+			cmd.setPolygonModeEXT(vk::PolygonMode::eFill);
+			cmd.setRasterizationSamplesEXT(vk::SampleCountFlagBits::e1);
+			vk::SampleMask mask = ~0u;  // enable all samples
+			cmd.setSampleMaskEXT(vk::SampleCountFlagBits::e1, &mask);
+			cmd.setAlphaToCoverageEnableEXT(VK_FALSE);
+			cmd.setColorBlendEnableEXT(0, VK_FALSE);
+			cmd.setColorWriteMaskEXT(0, vk::ColorComponentFlags(0xF));
+			cmd.setViewportWithCount(1, &viewport);
+			cmd.setScissorWithCount(1, &rect);
+			cmd.setPrimitiveRestartEnable(VK_FALSE);
+			vk::VertexInputBindingDescription2EXT binding{};
+			binding.binding = 0;
+			binding.divisor = 1;
+			binding.stride = sizeof(Vertex);
+			binding.inputRate = vk::VertexInputRate::eVertex;
+
+			vk::VertexInputAttributeDescription2EXT attribute{};
+			attribute.location = 0;
+			attribute.binding = 0;
+			attribute.format = vk::Format::eR32G32B32Sfloat; // vec3 position
+			attribute.offset = offsetof(Vertex, position);
+
+			cmd.setVertexInputEXT(1, &binding, 1, &attribute);
+
+			vk::DeviceSize stride = sizeof(Vertex); // Make sure this >= sum of attribute sizes
+			vk::DeviceSize size = sizeof(Vertex) * vertices.size(); // Make sure this >= sum of attribute sizes
+			cmd.bindVertexBuffers2(0, 1, &vertexBuffer->getBuffer(), &offset, &size, &stride);
+			cmd.draw(3, 1, 0, 0);
+			cmd.endRendering();
 
 
 			// Transition from COLOR_ATTACHMENT_OPTIMAL to PRESENT_SRC_KHR
-			layoutBarrier.setOldLayout(vk::ImageLayout::eColorAttachmentOptimal)
-				.setNewLayout(vk::ImageLayout::ePresentSrcKHR)
+			layoutBarrier.setSrcStageMask(vk::PipelineStageFlagBits2::eColorAttachmentOutput)
 				.setSrcAccessMask(vk::AccessFlagBits2::eColorAttachmentWrite)
-				.setDstAccessMask(vk::AccessFlagBits2::eNone);
+				.setDstStageMask(vk::PipelineStageFlagBits2::eBottomOfPipe)
+				.setDstAccessMask(vk::AccessFlagBits2::eNone)
+				.setOldLayout(vk::ImageLayout::eColorAttachmentOptimal)
+				.setNewLayout(vk::ImageLayout::ePresentSrcKHR);
 
 			cmd.pipelineBarrier2(depInfo);
-
-
-			cmd.draw(vertexBuffer.getVertexCount(), 1, 0, 0);
-
-			cmd.endRendering();
 
 			(void)cmd.end();
 
@@ -549,14 +678,28 @@ int main()
 				.setSwapchains(swapchainHPP)
 				.setImageIndices(imageIndex);
 
-			(void)presentQueue.presentKHR(present);
+			vk::Result presentResult = presentQueue.presentKHR(present);
+			if (presentResult != vk::Result::eSuccess && presentResult != vk::Result::eSuboptimalKHR) {
+				std::cerr << "Failed to present\n";
+			}
+
 			currentFrame = (currentFrame + 1) % MAX_FRAMES_IN_FLIGHT;
+
+			// Update push constant for animation
+			static float time = 0.0f;
+			time += 0.01f;
+			posOffsets.x = sinf(time) * 0.5f;
+			posOffsets.y = cosf(time) * 0.5f;
 		}
+		(void)device.waitIdle();
+
+		vertexBuffer.reset();
+
 		if (device)
 		{
-			(void)device.waitIdle();
 			device.destroyShaderEXT(vertShader);
 			device.destroyShaderEXT(fragShader);
+			device.destroyPipelineLayout(pipelineLayout);
 		}
 	}
 ;

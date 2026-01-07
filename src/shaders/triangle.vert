@@ -15,7 +15,5 @@ vec2 positions[3] = vec2[](
 
 void main()
 {
-    // vec2 pos = positions[gl_VertexIndex] + pc.offset;
-    vec2 pos = inPosition + pc.offset;
-    gl_Position = vec4(pos, 0.0, 1.0);
+    gl_Position = vec4(inPosition + pc.offset, 0.0, 1.0);
 }
