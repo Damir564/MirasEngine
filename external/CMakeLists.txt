@@ -75,6 +75,23 @@ FetchContent_Declare(
 )
 
 # ============================
+# Fetch Assimp from GitHub
+# ============================
+FetchContent_Declare(
+  assimp
+  GIT_REPOSITORY https://github.com/assimp/assimp.git
+  GIT_TAG v6.0.2
+  GIT_SHALLOW TRUE
+)
+
+# Disable building unnecessary things
+set(ASSIMP_BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)  # <-- static lib
+set(ASSIMP_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(ASSIMP_BUILD_SAMPLES OFF CACHE BOOL "" FORCE)
+set(ASSIMP_BUILD_DOCS OFF CACHE BOOL "" FORCE)
+set(ASSIMP_BUILD_ASSIMP_TOOLS OFF CACHE BOOL "" FORCE)
+
+# ============================
 # Make everything available
 # ============================
 FetchContent_MakeAvailable(
@@ -84,4 +101,5 @@ FetchContent_MakeAvailable(
   vk_bootstrap
   SDL3
   glm
+  assimp
 )

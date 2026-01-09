@@ -11,12 +11,15 @@
 #include <glm/glm.hpp>
 #include <glm/ext/matrix_transform.hpp>
 #include <glm/ext/matrix_clip_space.hpp>
+#include <assimp/Importer.hpp>
+#include <assimp/scene.h>
+#include <assimp/postprocess.h>
 
 struct Camera {
-	glm::vec3 position{ 0.0f, 0.0f, 2.0f };
+	glm::vec3 position{ 0.0f, 0.0f, 100.0f };
 	float yaw = -90.0f; // look forward
 	float pitch = 0.0f;
-	float speed = 2.4f;
+	float speed = 300.0f; 
 	float sensitivity = 0.1f;
 };
 
@@ -39,7 +42,7 @@ glm::mat4 getProjection(float width, float height) {
 		glm::radians(60.0f),
 		width / height,
 		0.1f,
-		100.0f
+		1000000.0f
 	);
 	proj[1][1] *= -1; // Vulkan clip space fix
 	return proj;
@@ -52,12 +55,47 @@ struct CameraPush {
 
 struct Vertex {
 	glm::vec3 position;
-};
+	glm::vec3 normal;
+	glm::vec2 texCoord;
 
-std::vector<Vertex> vertices = {
-	{{-0.8f, -0.4f, 0.0f}},
-	{{-0.4f,  0.4f, 0.0f}},
-	{{ 0.0f, -0.4f, 0.0f}},
+	static vk::VertexInputBindingDescription2EXT getBindingDescription(uint32_t binding = 0) {
+		vk::VertexInputBindingDescription2EXT desc{};
+		desc.binding = binding;
+		desc.stride = sizeof(Vertex);
+		desc.inputRate = vk::VertexInputRate::eVertex;
+		desc.divisor = 1;
+		return desc;
+	}
+
+	static std::array<vk::VertexInputAttributeDescription2EXT, 4> getAttributeDescriptions(uint32_t locationOffset = 0) {
+		std::array<vk::VertexInputAttributeDescription2EXT, 4> attributes{};
+
+		// position
+		attributes[0].location = locationOffset + 0;
+		attributes[0].binding = 0;
+		attributes[0].format = vk::Format::eR32G32B32Sfloat;
+		attributes[0].offset = offsetof(Vertex, position);
+
+		// normal
+		attributes[1].location = locationOffset + 1;
+		attributes[1].binding = 0;
+		attributes[1].format = vk::Format::eR32G32B32Sfloat;
+		attributes[1].offset = offsetof(Vertex, normal);
+
+		// texCoord
+		attributes[2].location = locationOffset + 2;
+		attributes[2].binding = 0;
+		attributes[2].format = vk::Format::eR32G32Sfloat;
+		attributes[2].offset = offsetof(Vertex, texCoord);
+
+		// Instance buffer attribute
+		attributes[3].location = locationOffset + 3;             // matches shader
+		attributes[3].binding = 1;              // instance buffer binding
+		attributes[3].format = vk::Format::eR32G32Sfloat; // vec2
+		attributes[3].offset = 0;               // offset inside InstanceData struct
+
+		return attributes;
+	}
 };
 
 class VertexBuffer {
@@ -151,11 +189,6 @@ private:
 	uint32_t m_vertexCount;
 };
 
-std::vector<uint32_t> indices = {
-	0, 1, 2,
-	3, 4, 5
-};
-
 class IndexBuffer {
 public:
 	IndexBuffer(VmaAllocator allocator,
@@ -223,10 +256,10 @@ struct InstanceData {
 
 // Example: 4 instances, spread out
 std::vector<InstanceData> instances = {
-	{{-0.5f, -0.4f}},
-	{{ 0.5f, -0.4f}},
-	{{-0.5f, 0.4f}},
-	{{ 0.5f, 0.4f}}
+	{{0.0f, 0.0f}},
+	//{{ 0.5f, -0.4f}},
+	//{{-0.5f, 0.4f}},
+	//{{ 0.5f, 0.4f}}
 };
 
 class InstanceBuffer {
@@ -289,6 +322,59 @@ std::vector<uint32_t> loadSpirv(const std::filesystem::path& path)
 	return code;
 }
 
+struct Mesh {
+	std::vector<Vertex> vertices;
+	std::vector<uint32_t> indices;
+};
+
+Mesh loadGLB(const std::string& path) {
+	Assimp::Importer importer;
+
+	const aiScene* scene = importer.ReadFile(
+		path,
+		aiProcess_Triangulate |
+		aiProcess_FlipUVs |
+		aiProcess_CalcTangentSpace |
+		aiProcess_GenNormals
+	);
+
+	if (!scene || !scene->HasMeshes()) {
+		throw std::runtime_error("Failed to load model: " + path);
+	}
+
+	Mesh result;
+	uint32_t vertexOffset = 0;
+	for (unsigned int m = 0; m < scene->mNumMeshes; ++m) {
+		const aiMesh* mesh = scene->mMeshes[m];
+
+		// Reserve space
+		result.vertices.reserve(result.vertices.size() + mesh->mNumVertices);
+		result.indices.reserve(result.indices.size() + mesh->mNumFaces * 3);
+
+		// Copy vertices
+		for (unsigned int i = 0; i < mesh->mNumVertices; ++i) {
+			Vertex vertex{};
+			vertex.position = { mesh->mVertices[i].x, mesh->mVertices[i].y, mesh->mVertices[i].z };
+			vertex.normal = mesh->HasNormals() ? glm::vec3(mesh->mNormals[i].x, mesh->mNormals[i].y, mesh->mNormals[i].z) : glm::vec3(0.0f);
+			vertex.texCoord = mesh->HasTextureCoords(0) ? glm::vec2(mesh->mTextureCoords[0][i].x, mesh->mTextureCoords[0][i].y) : glm::vec2(0.0f);
+			result.vertices.push_back(vertex);
+		}
+
+		// Copy indices (with vertex offset!)
+		for (unsigned int i = 0; i < mesh->mNumFaces; ++i) {
+			const aiFace& face = mesh->mFaces[i];
+			if (face.mNumIndices != 3) continue;
+			result.indices.push_back(face.mIndices[0] + vertexOffset);
+			result.indices.push_back(face.mIndices[1] + vertexOffset);
+			result.indices.push_back(face.mIndices[2] + vertexOffset);
+		}
+
+		vertexOffset += mesh->mNumVertices;
+	}
+
+	return result;
+}
+
 int main()
 {
 	// ------------------------
@@ -311,6 +397,15 @@ int main()
 	if (!window) {
 		std::cerr << "SDL_CreateWindow failed: " << SDL_GetError() << "\n";
 		SDL_Quit();
+		return -1;
+	}
+
+	Mesh model;
+	try {
+		model = loadGLB("models/sponza-palace/source/scene.glb"); // <-- path to your .glb
+	}
+	catch (const std::exception& e) {
+		std::cerr << "Error loading GLB: " << e.what() << "\n";
 		return -1;
 	}
 
@@ -467,6 +562,20 @@ int main()
 	}
 
 	std::cout << "SDL3 + Vulkan instance, device, and VMA initialized successfully!\n";
+
+	std::unique_ptr<VertexBuffer> vertexBuffer;
+	std::unique_ptr<IndexBuffer> indexBuffer;
+	std::unique_ptr<InstanceBuffer> instanceBuffer;
+
+	try {
+		vertexBuffer = std::make_unique<VertexBuffer>(allocator, device, model.vertices);
+		indexBuffer = std::make_unique<IndexBuffer>(allocator, device, model.indices);
+		instanceBuffer = std::make_unique<InstanceBuffer>(allocator, device, instances);
+	}
+	catch (const std::exception& e) {
+		std::cerr << "Failed to create buffers: " << e.what() << "\n";
+		return -1;
+	}
 	// ------------------------
 	// 10. Create Swapchain
 	// ------------------------
@@ -490,6 +599,47 @@ int main()
 		return -1;
 	}
 	vkb::Swapchain vkbSwapchain = swap_ret.value();	
+
+	// ------------------------
+	// 11a. Create Depth Image & View
+	// ------------------------
+	vk::Format depthFormat = vk::Format::eD32Sfloat;
+
+	// Image
+	vk::ImageCreateInfo depthImageInfo{};
+	depthImageInfo.imageType = vk::ImageType::e2D;
+	depthImageInfo.extent = vk::Extent3D{ 1280, 720, 1 };
+	depthImageInfo.mipLevels = 1;
+	depthImageInfo.arrayLayers = 1;
+	depthImageInfo.format = depthFormat;
+	depthImageInfo.tiling = vk::ImageTiling::eOptimal;
+	depthImageInfo.initialLayout = vk::ImageLayout::eUndefined;
+	depthImageInfo.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
+	depthImageInfo.samples = vk::SampleCountFlagBits::e1;
+	depthImageInfo.sharingMode = vk::SharingMode::eExclusive;
+
+	VmaAllocationCreateInfo allocInfo{};
+	allocInfo.usage = VMA_MEMORY_USAGE_GPU_ONLY;
+
+	VkImage depthImageRaw;
+	VmaAllocation depthAlloc;
+	if (vmaCreateImage(allocator, reinterpret_cast<VkImageCreateInfo*>(&depthImageInfo), &allocInfo, &depthImageRaw, &depthAlloc, nullptr) != VK_SUCCESS) {
+		throw std::runtime_error("Failed to create depth image");
+	}
+	vk::Image depthImage(depthImageRaw);
+
+	// Image view
+	vk::ImageViewCreateInfo depthViewInfo{};
+	depthViewInfo.image = depthImage;
+	depthViewInfo.viewType = vk::ImageViewType::e2D;
+	depthViewInfo.format = depthFormat;
+	depthViewInfo.subresourceRange.aspectMask = vk::ImageAspectFlagBits::eDepth;
+	depthViewInfo.subresourceRange.baseMipLevel = 0;
+	depthViewInfo.subresourceRange.levelCount = 1;
+	depthViewInfo.subresourceRange.baseArrayLayer = 0;
+	depthViewInfo.subresourceRange.layerCount = 1;
+
+	vk::ImageView depthImageView = device.createImageView(depthViewInfo).value;
 	// ------------------------
 	// 11. Get Swapchain Images and ImageViews
 	// ------------------------
@@ -505,6 +655,7 @@ int main()
 		SDL_Quit();
 		return -1;
 	}
+
 	std::vector<VkImage> swapchainImages = imagesRet.value();
 	uint32_t swapchainImageCount = static_cast<uint32_t>(swapchainImages.size());
 	const int MAX_FRAMES_IN_FLIGHT = swapchainImageCount;
@@ -560,44 +711,6 @@ int main()
 			imageAvailableSemaphores[i] = device.createSemaphoreUnique({}).value;
 			renderFinishedSemaphores[i] = device.createSemaphoreUnique({}).value;
 			inFlightFences[i] = device.createFenceUnique(fenceInfo).value;
-		}
-
-		// ------------------------
-		// 13. Create Vertex Buffer
-		// ------------------------
-		std::unique_ptr<VertexBuffer> vertexBuffer;
-		try {
-			vertexBuffer = std::make_unique<VertexBuffer>(allocator, device, vertices);
-		}
-		catch (const std::exception& e) {
-			std::cerr << "Failed to create vertex buffer: " << e.what() << "\n";
-			vmaDestroyAllocator(allocator);
-			vkb::destroy_swapchain(vkbSwapchain);
-			vkb::destroy_device(vkbDevice);
-			vkb::destroy_surface(vkbInstance, surface);
-			vkb::destroy_instance(vkbInstance);
-			SDL_DestroyWindow(window);
-			SDL_Quit();
-			return -1;
-		}
-		// ------------------------
-		// 13. Create Intance Buffer
-		// ------------------------
-		std::unique_ptr<InstanceBuffer> instanceBuffer;
-		instanceBuffer = std::make_unique<InstanceBuffer>(allocator, device, instances);
-
-		// ------------------------
-		// 13. Create Index Buffer
-		// ------------------------
-		std::unique_ptr<IndexBuffer> indexBuffer;
-		try {
-			indexBuffer = std::make_unique<IndexBuffer>(
-				allocator, device, indices);
-		}
-		catch (const std::exception& e) {
-			std::cerr << "Failed to create index buffer: "
-				<< e.what() << "\n";
-			return -1;
 		}
 
 		// ------------------------
@@ -701,50 +814,51 @@ int main()
 
 		// Push constant data
 		glm::vec2 posOffsets = { 0.0f, 0.0f }; // Start at center
-
+		uint32_t lastTime = SDL_GetTicks();
 		while (running) {
+			uint32_t currentTime = SDL_GetTicks();
+			float dt = (currentTime - lastTime) / 1000.0f; // convert ms to seconds
+			lastTime = currentTime;
 			while (SDL_PollEvent(&event)) {
 				const bool* keys = SDL_GetKeyboardState(nullptr);
-				if (event.type == SDL_EVENT_QUIT || keys[SDL_SCANCODE_ESCAPE]) 
+				if (event.type == SDL_EVENT_QUIT || keys[SDL_SCANCODE_ESCAPE])
 					running = false;
 
-				if (mouseEnabled) {
-					if (event.type == SDL_EVENT_MOUSE_MOTION) {
-						camera.yaw += event.motion.xrel * camera.sensitivity;
-						camera.pitch -= event.motion.yrel * camera.sensitivity;
-						camera.pitch = glm::clamp(camera.pitch, -89.0f, 89.0f);
-					}
-
-					float dt = 0.016f;
-
-					glm::vec3 front{
-						cos(glm::radians(camera.yaw)) * cos(glm::radians(camera.pitch)),
-						sin(glm::radians(camera.pitch)),
-						sin(glm::radians(camera.yaw)) * cos(glm::radians(camera.pitch))
-					};
-					front = glm::normalize(front);
-
-					glm::vec3 right = glm::normalize(glm::cross(front, glm::vec3(0, 1, 0)));
-
-					if (keys[SDL_SCANCODE_W]) camera.position += front * camera.speed * dt;
-					if (keys[SDL_SCANCODE_S]) camera.position -= front * camera.speed * dt;
-					if (keys[SDL_SCANCODE_A]) camera.position -= right * camera.speed * dt;
-					if (keys[SDL_SCANCODE_D]) camera.position += right * camera.speed * dt;
-				}
-
 				if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat) {
-					const SDL_KeyboardEvent& key = event.key;
+					if (event.key.scancode == SDL_SCANCODE_ESCAPE)
+						running = false;
 
 					bool shiftHeld =
-						(key.mod & SDL_KMOD_LSHIFT) ||
-						(key.mod & SDL_KMOD_RSHIFT);
+						(event.key.mod & SDL_KMOD_LSHIFT) ||
+						(event.key.mod & SDL_KMOD_RSHIFT);
 
-					if (shiftHeld && key.scancode == SDL_SCANCODE_GRAVE) {
+					if (shiftHeld && event.key.scancode == SDL_SCANCODE_GRAVE) {
 						mouseEnabled = !mouseEnabled;
 						SDL_SetWindowRelativeMouseMode(window, mouseEnabled);
 					}
 				}
+				if (mouseEnabled && event.type == SDL_EVENT_MOUSE_MOTION) {
+					camera.yaw += event.motion.xrel * camera.sensitivity;
+					camera.pitch -= event.motion.yrel * camera.sensitivity;
+					camera.pitch = glm::clamp(camera.pitch, -89.0f, 89.0f);
+				}
 			}
+			const bool* keys = SDL_GetKeyboardState(nullptr);
+			glm::vec3 front{
+				cos(glm::radians(camera.yaw)) * cos(glm::radians(camera.pitch)),
+				sin(glm::radians(camera.pitch)),
+				sin(glm::radians(camera.yaw)) * cos(glm::radians(camera.pitch))
+			};
+			front = glm::normalize(front);
+
+			glm::vec3 right = glm::normalize(glm::cross(front, glm::vec3(0, 1, 0)));
+
+			if (keys[SDL_SCANCODE_W]) camera.position += front * camera.speed * dt;
+			if (keys[SDL_SCANCODE_S]) camera.position -= front * camera.speed * dt;
+			if (keys[SDL_SCANCODE_A]) camera.position -= right * camera.speed * dt;
+			if (keys[SDL_SCANCODE_D]) camera.position += right * camera.speed * dt;
+				
+	
 
 			vk::SwapchainKHR swapchainHPP(vkbSwapchain.swapchain);
 
@@ -786,8 +900,23 @@ int main()
 			depInfo.setImageMemoryBarriers(layoutBarrier);
 			cmd.pipelineBarrier2(depInfo);
 
-			// Begin rendering
+			// Transition depth image
+			vk::ImageMemoryBarrier2 depthBarrier{};
+			depthBarrier.setSrcStageMask(vk::PipelineStageFlagBits2::eTopOfPipe)
+				.setSrcAccessMask(vk::AccessFlagBits2::eNone)
+				.setDstStageMask(vk::PipelineStageFlagBits2::eEarlyFragmentTests)
+				.setDstAccessMask(vk::AccessFlagBits2::eDepthStencilAttachmentWrite)
+				.setOldLayout(vk::ImageLayout::eUndefined)
+				.setNewLayout(vk::ImageLayout::eDepthAttachmentOptimal)
+				.setImage(depthImage)
+				.setSubresourceRange({ vk::ImageAspectFlagBits::eDepth, 0, 1, 0, 1 });
+
+			vk::DependencyInfo depInfoDepth{};
+			depInfoDepth.setImageMemoryBarriers(depthBarrier);
+			cmd.pipelineBarrier2(depInfoDepth);
+
 			vk::ClearValue clearColor(vk::ClearColorValue(std::array<float, 4>{0.0f, 0.2f, 1.0f, 1.0f}));
+			vk::ClearValue clearDepth(vk::ClearDepthStencilValue{ 1.0f, 0 });
 
 			vk::RenderingAttachmentInfo colorAttachment{};
 			colorAttachment.setImageView(swapchainImageViews[imageIndex])
@@ -796,11 +925,22 @@ int main()
 				.setStoreOp(vk::AttachmentStoreOp::eStore)
 				.setClearValue(clearColor);
 
+			vk::RenderingAttachmentInfo depthAttachment{};
+
+			depthAttachment.setImageView(depthImageView)
+				.setImageLayout(vk::ImageLayout::eDepthAttachmentOptimal)
+				.setLoadOp(vk::AttachmentLoadOp::eClear)
+				.setStoreOp(vk::AttachmentStoreOp::eDontCare)
+				.setClearValue(clearDepth);
+
+
 			vk::RenderingInfo renderInfo{};
 			renderInfo.setRenderArea({ {0,0},{1280,720} })
 				.setLayerCount(1)
-				.setColorAttachments(colorAttachment);
+				.setColorAttachments(colorAttachment)
+				.setPDepthAttachment(&depthAttachment);
 
+			// Begin rendering
 			cmd.beginRendering(renderInfo);
 
 			// Bind shaders and draw
@@ -812,7 +952,6 @@ int main()
 			
 			pc.view = getView(camera);
 			pc.proj = getProjection(1280.0f, 720.0f);
-
 			cmd.pushConstants(
 				pipelineLayout,
 				vk::ShaderStageFlagBits::eVertex,
@@ -826,11 +965,12 @@ int main()
 			cmd.setViewport(0, viewport);
 			cmd.setScissor(0, rect);
 			cmd.setRasterizerDiscardEnable(false);
-			cmd.setCullMode(vk::CullModeFlagBits::eNone);
+			cmd.setCullMode(vk::CullModeFlagBits::eBack);
 			cmd.setFrontFace(vk::FrontFace::eCounterClockwise);
 			cmd.setStencilTestEnable(false);
-			cmd.setDepthTestEnable(false);
-			cmd.setDepthWriteEnable(false);
+			cmd.setDepthTestEnable(true);
+			cmd.setDepthWriteEnable(true);
+			cmd.setDepthCompareOp(vk::CompareOp::eLess);
 			cmd.setDepthBiasEnable(false);
 			cmd.setPolygonModeEXT(vk::PolygonMode::eFill);
 			cmd.setRasterizationSamplesEXT(vk::SampleCountFlagBits::e1);
@@ -843,29 +983,21 @@ int main()
 			cmd.setScissorWithCount(1, &rect);
 			cmd.setPrimitiveRestartEnable(VK_FALSE);
 
-			vk::VertexInputBindingDescription2EXT bindings[2]{};
-			bindings[0].binding = 0;
-			bindings[0].stride = sizeof(Vertex);
-			bindings[0].inputRate = vk::VertexInputRate::eVertex; // per vertex
-			bindings[0].divisor = 1;
+			vk::VertexInputBindingDescription2EXT bindingDescs[2] = {
+				Vertex::getBindingDescription(0), // Main geometry
+				// If you use instances:
+				vk::VertexInputBindingDescription2EXT{1, sizeof(InstanceData), vk::VertexInputRate::eInstance}
+			};
+			auto attributesArray = Vertex::getAttributeDescriptions(0);
 
-			bindings[1].binding = 1;
-			bindings[1].stride = sizeof(InstanceData);
-			bindings[1].inputRate = vk::VertexInputRate::eInstance; // per instance
-			bindings[1].divisor = 1;
-
-			vk::VertexInputAttributeDescription2EXT attributes[2]{};
-			attributes[0].location = 0; // Vertex position
-			attributes[0].binding = 0;
-			attributes[0].format = vk::Format::eR32G32B32Sfloat;
-			attributes[0].offset = offsetof(Vertex, position);
-
-			attributes[1].location = 1; // Instance offset
-			attributes[1].binding = 1;
-			attributes[1].format = vk::Format::eR32G32Sfloat;
-			attributes[1].offset = offsetof(InstanceData, offset);
-
-			cmd.setVertexInputEXT(2, bindings, 2, attributes);
+			// If using instance buffer as second binding, keep it:
+			vk::VertexInputBindingDescription2EXT instanceBinding{};
+			instanceBinding.binding = 1;
+			instanceBinding.stride = sizeof(InstanceData);
+			instanceBinding.inputRate = vk::VertexInputRate::eInstance;
+			instanceBinding.divisor = 1;
+			// vk::VertexInputBindingDescription2EXT bindings[2]{ binding, instanceBinding };
+			cmd.setVertexInputEXT(2, bindingDescs, static_cast<uint32_t>(attributesArray.size()), attributesArray.data());
 
 			// Bind buffers
 			vk::DeviceSize offsets[2] = { 0, 0 };
@@ -873,7 +1005,7 @@ int main()
 				vertexBuffer->getBuffer(),
 				instanceBuffer->getBuffer()
 			};
-			vk::DeviceSize sizes[2] = { sizeof(Vertex) * vertices.size(), sizeof(InstanceData) * instances.size() };
+			vk::DeviceSize sizes[2] = { sizeof(Vertex) * model.vertices.size(), sizeof(InstanceData) * instances.size() };
 			vk::DeviceSize strides[2] = { sizeof(Vertex), sizeof(InstanceData) };
 			//vk::DeviceSize stride = sizeof(Vertex); // Make sure this >= sum of attribute sizes
 			//vk::DeviceSize size = sizeof(Vertex) * vertices.size(); // Make sure this >= sum of attribute sizes
@@ -960,16 +1092,19 @@ int main()
 		}
 		(void)device.waitIdle();
 
-		vertexBuffer.reset();
-
 		if (device)
 		{
 			device.destroyShaderEXT(vertShader);
 			device.destroyShaderEXT(fragShader);
 			device.destroyPipelineLayout(pipelineLayout);
+			device.destroyImageView(depthImageView);
 		}
-	} 
-;
+	};
+
+	vertexBuffer.reset();
+	indexBuffer.reset();
+	instanceBuffer.reset();
+	vmaDestroyImage(allocator, depthImage, depthAlloc);
 	vmaDestroyAllocator(allocator);
 	vkbSwapchain.destroy_image_views(swapchainImageViews);
 	vkb::destroy_swapchain(vkbSwapchain);
