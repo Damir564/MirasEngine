@@ -55,15 +55,9 @@ struct Vertex {
 };
 
 std::vector<Vertex> vertices = {
-	// Triangle 1
-	{{-0.8f, -0.5f, 0.0f}},
-	{{-0.4f,  0.5f, 0.0f}},
-	{{ 0.0f, -0.5f, 0.0f}},
-
-	// Triangle 2
-	{{ 0.2f, -0.5f, 0.0f}},
-	{{ 0.6f,  0.5f, 0.0f}},
-	{{ 1.0f, -0.5f, 0.0f}},
+	{{-0.8f, -0.4f, 0.0f}},
+	{{-0.4f,  0.4f, 0.0f}},
+	{{ 0.0f, -0.4f, 0.0f}},
 };
 
 class VertexBuffer {
@@ -221,6 +215,62 @@ private:
 	vk::Buffer   m_buffer;
 	VmaAllocation m_allocation;
 	uint32_t     m_indexCount;
+};
+
+struct InstanceData {
+	glm::vec2 offset; // Offset for this instance
+};
+
+// Example: 4 instances, spread out
+std::vector<InstanceData> instances = {
+	{{-0.5f, -0.4f}},
+	{{ 0.5f, -0.4f}},
+	{{-0.5f, 0.4f}},
+	{{ 0.5f, 0.4f}}
+};
+
+class InstanceBuffer {
+public:
+	InstanceBuffer(VmaAllocator allocator, vk::Device device, const std::vector<InstanceData>& data)
+		: m_allocator(allocator), m_device(device), m_instanceCount(static_cast<uint32_t>(data.size()))
+	{
+		VkBufferCreateInfo bufferInfo{};
+		bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+		bufferInfo.size = sizeof(InstanceData) * data.size();
+		bufferInfo.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
+		bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+		VmaAllocationCreateInfo allocInfo{};
+		allocInfo.usage = VMA_MEMORY_USAGE_CPU_TO_GPU;
+		allocInfo.requiredFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+		allocInfo.flags = VMA_ALLOCATION_CREATE_MAPPED_BIT;
+
+		VkBuffer rawBuffer;
+		if (vmaCreateBuffer(m_allocator, &bufferInfo, &allocInfo, &rawBuffer, &m_allocation, nullptr) != VK_SUCCESS)
+			throw std::runtime_error("Failed to create instance buffer");
+
+		m_buffer = vk::Buffer(rawBuffer);
+
+		void* mapped;
+		vmaMapMemory(m_allocator, m_allocation, &mapped);
+		memcpy(mapped, data.data(), sizeof(InstanceData) * data.size());
+		vmaUnmapMemory(m_allocator, m_allocation);
+	}
+
+	~InstanceBuffer() {
+		if (m_buffer && m_allocation)
+			vmaDestroyBuffer(m_allocator, VkBuffer(m_buffer), m_allocation);
+	}
+
+	vk::Buffer getBuffer() const { return m_buffer; }
+	uint32_t getInstanceCount() const { return m_instanceCount; }
+
+private:
+	VmaAllocator m_allocator;
+	vk::Device m_device;
+	vk::Buffer m_buffer;
+	VmaAllocation m_allocation;
+	uint32_t m_instanceCount;
 };
 
 std::vector<uint32_t> loadSpirv(const std::filesystem::path& path)
@@ -530,6 +580,11 @@ int main()
 			SDL_Quit();
 			return -1;
 		}
+		// ------------------------
+		// 13. Create Intance Buffer
+		// ------------------------
+		std::unique_ptr<InstanceBuffer> instanceBuffer;
+		instanceBuffer = std::make_unique<InstanceBuffer>(allocator, device, instances);
 
 		// ------------------------
 		// 13. Create Index Buffer
@@ -752,8 +807,6 @@ int main()
 			cmd.bindShadersEXT(2, stages, shaders);
 			cmd.setPrimitiveTopology(vk::PrimitiveTopology::eTriangleList);
 
-			// Bind vertex buffer
-			vk::DeviceSize offset = 0;
 			// cmd.bindVertexBuffers(0, 1, &vertexBuffer->getBuffer(), &offset);
 			
 			
@@ -789,30 +842,49 @@ int main()
 			cmd.setViewportWithCount(1, &viewport);
 			cmd.setScissorWithCount(1, &rect);
 			cmd.setPrimitiveRestartEnable(VK_FALSE);
-			vk::VertexInputBindingDescription2EXT binding{};
-			binding.binding = 0;
-			binding.divisor = 1;
-			binding.stride = sizeof(Vertex);
-			binding.inputRate = vk::VertexInputRate::eVertex;
 
-			vk::VertexInputAttributeDescription2EXT attribute{};
-			attribute.location = 0;
-			attribute.binding = 0;
-			attribute.format = vk::Format::eR32G32B32Sfloat; // vec3 position
-			attribute.offset = offsetof(Vertex, position);
+			vk::VertexInputBindingDescription2EXT bindings[2]{};
+			bindings[0].binding = 0;
+			bindings[0].stride = sizeof(Vertex);
+			bindings[0].inputRate = vk::VertexInputRate::eVertex; // per vertex
+			bindings[0].divisor = 1;
 
-			cmd.setVertexInputEXT(1, &binding, 1, &attribute);
+			bindings[1].binding = 1;
+			bindings[1].stride = sizeof(InstanceData);
+			bindings[1].inputRate = vk::VertexInputRate::eInstance; // per instance
+			bindings[1].divisor = 1;
 
-			vk::DeviceSize stride = sizeof(Vertex); // Make sure this >= sum of attribute sizes
-			vk::DeviceSize size = sizeof(Vertex) * vertices.size(); // Make sure this >= sum of attribute sizes
+			vk::VertexInputAttributeDescription2EXT attributes[2]{};
+			attributes[0].location = 0; // Vertex position
+			attributes[0].binding = 0;
+			attributes[0].format = vk::Format::eR32G32B32Sfloat;
+			attributes[0].offset = offsetof(Vertex, position);
+
+			attributes[1].location = 1; // Instance offset
+			attributes[1].binding = 1;
+			attributes[1].format = vk::Format::eR32G32Sfloat;
+			attributes[1].offset = offsetof(InstanceData, offset);
+
+			cmd.setVertexInputEXT(2, bindings, 2, attributes);
+
+			// Bind buffers
+			vk::DeviceSize offsets[2] = { 0, 0 };
+			vk::Buffer buffers[2] = {
+				vertexBuffer->getBuffer(),
+				instanceBuffer->getBuffer()
+			};
+			vk::DeviceSize sizes[2] = { sizeof(Vertex) * vertices.size(), sizeof(InstanceData) * instances.size() };
+			vk::DeviceSize strides[2] = { sizeof(Vertex), sizeof(InstanceData) };
+			//vk::DeviceSize stride = sizeof(Vertex); // Make sure this >= sum of attribute sizes
+			//vk::DeviceSize size = sizeof(Vertex) * vertices.size(); // Make sure this >= sum of attribute sizes
 
 			cmd.bindVertexBuffers2(
 				0
-				, 1
-				, &vertexBuffer->getBuffer()
-				, &offset
-				, &size
-				, &stride);
+				, 2
+				, buffers
+				, offsets
+				, sizes
+				, strides);
 
 			cmd.bindIndexBuffer(
 				indexBuffer->getBuffer(),
@@ -822,12 +894,13 @@ int main()
 
 			// cmd.draw(vertexBuffer->getVertexCount(), 1, 0, 0);
 			cmd.drawIndexed(
-				indexBuffer->getIndexCount(), // indexCount
-				2,                             // instanceCount
-				0,                             // firstIndex
-				0,                             // vertexOffset
-				0                              // firstInstance
+				indexBuffer->getIndexCount(),        // number of indices
+				instanceBuffer->getInstanceCount(),  // number of instances
+				0,                                   // first index
+				0,                                   // vertex offset
+				0                                    // first instance
 			);
+
 			cmd.endRendering();
 
 
@@ -895,7 +968,7 @@ int main()
 			device.destroyShaderEXT(fragShader);
 			device.destroyPipelineLayout(pipelineLayout);
 		}
-	}
+	} 
 ;
 	vmaDestroyAllocator(allocator);
 	vkbSwapchain.destroy_image_views(swapchainImageViews);
