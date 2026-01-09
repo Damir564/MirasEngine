@@ -9,15 +9,60 @@
 #include <filesystem>
 #include <fstream>
 #include <glm/glm.hpp>
+#include <glm/ext/matrix_transform.hpp>
+#include <glm/ext/matrix_clip_space.hpp>
+
+struct Camera {
+	glm::vec3 position{ 0.0f, 0.0f, 2.0f };
+	float yaw = -90.0f; // look forward
+	float pitch = 0.0f;
+	float speed = 2.4f;
+	float sensitivity = 0.1f;
+};
+
+glm::mat4 getView(const Camera& cam) {
+	glm::vec3 front{
+		cos(glm::radians(cam.yaw)) * cos(glm::radians(cam.pitch)),
+		sin(glm::radians(cam.pitch)),
+		sin(glm::radians(cam.yaw)) * cos(glm::radians(cam.pitch))
+	};
+
+	return glm::lookAt(
+		cam.position,
+		cam.position + glm::normalize(front),
+		glm::vec3(0, 1, 0)
+	);
+}
+
+glm::mat4 getProjection(float width, float height) {
+	glm::mat4 proj = glm::perspective(
+		glm::radians(60.0f),
+		width / height,
+		0.1f,
+		100.0f
+	);
+	proj[1][1] *= -1; // Vulkan clip space fix
+	return proj;
+}
+
+struct CameraPush {
+	glm::mat4 view;
+	glm::mat4 proj;
+};
+
 
 struct Vertex {
 	glm::vec3 position;
 };
 
 std::vector<Vertex> vertices = {
-	Vertex{{0.0f, -0.5f, 0.0f}},
-	Vertex{{0.5f,  0.5f, 0.0f}},
-	Vertex{{-0.5f, 0.5f, 0.0f}},
+	{{0.0f, -0.5f, 0.0f}},
+	{{0.5f,  0.5f, 0.0f}},
+	{{-0.5f, 0.5f, 0.0f}},
+
+	{{ 0.6f, -0.5f, 0.3f}},
+	{{ 1.1f,  0.5f, 0.3f}},
+	{{ 1.6f, -0.5f, 0.3f}},
 };
 
 class VertexBuffer {
@@ -185,8 +230,8 @@ int main()
 	vkb::InstanceBuilder builder;
 	auto instRet = builder
 		.set_app_name("SDL3 Vulkan App")
-		.require_api_version(1, 3, 0)
-		.set_minimum_instance_version(1, 3)
+		.require_api_version(1, 4, 0)
+		.set_minimum_instance_version(1, 4)
 		// .use_default_debug_messenger()
 		.enable_extensions(extensions)
 		// .enable_extension(VK_EXT_SHADER_OBJECT_EXTENSION_NAME)
@@ -233,7 +278,7 @@ int main()
 
 	vkb::PhysicalDeviceSelector selector{ vkbInstance };
 	auto physRet = selector
-		.set_minimum_version(1, 3)
+		.set_minimum_version(1, 4)
 		.add_required_extension(vk::EXTShaderObjectExtensionName)
 		.add_required_extension_features(shaderObjectFeatures)
 		.set_required_features_13(features13)
@@ -291,7 +336,7 @@ int main()
 	allocatorInfo.device = device;
 	allocatorInfo.instance = instance;
 	allocatorInfo.pVulkanFunctions = &vulkanFunctions;
-	allocatorInfo.vulkanApiVersion = vk::ApiVersion13;
+	allocatorInfo.vulkanApiVersion = vk::ApiVersion14;
 
 	VmaAllocator allocator;
 	if (vmaCreateAllocator(&allocatorInfo, &allocator) != VK_SUCCESS) {
@@ -446,7 +491,7 @@ int main()
 		vk::PushConstantRange pcRange{};
 		pcRange.stageFlags = vk::ShaderStageFlagBits::eVertex;
 		pcRange.offset = 0;
-		pcRange.size = sizeof(glm::vec2);
+		pcRange.size = sizeof(CameraPush);
 
 
 
@@ -507,20 +552,62 @@ int main()
 			fragShader
 		};
 
-
 		// ------------------------
 		// 8. Main loop
 		// ------------------------
+		Camera camera;
+		bool mouseEnabled = true;
+		SDL_SetWindowRelativeMouseMode(window, mouseEnabled);
 		bool running = true;
 		SDL_Event event;
 		uint32_t currentFrame = 0;
+		CameraPush pc{};
 
 		// Push constant data
 		glm::vec2 posOffsets = { 0.0f, 0.0f }; // Start at center
 
 		while (running) {
 			while (SDL_PollEvent(&event)) {
-				if (event.type == SDL_EVENT_QUIT) running = false;
+				const bool* keys = SDL_GetKeyboardState(nullptr);
+				if (event.type == SDL_EVENT_QUIT || keys[SDL_SCANCODE_ESCAPE]) 
+					running = false;
+
+				if (mouseEnabled) {
+					if (event.type == SDL_EVENT_MOUSE_MOTION) {
+						camera.yaw += event.motion.xrel * camera.sensitivity;
+						camera.pitch -= event.motion.yrel * camera.sensitivity;
+						camera.pitch = glm::clamp(camera.pitch, -89.0f, 89.0f);
+					}
+
+					float dt = 0.016f;
+
+					glm::vec3 front{
+						cos(glm::radians(camera.yaw)) * cos(glm::radians(camera.pitch)),
+						sin(glm::radians(camera.pitch)),
+						sin(glm::radians(camera.yaw)) * cos(glm::radians(camera.pitch))
+					};
+					front = glm::normalize(front);
+
+					glm::vec3 right = glm::normalize(glm::cross(front, glm::vec3(0, 1, 0)));
+
+					if (keys[SDL_SCANCODE_W]) camera.position += front * camera.speed * dt;
+					if (keys[SDL_SCANCODE_S]) camera.position -= front * camera.speed * dt;
+					if (keys[SDL_SCANCODE_A]) camera.position -= right * camera.speed * dt;
+					if (keys[SDL_SCANCODE_D]) camera.position += right * camera.speed * dt;
+				}
+
+				if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat) {
+					const SDL_KeyboardEvent& key = event.key;
+
+					bool shiftHeld =
+						(key.mod & SDL_KMOD_LSHIFT) ||
+						(key.mod & SDL_KMOD_RSHIFT);
+
+					if (shiftHeld && key.scancode == SDL_SCANCODE_GRAVE) {
+						mouseEnabled = !mouseEnabled;
+						SDL_SetWindowRelativeMouseMode(window, mouseEnabled);
+					}
+				}
 			}
 
 			vk::SwapchainKHR swapchainHPP(vkbSwapchain.swapchain);
@@ -588,11 +675,16 @@ int main()
 			vk::DeviceSize offset = 0;
 			// cmd.bindVertexBuffers(0, 1, &vertexBuffer->getBuffer(), &offset);
 			
-			cmd.pushConstants<glm::vec2>(
+			
+			pc.view = getView(camera);
+			pc.proj = getProjection(1280.0f, 720.0f);
+
+			cmd.pushConstants(
 				pipelineLayout,
 				vk::ShaderStageFlagBits::eVertex,
 				0,
-				posOffsets
+				sizeof(CameraPush),
+				&pc
 			);
 
 			const vk::Viewport viewport{ 0, 0, 1280.f, 720.f, 0.f, 1.f };
@@ -633,7 +725,7 @@ int main()
 			vk::DeviceSize stride = sizeof(Vertex); // Make sure this >= sum of attribute sizes
 			vk::DeviceSize size = sizeof(Vertex) * vertices.size(); // Make sure this >= sum of attribute sizes
 			cmd.bindVertexBuffers2(0, 1, &vertexBuffer->getBuffer(), &offset, &size, &stride);
-			cmd.draw(3, 1, 0, 0);
+			cmd.draw(vertexBuffer->getVertexCount(), 1, 0, 0);
 			cmd.endRendering();
 
 
