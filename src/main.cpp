@@ -50,19 +50,20 @@ struct CameraPush {
 	glm::mat4 proj;
 };
 
-
 struct Vertex {
 	glm::vec3 position;
 };
 
 std::vector<Vertex> vertices = {
-	{{0.0f, -0.5f, 0.0f}},
-	{{0.5f,  0.5f, 0.0f}},
-	{{-0.5f, 0.5f, 0.0f}},
+	// Triangle 1
+	{{-0.8f, -0.5f, 0.0f}},
+	{{-0.4f,  0.5f, 0.0f}},
+	{{ 0.0f, -0.5f, 0.0f}},
 
-	{{ 0.6f, -0.5f, 0.3f}},
-	{{ 1.1f,  0.5f, 0.3f}},
-	{{ 1.6f, -0.5f, 0.3f}},
+	// Triangle 2
+	{{ 0.2f, -0.5f, 0.0f}},
+	{{ 0.6f,  0.5f, 0.0f}},
+	{{ 1.0f, -0.5f, 0.0f}},
 };
 
 class VertexBuffer {
@@ -154,6 +155,72 @@ private:
 	vk::Buffer m_buffer;
 	VmaAllocation m_allocation;
 	uint32_t m_vertexCount;
+};
+
+std::vector<uint32_t> indices = {
+	0, 1, 2,
+	3, 4, 5
+};
+
+class IndexBuffer {
+public:
+	IndexBuffer(VmaAllocator allocator,
+		vk::Device device,
+		const std::vector<uint32_t>& indices)
+		: m_allocator(allocator), m_device(device),
+		m_indexCount(static_cast<uint32_t>(indices.size()))
+	{
+		VkBufferCreateInfo bufferInfo{};
+		bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+		bufferInfo.size = sizeof(uint32_t) * indices.size();
+		bufferInfo.usage = VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
+		bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+		VmaAllocationCreateInfo allocInfo{};
+		allocInfo.usage = VMA_MEMORY_USAGE_CPU_TO_GPU;
+		allocInfo.requiredFlags =
+			VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+			VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+		allocInfo.flags = VMA_ALLOCATION_CREATE_MAPPED_BIT;
+
+		VkBuffer rawBuffer;
+		if (vmaCreateBuffer(
+			m_allocator,
+			&bufferInfo,
+			&allocInfo,
+			&rawBuffer,
+			&m_allocation,
+			nullptr) != VK_SUCCESS)
+		{
+			throw std::runtime_error("Failed to create index buffer");
+		}
+
+		m_buffer = vk::Buffer(rawBuffer);
+
+		void* mapped;
+		vmaMapMemory(m_allocator, m_allocation, &mapped);
+		memcpy(mapped, indices.data(), bufferInfo.size);
+		vmaUnmapMemory(m_allocator, m_allocation);
+	}
+
+	~IndexBuffer() {
+		if (m_buffer && m_allocation) {
+			vmaDestroyBuffer(
+				m_allocator,
+				VkBuffer(m_buffer),
+				m_allocation);
+		}
+	}
+
+	vk::Buffer getBuffer() const { return m_buffer; }
+	uint32_t getIndexCount() const { return m_indexCount; }
+
+private:
+	VmaAllocator m_allocator;
+	vk::Device   m_device;
+	vk::Buffer   m_buffer;
+	VmaAllocation m_allocation;
+	uint32_t     m_indexCount;
 };
 
 std::vector<uint32_t> loadSpirv(const std::filesystem::path& path)
@@ -465,6 +532,20 @@ int main()
 		}
 
 		// ------------------------
+		// 13. Create Index Buffer
+		// ------------------------
+		std::unique_ptr<IndexBuffer> indexBuffer;
+		try {
+			indexBuffer = std::make_unique<IndexBuffer>(
+				allocator, device, indices);
+		}
+		catch (const std::exception& e) {
+			std::cerr << "Failed to create index buffer: "
+				<< e.what() << "\n";
+			return -1;
+		}
+
+		// ------------------------
 		// 14. Load Shaders
 		// ------------------------
 		std::vector<uint32_t> vertCode, fragCode;
@@ -724,8 +805,29 @@ int main()
 
 			vk::DeviceSize stride = sizeof(Vertex); // Make sure this >= sum of attribute sizes
 			vk::DeviceSize size = sizeof(Vertex) * vertices.size(); // Make sure this >= sum of attribute sizes
-			cmd.bindVertexBuffers2(0, 1, &vertexBuffer->getBuffer(), &offset, &size, &stride);
-			cmd.draw(vertexBuffer->getVertexCount(), 1, 0, 0);
+
+			cmd.bindVertexBuffers2(
+				0
+				, 1
+				, &vertexBuffer->getBuffer()
+				, &offset
+				, &size
+				, &stride);
+
+			cmd.bindIndexBuffer(
+				indexBuffer->getBuffer(),
+				0,
+				vk::IndexType::eUint32
+			);
+
+			// cmd.draw(vertexBuffer->getVertexCount(), 1, 0, 0);
+			cmd.drawIndexed(
+				indexBuffer->getIndexCount(), // indexCount
+				2,                             // instanceCount
+				0,                             // firstIndex
+				0,                             // vertexOffset
+				0                              // firstInstance
+			);
 			cmd.endRendering();
 
 
