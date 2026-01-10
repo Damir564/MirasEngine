@@ -85,11 +85,21 @@ FetchContent_Declare(
 )
 
 # Disable building unnecessary things
-set(ASSIMP_BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)  # <-- static lib
+set(ASSIMP_BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 set(ASSIMP_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(ASSIMP_BUILD_SAMPLES OFF CACHE BOOL "" FORCE)
 set(ASSIMP_BUILD_DOCS OFF CACHE BOOL "" FORCE)
 set(ASSIMP_BUILD_ASSIMP_TOOLS OFF CACHE BOOL "" FORCE)
+
+# ============================
+# Fetch stb_image from GitHub
+# ============================
+FetchContent_Declare(
+    stb
+    GIT_REPOSITORY https://github.com/nothings/stb.git
+    GIT_TAG master
+    GIT_SHALLOW TRUE
+)
 
 # ============================
 # Make everything available
@@ -102,4 +112,13 @@ FetchContent_MakeAvailable(
   SDL3
   glm
   assimp
+  stb
+)
+
+add_library(stb_image STATIC
+    stb_image.cpp
+)
+
+target_include_directories(stb_image
+    PUBLIC ${stb_SOURCE_DIR}
 )

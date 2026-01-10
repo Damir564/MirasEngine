@@ -23,6 +23,7 @@ target_link_libraries(engine PRIVATE
     SDL3::SDL3
     glm::glm-header-only
     assimp
+    stb_image
 )
 
 

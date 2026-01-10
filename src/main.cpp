@@ -48,6 +48,10 @@ glm::mat4 getProjection(float width, float height) {
 	return proj;
 }
 
+struct MaterialPush {
+	alignas(16) glm::vec3 diffuseColor;
+};
+
 struct CameraPush {
 	glm::mat4 view;
 	glm::mat4 proj;
@@ -322,10 +326,18 @@ std::vector<uint32_t> loadSpirv(const std::filesystem::path& path)
 	return code;
 }
 
+struct Material {
+	glm::vec3 diffuseColor{ 1.0f };
+	std::string diffuseTexture; // path to diffuse texture
+};
+
 struct Mesh {
 	std::vector<Vertex> vertices;
 	std::vector<uint32_t> indices;
+	std::vector<Material> materials;
+	std::vector<uint32_t> meshMaterialIdx;
 };
+
 
 Mesh loadGLB(const std::string& path) {
 	Assimp::Importer importer;
@@ -370,6 +382,36 @@ Mesh loadGLB(const std::string& path) {
 		}
 
 		vertexOffset += mesh->mNumVertices;
+
+		// ----------------- MATERIAL HANDLING -----------------
+		uint32_t matIndex = mesh->mMaterialIndex;
+		Material mat{ glm::vec3(1.0f), "" }; // default white
+
+		if (scene->HasMaterials()) {
+			const aiMaterial* aMat = scene->mMaterials[matIndex];
+
+			aiColor3D color(1.0f, 1.0f, 1.0f);
+			if (AI_SUCCESS == aMat->Get(AI_MATKEY_COLOR_DIFFUSE, color)) {
+				mat.diffuseColor = glm::vec3(color.r, color.g, color.b);
+			}
+
+			if (aMat->GetTextureCount(aiTextureType_DIFFUSE) > 0) {
+				aiString path;
+				aMat->GetTexture(aiTextureType_DIFFUSE, 0, &path);
+				mat.diffuseTexture = path.C_Str(); // store texture path
+			}
+		}
+
+		// store material if new
+		auto it = std::find_if(result.materials.begin(), result.materials.end(),
+			[&](const Material& m) { return m.diffuseColor == mat.diffuseColor && m.diffuseTexture == mat.diffuseTexture; });
+		if (it == result.materials.end()) {
+			result.materials.push_back(mat);
+			result.meshMaterialIdx.push_back(static_cast<uint32_t>(result.materials.size() - 1));
+		}
+		else {
+			result.meshMaterialIdx.push_back(static_cast<uint32_t>(it - result.materials.begin()));
+		}
 	}
 
 	return result;
@@ -742,6 +784,12 @@ int main()
 		pcRange.offset = 0;
 		pcRange.size = sizeof(CameraPush);
 
+		vk::PushConstantRange materialRange{};
+		materialRange.stageFlags = vk::ShaderStageFlagBits::eFragment; // or vertex+fragment
+		materialRange.offset = sizeof(CameraPush);
+		materialRange.size = sizeof(MaterialPush);
+
+		vk::PushConstantRange allRanges[] = { pcRange, materialRange };
 
 
 		// shader create info
@@ -753,8 +801,8 @@ int main()
 			.setCodeSize(vertCode.size() * sizeof(vertCode.front()))
 			.setPCode(vertCode.data())
 			.setPName("main")
-			.setPushConstantRangeCount(1)
-			.setPPushConstantRanges(&pcRange);
+			.setPushConstantRangeCount(2)
+			.setPPushConstantRanges(allRanges);
 
 		vk::ShaderCreateInfoEXT fragInfo{};
 		fragInfo.setStage(vk::ShaderStageFlagBits::eFragment)
@@ -763,16 +811,17 @@ int main()
 			.setCodeSize(fragCode.size() * sizeof(uint32_t))
 			.setPCode(fragCode.data())
 			.setPName("main")
-			.setPushConstantRangeCount(1)
-			.setPPushConstantRanges(&pcRange);
+			.setPushConstantRangeCount(2)
+			.setPPushConstantRanges(allRanges);
 
 		vk::ShaderEXT vertShader, fragShader;
 		vertShader = device.createShaderEXT(vertInfo).value;
 		fragShader = device.createShaderEXT(fragInfo).value;
 
 
+		std::vector<vk::PushConstantRange> pushRanges = { pcRange, materialRange };
 		vk::PipelineLayoutCreateInfo layoutInfo{};
-		layoutInfo.setPushConstantRanges(pcRange);
+		layoutInfo.setPushConstantRanges(pushRanges);
 		// arrays for binding shaders
 		vk::PipelineLayout pipelineLayout;
 		try {
@@ -960,6 +1009,18 @@ int main()
 				&pc
 			);
 
+			MaterialPush matPC{};
+			uint32_t meshMatIdx = 0; // or result.meshMaterialIdx[meshIndex];
+			matPC.diffuseColor = glm::vec3(model.materials[meshMatIdx].diffuseColor);
+
+			cmd.pushConstants(
+				pipelineLayout,
+				vk::ShaderStageFlagBits::eFragment, // fragment shader
+				sizeof(CameraPush),                 // offset after camera push constant
+				sizeof(MaterialPush),
+				&matPC
+			);
+
 			const vk::Viewport viewport{ 0, 0, 1280.f, 720.f, 0.f, 1.f };
 			const vk::Rect2D rect{ {0,0},{1280,720} };
 			cmd.setViewport(0, viewport);
@@ -983,11 +1044,6 @@ int main()
 			cmd.setScissorWithCount(1, &rect);
 			cmd.setPrimitiveRestartEnable(VK_FALSE);
 
-			vk::VertexInputBindingDescription2EXT bindingDescs[2] = {
-				Vertex::getBindingDescription(0), // Main geometry
-				// If you use instances:
-				vk::VertexInputBindingDescription2EXT{1, sizeof(InstanceData), vk::VertexInputRate::eInstance}
-			};
 			auto attributesArray = Vertex::getAttributeDescriptions(0);
 
 			// If using instance buffer as second binding, keep it:
@@ -996,6 +1052,11 @@ int main()
 			instanceBinding.stride = sizeof(InstanceData);
 			instanceBinding.inputRate = vk::VertexInputRate::eInstance;
 			instanceBinding.divisor = 1;
+			vk::VertexInputBindingDescription2EXT bindingDescs[2] = {
+				Vertex::getBindingDescription(0), // Main geometry
+				// If you use instances:
+				instanceBinding
+			};
 			// vk::VertexInputBindingDescription2EXT bindings[2]{ binding, instanceBinding };
 			cmd.setVertexInputEXT(2, bindingDescs, static_cast<uint32_t>(attributesArray.size()), attributesArray.data());
 
