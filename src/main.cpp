@@ -63,6 +63,7 @@ struct Vertex {
 	glm::vec3 position;
 	glm::vec3 normal;
 	glm::vec2 texCoord;
+	glm::vec3 tangent;
 
 	static vk::VertexInputBindingDescription2EXT getBindingDescription(uint32_t binding = 0) {
 		vk::VertexInputBindingDescription2EXT desc{};
@@ -73,8 +74,8 @@ struct Vertex {
 		return desc;
 	}
 
-	static std::array<vk::VertexInputAttributeDescription2EXT, 4> getAttributeDescriptions(uint32_t locationOffset = 0) {
-		std::array<vk::VertexInputAttributeDescription2EXT, 4> attributes{};
+	static std::array<vk::VertexInputAttributeDescription2EXT, 5> getAttributeDescriptions(uint32_t locationOffset = 0) {
+		std::array<vk::VertexInputAttributeDescription2EXT, 5> attributes{};
 
 		// position
 		attributes[0].location = locationOffset + 0;
@@ -94,11 +95,17 @@ struct Vertex {
 		attributes[2].format = vk::Format::eR32G32Sfloat;
 		attributes[2].offset = offsetof(Vertex, texCoord);
 
+		// Tangent (Loc 3)
+		attributes[3].location = locationOffset + 3;
+		attributes[3].binding = 0;
+		attributes[3].format = vk::Format::eR32G32B32Sfloat;
+		attributes[3].offset = offsetof(Vertex, tangent);
+
 		// Instance buffer attribute
-		attributes[3].location = locationOffset + 3;             // matches shader
-		attributes[3].binding = 1;              // instance buffer binding
-		attributes[3].format = vk::Format::eR32G32B32Sfloat; // vec3
-		attributes[3].offset = 0;               // offset inside InstanceData struct
+		attributes[4].location = locationOffset + 4;             // matches shader
+		attributes[4].binding = 1;              // instance buffer binding
+		attributes[4].format = vk::Format::eR32G32B32Sfloat; // vec3
+		attributes[4].offset = 0;               // offset inside InstanceData struct
 
 		return attributes;
 	}
@@ -262,7 +269,7 @@ struct InstanceData {
 
 // Example: 4 instances, spread out
 std::vector<InstanceData> instances = {
-	{{0.0f, 0.0f, 0.0f}},
+	{{0.0f, -200.0f, 0.0f}},
 	//{{ 0.5f, -0.4f}},
 	//{{-0.5f, 0.4f}},
 	//{{ 0.5f, 0.4f}}
@@ -488,6 +495,7 @@ struct Material {
 	float metallicFactor{ 1.0f };
 	float roughnessFactor{ 1.0f };
 	int baseColorTextureIndex = -1;
+	int normalTextureIndex = -1;
 };
 
 struct SubmeshInfo {
@@ -504,13 +512,9 @@ struct Mesh {
 	std::vector<TextureData> textureData;
 };
 
-TextureData loadMaterialTexture(const aiScene* scene, const aiMaterial* mat, const std::string& modelPath) {
+TextureData loadMaterialTexture(const aiScene* scene, const aiMaterial* mat, const std::string& modelPath, aiTextureType type) {
 	TextureData texture{};
 	aiString path;
-
-	// Try BASE_COLOR (GLTF standard), fall back to DIFFUSE
-	aiTextureType type = aiTextureType_BASE_COLOR;
-	if (mat->GetTextureCount(type) == 0) type = aiTextureType_DIFFUSE;
 
 	if (mat->GetTexture(type, 0, &path) == AI_SUCCESS) {
 		// 1. Check for Embedded Texture (marked with *)
@@ -576,6 +580,9 @@ Mesh loadGLB(const std::string& path) {
 			vertex.position = { mesh->mVertices[i].x, mesh->mVertices[i].y, mesh->mVertices[i].z };
 			vertex.normal = mesh->HasNormals() ? glm::vec3(mesh->mNormals[i].x, mesh->mNormals[i].y, mesh->mNormals[i].z) : glm::vec3(0.0f);
 			vertex.texCoord = mesh->HasTextureCoords(0) ? glm::vec2(mesh->mTextureCoords[0][i].x, mesh->mTextureCoords[0][i].y) : glm::vec2(0.0f);
+			vertex.tangent = mesh->HasTangentsAndBitangents()
+				? glm::vec3(mesh->mTangents[i].x, mesh->mTangents[i].y, mesh->mTangents[i].z)
+				: glm::vec3(0.0f);
 			result.vertices.push_back(vertex);
 		}
 
@@ -608,21 +615,35 @@ Mesh loadGLB(const std::string& path) {
 				info.material.roughnessFactor = roughness;
 
 			aiString texPath;
-			aiTextureType type = aiTextureType_BASE_COLOR;
-			if (material->GetTextureCount(type) == 0) type = aiTextureType_DIFFUSE;
-
-			if (material->GetTexture(type, 0, &texPath) == AI_SUCCESS) {
+			// Base Color
+			if (material->GetTexture(aiTextureType_BASE_COLOR, 0, &texPath) == AI_SUCCESS) {
 				std::string key = texPath.C_Str();
 				if (textureCache.find(key) != textureCache.end()) {
 					info.material.baseColorTextureIndex = textureCache[key];
 				}
 				else {
-					TextureData tex = loadMaterialTexture(scene, material, path);
+					TextureData tex = loadMaterialTexture(scene, material, path, aiTextureType_BASE_COLOR);
 					if (tex.pixels) { // Only add if load succeeded
 						int newIdx = (int)result.textureData.size();
 						result.textureData.push_back(tex);
 						textureCache[key] = newIdx;
 						info.material.baseColorTextureIndex = newIdx;
+					}
+				}
+			}
+			// Normal Map
+			if (material->GetTexture(aiTextureType_NORMALS, 0, &texPath) == AI_SUCCESS) {
+				std::string key = texPath.C_Str();
+				if (textureCache.find(key) != textureCache.end()) {
+					info.material.normalTextureIndex = textureCache[key];
+				}
+				else {
+					TextureData tex = loadMaterialTexture(scene, material, path, aiTextureType_NORMALS);
+					if (tex.pixels) {
+						int newIdx = (int)result.textureData.size();
+						result.textureData.push_back(tex);
+						textureCache[key] = newIdx;
+						info.material.normalTextureIndex = newIdx;
 					}
 				}
 			}
@@ -661,10 +682,10 @@ int main()
 
 	Mesh model;
 	try {
-		// model = loadGLB("models/sponza-palace/source/scene.glb");
+		model = loadGLB("models/sponza-palace/source/scene.glb");
 		// model = loadGLB("models/london-city/source/traffic_slam_2_map.glb");
 		// model = loadGLB("models/dae-diorama-grandmas-house/source/Dae_diorama_upload/Dae_diorama_upload.fbx");
-		model = loadGLB("models/polygon-mini-free/source/model.obj");
+		// model = loadGLB("models/polygon-mini-free/source/model.obj");
 		// model = loadGLB("models/figure-embodying-the-element-silver/Ag_rechte_f Figur_lowres.obj");
 	}
 	catch (const std::exception& e) {
@@ -974,8 +995,6 @@ int main()
 			// Free CPU memory now that it's on GPU
 			cpuTex.free();
 		}
-		// ... [Before pipelineLayout creation] ...
-
 		// 1. Create Texture Sampler (Common for all textures)
 		vk::SamplerCreateInfo samplerInfo{};
 		samplerInfo.magFilter = vk::Filter::eLinear;
@@ -1019,18 +1038,27 @@ int main()
 			allocator, device, commandPool.get(), graphicsQueue, whiteTexData
 		);
 
+		TextureData normalTexData;
+		normalTexData.width = 1; normalTexData.height = 1; normalTexData.channels = 4;
+		unsigned char normalPixels[] = { 128, 128, 255, 255 };
+		normalTexData.pixels = normalPixels;
+
+		auto defaultNormalTexture = std::make_unique<TextureImage>(
+			allocator, device, commandPool.get(), graphicsQueue, normalTexData
+		);
+
 		// 2. Create Descriptor Pool
 		// We need 1 set for the default texture + 1 set per loaded texture
 		uint32_t totalTextures = 1 + (uint32_t)gpuTextures.size();
 
 		vk::DescriptorPoolSize poolSize{};
 		poolSize.type = vk::DescriptorType::eCombinedImageSampler;
-		poolSize.descriptorCount = totalTextures;
+		poolSize.descriptorCount = totalTextures + 2;
 
 		vk::DescriptorPoolCreateInfo poolInfo{};
 		poolInfo.poolSizeCount = 1;
 		poolInfo.pPoolSizes = &poolSize;
-		poolInfo.maxSets = totalTextures;
+		poolInfo.maxSets = totalTextures + 2;
 
 		vk::UniqueDescriptorPool descriptorPool = device.createDescriptorPoolUnique(poolInfo).value;
 
@@ -1064,6 +1092,14 @@ int main()
 
 		// Update Default Set (Index 0)
 		updateDescriptorSet(textureDescriptorSets[0], defaultTexture->getView());
+
+		vk::DescriptorSetAllocateInfo defaultNormalAllocInfo{};
+		defaultNormalAllocInfo.descriptorPool = descriptorPool.get();
+		defaultNormalAllocInfo.descriptorSetCount = 1;
+		defaultNormalAllocInfo.pSetLayouts = &descriptorSetLayout.get();
+
+		vk::DescriptorSet defaultNormalSet = device.allocateDescriptorSets(defaultNormalAllocInfo).value[0];
+		updateDescriptorSet(defaultNormalSet, defaultNormalTexture->getView());
 
 		// Update Loaded Textures (Indices 1 to N)
 		for (size_t i = 0; i < gpuTextures.size(); i++) {
@@ -1117,7 +1153,9 @@ int main()
 
 		vk::PushConstantRange allRanges[] = { pcRange };
 
-		vk::DescriptorSetLayout layouts[] = { descriptorSetLayout.get() };
+		vk::DescriptorSetLayout layouts[] = { 
+			descriptorSetLayout.get()
+			, descriptorSetLayout.get() };
 
 		// shader create info
 		vk::ShaderCreateInfoEXT vertInfo{};
@@ -1130,7 +1168,7 @@ int main()
 			.setPName("main")
 			.setPushConstantRangeCount(1)
 			.setPPushConstantRanges(allRanges)
-			.setSetLayoutCount(1)
+			.setSetLayoutCount(2)
 			.setPSetLayouts(layouts);
 
 		vk::ShaderCreateInfoEXT fragInfo{};
@@ -1142,7 +1180,7 @@ int main()
 			.setPName("main")
 			.setPushConstantRangeCount(1)
 			.setPPushConstantRanges(allRanges)
-			.setSetLayoutCount(1)
+			.setSetLayoutCount(2)
 			.setPSetLayouts(layouts);
 
 		vk::ShaderEXT vertShader, fragShader;
@@ -1153,7 +1191,8 @@ int main()
 		std::vector<vk::PushConstantRange> pushRanges = { pcRange };
 		vk::PipelineLayoutCreateInfo pipelineLayoutInfo{};
 		pipelineLayoutInfo.setPushConstantRanges(pushRanges);
-		pipelineLayoutInfo.setSetLayouts(descriptorSetLayout.get());
+		pipelineLayoutInfo.setSetLayoutCount(2);
+		pipelineLayoutInfo.setPSetLayouts(layouts);
 		// arrays for binding shaders
 		vk::PipelineLayout pipelineLayout;
 		try {
@@ -1420,6 +1459,7 @@ int main()
 					&pc
 				);
 
+				// base color
 				vk::DescriptorSet setParams;
 				if (sub.material.baseColorTextureIndex >= 0) {
 					// Index + 1 because set[0] is the default white texture
@@ -1436,6 +1476,22 @@ int main()
 					1, &setParams,
 					0, nullptr
 				);
+
+				//normal
+				vk::DescriptorSet normalSet;
+				if (sub.material.normalTextureIndex >= 0) {
+					normalSet = textureDescriptorSets[sub.material.normalTextureIndex + 1];
+				}
+				else {
+					normalSet = defaultNormalSet;
+				}
+				cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics
+					, pipelineLayout
+					, 1
+					, 1
+					, &normalSet
+					, 0
+					, nullptr);
 
 				cmd.drawIndexed(
 					sub.indexCount,      // number of indices

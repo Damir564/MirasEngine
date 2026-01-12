@@ -2,12 +2,15 @@
 #extension GL_NV_uniform_buffer_std430_layout : enable
 #extension GL_KHR_vulkan_glsl : enable
 
-layout(location = 0) in vec3 fragColor;
-layout(location = 1) in vec3 N;
-layout(location = 2) in vec3 L;
-layout(location = 3) in vec2 fragTexCoord;
+layout(location = 0) in vec3 fragWorldPos;
+layout(location = 1) in vec3 fragNormal;
+layout(location = 2) in vec2 fragTexCoord;
+layout(location = 3) in mat3 TBN;
 
-layout(set = 0, binding = 0) uniform sampler2D texSampler;
+// Set 0: Base Color
+layout(set = 0, binding = 0) uniform sampler2D baseColorSampler;
+// Set 1: Normal Map (NEW)
+layout(set = 1, binding = 0) uniform sampler2D normalMapSampler;
 
 layout(push_constant) uniform MeshData {
     mat4 view;
@@ -41,7 +44,9 @@ float GeometrySchlickGGX(float NdotV, float roughness) {
 }
 
 float GeometrySmith(vec3 N, vec3 V, vec3 L, float roughness) {
-    return GeometrySchlickGGX(max(dot(N, V), 0.0), roughness) * GeometrySchlickGGX(max(dot(N, L), 0.0), roughness);
+    float ggx2 = GeometrySchlickGGX(max(dot(N, V), 0.0), roughness);
+    float ggx1 = GeometrySchlickGGX(max(dot(N, L), 0.0), roughness);
+    return ggx1 * ggx2;
 }
 
 // 3. Fresnel Equation (Schlick)
@@ -51,39 +56,46 @@ vec3 fresnelSchlick(float cosTheta, vec3 F0) {
 
 void main() {
     // 1. Sample the texture
-    vec4 texColor = texture(texSampler, fragTexCoord);
+    vec4 texColor = texture(baseColorSampler, fragTexCoord);
+    vec3 albedo = pc.baseColor.rgb * texColor.rgb;
     
-    // 2. Combine Material Base Color with Texture Color
-    vec3 baseColor = pc.baseColor.rgb * texColor.rgb;
-    float lightIntensity = 2.0;
-    vec3 ambient = vec3(0.05) * baseColor;
-    vec3 normal = normalize(N);
-    vec3 viewDir = normalize(vec3(0.0, 0.0, 1.0)); // Simplification: assuming view is forward
-    vec3 lightDir = normalize(L);
-    vec3 halfwayDir = normalize(viewDir + lightDir);
+    // 2. Normal Mapping
+    vec3 normalMapValue = texture(normalMapSampler, fragTexCoord).rgb;
+    // Transform from [0,1] range to [-1,1] range
+    normalMapValue = normalMapValue * 2.0 - 1.0; 
+    // Transform from Tangent Space to World Space
+    vec3 N = normalize(TBN * normalMapValue); 
 
-    // Surface reflection at zero incidence
+    // 3. Lighting Setup
+    vec3 L = normalize(vec3(-0.4, 0.8, 0.6)); // Light Direction
+    // Approximate view pos (assuming camera at 0,0,100 or similar, pass actual cam pos for better accuracy)
+    vec3 V = normalize(vec3(0.0, 0.0, 100.0) - fragWorldPos);
+    vec3 H = normalize(V + L);
+
+    // 4. PBR Calculation
     vec3 F0 = vec3(0.04); 
-    F0 = mix(F0, baseColor, pc.metallic);
+    F0 = mix(F0, albedo, pc.metallic);
 
-    // Cook-Torrance BRDF components
-    float NDF = DistributionGGX(normal, halfwayDir, pc.roughness);
-    float G = GeometrySmith(normal, viewDir, lightDir, pc.roughness);
-    vec3 F = fresnelSchlick(max(dot(halfwayDir, viewDir), 0.0), F0);
+    float NDF = DistributionGGX(N, H, pc.roughness);
+    float G = GeometrySmith(N, V, L, pc.roughness);
+    vec3 F = fresnelSchlick(max(dot(H, V), 0.0), F0);
 
     vec3 numerator = NDF * G * F;
-    float denominator = 4.0 * max(dot(normal, viewDir), 0.0) * max(dot(normal, lightDir), 0.0) + 0.0001;
+    float denominator = 4.0 * max(dot(N, V), 0.0) * max(dot(N, L), 0.0) + 0.0001;
     vec3 specular = numerator / denominator;
 
     vec3 kS = F;
     vec3 kD = vec3(1.0) - kS;
     kD *= 1.0 - pc.metallic;
 
-    float nDotL = max(dot(normal, lightDir), 0.0);
-    vec3 diffuse = kD * baseColor / PI;
-    //  vec3 color = (diffuse + specular) * nDotL;
-    vec3 color = ambient + (diffuse + specular) * nDotL * lightIntensity;;
+    float NdotL = max(dot(N, L), 0.0);
+    vec3 diffuse = kD * albedo / PI;
 
-    color = color / (color + vec3(1.0)); // Simple Tone mapping
+    vec3 ambient = vec3(0.05) * albedo;
+    vec3 color = ambient + (diffuse + specular) * NdotL * 2.0; // 2.0 = light intensity
+
+    // Tone Mapping
+    color = color / (color + vec3(1.0));
+    
     outColor = vec4(color, texColor.a * pc.baseColor.a);
 }
