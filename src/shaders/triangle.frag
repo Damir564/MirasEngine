@@ -1,9 +1,13 @@
 #version 460
 #extension GL_NV_uniform_buffer_std430_layout : enable
+#extension GL_KHR_vulkan_glsl : enable
 
 layout(location = 0) in vec3 fragColor;
 layout(location = 1) in vec3 N;
 layout(location = 2) in vec3 L;
+layout(location = 3) in vec2 fragTexCoord;
+
+layout(set = 0, binding = 0) uniform sampler2D texSampler;
 
 layout(push_constant) uniform MeshData {
     mat4 view;
@@ -46,7 +50,13 @@ vec3 fresnelSchlick(float cosTheta, vec3 F0) {
 }
 
 void main() {
-    float lightIntensity = 1.5;
+    // 1. Sample the texture
+    vec4 texColor = texture(texSampler, fragTexCoord);
+    
+    // 2. Combine Material Base Color with Texture Color
+    vec3 baseColor = pc.baseColor.rgb * texColor.rgb;
+    float lightIntensity = 2.0;
+    vec3 ambient = vec3(0.05) * baseColor;
     vec3 normal = normalize(N);
     vec3 viewDir = normalize(vec3(0.0, 0.0, 1.0)); // Simplification: assuming view is forward
     vec3 lightDir = normalize(L);
@@ -54,7 +64,7 @@ void main() {
 
     // Surface reflection at zero incidence
     vec3 F0 = vec3(0.04); 
-    F0 = mix(F0, pc.baseColor.rgb, pc.metallic);
+    F0 = mix(F0, baseColor, pc.metallic);
 
     // Cook-Torrance BRDF components
     float NDF = DistributionGGX(normal, halfwayDir, pc.roughness);
@@ -70,12 +80,10 @@ void main() {
     kD *= 1.0 - pc.metallic;
 
     float nDotL = max(dot(normal, lightDir), 0.0);
-    vec3 diffuse = kD * pc.baseColor.rgb / PI;
+    vec3 diffuse = kD * baseColor / PI;
+    //  vec3 color = (diffuse + specular) * nDotL;
+    vec3 color = ambient + (diffuse + specular) * nDotL * lightIntensity;;
 
-    vec3 color = (diffuse + specular) * nDotL;
-
-    // Ambient + Tone mapping (very basic)
-    color = color / (color + vec3(1.0));
-    
-    outColor = vec4(color, 1.0);
+    color = color / (color + vec3(1.0)); // Simple Tone mapping
+    outColor = vec4(color, texColor.a * pc.baseColor.a);
 }

@@ -661,10 +661,10 @@ int main()
 
 	Mesh model;
 	try {
-		model = loadGLB("models/sponza-palace/source/scene.glb");
+		// model = loadGLB("models/sponza-palace/source/scene.glb");
 		// model = loadGLB("models/london-city/source/traffic_slam_2_map.glb");
 		// model = loadGLB("models/dae-diorama-grandmas-house/source/Dae_diorama_upload/Dae_diorama_upload.fbx");
-		// model = loadGLB("models/polygon-mini-free/source/model.obj");
+		model = loadGLB("models/polygon-mini-free/source/model.obj");
 		// model = loadGLB("models/figure-embodying-the-element-silver/Ag_rechte_f Figur_lowres.obj");
 	}
 	catch (const std::exception& e) {
@@ -758,6 +758,7 @@ int main()
 		.add_required_extension_features(shaderObjectFeatures)
 		.set_required_features_13(features13)
 		.set_surface(surface)
+		// .add_required_extension_features(VkPhysicalDeviceFeatures{ .samplerAnisotropy = VK_TRUE })
 		.select();
 
 	if (!physRet) {
@@ -944,20 +945,20 @@ int main()
 		// ------------------------
 		// 12. Command Pool
 		// ------------------------
-		vk::CommandPoolCreateInfo poolInfo{};
-		poolInfo.flags = vk::CommandPoolCreateFlagBits::eResetCommandBuffer;
-		poolInfo.queueFamilyIndex = graphicsQueueIndex;
+		vk::CommandPoolCreateInfo commandPoolInfo{};
+		commandPoolInfo.flags = vk::CommandPoolCreateFlagBits::eResetCommandBuffer;
+		commandPoolInfo.queueFamilyIndex = graphicsQueueIndex;
 
-		vk::UniqueCommandPool commandPool = device.createCommandPoolUnique(poolInfo).value;
+		vk::UniqueCommandPool commandPool = device.createCommandPoolUnique(commandPoolInfo).value;
 		// ------------------------
 		// 13. Command Buffer
 		// ------------------------
-		vk::CommandBufferAllocateInfo allocInfo{};
-		allocInfo.commandPool = commandPool.get();
-		allocInfo.level = vk::CommandBufferLevel::ePrimary;
-		allocInfo.commandBufferCount = MAX_FRAMES_IN_FLIGHT;
+		vk::CommandBufferAllocateInfo commandAllocInfo{};
+		commandAllocInfo.commandPool = commandPool.get();
+		commandAllocInfo.level = vk::CommandBufferLevel::ePrimary;
+		commandAllocInfo.commandBufferCount = MAX_FRAMES_IN_FLIGHT;
 
-		auto allocatedCommandBuffers = device.allocateCommandBuffersUnique(allocInfo);
+		auto allocatedCommandBuffers = device.allocateCommandBuffersUnique(commandAllocInfo);
 		std::vector<vk::UniqueCommandBuffer> commandBuffers = std::move(allocatedCommandBuffers.value);
 
 		// ------------------------
@@ -972,6 +973,101 @@ int main()
 			));
 			// Free CPU memory now that it's on GPU
 			cpuTex.free();
+		}
+		// ... [Before pipelineLayout creation] ...
+
+		// 1. Create Texture Sampler (Common for all textures)
+		vk::SamplerCreateInfo samplerInfo{};
+		samplerInfo.magFilter = vk::Filter::eLinear;
+		samplerInfo.minFilter = vk::Filter::eLinear;
+		samplerInfo.addressModeU = vk::SamplerAddressMode::eRepeat;
+		samplerInfo.addressModeV = vk::SamplerAddressMode::eRepeat;
+		samplerInfo.addressModeW = vk::SamplerAddressMode::eRepeat;
+		// samplerInfo.anisotropyEnable = VK_TRUE;
+		// samplerInfo.maxAnisotropy = 16.0f; // Ensure your physical device supports this!
+		samplerInfo.anisotropyEnable = VK_FALSE;
+		samplerInfo.maxAnisotropy = 1.0f;
+		samplerInfo.borderColor = vk::BorderColor::eIntOpaqueBlack;
+		samplerInfo.unnormalizedCoordinates = VK_FALSE;
+		samplerInfo.compareEnable = VK_FALSE;
+		samplerInfo.mipmapMode = vk::SamplerMipmapMode::eLinear;
+
+		vk::UniqueSampler textureSampler = device.createSamplerUnique(samplerInfo).value;
+
+		// 2. Create Descriptor Set Layout
+		// Binding 0: Combined Image Sampler (Fragment Shader)
+		vk::DescriptorSetLayoutBinding samplerLayoutBinding{};
+		samplerLayoutBinding.binding = 0;
+		samplerLayoutBinding.descriptorCount = 1;
+		samplerLayoutBinding.descriptorType = vk::DescriptorType::eCombinedImageSampler;
+		samplerLayoutBinding.pImmutableSamplers = nullptr;
+		samplerLayoutBinding.stageFlags = vk::ShaderStageFlagBits::eFragment;
+
+		vk::DescriptorSetLayoutCreateInfo layoutInfo{};
+		layoutInfo.bindingCount = 1;
+		layoutInfo.pBindings = &samplerLayoutBinding;
+
+		vk::UniqueDescriptorSetLayout descriptorSetLayout = device.createDescriptorSetLayoutUnique(layoutInfo).value;
+
+		// 1. Create a 1x1 White Default Texture (Fallback)
+		TextureData whiteTexData;
+		whiteTexData.width = 1; whiteTexData.height = 1; whiteTexData.channels = 4;
+		unsigned char whitePixels[] = { 255, 255, 255, 255 };
+		whiteTexData.pixels = whitePixels; // No need to free this specifically
+
+		auto defaultTexture = std::make_unique<TextureImage>(
+			allocator, device, commandPool.get(), graphicsQueue, whiteTexData
+		);
+
+		// 2. Create Descriptor Pool
+		// We need 1 set for the default texture + 1 set per loaded texture
+		uint32_t totalTextures = 1 + (uint32_t)gpuTextures.size();
+
+		vk::DescriptorPoolSize poolSize{};
+		poolSize.type = vk::DescriptorType::eCombinedImageSampler;
+		poolSize.descriptorCount = totalTextures;
+
+		vk::DescriptorPoolCreateInfo poolInfo{};
+		poolInfo.poolSizeCount = 1;
+		poolInfo.pPoolSizes = &poolSize;
+		poolInfo.maxSets = totalTextures;
+
+		vk::UniqueDescriptorPool descriptorPool = device.createDescriptorPoolUnique(poolInfo).value;
+
+		// 3. Allocate Descriptor Sets
+		std::vector<vk::DescriptorSetLayout> layoutsVector(totalTextures, descriptorSetLayout.get());
+		vk::DescriptorSetAllocateInfo allocInfo{};
+		allocInfo.descriptorPool = descriptorPool.get();
+		allocInfo.descriptorSetCount = totalTextures;
+		allocInfo.pSetLayouts = layoutsVector.data();
+
+		std::vector<vk::DescriptorSet> textureDescriptorSets = device.allocateDescriptorSets(allocInfo).value;
+
+		// 4. Update Descriptor Sets
+		// Function to write texture to a specific set index
+		auto updateDescriptorSet = [&](vk::DescriptorSet set, vk::ImageView view) {
+			vk::DescriptorImageInfo imageInfo{};
+			imageInfo.imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal;
+			imageInfo.imageView = view;
+			imageInfo.sampler = textureSampler.get();
+
+			vk::WriteDescriptorSet descriptorWrite{};
+			descriptorWrite.dstSet = set;
+			descriptorWrite.dstBinding = 0;
+			descriptorWrite.dstArrayElement = 0;
+			descriptorWrite.descriptorType = vk::DescriptorType::eCombinedImageSampler;
+			descriptorWrite.descriptorCount = 1;
+			descriptorWrite.pImageInfo = &imageInfo;
+
+			device.updateDescriptorSets(1, &descriptorWrite, 0, nullptr);
+			};
+
+		// Update Default Set (Index 0)
+		updateDescriptorSet(textureDescriptorSets[0], defaultTexture->getView());
+
+		// Update Loaded Textures (Indices 1 to N)
+		for (size_t i = 0; i < gpuTextures.size(); i++) {
+			updateDescriptorSet(textureDescriptorSets[i + 1], gpuTextures[i]->getView());
 		}
 
 		// ------------------------
@@ -1021,6 +1117,7 @@ int main()
 
 		vk::PushConstantRange allRanges[] = { pcRange };
 
+		vk::DescriptorSetLayout layouts[] = { descriptorSetLayout.get() };
 
 		// shader create info
 		vk::ShaderCreateInfoEXT vertInfo{};
@@ -1032,7 +1129,9 @@ int main()
 			.setPCode(vertCode.data())
 			.setPName("main")
 			.setPushConstantRangeCount(1)
-			.setPPushConstantRanges(allRanges);
+			.setPPushConstantRanges(allRanges)
+			.setSetLayoutCount(1)
+			.setPSetLayouts(layouts);
 
 		vk::ShaderCreateInfoEXT fragInfo{};
 		fragInfo.setStage(vk::ShaderStageFlagBits::eFragment)
@@ -1042,7 +1141,9 @@ int main()
 			.setPCode(fragCode.data())
 			.setPName("main")
 			.setPushConstantRangeCount(1)
-			.setPPushConstantRanges(allRanges);
+			.setPPushConstantRanges(allRanges)
+			.setSetLayoutCount(1)
+			.setPSetLayouts(layouts);
 
 		vk::ShaderEXT vertShader, fragShader;
 		vertShader = device.createShaderEXT(vertInfo).value;
@@ -1050,12 +1151,13 @@ int main()
 
 
 		std::vector<vk::PushConstantRange> pushRanges = { pcRange };
-		vk::PipelineLayoutCreateInfo layoutInfo{};
-		layoutInfo.setPushConstantRanges(pushRanges);
+		vk::PipelineLayoutCreateInfo pipelineLayoutInfo{};
+		pipelineLayoutInfo.setPushConstantRanges(pushRanges);
+		pipelineLayoutInfo.setSetLayouts(descriptorSetLayout.get());
 		// arrays for binding shaders
 		vk::PipelineLayout pipelineLayout;
 		try {
-			pipelineLayout = device.createPipelineLayout(layoutInfo).value;
+			pipelineLayout = device.createPipelineLayout(pipelineLayoutInfo).value;
 		}
 		catch (const std::exception& e) {
 			std::cerr << "Failed to create pipeline layout: " << e.what() << "\n";
@@ -1070,15 +1172,6 @@ int main()
 			SDL_Quit();
 			return -1;
 		}
-		vk::ShaderStageFlagBits stages[] = {
-			vk::ShaderStageFlagBits::eVertex,
-			vk::ShaderStageFlagBits::eFragment
-		};
-
-		vk::ShaderEXT shaders[] = {
-			vertShader,
-			fragShader
-		};
 
 		// ------------------------
 		// 8. Main loop
@@ -1224,12 +1317,19 @@ int main()
 				.setLayerCount(1)
 				.setColorAttachments(colorAttachment)
 				.setPDepthAttachment(&depthAttachment);
-
-			// Begin rendering
 			cmd.beginRendering(renderInfo);
+			vk::ShaderStageFlagBits stages[] = {
+				vk::ShaderStageFlagBits::eVertex,
+				vk::ShaderStageFlagBits::eFragment
+			};
 
+			vk::ShaderEXT shaders[] = {
+				vertShader,
+				fragShader
+			};
 			// Bind shaders and draw
 			cmd.bindShadersEXT(2, stages, shaders);
+			// Begin rendering
 			cmd.setPrimitiveTopology(vk::PrimitiveTopology::eTriangleList);
 
 			// cmd.bindVertexBuffers(0, 1, &vertexBuffer->getBuffer(), &offset);
@@ -1303,7 +1403,7 @@ int main()
 			pc.view = getView(camera);
 			pc.proj = getProjection(1280.0f, 720.0f);
 			//int submeshCounter = 0;
-			for (auto& sub : model.submeshes) {
+			for (const auto& sub : model.submeshes) {
 				//++submeshCounter;
 				//if (submeshCounter % 2) continue;
 				pc.baseColor = sub.material.baseColorFactor;
@@ -1319,6 +1419,24 @@ int main()
 					sizeof(MeshPushConstants),
 					&pc
 				);
+
+				vk::DescriptorSet setParams;
+				if (sub.material.baseColorTextureIndex >= 0) {
+					// Index + 1 because set[0] is the default white texture
+					setParams = textureDescriptorSets[sub.material.baseColorTextureIndex + 1];
+				}
+				else {
+					setParams = textureDescriptorSets[0];
+				}
+
+				cmd.bindDescriptorSets(
+					vk::PipelineBindPoint::eGraphics,
+					pipelineLayout, // This must be the layout that includes the descriptorSetLayout
+					0,
+					1, &setParams,
+					0, nullptr
+				);
+
 				cmd.drawIndexed(
 					sub.indexCount,      // number of indices
 					instanceBuffer->getInstanceCount(),  // number of instances
