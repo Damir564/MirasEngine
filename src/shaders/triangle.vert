@@ -29,5 +29,5 @@ void main()
     N = normalize(inNormal);
     fragColor = N * 0.5 + 0.5;
     // L = normalize(vec3(1.0, 1.0, 0.0));
-    L = normalize(vec3(-0.5, 1.0, -0.3));
+    L = normalize(vec3(-0.4, 0.8, 0.6));
 }

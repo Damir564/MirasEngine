@@ -14,6 +14,7 @@
 #include <assimp/Importer.hpp>
 #include <assimp/scene.h>
 #include <assimp/postprocess.h>
+#include "stb_image.h"
 
 struct Camera {
 	glm::vec3 position{ 0.0f, 0.0f, 100.0f };
@@ -311,6 +312,159 @@ private:
 	uint32_t m_instanceCount;
 };
 
+// Holds raw CPU pixel data
+struct TextureData {
+	int width, height, channels;
+	unsigned char* pixels = nullptr;
+	std::string path;
+
+	// Helper to free CPU memory
+	void free() {
+		if (pixels) {
+			stbi_image_free(pixels);
+			pixels = nullptr;
+		}
+	}
+};
+
+class TextureImage {
+public:
+	TextureImage(VmaAllocator allocator, vk::Device device, vk::CommandPool cmdPool, vk::Queue queue, const TextureData& data)
+		: m_allocator(allocator), m_device(device) {
+
+		vk::DeviceSize imageSize = data.width * data.height * 4;
+
+		// 1. Staging Buffer
+		VkBufferCreateInfo stagingInfo = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+		stagingInfo.size = imageSize;
+		stagingInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+		VmaAllocationCreateInfo stagingAllocInfo = {};
+		stagingAllocInfo.usage = VMA_MEMORY_USAGE_CPU_ONLY;
+
+		VkBuffer stagingBuffer;
+		VmaAllocation stagingAlloc;
+		vmaCreateBuffer(allocator, &stagingInfo, &stagingAllocInfo, &stagingBuffer, &stagingAlloc, nullptr);
+
+		void* mapped;
+		vmaMapMemory(allocator, stagingAlloc, &mapped);
+		memcpy(mapped, data.pixels, static_cast<size_t>(imageSize));
+		vmaUnmapMemory(allocator, stagingAlloc);
+
+		// 2. Create Image (GPU)
+		VkImageCreateInfo imageInfo = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+		imageInfo.imageType = VK_IMAGE_TYPE_2D;
+		imageInfo.extent.width = data.width;
+		imageInfo.extent.height = data.height;
+		imageInfo.extent.depth = 1;
+		imageInfo.mipLevels = 1;
+		imageInfo.arrayLayers = 1;
+		imageInfo.format = VK_FORMAT_R8G8B8A8_SRGB;
+		imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+		imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+		imageInfo.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+		imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+		imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+		VmaAllocationCreateInfo imageAllocInfo = {};
+		imageAllocInfo.usage = VMA_MEMORY_USAGE_GPU_ONLY;
+
+		VkImage rawImage;
+		vmaCreateImage(allocator, &imageInfo, &imageAllocInfo, &rawImage, &m_allocation, nullptr);
+		m_image = vk::Image(rawImage);
+
+		// 3. Transition & Copy (Immediate Submit)
+		vk::CommandBufferAllocateInfo allocInfo(cmdPool, vk::CommandBufferLevel::ePrimary, 1);
+		vk::UniqueCommandBuffer cmd = std::move(device.allocateCommandBuffersUnique(allocInfo).value[0]);
+
+		cmd->begin(vk::CommandBufferBeginInfo(vk::CommandBufferUsageFlagBits::eOneTimeSubmit));
+
+		// Transition Undefined -> TransferDst
+		transitionLayout(cmd.get(), vk::ImageLayout::eUndefined, vk::ImageLayout::eTransferDstOptimal);
+
+		// Copy Buffer -> Image
+		vk::BufferImageCopy region{};
+		region.imageSubresource = { vk::ImageAspectFlagBits::eColor, 0, 0, 1 };
+		region.imageExtent = vk::Extent3D{ (uint32_t)data.width, (uint32_t)data.height, 1 };
+		cmd->copyBufferToImage(vk::Buffer(stagingBuffer), m_image, vk::ImageLayout::eTransferDstOptimal, 1, &region);
+
+		// Transition TransferDst -> ShaderReadOnly
+		transitionLayout(cmd.get(), vk::ImageLayout::eTransferDstOptimal, vk::ImageLayout::eShaderReadOnlyOptimal);
+
+		cmd->end();
+		vk::SubmitInfo submitInfo{};
+		submitInfo.setCommandBufferCount(1);
+		submitInfo.setPCommandBuffers(&cmd.get());
+		queue.submit(submitInfo, nullptr);
+		queue.waitIdle();
+
+		vmaDestroyBuffer(allocator, stagingBuffer, stagingAlloc);
+
+		// 4. Create View
+		vk::ImageViewCreateInfo viewInfo{};
+		viewInfo.image = m_image;
+		viewInfo.viewType = vk::ImageViewType::e2D;
+		viewInfo.format = vk::Format::eR8G8B8A8Srgb;
+		viewInfo.subresourceRange.aspectMask = vk::ImageAspectFlagBits::eColor;
+		viewInfo.subresourceRange.levelCount = 1;
+		viewInfo.subresourceRange.layerCount = 1;
+		m_view = device.createImageView(viewInfo).value;
+	}
+
+	~TextureImage() {
+		if (m_view) m_device.destroyImageView(m_view);
+		if (m_image) vmaDestroyImage(m_allocator, VkImage(m_image), m_allocation);
+	}
+
+	// Disable copy
+	TextureImage(const TextureImage&) = delete;
+	TextureImage& operator=(const TextureImage&) = delete;
+
+	// Enable move
+	TextureImage(TextureImage&& other) noexcept
+		: m_allocator(other.m_allocator), m_device(other.m_device), m_image(other.m_image),
+		m_allocation(other.m_allocation), m_view(other.m_view) {
+		other.m_image = nullptr; other.m_view = nullptr;
+	}
+
+	vk::ImageView getView() { return m_view; }
+
+private:
+	void transitionLayout(vk::CommandBuffer cmd, vk::ImageLayout oldLayout, vk::ImageLayout newLayout) {
+		vk::ImageMemoryBarrier barrier{};
+		barrier.oldLayout = oldLayout;
+		barrier.newLayout = newLayout;
+		barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		barrier.image = m_image;
+		barrier.subresourceRange.aspectMask = vk::ImageAspectFlagBits::eColor;
+		barrier.subresourceRange.levelCount = 1;
+		barrier.subresourceRange.layerCount = 1;
+
+		vk::PipelineStageFlags sourceStage;
+		vk::PipelineStageFlags destinationStage;
+
+		if (oldLayout == vk::ImageLayout::eUndefined && newLayout == vk::ImageLayout::eTransferDstOptimal) {
+			barrier.srcAccessMask = vk::AccessFlagBits::eNone;
+			barrier.dstAccessMask = vk::AccessFlagBits::eTransferWrite;
+			sourceStage = vk::PipelineStageFlagBits::eTopOfPipe;
+			destinationStage = vk::PipelineStageFlagBits::eTransfer;
+		}
+		else if (oldLayout == vk::ImageLayout::eTransferDstOptimal && newLayout == vk::ImageLayout::eShaderReadOnlyOptimal) {
+			barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+			barrier.dstAccessMask = vk::AccessFlagBits::eShaderRead;
+			sourceStage = vk::PipelineStageFlagBits::eTransfer;
+			destinationStage = vk::PipelineStageFlagBits::eFragmentShader;
+		}
+		cmd.pipelineBarrier(sourceStage, destinationStage, {}, 0, nullptr, 0, nullptr, 1, &barrier);
+	}
+
+	VmaAllocator m_allocator;
+	vk::Device m_device;
+	vk::Image m_image;
+	VmaAllocation m_allocation;
+	vk::ImageView m_view;
+};
+
 std::vector<uint32_t> loadSpirv(const std::filesystem::path& path)
 {
 	std::ifstream file(path, std::ios::binary | std::ios::ate);
@@ -327,11 +481,13 @@ std::vector<uint32_t> loadSpirv(const std::filesystem::path& path)
 	return code;
 }
 
+
+
 struct Material {
 	glm::vec4 baseColorFactor{ 1.0f };
 	float metallicFactor{ 1.0f };
 	float roughnessFactor{ 1.0f };
-	// Texture indices would go here once you implement a Descriptor Set
+	int baseColorTextureIndex = -1;
 };
 
 struct SubmeshInfo {
@@ -345,7 +501,45 @@ struct Mesh {
 	std::vector<Vertex> vertices;
 	std::vector<uint32_t> indices;
 	std::vector<SubmeshInfo> submeshes;
+	std::vector<TextureData> textureData;
 };
+
+TextureData loadMaterialTexture(const aiScene* scene, const aiMaterial* mat, const std::string& modelPath) {
+	TextureData texture{};
+	aiString path;
+
+	// Try BASE_COLOR (GLTF standard), fall back to DIFFUSE
+	aiTextureType type = aiTextureType_BASE_COLOR;
+	if (mat->GetTextureCount(type) == 0) type = aiTextureType_DIFFUSE;
+
+	if (mat->GetTexture(type, 0, &path) == AI_SUCCESS) {
+		// 1. Check for Embedded Texture (marked with *)
+		const aiTexture* embeddedTex = scene->GetEmbeddedTexture(path.C_Str());
+		if (embeddedTex) {
+			if (embeddedTex->mHeight == 0) { // Compressed (png/jpg)
+				texture.pixels = stbi_load_from_memory(
+					reinterpret_cast<unsigned char*>(embeddedTex->pcData),
+					embeddedTex->mWidth, &texture.width, &texture.height, &texture.channels, 4);
+			}
+			else { // Raw data
+				texture.pixels = stbi_load_from_memory(
+					reinterpret_cast<unsigned char*>(embeddedTex->pcData),
+					embeddedTex->mWidth * embeddedTex->mHeight,
+					&texture.width, &texture.height, &texture.channels, 4);
+			}
+		}
+		// 2. Load from File
+		else {
+			std::string fullPath = path.C_Str();
+			// Simple path fix: assume texture is in same dir as model
+			std::string baseDir = modelPath.substr(0, modelPath.find_last_of("/\\") + 1);
+			texture.pixels = stbi_load((baseDir + fullPath).c_str(),
+				&texture.width, &texture.height, &texture.channels, 4); // Force 4 channels (RGBA)
+			texture.path = fullPath;
+		}
+	}
+	return texture;
+}
 
 
 Mesh loadGLB(const std::string& path) {
@@ -364,6 +558,7 @@ Mesh loadGLB(const std::string& path) {
 	}
 
 	Mesh result;
+	std::unordered_map<std::string, int> textureCache;
 	uint32_t vertexOffset = 0;
 	uint32_t indexOffset = 0;
 
@@ -411,6 +606,26 @@ Mesh loadGLB(const std::string& path) {
 				info.material.metallicFactor = metallic;
 			if (AI_SUCCESS == aiGetMaterialFloat(material, AI_MATKEY_ROUGHNESS_FACTOR, &roughness))
 				info.material.roughnessFactor = roughness;
+
+			aiString texPath;
+			aiTextureType type = aiTextureType_BASE_COLOR;
+			if (material->GetTextureCount(type) == 0) type = aiTextureType_DIFFUSE;
+
+			if (material->GetTexture(type, 0, &texPath) == AI_SUCCESS) {
+				std::string key = texPath.C_Str();
+				if (textureCache.find(key) != textureCache.end()) {
+					info.material.baseColorTextureIndex = textureCache[key];
+				}
+				else {
+					TextureData tex = loadMaterialTexture(scene, material, path);
+					if (tex.pixels) { // Only add if load succeeded
+						int newIdx = (int)result.textureData.size();
+						result.textureData.push_back(tex);
+						textureCache[key] = newIdx;
+						info.material.baseColorTextureIndex = newIdx;
+					}
+				}
+			}
 		}
 
 		result.submeshes.push_back(info);
@@ -744,6 +959,20 @@ int main()
 
 		auto allocatedCommandBuffers = device.allocateCommandBuffersUnique(allocInfo);
 		std::vector<vk::UniqueCommandBuffer> commandBuffers = std::move(allocatedCommandBuffers.value);
+
+		// ------------------------
+		// 13. Upload Textures
+		// ------------------------
+		std::vector<std::unique_ptr<TextureImage>> gpuTextures;
+
+		std::cout << "Uploading " << model.textureData.size() << " textures...\n";
+		for (auto& cpuTex : model.textureData) {
+			gpuTextures.push_back(std::make_unique<TextureImage>(
+				allocator, device, commandPool.get(), graphicsQueue, cpuTex
+			));
+			// Free CPU memory now that it's on GPU
+			cpuTex.free();
+		}
 
 		// ------------------------
 		// 12. Semaphores and Fences
