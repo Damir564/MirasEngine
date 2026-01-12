@@ -9,9 +9,12 @@ layout(location = 2) in vec2 inTexCoord;  // still there
 // Instance data from InstanceBuffer
 layout(location = 3) in vec3 inOffset;    // location 3 now
 
-layout(push_constant) uniform Camera {
+layout(push_constant) uniform MeshData {
     mat4 view;
     mat4 proj;
+    vec4 baseColor;
+    float metallic;
+    float roughness;
 } pc;
 
 layout(location = 0) out vec3 fragColor;

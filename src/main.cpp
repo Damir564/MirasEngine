@@ -48,9 +48,14 @@ glm::mat4 getProjection(float width, float height) {
 	return proj;
 }
 
-struct CameraPush {
+struct MeshPushConstants {
+	// camera
 	glm::mat4 view;
 	glm::mat4 proj;
+	// material
+	glm::vec4 baseColor{ 1.0f, 1.0f, 1.0f, 1.0f };
+	float metallic{ 0.0f };
+	float roughness{ 0.5f };
 };
 
 struct Vertex {
@@ -322,10 +327,18 @@ std::vector<uint32_t> loadSpirv(const std::filesystem::path& path)
 	return code;
 }
 
+struct Material {
+	glm::vec4 baseColorFactor{ 1.0f };
+	float metallicFactor{ 1.0f };
+	float roughnessFactor{ 1.0f };
+	// Texture indices would go here once you implement a Descriptor Set
+};
+
 struct SubmeshInfo {
 	uint32_t indexOffset;   // starting index in the global index buffer
 	uint32_t indexCount;    // number of indices
 	uint32_t vertexOffset;  // optional: starting vertex (needed if using drawIndexed with baseVertex)
+	Material material;
 };
 
 struct Mesh {
@@ -383,6 +396,23 @@ Mesh loadGLB(const std::string& path) {
 		vertexOffset += mesh->mNumVertices;
 		indexOffset += mesh->mNumFaces * 3;
 
+		// MATERIALS
+		if (mesh->mMaterialIndex >= 0) {
+			aiMaterial* material = scene->mMaterials[mesh->mMaterialIndex];
+			aiColor4D color;
+			if (AI_SUCCESS == aiGetMaterialColor(material, AI_MATKEY_BASE_COLOR, &color)) {
+				info.material.baseColorFactor = glm::vec4(color.r, color.g, color.b, color.a);
+			}
+
+			float metallic = 0.0f;
+			float roughness = 0.5f;
+			// float metallic, roughness;
+			if (AI_SUCCESS == aiGetMaterialFloat(material, AI_MATKEY_METALLIC_FACTOR, &metallic))
+				info.material.metallicFactor = metallic;
+			if (AI_SUCCESS == aiGetMaterialFloat(material, AI_MATKEY_ROUGHNESS_FACTOR, &roughness))
+				info.material.roughnessFactor = roughness;
+		}
+
 		result.submeshes.push_back(info);
 	}
 
@@ -416,11 +446,11 @@ int main()
 
 	Mesh model;
 	try {
-		model = loadGLB("models/sponza-palace/source/scene.glb"); // <-- path to your .glb
-		// model = loadGLB("models/london-city/source/traffic_slam_2_map.glb"); // <-- path to your .glb
-		// model = loadGLB("models/dae-diorama-grandmas-house/source/Dae_diorama_upload/Dae_diorama_upload.fbx"); // <-- path to your .glb
-		// model = loadGLB("models/polygon-mini-free/source/model.obj"); // <-- path to your .glb
-		// model = loadGLB("models/figure-embodying-the-element-silver/Ag_rechte_f Figur_lowres.obj"); // <-- path to your .glb
+		model = loadGLB("models/sponza-palace/source/scene.glb");
+		// model = loadGLB("models/london-city/source/traffic_slam_2_map.glb");
+		// model = loadGLB("models/dae-diorama-grandmas-house/source/Dae_diorama_upload/Dae_diorama_upload.fbx");
+		// model = loadGLB("models/polygon-mini-free/source/model.obj");
+		// model = loadGLB("models/figure-embodying-the-element-silver/Ag_rechte_f Figur_lowres.obj");
 	}
 	catch (const std::exception& e) {
 		std::cerr << "Error loading GLB: " << e.what() << "\n";
@@ -756,9 +786,9 @@ int main()
 		// 16. Create Pipeline Layout
 		// ------------------------
 		vk::PushConstantRange pcRange{};
-		pcRange.stageFlags = vk::ShaderStageFlagBits::eVertex;
+		pcRange.stageFlags = vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment;
 		pcRange.offset = 0;
-		pcRange.size = sizeof(CameraPush);
+		pcRange.size = sizeof(MeshPushConstants);
 
 		vk::PushConstantRange allRanges[] = { pcRange };
 
@@ -830,7 +860,7 @@ int main()
 		bool running = true;
 		SDL_Event event;
 		uint32_t currentFrame = 0;
-		CameraPush pc{};
+		MeshPushConstants pc{};
 		float cameraAmpilfier = 1.0f;
 		// Push constant data
 		uint32_t lastTime = SDL_GetTicks();
@@ -976,15 +1006,7 @@ int main()
 			// cmd.bindVertexBuffers(0, 1, &vertexBuffer->getBuffer(), &offset);
 			
 			
-			pc.view = getView(camera);
-			pc.proj = getProjection(1280.0f, 720.0f);
-			cmd.pushConstants(
-				pipelineLayout,
-				vk::ShaderStageFlagBits::eVertex,
-				0,
-				sizeof(CameraPush),
-				&pc
-			);
+
 
 			const vk::Viewport viewport{ 0, 0, 1280.f, 720.f, 0.f, 1.f };
 			const vk::Rect2D rect{ {0,0},{1280,720} };
@@ -1049,11 +1071,25 @@ int main()
 				0,
 				vk::IndexType::eUint32
 			);
-
+			pc.view = getView(camera);
+			pc.proj = getProjection(1280.0f, 720.0f);
 			//int submeshCounter = 0;
 			for (auto& sub : model.submeshes) {
 				//++submeshCounter;
 				//if (submeshCounter % 2) continue;
+				pc.baseColor = sub.material.baseColorFactor;
+				pc.metallic = sub.material.metallicFactor;
+				pc.roughness = sub.material.roughnessFactor;
+				//pc.baseColor = glm::vec4(1.0f);
+				//pc.metallic = 0.0f;             // Non-metal (easier to see initially)
+				//pc.roughness = 0.5f;
+				cmd.pushConstants(
+					pipelineLayout,
+					vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment,
+					0,
+					sizeof(MeshPushConstants),
+					&pc
+				);
 				cmd.drawIndexed(
 					sub.indexCount,      // number of indices
 					instanceBuffer->getInstanceCount(),  // number of instances
