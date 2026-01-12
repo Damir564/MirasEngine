@@ -42,7 +42,7 @@ glm::mat4 getProjection(float width, float height) {
 		glm::radians(60.0f),
 		width / height,
 		0.1f,
-		1000000.0f
+		10000.0f
 	);
 	proj[1][1] *= -1; // Vulkan clip space fix
 	return proj;
@@ -91,7 +91,7 @@ struct Vertex {
 		// Instance buffer attribute
 		attributes[3].location = locationOffset + 3;             // matches shader
 		attributes[3].binding = 1;              // instance buffer binding
-		attributes[3].format = vk::Format::eR32G32Sfloat; // vec2
+		attributes[3].format = vk::Format::eR32G32B32Sfloat; // vec3
 		attributes[3].offset = 0;               // offset inside InstanceData struct
 
 		return attributes;
@@ -256,7 +256,7 @@ struct InstanceData {
 
 // Example: 4 instances, spread out
 std::vector<InstanceData> instances = {
-	{{1000.0f, 0.0f, 1000.0f}},
+	{{0.0f, 0.0f, 0.0f}},
 	//{{ 0.5f, -0.4f}},
 	//{{-0.5f, 0.4f}},
 	//{{ 0.5f, 0.4f}}
@@ -322,9 +322,16 @@ std::vector<uint32_t> loadSpirv(const std::filesystem::path& path)
 	return code;
 }
 
+struct SubmeshInfo {
+	uint32_t indexOffset;   // starting index in the global index buffer
+	uint32_t indexCount;    // number of indices
+	uint32_t vertexOffset;  // optional: starting vertex (needed if using drawIndexed with baseVertex)
+};
+
 struct Mesh {
 	std::vector<Vertex> vertices;
 	std::vector<uint32_t> indices;
+	std::vector<SubmeshInfo> submeshes;
 };
 
 
@@ -345,12 +352,15 @@ Mesh loadGLB(const std::string& path) {
 
 	Mesh result;
 	uint32_t vertexOffset = 0;
+	uint32_t indexOffset = 0;
+
 	for (unsigned int m = 0; m < scene->mNumMeshes; ++m) {
 		const aiMesh* mesh = scene->mMeshes[m];
 
-		// Reserve space
-		result.vertices.reserve(result.vertices.size() + mesh->mNumVertices);
-		result.indices.reserve(result.indices.size() + mesh->mNumFaces * 3);
+		SubmeshInfo info{};
+		info.vertexOffset = vertexOffset;
+		info.indexOffset = indexOffset;
+		info.indexCount = mesh->mNumFaces * 3;
 
 		// Copy vertices
 		for (unsigned int i = 0; i < mesh->mNumVertices; ++i) {
@@ -365,12 +375,15 @@ Mesh loadGLB(const std::string& path) {
 		for (unsigned int i = 0; i < mesh->mNumFaces; ++i) {
 			const aiFace& face = mesh->mFaces[i];
 			if (face.mNumIndices != 3) continue;
-			result.indices.push_back(face.mIndices[0] + vertexOffset);
-			result.indices.push_back(face.mIndices[1] + vertexOffset);
-			result.indices.push_back(face.mIndices[2] + vertexOffset);
+			result.indices.push_back(face.mIndices[1]);
+			result.indices.push_back(face.mIndices[2]);
+			result.indices.push_back(face.mIndices[0]);
 		}
 
 		vertexOffset += mesh->mNumVertices;
+		indexOffset += mesh->mNumFaces * 3;
+
+		result.submeshes.push_back(info);
 	}
 
 	return result;
@@ -404,6 +417,10 @@ int main()
 	Mesh model;
 	try {
 		model = loadGLB("models/sponza-palace/source/scene.glb"); // <-- path to your .glb
+		// model = loadGLB("models/london-city/source/traffic_slam_2_map.glb"); // <-- path to your .glb
+		// model = loadGLB("models/dae-diorama-grandmas-house/source/Dae_diorama_upload/Dae_diorama_upload.fbx"); // <-- path to your .glb
+		// model = loadGLB("models/polygon-mini-free/source/model.obj"); // <-- path to your .glb
+		// model = loadGLB("models/figure-embodying-the-element-silver/Ag_rechte_f Figur_lowres.obj"); // <-- path to your .glb
 	}
 	catch (const std::exception& e) {
 		std::cerr << "Error loading GLB: " << e.what() << "\n";
@@ -1033,14 +1050,18 @@ int main()
 				vk::IndexType::eUint32
 			);
 
-			// cmd.draw(vertexBuffer->getVertexCount(), 1, 0, 0);
-			cmd.drawIndexed(
-				indexBuffer->getIndexCount(),        // number of indices
-				instanceBuffer->getInstanceCount(),  // number of instances
-				0,                                   // first index
-				0,                                   // vertex offset
-				0                                    // first instance
-			);
+			//int submeshCounter = 0;
+			for (auto& sub : model.submeshes) {
+				//++submeshCounter;
+				//if (submeshCounter % 2) continue;
+				cmd.drawIndexed(
+					sub.indexCount,      // number of indices
+					instanceBuffer->getInstanceCount(),  // number of instances
+					sub.indexOffset,     // first index
+					sub.vertexOffset,    // vertex offset (baseVertex)
+					0                    // first instance
+				);
+			}
 
 			cmd.endRendering();
 
