@@ -48,10 +48,6 @@ glm::mat4 getProjection(float width, float height) {
 	return proj;
 }
 
-struct MaterialPush {
-	alignas(16) glm::vec3 diffuseColor;
-};
-
 struct CameraPush {
 	glm::mat4 view;
 	glm::mat4 proj;
@@ -326,16 +322,9 @@ std::vector<uint32_t> loadSpirv(const std::filesystem::path& path)
 	return code;
 }
 
-struct Material {
-	glm::vec3 diffuseColor{ 1.0f };
-	std::string diffuseTexture; // path to diffuse texture
-};
-
 struct Mesh {
 	std::vector<Vertex> vertices;
 	std::vector<uint32_t> indices;
-	std::vector<Material> materials;
-	std::vector<uint32_t> meshMaterialIdx;
 };
 
 
@@ -382,36 +371,6 @@ Mesh loadGLB(const std::string& path) {
 		}
 
 		vertexOffset += mesh->mNumVertices;
-
-		// ----------------- MATERIAL HANDLING -----------------
-		uint32_t matIndex = mesh->mMaterialIndex;
-		Material mat{ glm::vec3(1.0f), "" }; // default white
-
-		if (scene->HasMaterials()) {
-			const aiMaterial* aMat = scene->mMaterials[matIndex];
-
-			aiColor3D color(1.0f, 1.0f, 1.0f);
-			if (AI_SUCCESS == aMat->Get(AI_MATKEY_COLOR_DIFFUSE, color)) {
-				mat.diffuseColor = glm::vec3(color.r, color.g, color.b);
-			}
-
-			if (aMat->GetTextureCount(aiTextureType_DIFFUSE) > 0) {
-				aiString path;
-				aMat->GetTexture(aiTextureType_DIFFUSE, 0, &path);
-				mat.diffuseTexture = path.C_Str(); // store texture path
-			}
-		}
-
-		// store material if new
-		auto it = std::find_if(result.materials.begin(), result.materials.end(),
-			[&](const Material& m) { return m.diffuseColor == mat.diffuseColor && m.diffuseTexture == mat.diffuseTexture; });
-		if (it == result.materials.end()) {
-			result.materials.push_back(mat);
-			result.meshMaterialIdx.push_back(static_cast<uint32_t>(result.materials.size() - 1));
-		}
-		else {
-			result.meshMaterialIdx.push_back(static_cast<uint32_t>(it - result.materials.begin()));
-		}
 	}
 
 	return result;
@@ -784,12 +743,7 @@ int main()
 		pcRange.offset = 0;
 		pcRange.size = sizeof(CameraPush);
 
-		vk::PushConstantRange materialRange{};
-		materialRange.stageFlags = vk::ShaderStageFlagBits::eFragment; // or vertex+fragment
-		materialRange.offset = sizeof(CameraPush);
-		materialRange.size = sizeof(MaterialPush);
-
-		vk::PushConstantRange allRanges[] = { pcRange, materialRange };
+		vk::PushConstantRange allRanges[] = { pcRange };
 
 
 		// shader create info
@@ -801,17 +755,17 @@ int main()
 			.setCodeSize(vertCode.size() * sizeof(vertCode.front()))
 			.setPCode(vertCode.data())
 			.setPName("main")
-			.setPushConstantRangeCount(2)
+			.setPushConstantRangeCount(1)
 			.setPPushConstantRanges(allRanges);
 
 		vk::ShaderCreateInfoEXT fragInfo{};
 		fragInfo.setStage(vk::ShaderStageFlagBits::eFragment)
 			.setFlags(vk::ShaderCreateFlagBitsEXT::eLinkStage)
 			.setCodeType(vk::ShaderCodeTypeEXT::eSpirv)
-			.setCodeSize(fragCode.size() * sizeof(uint32_t))
+			.setCodeSize(fragCode.size() * sizeof(fragCode.front()))
 			.setPCode(fragCode.data())
 			.setPName("main")
-			.setPushConstantRangeCount(2)
+			.setPushConstantRangeCount(1)
 			.setPPushConstantRanges(allRanges);
 
 		vk::ShaderEXT vertShader, fragShader;
@@ -819,7 +773,7 @@ int main()
 		fragShader = device.createShaderEXT(fragInfo).value;
 
 
-		std::vector<vk::PushConstantRange> pushRanges = { pcRange, materialRange };
+		std::vector<vk::PushConstantRange> pushRanges = { pcRange };
 		vk::PipelineLayoutCreateInfo layoutInfo{};
 		layoutInfo.setPushConstantRanges(pushRanges);
 		// arrays for binding shaders
@@ -1013,18 +967,6 @@ int main()
 				0,
 				sizeof(CameraPush),
 				&pc
-			);
-
-			MaterialPush matPC{};
-			uint32_t meshMatIdx = 0; // or result.meshMaterialIdx[meshIndex];
-			matPC.diffuseColor = glm::vec3(model.materials[meshMatIdx].diffuseColor);
-
-			cmd.pushConstants(
-				pipelineLayout,
-				vk::ShaderStageFlagBits::eFragment, // fragment shader
-				sizeof(CameraPush),                 // offset after camera push constant
-				sizeof(MaterialPush),
-				&matPC
 			);
 
 			const vk::Viewport viewport{ 0, 0, 1280.f, 720.f, 0.f, 1.f };
