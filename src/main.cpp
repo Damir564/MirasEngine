@@ -255,12 +255,12 @@ private:
 };
 
 struct InstanceData {
-	glm::vec2 offset; // Offset for this instance
+	glm::vec3 offset; // Offset for this instance
 };
 
 // Example: 4 instances, spread out
 std::vector<InstanceData> instances = {
-	{{0.0f, 0.0f}},
+	{{1000.0f, 0.0f, 1000.0f}},
 	//{{ 0.5f, -0.4f}},
 	//{{-0.5f, 0.4f}},
 	//{{ 0.5f, 0.4f}}
@@ -860,15 +860,17 @@ int main()
 		SDL_Event event;
 		uint32_t currentFrame = 0;
 		CameraPush pc{};
-
+		float cameraAmpilfier = 1.0f;
 		// Push constant data
-		glm::vec2 posOffsets = { 0.0f, 0.0f }; // Start at center
 		uint32_t lastTime = SDL_GetTicks();
 		while (running) {
 			uint32_t currentTime = SDL_GetTicks();
 			float dt = (currentTime - lastTime) / 1000.0f; // convert ms to seconds
 			lastTime = currentTime;
 			while (SDL_PollEvent(&event)) {
+				bool shiftHeld =
+					(event.key.mod & SDL_KMOD_LSHIFT) ||
+					(event.key.mod & SDL_KMOD_RSHIFT);
 				const bool* keys = SDL_GetKeyboardState(nullptr);
 				if (event.type == SDL_EVENT_QUIT || keys[SDL_SCANCODE_ESCAPE])
 					running = false;
@@ -877,14 +879,18 @@ int main()
 					if (event.key.scancode == SDL_SCANCODE_ESCAPE)
 						running = false;
 
-					bool shiftHeld =
-						(event.key.mod & SDL_KMOD_LSHIFT) ||
-						(event.key.mod & SDL_KMOD_RSHIFT);
 
-					if (shiftHeld && event.key.scancode == SDL_SCANCODE_GRAVE) {
-						mouseEnabled = !mouseEnabled;
-						SDL_SetWindowRelativeMouseMode(window, mouseEnabled);
+					if (shiftHeld) {
+						cameraAmpilfier = 4.0f;
+						if(event.key.scancode == SDL_SCANCODE_GRAVE) {
+							mouseEnabled = !mouseEnabled;
+							SDL_SetWindowRelativeMouseMode(window, mouseEnabled);
+						}
 					}
+				}
+				if (event.type == SDL_EVENT_KEY_UP && !event.key.repeat) {
+					if (!shiftHeld)
+						cameraAmpilfier = 1.0f;
 				}
 				if (mouseEnabled && event.type == SDL_EVENT_MOUSE_MOTION) {
 					camera.yaw += event.motion.xrel * camera.sensitivity;
@@ -902,10 +908,10 @@ int main()
 
 			glm::vec3 right = glm::normalize(glm::cross(front, glm::vec3(0, 1, 0)));
 
-			if (keys[SDL_SCANCODE_W]) camera.position += front * camera.speed * dt;
-			if (keys[SDL_SCANCODE_S]) camera.position -= front * camera.speed * dt;
-			if (keys[SDL_SCANCODE_A]) camera.position -= right * camera.speed * dt;
-			if (keys[SDL_SCANCODE_D]) camera.position += right * camera.speed * dt;
+			if (keys[SDL_SCANCODE_W]) camera.position += front * camera.speed * dt * cameraAmpilfier;
+			if (keys[SDL_SCANCODE_A]) camera.position -= right * camera.speed * dt * cameraAmpilfier;
+			if (keys[SDL_SCANCODE_D]) camera.position += right * camera.speed * dt * cameraAmpilfier;
+			if (keys[SDL_SCANCODE_S]) camera.position -= front * camera.speed * dt * cameraAmpilfier;
 				
 	
 
@@ -1148,8 +1154,6 @@ int main()
 			// Update push constant for animation
 			static float time = 0.0f;
 			time += 0.01f;
-			posOffsets.x = sinf(time) * 0.5f;
-			posOffsets.y = cosf(time) * 0.5f;
 		}
 		(void)device.waitIdle();
 
