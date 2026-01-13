@@ -32,6 +32,7 @@ void main()
         0, 1, 0,
        -s, 0, c
     );
+    rotY = mat3(1.0);
     // 1. Rotate the vertex position before adding offset
     vec3 rotatedPos = rotY * inPosition;
     vec3 pos = rotatedPos + inOffset;

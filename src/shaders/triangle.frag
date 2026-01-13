@@ -68,9 +68,9 @@ void main() {
     vec3 N = normalize(TBN * normalMapValue); 
 
     // 3. Lighting Setup
-    vec3 L = normalize(vec3(-0.4, 0.8, 0.6)); // Light Direction
+    vec3 L = normalize(vec3(-0.4, 0.8, -0.6)); // Light Direction
     // Approximate view pos (assuming camera at 0,0,100 or similar, pass actual cam pos for better accuracy)
-    vec3 V = normalize(vec3(0.0, 0.0, 100.0) - fragWorldPos);
+    vec3 V = normalize(vec3(0.0, 0.0, 0.0) - fragWorldPos);
     vec3 H = normalize(V + L);
 
     // 4. PBR Calculation
