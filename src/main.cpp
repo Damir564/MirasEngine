@@ -17,10 +17,10 @@
 #include "stb_image.h"
 
 struct Camera {
-	glm::vec3 position{ 0.0f, 0.0f, 100.0f };
+	glm::vec3 position{ 0.0f, 0.0f, 0.0f };
 	float yaw = -90.0f; // look forward
 	float pitch = 0.0f;
-	float speed = 300.0f; 
+	float speed = 40.0f; 
 	float sensitivity = 0.1f;
 };
 
@@ -270,7 +270,7 @@ struct InstanceData {
 
 // Example: 4 instances, spread out
 std::vector<InstanceData> instances = {
-	{{0.0f, -200.0f, 0.0f}},
+	{{0.0f, 0.0f, 0.0f}},
 	//{{ 0.5f, -0.4f}},
 	//{{-0.5f, 0.4f}},
 	//{{ 0.5f, 0.4f}}
@@ -547,42 +547,49 @@ TextureData loadMaterialTexture(const aiScene* scene, const aiMaterial* mat, con
 }
 
 
-Mesh loadGLB(const std::string& path) {
-	Assimp::Importer importer;
+inline glm::mat4 aiMatrix4x4ToGlm(const aiMatrix4x4& from) {
+	glm::mat4 to;
+	to[0][0] = from.a1; to[1][0] = from.a2; to[2][0] = from.a3; to[3][0] = from.a4;
+	to[0][1] = from.b1; to[1][1] = from.b2; to[2][1] = from.b3; to[3][1] = from.b4;
+	to[0][2] = from.c1; to[1][2] = from.c2; to[2][2] = from.c3; to[3][2] = from.c4;
+	to[0][3] = from.d1; to[1][3] = from.d2; to[2][3] = from.d3; to[3][3] = from.d4;
+	return to;
+}
 
-	const aiScene* scene = importer.ReadFile(
-		path,
-		aiProcess_Triangulate |
-		aiProcess_FlipUVs |
-		aiProcess_CalcTangentSpace |
-		aiProcess_GenNormals
-	);
+const int MAX_NODES = 1000000000;
+int g_NodesCounter = 0;
 
-	if (!scene || !scene->HasMeshes()) {
-		throw std::runtime_error("Failed to load model: " + path);
-	}
+void processNode(aiNode* node, const aiScene* scene, glm::mat4 parentTransform, Mesh& result,
+	std::unordered_map<std::string, int>& textureCache, const std::string& path) {
+	++g_NodesCounter;
+	//if (g_NodesCounter > MAX_NODES)
+	//	return;
+	// 1. Calculate the global transform for this node
+	glm::mat4 nodeTransform = aiMatrix4x4ToGlm(node->mTransformation);
+	glm::mat4 globalTransform = parentTransform * nodeTransform;
 
-	Mesh result;
-	std::unordered_map<std::string, int> textureCache;
-	uint32_t vertexOffset = 0;
-	uint32_t indexOffset = 0;
+	uint32_t vertexOffset = static_cast<uint32_t>(result.vertices.size());
+	uint32_t indexOffset = static_cast<uint32_t>(result.indices.size());
 
-	for (unsigned int m = 0; m < scene->mNumMeshes; ++m) {
-		const aiMesh* mesh = scene->mMeshes[m];
+	for (unsigned int m = 0; m < node->mNumMeshes; ++m) {
+		const aiMesh* mesh = scene->mMeshes[node->mMeshes[m]];
 
 		SubmeshInfo info{};
 		info.vertexOffset = vertexOffset;
 		info.indexOffset = indexOffset;
 		info.indexCount = mesh->mNumFaces * 3;
 
+		glm::mat3 normalMatrix = glm::transpose(glm::inverse(glm::mat3(globalTransform)));
+
 		// Copy vertices
 		for (unsigned int i = 0; i < mesh->mNumVertices; ++i) {
 			Vertex vertex{};
-			vertex.position = { mesh->mVertices[i].x, mesh->mVertices[i].y, mesh->mVertices[i].z };
-			vertex.normal = mesh->HasNormals() ? glm::vec3(mesh->mNormals[i].x, mesh->mNormals[i].y, mesh->mNormals[i].z) : glm::vec3(0.0f);
+			glm::vec4 pos = globalTransform * glm::vec4(mesh->mVertices[i].x, mesh->mVertices[i].y, mesh->mVertices[i].z, 1.0f);
+			vertex.position = glm::vec3(pos);
+			vertex.normal = mesh->HasNormals() ? normalMatrix * glm::vec3(mesh->mNormals[i].x, mesh->mNormals[i].y, mesh->mNormals[i].z) : glm::vec3(0.0f);
 			vertex.texCoord = mesh->HasTextureCoords(0) ? glm::vec2(mesh->mTextureCoords[0][i].x, mesh->mTextureCoords[0][i].y) : glm::vec2(0.0f);
 			vertex.tangent = mesh->HasTangentsAndBitangents()
-				? glm::vec3(mesh->mTangents[i].x, mesh->mTangents[i].y, mesh->mTangents[i].z)
+				? normalMatrix * glm::vec3(mesh->mTangents[i].x, mesh->mTangents[i].y, mesh->mTangents[i].z)
 				: glm::vec3(0.0f);
 			result.vertices.push_back(vertex);
 		}
@@ -653,6 +660,41 @@ Mesh loadGLB(const std::string& path) {
 		result.submeshes.push_back(info);
 	}
 
+	//if (g_NodesCounter > MAX_NODES)
+	//	return;
+	// 3. Recurse through children
+	for (unsigned int i = 0; i < node->mNumChildren; ++i) {
+		processNode(node->mChildren[i], scene, globalTransform, result, textureCache, path);
+		//if (g_NodesCounter > MAX_NODES)
+		//	return;
+	}
+	//if (g_NodesCounter > MAX_NODES)
+	//	return;
+}
+
+
+Mesh loadGLB(const std::string& path) {
+	Assimp::Importer importer;
+
+	const aiScene* scene = importer.ReadFile(
+		path,
+		aiProcess_Triangulate 
+		| aiProcess_FlipUVs 
+		| aiProcess_CalcTangentSpace 
+		| aiProcess_GenSmoothNormals
+		| aiProcess_GlobalScale
+	);
+
+	if (!scene || !scene->HasMeshes()) {
+		throw std::runtime_error("Failed to load model: " + path);
+	}
+
+	Mesh result;
+	std::unordered_map<std::string, int> textureCache;
+
+	// Start recursion from the root node with an identity matrix
+	processNode(scene->mRootNode, scene, glm::mat4(1.0f), result, textureCache, path);
+
 	return result;
 }
 
@@ -683,7 +725,8 @@ int main()
 
 	Mesh model;
 	try {
-		model = loadGLB("models/sponza-palace/source/scene.glb");
+		// model = loadGLB("models/sponza-palace/source/scene.glb");
+		model = loadGLB("models/main_sponza/NewSponza_Main_glTF_003.gltf");
 		// model = loadGLB("models/london-city/source/traffic_slam_2_map.glb");
 		// model = loadGLB("models/dae-diorama-grandmas-house/source/Dae_diorama_upload/Dae_diorama_upload.fbx");
 		// model = loadGLB("models/polygon-mini-free/source/model.obj");

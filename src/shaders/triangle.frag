@@ -61,6 +61,7 @@ void main() {
     
     // 2. Normal Mapping
     vec3 normalMapValue = texture(normalMapSampler, fragTexCoord).rgb;
+
     // Transform from [0,1] range to [-1,1] range
     normalMapValue = normalMapValue * 2.0 - 1.0; 
     // Transform from Tangent Space to World Space
