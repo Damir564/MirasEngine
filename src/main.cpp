@@ -57,6 +57,7 @@ struct MeshPushConstants {
 	glm::vec4 baseColor{ 1.0f, 1.0f, 1.0f, 1.0f };
 	float metallic{ 0.0f };
 	float roughness{ 0.5f };
+	float time;
 };
 
 struct Vertex {
@@ -1223,6 +1224,8 @@ int main()
 		uint32_t currentFrame = 0;
 		MeshPushConstants pc{};
 		float cameraAmpilfier = 1.0f;
+		// Update push constant for animation
+		static float time = 0.0f;
 		// Push constant data
 		uint32_t lastTime = SDL_GetTicks();
 		while (running) {
@@ -1441,6 +1444,7 @@ int main()
 			);
 			pc.view = getView(camera);
 			pc.proj = getProjection(1280.0f, 720.0f);
+			pc.time = time;
 			//int submeshCounter = 0;
 			for (const auto& sub : model.submeshes) {
 				//++submeshCounter;
@@ -1553,9 +1557,8 @@ int main()
 
 			currentFrame = (currentFrame + 1) % MAX_FRAMES_IN_FLIGHT;
 
-			// Update push constant for animation
-			static float time = 0.0f;
-			time += 0.01f;
+			
+			time += 0.001f;
 		}
 		(void)device.waitIdle();
 

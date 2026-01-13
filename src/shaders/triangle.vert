@@ -14,6 +14,7 @@ layout(push_constant) uniform MeshData {
     vec4 baseColor;
     float metallic;
     float roughness;
+    float time;
 } pc;
 
 layout(location = 0) out vec3 fragWorldPos;
@@ -23,27 +24,30 @@ layout(location = 3) out mat3 TBN; // NEW: Output TBN matrix
 
 void main()
 {
-    // add instance offset
-    vec3 pos = inPosition * 1.0 + inOffset; // [cite: 34]
+   // Create Y-axis rotation matrix from time
+    float s = sin(pc.time);
+    float c = cos(pc.time);
+    mat3 rotY = mat3(
+        c, 0, s,
+        0, 1, 0,
+       -s, 0, c
+    );
+    // 1. Rotate the vertex position before adding offset
+    vec3 rotatedPos = rotY * inPosition;
+    vec3 pos = rotatedPos + inOffset;
     vec4 worldPosition = vec4(pos, 1.0);
 
     gl_Position = pc.proj * pc.view * worldPosition;
 
+    // 2. Transform Normal and Tangent by the same rotation
+    // This ensures the TBN frame rotates with the geometry
+    vec3 worldNormal = normalize(inNormal);
+    vec3 worldTangent = normalize(inTangent);
+    vec3 worldBitangent = cross(worldNormal, worldTangent);
+
+    // 3. Set Outputs
     fragWorldPos = vec3(worldPosition);
-    fragNormal = inNormal;
+    fragNormal = worldNormal;
     fragTexCoord = inTexCoord;
-    // --- Create TBN Matrix ---
-    vec3 T = normalize(inTangent);
-    vec3 N = normalize(inNormal);
-    
-    // Gram-Schmidt process: re-orthogonalize T with respect to N
-    T = normalize(T - dot(T, N) * N);
-    
-    // Calculate Bitangent (B)
-    vec3 B = cross(N, T);
-
-    // If you see inverted normals later, you might need to flip B:
-    // B = -cross(N, T); 
-
-    TBN = mat3(T, B, N);
+    TBN = mat3(worldTangent, worldBitangent, worldNormal);
 }
