@@ -24,6 +24,7 @@ target_link_libraries(engine PRIVATE
     glm::glm-header-only
     assimp
     stb_image
+    fastgltf::fastgltf
 )
 
 

@@ -11,16 +11,23 @@
 #include <glm/glm.hpp>
 #include <glm/ext/matrix_transform.hpp>
 #include <glm/ext/matrix_clip_space.hpp>
+#include <glm/gtc/quaternion.hpp>
 #include <assimp/Importer.hpp>
 #include <assimp/scene.h>
 #include <assimp/postprocess.h>
 #include "stb_image.h"
+//#define FASTGLTF_USE_CUSTOM_SMALLVECTOR 0
+//#define FASTGLTF_ENABLE_GLM_EXT 1 
+#define FASTGLTF_USE_STD_MODULE 0
+#include <fastgltf/core.hpp>
+#include <fastgltf/glm_element_traits.hpp>
+#include <fastgltf/tools.hpp>
 
 struct Camera {
 	glm::vec3 position{ 0.0f, 0.0f, 0.0f };
 	float yaw = -90.0f; // look forward
 	float pitch = 0.0f;
-	float speed = 40.0f; 
+	float speed = 10.0f; 
 	float sensitivity = 0.1f;
 };
 
@@ -673,7 +680,7 @@ void processNode(aiNode* node, const aiScene* scene, glm::mat4 parentTransform, 
 }
 
 
-Mesh loadGLB(const std::string& path) {
+Mesh loadWithAssimp(const std::string& path) {
 	Assimp::Importer importer;
 
 	const aiScene* scene = importer.ReadFile(
@@ -695,6 +702,255 @@ Mesh loadGLB(const std::string& path) {
 	// Start recursion from the root node with an identity matrix
 	processNode(scene->mRootNode, scene, glm::mat4(1.0f), result, textureCache, path);
 
+	return result;
+}
+
+// =============================================================
+// Helper: Load Texture from fastgltf Image
+// =============================================================
+TextureData loadTexture(const fastgltf::Asset& asset, const fastgltf::Image& image, const std::string& modelPath) {
+	TextureData texData{};
+
+	std::visit(fastgltf::visitor{
+		[&](const fastgltf::sources::URI& uri) {
+			// 1. Load from File (URI)
+			// Handle both absolute and relative paths
+			std::string pathString = std::string(uri.uri.path()); // fastgltf 0.9+ uses .path()
+			std::filesystem::path fullPath = std::filesystem::path(modelPath).parent_path() / pathString;
+
+			texData.pixels = stbi_load(fullPath.string().c_str(), &texData.width, &texData.height, &texData.channels, 4);
+			if (!texData.pixels) {
+				std::cerr << "Failed to load texture: " << fullPath << "\n";
+			}
+		},
+		[&](const fastgltf::sources::Array& array) {
+			// 2. Load from Embedded Array (e.g. base64 decoded)
+			texData.pixels = stbi_load_from_memory(
+				reinterpret_cast<const stbi_uc*>(array.bytes.data()),
+				static_cast<int>(array.bytes.size()),
+				&texData.width, &texData.height, &texData.channels, 4);
+		},
+		[&](const fastgltf::sources::BufferView& view) {
+			// 3. Load from BufferView (GLB binary chunk)
+			auto& bufferView = asset.bufferViews[view.bufferViewIndex];
+			auto& buffer = asset.buffers[bufferView.bufferIndex];
+
+			std::visit(fastgltf::visitor{
+				[&](const fastgltf::sources::Array& bufferArray) {
+					const stbi_uc* data = reinterpret_cast<const stbi_uc*>(bufferArray.bytes.data() + bufferView.byteOffset);
+					texData.pixels = stbi_load_from_memory(
+						data,
+						static_cast<int>(bufferView.byteLength),
+						&texData.width, &texData.height, &texData.channels, 4);
+				},
+				[](auto&) {} // Handle other buffer types if necessary
+			}, buffer.data);
+		},
+		[](auto&) {} // Fallback
+		}, image.data);
+
+	return texData;
+}
+
+// =============================================================
+// Helper: Convert glTF transform to GLM Matrix
+// =============================================================
+glm::mat4 getTransformMatrix(const fastgltf::Node& node, glm::mat4& parentMatrix) {
+	glm::mat4 localMatrix(1.0f);
+
+	std::visit(fastgltf::visitor{
+		[&](const fastgltf::math::fmat4x4& matrix) {
+			memcpy(&localMatrix, matrix.data(), sizeof(float) * 16);
+		},
+		[&](const fastgltf::TRS& trs) {
+			glm::vec3 translation(trs.translation[0], trs.translation[1], trs.translation[2]);
+			// GLM quat constructor is (w, x, y, z). glTF is (x, y, z, w).
+			glm::quat rotation(trs.rotation[3], trs.rotation[0], trs.rotation[1], trs.rotation[2]);
+			glm::vec3 scale(trs.scale[0], trs.scale[1], trs.scale[2]);
+
+			glm::mat4 mT = glm::translate(glm::mat4(1.0f), translation);
+			glm::mat4 mR = glm::mat4_cast(rotation);
+			glm::mat4 mS = glm::scale(glm::mat4(1.0f), scale);
+
+			localMatrix = mT * mR * mS;
+		}
+		}, node.transform);
+
+	return parentMatrix * localMatrix;
+}
+
+// =============================================================
+// Helper: Recursive Node Processor
+// =============================================================
+void processFastGltfNode(fastgltf::Asset& asset, size_t nodeIndex, const glm::mat4& parentTransform,
+	Mesh& result, std::unordered_map<std::string, int>& textureCache, const std::string& path)
+{
+	auto& node = asset.nodes[nodeIndex];
+	glm::mat4 globalTransform = getTransformMatrix(node, const_cast<glm::mat4&>(parentTransform));
+
+	if (node.meshIndex.has_value()) {
+		auto& mesh = asset.meshes[node.meshIndex.value()];
+		glm::mat3 normalMatrix = glm::transpose(glm::inverse(glm::mat3(globalTransform)));
+
+		for (const auto& primitive : mesh.primitives) {
+			SubmeshInfo sub{};
+			sub.vertexOffset = static_cast<uint32_t>(result.vertices.size());
+			sub.indexOffset = static_cast<uint32_t>(result.indices.size());
+
+			// === POSITION ===
+			auto posAttrIt = primitive.findAttribute("POSITION");
+			if (posAttrIt == primitive.attributes.end()) continue;
+			auto& posAccessor = asset.accessors[posAttrIt->accessorIndex];
+
+			// === INDICES ===
+			std::vector<uint32_t> localIndices;
+			if (primitive.indicesAccessor.has_value()) {
+				auto& idxAccessor = asset.accessors[primitive.indicesAccessor.value()];
+				sub.indexCount = static_cast<uint32_t>(idxAccessor.count);
+				fastgltf::iterateAccessor<std::uint32_t>(asset, idxAccessor, [&](std::uint32_t idx) {
+					localIndices.push_back(idx);
+					});
+			}
+			else {
+				sub.indexCount = static_cast<uint32_t>(posAccessor.count);
+				for (size_t i = 0; i < posAccessor.count; ++i) localIndices.push_back((uint32_t)i);
+			}
+
+			// === DATA ARRAYS (Read into Safe Types) ===
+			size_t vCount = posAccessor.count;
+			std::vector<glm::vec3> positions(vCount);
+			std::vector<glm::vec3> normals(vCount, glm::vec3(0.0f));
+			std::vector<glm::vec2> texcoords(vCount, glm::vec2(0.0f));
+			std::vector<glm::vec3> tangents(vCount, glm::vec3(0.0f));
+
+			// Use fastgltf types for reading to ensure binary safety, then cast to GLM
+			fastgltf::iterateAccessorWithIndex<fastgltf::math::fvec3>(asset, posAccessor,
+				[&](fastgltf::math::fvec3 v, size_t i) {
+					positions[i] = glm::vec3(v.x(), v.y(), v.z());
+				});
+
+			if (auto it = primitive.findAttribute("NORMAL"); it != primitive.attributes.end()) {
+				fastgltf::iterateAccessorWithIndex<fastgltf::math::fvec3>(asset, asset.accessors[it->accessorIndex],
+					[&](fastgltf::math::fvec3 v, size_t i) {
+						normals[i] = glm::vec3(v.x(), v.y(), v.z());
+					});
+			}
+			if (auto it = primitive.findAttribute("TEXCOORD_0"); it != primitive.attributes.end()) {
+				fastgltf::iterateAccessorWithIndex<fastgltf::math::fvec2>(asset, asset.accessors[it->accessorIndex],
+					[&](fastgltf::math::fvec2 v, size_t i) {
+						texcoords[i] = glm::vec2(v.x(), v.y());
+					});
+			}
+			if (auto it = primitive.findAttribute("TANGENT"); it != primitive.attributes.end()) {
+				fastgltf::iterateAccessorWithIndex<fastgltf::math::fvec4>(asset, asset.accessors[it->accessorIndex],
+					[&](fastgltf::math::fvec4 v, size_t i) {
+						tangents[i] = glm::vec3(v.x(), v.y(), v.z());
+					});
+			}
+
+			// === TRANSFORM AND PUSH ===
+			for (size_t i = 0; i < vCount; ++i) {
+				Vertex v{};
+				v.position = glm::vec3(globalTransform * glm::vec4(positions[i], 1.0f));
+				v.normal = glm::normalize(normalMatrix * normals[i]);
+				v.tangent = glm::normalize(normalMatrix * tangents[i]);
+				v.texCoord = texcoords[i];
+				result.vertices.push_back(v);
+			}
+
+			for (uint32_t idx : localIndices) {
+				result.indices.push_back(idx); //+ sub.vertexOffset);
+			}
+
+			// === MATERIALS ===
+			if (primitive.materialIndex.has_value()) {
+				const auto& material = asset.materials[primitive.materialIndex.value()];
+				auto& pbr = material.pbrData;
+				auto baseColor = pbr.baseColorFactor;
+
+				sub.material.baseColorFactor = glm::vec4(baseColor.x(), baseColor.y(), baseColor.z(), baseColor.w());
+				sub.material.metallicFactor = pbr.metallicFactor;
+				sub.material.roughnessFactor = pbr.roughnessFactor;
+
+				// 1. Base Color Texture
+				if (pbr.baseColorTexture.has_value() && asset.textures[pbr.baseColorTexture.value().textureIndex].imageIndex.has_value()) {
+					size_t imgIdx = asset.textures[pbr.baseColorTexture.value().textureIndex].imageIndex.value();
+					std::string key = "base:" + std::to_string(imgIdx);
+
+					if (textureCache.find(key) != textureCache.end()) {
+						sub.material.baseColorTextureIndex = textureCache[key];
+					}
+					else {
+						// LOAD TEXTURE HERE
+						TextureData tex = loadTexture(asset, asset.images[imgIdx], path);
+						if (tex.pixels) {
+							int newIdx = (int)result.textureData.size();
+							result.textureData.push_back(tex);
+							textureCache[key] = newIdx;
+							sub.material.baseColorTextureIndex = newIdx;
+						}
+					}
+				}
+
+				// 2. Normal Texture
+				if (material.normalTexture.has_value() && asset.textures[material.normalTexture.value().textureIndex].imageIndex.has_value()) {
+					size_t imgIdx = asset.textures[material.normalTexture.value().textureIndex].imageIndex.value();
+					std::string key = "norm:" + std::to_string(imgIdx);
+
+					if (textureCache.find(key) != textureCache.end()) {
+						sub.material.normalTextureIndex = textureCache[key];
+					}
+					else {
+						// LOAD TEXTURE HERE
+						TextureData tex = loadTexture(asset, asset.images[imgIdx], path);
+						if (tex.pixels) {
+							int newIdx = (int)result.textureData.size();
+							result.textureData.push_back(tex);
+							textureCache[key] = newIdx;
+							sub.material.normalTextureIndex = newIdx;
+						}
+					}
+				}
+			}
+			result.submeshes.push_back(sub);
+		}
+	}
+
+	for (size_t childIndex : node.children) {
+		processFastGltfNode(asset, childIndex, globalTransform, result, textureCache, path);
+	}
+}
+
+// =============================================================
+// Main Load Function
+// =============================================================
+Mesh loadWithFastGltf(const std::string& path) {
+	Mesh result;
+	fastgltf::Parser parser;
+	auto gltfFile = fastgltf::MappedGltfFile::FromPath(path);
+	if (!gltfFile) throw std::runtime_error("Failed to load glTF file: " + path);
+
+	auto gltfOptions = fastgltf::Options::LoadGLBBuffers | fastgltf::Options::LoadExternalBuffers;
+
+	auto assetRet = parser.loadGltf(gltfFile.get(), std::filesystem::path(path).parent_path(), gltfOptions);
+	if (auto error = assetRet.error(); error != fastgltf::Error::None) {
+		throw std::runtime_error("Failed to parse: " + std::string(fastgltf::getErrorMessage(error)));
+	}
+	auto& asset = assetRet.get();
+
+	std::unordered_map<std::string, int> textureCache;
+
+	size_t sceneIndex = asset.defaultScene.value_or(0);
+	if (asset.scenes.empty()) return result;
+
+	const auto& scene = asset.scenes[sceneIndex];
+	glm::mat4 rootTransform(1.0f);
+
+	for (size_t nodeIndex : scene.nodeIndices) {
+		processFastGltfNode(asset, nodeIndex, rootTransform, result, textureCache, path);
+	}
+
+	std::cout << "Loaded " << result.vertices.size() << " vertices, " << result.textureData.size() << " textures.\n";
 	return result;
 }
 
@@ -725,12 +981,15 @@ int main()
 
 	Mesh model;
 	try {
-		// model = loadGLB("models/sponza-palace/source/scene.glb");
-		model = loadGLB("models/main_sponza/NewSponza_Main_glTF_003.gltf");
-		// model = loadGLB("models/london-city/source/traffic_slam_2_map.glb");
-		// model = loadGLB("models/dae-diorama-grandmas-house/source/Dae_diorama_upload/Dae_diorama_upload.fbx");
-		// model = loadGLB("models/polygon-mini-free/source/model.obj");
-		// model = loadGLB("models/figure-embodying-the-element-silver/Ag_rechte_f Figur_lowres.obj");
+		// model = loadWithAssimp("models/sponza-palace/source/scene.glb");
+		model = loadWithFastGltf("models/sponza-palace/source/scene.glb");
+		// model = loadWithAssimp("models/main_sponza/NewSponza_Main_glTF_003.gltf");
+		// model = loadWithFastGltf("models/main_sponza/NewSponza_Main_glTF_003.gltf");
+		// model = loadWithAssimp("models/main_sponza/NewSponza_Main_Yup_003.fbx");
+		// model = loadWithAssimp("models/london-city/source/traffic_slam_2_map.glb");
+		// model = loadWithAssimp("models/dae-diorama-grandmas-house/source/Dae_diorama_upload/Dae_diorama_upload.fbx");
+		// model = loadWithAssimp("models/polygon-mini-free/source/model.obj");
+		// model = loadWithAssimp("models/figure-embodying-the-element-silver/Ag_rechte_f Figur_lowres.obj");
 	}
 	catch (const std::exception& e) {
 		std::cerr << "Error loading GLB: " << e.what() << "\n";

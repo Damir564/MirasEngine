@@ -84,6 +84,9 @@ FetchContent_Declare(
   GIT_SHALLOW TRUE
 )
 
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+set(ASSIMP_BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+
 # Disable building unnecessary things
 set(ASSIMP_BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 set(ASSIMP_BUILD_TESTS OFF CACHE BOOL "" FORCE)
@@ -101,6 +104,15 @@ FetchContent_Declare(
     GIT_SHALLOW TRUE
 )
 
+FetchContent_Declare(
+    fastgltf
+    GIT_REPOSITORY https://github.com/spnda/fastgltf.git
+    GIT_TAG v0.9.0
+    GIT_SHALLOW TRUE
+)
+
+set(FASTGLTF_COMPILE_AS_CPP20 ON CACHE BOOL "" FORCE)
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 # ============================
 # Make everything available
 # ============================
@@ -113,7 +125,9 @@ FetchContent_MakeAvailable(
   glm
   assimp
   stb
+  fastgltf
 )
+
 
 add_library(stb_image STATIC
     stb_image.cpp
