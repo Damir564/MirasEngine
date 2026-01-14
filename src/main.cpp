@@ -997,11 +997,8 @@ void processFastGltfNode(fastgltf::Asset& asset, size_t nodeIndex, const glm::ma
 					}
 					else {
 						// LOAD TEXTURE HERE
-						// TextureData tex = prepareTextureInfo(asset, asset.images[imgIdx], path);
-						// if (!tex.path.empty() || tex.encodedData != nullptr) {
-						TextureData tex = loadTexture(asset, asset.images[imgIdx], path);
-						// TextureData tex = prepareTextureInfo(asset, asset.images[imgIdx], path);
-						if (tex.pixels) {
+						TextureData tex = prepareTextureInfo(asset, asset.images[imgIdx], path);
+						if (!tex.path.empty() || tex.encodedData != nullptr) {
 							int newIdx = (int)result.textureData.size();
 							result.textureData.push_back(tex);
 							textureCache[key] = newIdx;
@@ -1020,8 +1017,8 @@ void processFastGltfNode(fastgltf::Asset& asset, size_t nodeIndex, const glm::ma
 					}
 					else {
 						// LOAD TEXTURE HERE
-						TextureData tex = loadTexture(asset, asset.images[imgIdx], path);
-						if (tex.pixels) {
+						TextureData tex = prepareTextureInfo(asset, asset.images[imgIdx], path);
+						if (!tex.path.empty() || tex.encodedData != nullptr) {
 							int newIdx = (int)result.textureData.size();
 							result.textureData.push_back(tex);
 							textureCache[key] = newIdx;
@@ -1041,8 +1038,8 @@ void processFastGltfNode(fastgltf::Asset& asset, size_t nodeIndex, const glm::ma
 							sub.material.metallicRoughnessTextureIndex = textureCache[key];
 						}
 						else {
-							TextureData tex = loadTexture(asset, asset.images[imgIdx], path);
-							if (tex.pixels) {
+							TextureData tex = prepareTextureInfo(asset, asset.images[imgIdx], path);
+							if (!tex.path.empty() || tex.encodedData != nullptr) {
 								int newIdx = (int)result.textureData.size();
 								result.textureData.push_back(tex);
 								textureCache[key] = newIdx;
