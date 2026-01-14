@@ -22,6 +22,7 @@
 #include <fastgltf/core.hpp>
 #include <fastgltf/glm_element_traits.hpp>
 #include <fastgltf/tools.hpp>
+#include <future>
 
 struct Camera {
 	glm::vec3 position{ 0.0f, 0.0f, 0.0f };
@@ -333,6 +334,9 @@ struct TextureData {
 	unsigned char* pixels = nullptr;
 	std::string path;
 
+	const unsigned char* encodedData = nullptr;
+	size_t encodedSize = 0;
+
 	// Helper to free CPU memory
 	void free() {
 		if (pixels) {
@@ -343,6 +347,63 @@ struct TextureData {
 
 	bool isLinear = false;
 };
+
+void decodeTextureParallel(TextureData& tex) {
+	if (tex.encodedData != nullptr && tex.encodedSize > 0) {
+		// Load from Memory (Embedded)
+		tex.pixels = stbi_load_from_memory(
+			tex.encodedData,
+			static_cast<int>(tex.encodedSize),
+			&tex.width, &tex.height, &tex.channels, 4);
+	}
+	else if (!tex.path.empty()) {
+		// Load from File
+		tex.pixels = stbi_load(
+			tex.path.c_str(),
+			&tex.width, &tex.height, &tex.channels, 4);
+	}
+
+	if (!tex.pixels) {
+		std::cerr << "Texture failed to load: " << (tex.path.empty() ? "Embedded" : tex.path) << "\n";
+		// Create a 1x1 magenta fallback so the app doesn't crash
+		tex.width = 1; tex.height = 1; tex.channels = 4;
+		tex.pixels = (unsigned char*)malloc(4);
+		tex.pixels[0] = 255; tex.pixels[1] = 0; tex.pixels[2] = 255; tex.pixels[3] = 255;
+	}
+}
+
+TextureData prepareTextureInfo(const fastgltf::Asset& asset, const fastgltf::Image& image, const std::string& modelPath) {
+	TextureData texData{};
+
+	std::visit(fastgltf::visitor{
+		[&](const fastgltf::sources::URI& uri) {
+			// Store Path only
+			std::string pathString = std::string(uri.uri.path());
+			texData.path = (std::filesystem::path(modelPath).parent_path() / pathString).string();
+		},
+		[&](const fastgltf::sources::Array& array) {
+			// Store Pointer only
+			texData.encodedData = reinterpret_cast<const unsigned char*>(array.bytes.data());
+			texData.encodedSize = array.bytes.size();
+		},
+		[&](const fastgltf::sources::BufferView& view) {
+			// Store Pointer only
+			auto& bufferView = asset.bufferViews[view.bufferViewIndex];
+			auto& buffer = asset.buffers[bufferView.bufferIndex];
+
+			std::visit(fastgltf::visitor{
+				[&](const fastgltf::sources::Array& bufferArray) {
+					texData.encodedData = reinterpret_cast<const unsigned char*>(bufferArray.bytes.data() + bufferView.byteOffset);
+					texData.encodedSize = bufferView.byteLength;
+				},
+				[](auto&) {}
+			}, buffer.data);
+		},
+		[](auto&) {}
+		}, image.data);
+
+	return texData;
+}
 
 class TextureImage {
 public:
@@ -936,7 +997,10 @@ void processFastGltfNode(fastgltf::Asset& asset, size_t nodeIndex, const glm::ma
 					}
 					else {
 						// LOAD TEXTURE HERE
+						// TextureData tex = prepareTextureInfo(asset, asset.images[imgIdx], path);
+						// if (!tex.path.empty() || tex.encodedData != nullptr) {
 						TextureData tex = loadTexture(asset, asset.images[imgIdx], path);
+						// TextureData tex = prepareTextureInfo(asset, asset.images[imgIdx], path);
 						if (tex.pixels) {
 							int newIdx = (int)result.textureData.size();
 							result.textureData.push_back(tex);
@@ -1039,6 +1103,27 @@ Mesh loadWithFastGltf(const std::string& path) {
 
 	for (size_t nodeIndex : scene.nodeIndices) {
 		processFastGltfNode(asset, nodeIndex, rootTransform, result, textureCache, path);
+	}
+
+	// 3. Parallel Texture Loading
+	// Now that result.textureData is fully populated and stable, we process it in parallel.
+	if (!result.textureData.empty()) {
+		std::cout << "Decoding " << result.textureData.size() << " textures in parallel...\n";
+
+		std::vector<std::future<void>> futures;
+		futures.reserve(result.textureData.size());
+
+		for (auto& tex : result.textureData) {
+			// Launch async job for each texture
+			futures.push_back(std::async(std::launch::async, [&tex]() {
+				decodeTextureParallel(tex);
+				}));
+		}
+
+		// Wait for all threads to finish
+		for (auto& f : futures) {
+			f.wait();
+		}
 	}
 
 	std::cout << "Loaded " << result.vertices.size() << " vertices, " << result.textureData.size() << " textures.\n";
