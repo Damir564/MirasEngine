@@ -340,11 +340,13 @@ struct TextureData {
 			pixels = nullptr;
 		}
 	}
+
+	bool isLinear = false;
 };
 
 class TextureImage {
 public:
-	TextureImage(VmaAllocator allocator, vk::Device device, vk::CommandPool cmdPool, vk::Queue queue, const TextureData& data)
+	TextureImage(VmaAllocator allocator, vk::Device device, vk::CommandPool cmdPool, vk::Queue queue, const TextureData& data, vk::Format format)
 		: m_allocator(allocator), m_device(device) {
 
 		vk::DeviceSize imageSize = data.width * data.height * 4;
@@ -373,7 +375,7 @@ public:
 		imageInfo.extent.depth = 1;
 		imageInfo.mipLevels = 1;
 		imageInfo.arrayLayers = 1;
-		imageInfo.format = VK_FORMAT_R8G8B8A8_SRGB;
+		imageInfo.format = static_cast<VkFormat>(format);
 		imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
 		imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 		imageInfo.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
@@ -418,7 +420,7 @@ public:
 		vk::ImageViewCreateInfo viewInfo{};
 		viewInfo.image = m_image;
 		viewInfo.viewType = vk::ImageViewType::e2D;
-		viewInfo.format = vk::Format::eR8G8B8A8Srgb;
+		viewInfo.format = format;
 		viewInfo.subresourceRange.aspectMask = vk::ImageAspectFlagBits::eColor;
 		viewInfo.subresourceRange.levelCount = 1;
 		viewInfo.subresourceRange.layerCount = 1;
@@ -504,6 +506,7 @@ struct Material {
 	float roughnessFactor{ 1.0f };
 	int baseColorTextureIndex = -1;
 	int normalTextureIndex = -1;
+	int metallicRoughnessTextureIndex = -1;
 };
 
 struct SubmeshInfo {
@@ -569,11 +572,11 @@ int g_NodesCounter = 0;
 void processNode(aiNode* node, const aiScene* scene, glm::mat4 parentTransform, Mesh& result,
 	std::unordered_map<std::string, int>& textureCache, const std::string& path) {
 	++g_NodesCounter;
-	//if (g_NodesCounter > MAX_NODES)
-	//	return;
-	// 1. Calculate the global transform for this node
+
+	// 1. Transform
 	glm::mat4 nodeTransform = aiMatrix4x4ToGlm(node->mTransformation);
 	glm::mat4 globalTransform = parentTransform * nodeTransform;
+	glm::mat3 normalMatrix = glm::transpose(glm::inverse(glm::mat3(globalTransform)));
 
 	uint32_t vertexOffset = static_cast<uint32_t>(result.vertices.size());
 	uint32_t indexOffset = static_cast<uint32_t>(result.indices.size());
@@ -586,22 +589,20 @@ void processNode(aiNode* node, const aiScene* scene, glm::mat4 parentTransform, 
 		info.indexOffset = indexOffset;
 		info.indexCount = mesh->mNumFaces * 3;
 
-		glm::mat3 normalMatrix = glm::transpose(glm::inverse(glm::mat3(globalTransform)));
-
-		// Copy vertices
+		// 2. Vertices
 		for (unsigned int i = 0; i < mesh->mNumVertices; ++i) {
 			Vertex vertex{};
 			glm::vec4 pos = globalTransform * glm::vec4(mesh->mVertices[i].x, mesh->mVertices[i].y, mesh->mVertices[i].z, 1.0f);
 			vertex.position = glm::vec3(pos);
-			vertex.normal = mesh->HasNormals() ? normalMatrix * glm::vec3(mesh->mNormals[i].x, mesh->mNormals[i].y, mesh->mNormals[i].z) : glm::vec3(0.0f);
+			vertex.normal = mesh->HasNormals() ? glm::normalize(normalMatrix * glm::vec3(mesh->mNormals[i].x, mesh->mNormals[i].y, mesh->mNormals[i].z)) : glm::vec3(0.0f);
 			vertex.texCoord = mesh->HasTextureCoords(0) ? glm::vec2(mesh->mTextureCoords[0][i].x, mesh->mTextureCoords[0][i].y) : glm::vec2(0.0f);
 			vertex.tangent = mesh->HasTangentsAndBitangents()
-				? normalMatrix * glm::vec3(mesh->mTangents[i].x, mesh->mTangents[i].y, mesh->mTangents[i].z)
+				? glm::normalize(normalMatrix * glm::vec3(mesh->mTangents[i].x, mesh->mTangents[i].y, mesh->mTangents[i].z))
 				: glm::vec3(0.0f);
 			result.vertices.push_back(vertex);
 		}
 
-		// Copy indices (with vertex offset!)
+		// 3. Indices
 		for (unsigned int i = 0; i < mesh->mNumFaces; ++i) {
 			const aiFace& face = mesh->mFaces[i];
 			if (face.mNumIndices != 3) continue;
@@ -613,40 +614,54 @@ void processNode(aiNode* node, const aiScene* scene, glm::mat4 parentTransform, 
 		vertexOffset += mesh->mNumVertices;
 		indexOffset += mesh->mNumFaces * 3;
 
-		// MATERIALS
+		// 4. Materials
 		if (mesh->mMaterialIndex >= 0) {
 			aiMaterial* material = scene->mMaterials[mesh->mMaterialIndex];
+
+			// A. Factors
 			aiColor4D color;
 			if (AI_SUCCESS == aiGetMaterialColor(material, AI_MATKEY_BASE_COLOR, &color)) {
 				info.material.baseColorFactor = glm::vec4(color.r, color.g, color.b, color.a);
 			}
+			else if (AI_SUCCESS == aiGetMaterialColor(material, AI_MATKEY_COLOR_DIFFUSE, &color)) {
+				info.material.baseColorFactor = glm::vec4(color.r, color.g, color.b, color.a);
+			}
 
-			float metallic = 0.0f;
-			float roughness = 0.5f;
-			// float metallic, roughness;
-			if (AI_SUCCESS == aiGetMaterialFloat(material, AI_MATKEY_METALLIC_FACTOR, &metallic))
-				info.material.metallicFactor = metallic;
-			if (AI_SUCCESS == aiGetMaterialFloat(material, AI_MATKEY_ROUGHNESS_FACTOR, &roughness))
-				info.material.roughnessFactor = roughness;
+			// Default to non-metal for FBX
+			float metallic = 1.0f;
+			float roughness = 1.0f;
+
+			aiGetMaterialFloat(material, AI_MATKEY_METALLIC_FACTOR, &metallic);
+			aiGetMaterialFloat(material, AI_MATKEY_ROUGHNESS_FACTOR, &roughness);
+
+			info.material.metallicFactor = metallic;
+			info.material.roughnessFactor = roughness;
 
 			aiString texPath;
-			// Base Color
-			if (material->GetTexture(aiTextureType_BASE_COLOR, 0, &texPath) == AI_SUCCESS) {
+
+			// B. Base Color Texture
+			// Try PBR first, then Diffuse
+			aiTextureType type = aiTextureType_BASE_COLOR;
+			if (material->GetTextureCount(type) == 0) type = aiTextureType_DIFFUSE;
+
+			if (material->GetTexture(type, 0, &texPath) == AI_SUCCESS) {
 				std::string key = texPath.C_Str();
 				if (textureCache.find(key) != textureCache.end()) {
 					info.material.baseColorTextureIndex = textureCache[key];
 				}
 				else {
-					TextureData tex = loadMaterialTexture(scene, material, path, aiTextureType_BASE_COLOR);
-					if (tex.pixels) { // Only add if load succeeded
+					TextureData tex = loadMaterialTexture(scene, material, path, type);
+					if (tex.pixels) {
 						int newIdx = (int)result.textureData.size();
+						tex.isLinear = false;
 						result.textureData.push_back(tex);
 						textureCache[key] = newIdx;
 						info.material.baseColorTextureIndex = newIdx;
 					}
 				}
 			}
-			// Normal Map
+
+			// C. Normal Map
 			if (material->GetTexture(aiTextureType_NORMALS, 0, &texPath) == AI_SUCCESS) {
 				std::string key = texPath.C_Str();
 				if (textureCache.find(key) != textureCache.end()) {
@@ -656,9 +671,31 @@ void processNode(aiNode* node, const aiScene* scene, glm::mat4 parentTransform, 
 					TextureData tex = loadMaterialTexture(scene, material, path, aiTextureType_NORMALS);
 					if (tex.pixels) {
 						int newIdx = (int)result.textureData.size();
+						tex.isLinear = true;
 						result.textureData.push_back(tex);
 						textureCache[key] = newIdx;
 						info.material.normalTextureIndex = newIdx;
+					}
+				}
+			}
+
+			// D. Metallic-Roughness (NEW: Support for glTF via Assimp)
+			// Assimp maps the glTF packed texture to aiTextureType_UNKNOWN (index 0) usually.
+			// We check UNKNOWN. If loading FBX, this is usually empty, so it's safe.
+			if (material->GetTexture(aiTextureType_UNKNOWN, 0, &texPath) == AI_SUCCESS) {
+				std::string key = texPath.C_Str();
+				if (textureCache.find(key) != textureCache.end()) {
+					info.material.metallicRoughnessTextureIndex = textureCache[key];
+				}
+				else {
+					// Use UNKNOWN type
+					TextureData tex = loadMaterialTexture(scene, material, path, aiTextureType_UNKNOWN);
+					if (tex.pixels) {
+						int newIdx = (int)result.textureData.size();
+						tex.isLinear = true;
+						result.textureData.push_back(tex);
+						textureCache[key] = newIdx;
+						info.material.metallicRoughnessTextureIndex = newIdx;
 					}
 				}
 			}
@@ -667,18 +704,25 @@ void processNode(aiNode* node, const aiScene* scene, glm::mat4 parentTransform, 
 		result.submeshes.push_back(info);
 	}
 
-	//if (g_NodesCounter > MAX_NODES)
-	//	return;
-	// 3. Recurse through children
 	for (unsigned int i = 0; i < node->mNumChildren; ++i) {
 		processNode(node->mChildren[i], scene, globalTransform, result, textureCache, path);
-		//if (g_NodesCounter > MAX_NODES)
-		//	return;
 	}
-	//if (g_NodesCounter > MAX_NODES)
-	//	return;
 }
 
+void calculateTotalAssimpVertices(const aiNode* node, const aiScene* scene, size_t& totalVerts, size_t& totalIndices) {
+	// Count vertices/indices for meshes attached to THIS node
+	for (unsigned int i = 0; i < node->mNumMeshes; ++i) {
+		const aiMesh* mesh = scene->mMeshes[node->mMeshes[i]];
+		totalVerts += mesh->mNumVertices;
+		// Since we use aiProcess_Triangulate, every face has 3 indices
+		totalIndices += mesh->mNumFaces * 3;
+	}
+
+	// Recurse into children
+	for (unsigned int i = 0; i < node->mNumChildren; ++i) {
+		calculateTotalAssimpVertices(node->mChildren[i], scene, totalVerts, totalIndices);
+	}
+}
 
 Mesh loadWithAssimp(const std::string& path) {
 	Assimp::Importer importer;
@@ -697,6 +741,16 @@ Mesh loadWithAssimp(const std::string& path) {
 	}
 
 	Mesh result;
+
+	size_t totalVerts = 0;
+	size_t totalIndices = 0;
+
+	// Calculate exact counts to prevent std::vector reallocation resizing
+	calculateTotalAssimpVertices(scene->mRootNode, scene, totalVerts, totalIndices);
+
+	result.vertices.reserve(totalVerts);
+	result.indices.reserve(totalIndices);
+
 	std::unordered_map<std::string, int> textureCache;
 
 	// Start recursion from the root node with an identity matrix
@@ -911,6 +965,28 @@ void processFastGltfNode(fastgltf::Asset& asset, size_t nodeIndex, const glm::ma
 						}
 					}
 				}
+
+				// 3. Metallic-Roughness (NEW)
+				if (pbr.metallicRoughnessTexture.has_value()) {
+					size_t texIndex = pbr.metallicRoughnessTexture.value().textureIndex;
+					if (asset.textures[texIndex].imageIndex.has_value()) {
+						size_t imgIdx = asset.textures[texIndex].imageIndex.value();
+						std::string key = "mr:" + std::to_string(imgIdx);
+
+						if (textureCache.find(key) != textureCache.end()) {
+							sub.material.metallicRoughnessTextureIndex = textureCache[key];
+						}
+						else {
+							TextureData tex = loadTexture(asset, asset.images[imgIdx], path);
+							if (tex.pixels) {
+								int newIdx = (int)result.textureData.size();
+								result.textureData.push_back(tex);
+								textureCache[key] = newIdx;
+								sub.material.metallicRoughnessTextureIndex = newIdx;
+							}
+						}
+					}
+				}
 			}
 			result.submeshes.push_back(sub);
 		}
@@ -919,6 +995,19 @@ void processFastGltfNode(fastgltf::Asset& asset, size_t nodeIndex, const glm::ma
 	for (size_t childIndex : node.children) {
 		processFastGltfNode(asset, childIndex, globalTransform, result, textureCache, path);
 	}
+}
+
+size_t calculateTotalVertices(const fastgltf::Asset& asset) {
+	size_t totalVertices = 0;
+	for (const auto& mesh : asset.meshes) {
+		for (const auto& primitive : mesh.primitives) {
+			auto it = primitive.findAttribute("POSITION");
+			if (it != primitive.attributes.end()) {
+				totalVertices += asset.accessors[it->accessorIndex].count;
+			}
+		}
+	}
+	return totalVertices;
 }
 
 // =============================================================
@@ -937,7 +1026,9 @@ Mesh loadWithFastGltf(const std::string& path) {
 		throw std::runtime_error("Failed to parse: " + std::string(fastgltf::getErrorMessage(error)));
 	}
 	auto& asset = assetRet.get();
-
+	size_t totalVerts = calculateTotalVertices(asset);
+	result.vertices.reserve(totalVerts);
+	result.indices.reserve(totalVerts);
 	std::unordered_map<std::string, int> textureCache;
 
 	size_t sceneIndex = asset.defaultScene.value_or(0);
@@ -982,9 +1073,9 @@ int main()
 	Mesh model;
 	try {
 		// model = loadWithAssimp("models/sponza-palace/source/scene.glb");
-		model = loadWithFastGltf("models/sponza-palace/source/scene.glb");
+		// model = loadWithFastGltf("models/sponza-palace/source/scene.glb");
 		// model = loadWithAssimp("models/main_sponza/NewSponza_Main_glTF_003.gltf");
-		// model = loadWithFastGltf("models/main_sponza/NewSponza_Main_glTF_003.gltf");
+		model = loadWithFastGltf("models/main_sponza/NewSponza_Main_glTF_003.gltf");
 		// model = loadWithAssimp("models/main_sponza/NewSponza_Main_Yup_003.fbx");
 		// model = loadWithAssimp("models/london-city/source/traffic_slam_2_map.glb");
 		// model = loadWithAssimp("models/dae-diorama-grandmas-house/source/Dae_diorama_upload/Dae_diorama_upload.fbx");
@@ -1292,8 +1383,9 @@ int main()
 
 		std::cout << "Uploading " << model.textureData.size() << " textures...\n";
 		for (auto& cpuTex : model.textureData) {
+			vk::Format fmt = cpuTex.isLinear ? vk::Format::eR8G8B8A8Unorm : vk::Format::eR8G8B8A8Srgb;
 			gpuTextures.push_back(std::make_unique<TextureImage>(
-				allocator, device, commandPool.get(), graphicsQueue, cpuTex
+				allocator, device, commandPool.get(), graphicsQueue, cpuTex, fmt
 			));
 			// Free CPU memory now that it's on GPU
 			cpuTex.free();
@@ -1338,7 +1430,7 @@ int main()
 		whiteTexData.pixels = whitePixels; // No need to free this specifically
 
 		auto defaultTexture = std::make_unique<TextureImage>(
-			allocator, device, commandPool.get(), graphicsQueue, whiteTexData
+			allocator, device, commandPool.get(), graphicsQueue, whiteTexData, vk::Format::eR8G8B8A8Srgb
 		);
 
 		TextureData normalTexData;
@@ -1347,7 +1439,16 @@ int main()
 		normalTexData.pixels = normalPixels;
 
 		auto defaultNormalTexture = std::make_unique<TextureImage>(
-			allocator, device, commandPool.get(), graphicsQueue, normalTexData
+			allocator, device, commandPool.get(), graphicsQueue, normalTexData, vk::Format::eR8G8B8A8Unorm
+		);
+
+		TextureData mrTexData;
+		mrTexData.width = 1; mrTexData.height = 1; mrTexData.channels = 4;
+		unsigned char mrPixels[] = { 0, 255, 0, 255 };
+		mrTexData.pixels = mrPixels;
+
+		auto defaultMrTexture = std::make_unique<TextureImage>(
+			allocator, device, commandPool.get(), graphicsQueue, mrTexData, vk::Format::eR8G8B8A8Unorm
 		);
 
 		// 2. Create Descriptor Pool
@@ -1356,23 +1457,23 @@ int main()
 
 		vk::DescriptorPoolSize poolSize{};
 		poolSize.type = vk::DescriptorType::eCombinedImageSampler;
-		poolSize.descriptorCount = totalTextures + 2;
+		poolSize.descriptorCount = (totalTextures + 2) * 3;
 
 		vk::DescriptorPoolCreateInfo poolInfo{};
 		poolInfo.poolSizeCount = 1;
 		poolInfo.pPoolSizes = &poolSize;
-		poolInfo.maxSets = totalTextures + 2;
+		poolInfo.maxSets = (totalTextures + 2) * 3;
 
 		vk::UniqueDescriptorPool descriptorPool = device.createDescriptorPoolUnique(poolInfo).value;
 
 		// 3. Allocate Descriptor Sets
 		std::vector<vk::DescriptorSetLayout> layoutsVector(totalTextures, descriptorSetLayout.get());
-		vk::DescriptorSetAllocateInfo allocInfo{};
-		allocInfo.descriptorPool = descriptorPool.get();
-		allocInfo.descriptorSetCount = totalTextures;
-		allocInfo.pSetLayouts = layoutsVector.data();
+		vk::DescriptorSetAllocateInfo defaultBaseColorAllocInfo{};
+		defaultBaseColorAllocInfo.descriptorPool = descriptorPool.get();
+		defaultBaseColorAllocInfo.descriptorSetCount = totalTextures;
+		defaultBaseColorAllocInfo.pSetLayouts = layoutsVector.data();
 
-		std::vector<vk::DescriptorSet> textureDescriptorSets = device.allocateDescriptorSets(allocInfo).value;
+		std::vector<vk::DescriptorSet> textureDescriptorSets = device.allocateDescriptorSets(defaultBaseColorAllocInfo).value;
 
 		// 4. Update Descriptor Sets
 		// Function to write texture to a specific set index
@@ -1408,6 +1509,14 @@ int main()
 		for (size_t i = 0; i < gpuTextures.size(); i++) {
 			updateDescriptorSet(textureDescriptorSets[i + 1], gpuTextures[i]->getView());
 		}
+
+		vk::DescriptorSetAllocateInfo defaultMrAllocInfo{};
+		defaultMrAllocInfo.descriptorPool = descriptorPool.get();
+		defaultMrAllocInfo.descriptorSetCount = 1;
+		defaultMrAllocInfo.pSetLayouts = &descriptorSetLayout.get();
+
+		vk::DescriptorSet defaultMrSet = device.allocateDescriptorSets(defaultMrAllocInfo).value[0];
+		updateDescriptorSet(defaultMrSet, defaultMrTexture->getView());
 
 		// ------------------------
 		// 12. Semaphores and Fences
@@ -1458,6 +1567,7 @@ int main()
 
 		vk::DescriptorSetLayout layouts[] = { 
 			descriptorSetLayout.get()
+			, descriptorSetLayout.get()
 			, descriptorSetLayout.get() };
 
 		// shader create info
@@ -1471,7 +1581,7 @@ int main()
 			.setPName("main")
 			.setPushConstantRangeCount(1)
 			.setPPushConstantRanges(allRanges)
-			.setSetLayoutCount(2)
+			.setSetLayoutCount(3)
 			.setPSetLayouts(layouts);
 
 		vk::ShaderCreateInfoEXT fragInfo{};
@@ -1483,7 +1593,7 @@ int main()
 			.setPName("main")
 			.setPushConstantRangeCount(1)
 			.setPPushConstantRanges(allRanges)
-			.setSetLayoutCount(2)
+			.setSetLayoutCount(3)
 			.setPSetLayouts(layouts);
 
 		vk::ShaderEXT vertShader, fragShader;
@@ -1494,7 +1604,7 @@ int main()
 		std::vector<vk::PushConstantRange> pushRanges = { pcRange };
 		vk::PipelineLayoutCreateInfo pipelineLayoutInfo{};
 		pipelineLayoutInfo.setPushConstantRanges(pushRanges);
-		pipelineLayoutInfo.setSetLayoutCount(2);
+		pipelineLayoutInfo.setSetLayoutCount(3);
 		pipelineLayoutInfo.setPSetLayouts(layouts);
 		// arrays for binding shaders
 		vk::PipelineLayout pipelineLayout;
@@ -1766,20 +1876,20 @@ int main()
 				);
 
 				// base color
-				vk::DescriptorSet setParams;
+				vk::DescriptorSet baseColorSet;
 				if (sub.material.baseColorTextureIndex >= 0) {
 					// Index + 1 because set[0] is the default white texture
-					setParams = textureDescriptorSets[sub.material.baseColorTextureIndex + 1];
+					baseColorSet = textureDescriptorSets[sub.material.baseColorTextureIndex + 1];
 				}
 				else {
-					setParams = textureDescriptorSets[0];
+					baseColorSet = textureDescriptorSets[0];
 				}
 
 				cmd.bindDescriptorSets(
 					vk::PipelineBindPoint::eGraphics,
 					pipelineLayout, // This must be the layout that includes the descriptorSetLayout
 					0,
-					1, &setParams,
+					1, &baseColorSet,
 					0, nullptr
 				);
 
@@ -1798,6 +1908,23 @@ int main()
 					, &normalSet
 					, 0
 					, nullptr);
+
+				vk::DescriptorSet mrSet;
+				if (sub.material.metallicRoughnessTextureIndex >= 0) {
+					// Offset by +1 because textureDescriptorSets[0] is default white
+					mrSet = textureDescriptorSets[sub.material.metallicRoughnessTextureIndex + 1];
+				}
+				else {
+					mrSet = defaultMrSet;
+				}
+
+				cmd.bindDescriptorSets(
+					vk::PipelineBindPoint::eGraphics,
+					pipelineLayout,
+					2, // Set 2
+					1, &mrSet,
+					0, nullptr
+				);
 
 				cmd.drawIndexed(
 					sub.indexCount,      // number of indices

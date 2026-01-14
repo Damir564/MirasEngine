@@ -9,8 +9,10 @@ layout(location = 3) in mat3 TBN;
 
 // Set 0: Base Color
 layout(set = 0, binding = 0) uniform sampler2D baseColorSampler;
-// Set 1: Normal Map (NEW)
+// Set 1: Normal Map 
 layout(set = 1, binding = 0) uniform sampler2D normalMapSampler;
+// Set 2: Metallic-Roughness Map
+layout(set = 2, binding = 0) uniform sampler2D mrSampler;
 
 layout(push_constant) uniform MeshData {
     mat4 view;
@@ -61,11 +63,15 @@ void main() {
     
     // 2. Normal Mapping
     vec3 normalMapValue = texture(normalMapSampler, fragTexCoord).rgb;
-
-    // Transform from [0,1] range to [-1,1] range
     normalMapValue = normalMapValue * 2.0 - 1.0; 
-    // Transform from Tangent Space to World Space
     vec3 N = normalize(TBN * normalMapValue); 
+
+    // 3. Metallic & Roughness
+    // glTF standard: G = Roughness, B = Metallic
+    vec4 mrSample = texture(mrSampler, fragTexCoord);
+    // Combine factor (push constant) with texture value
+    float metallic = pc.metallic * mrSample.b;
+    float roughness = pc.roughness * mrSample.g;
 
     // 3. Lighting Setup
     vec3 L = normalize(vec3(-0.4, 0.8, -0.6)); // Light Direction
@@ -75,10 +81,10 @@ void main() {
 
     // 4. PBR Calculation
     vec3 F0 = vec3(0.04); 
-    F0 = mix(F0, albedo, pc.metallic);
+    F0 = mix(F0, albedo, metallic);
 
-    float NDF = DistributionGGX(N, H, pc.roughness);
-    float G = GeometrySmith(N, V, L, pc.roughness);
+    float NDF = DistributionGGX(N, H, roughness);
+    float G = GeometrySmith(N, V, L, roughness);
     vec3 F = fresnelSchlick(max(dot(H, V), 0.0), F0);
 
     vec3 numerator = NDF * G * F;
@@ -87,7 +93,7 @@ void main() {
 
     vec3 kS = F;
     vec3 kD = vec3(1.0) - kS;
-    kD *= 1.0 - pc.metallic;
+    kD *= 1.0 - metallic;
 
     float NdotL = max(dot(N, L), 0.0);
     vec3 diffuse = kD * albedo / PI;
