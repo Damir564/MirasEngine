@@ -584,6 +584,47 @@ struct Mesh {
 	std::vector<TextureData> textureData;
 };
 
+TextureData prepareAssimpTextureInfo(const aiScene* scene, const aiMaterial* mat, const std::string& modelPath, aiTextureType type) {
+	TextureData texture{};
+	aiString path;
+
+	if (mat->GetTexture(type, 0, &path) == AI_SUCCESS) {
+		// 1. Check for Embedded Texture (marked with *)
+		const aiTexture* embeddedTex = scene->GetEmbeddedTexture(path.C_Str());
+		if (embeddedTex) {
+			texture.encodedData = reinterpret_cast<const unsigned char*>(embeddedTex->pcData);
+
+			if (embeddedTex->mHeight == 0) {
+				// Compressed (png/jpg) inside the binary
+				texture.encodedSize = embeddedTex->mWidth;
+			}
+			else {
+				// Raw ARGB data (less common in modern formats like GLB/FBX but possible)
+				// Note: stbi_load_from_memory generally expects file headers (PNG/JPG). 
+				// If Assimp returns raw texels, this might need manual copying, 
+				// but we will stick to the existing logic's buffer size assumption.
+				texture.encodedSize = embeddedTex->mWidth * embeddedTex->mHeight * 4;
+			}
+		}
+		// 2. Load from File
+		else {
+			std::string fullPath = path.C_Str();
+			// Fix path relative to model directory
+			std::filesystem::path mPath(modelPath);
+			std::filesystem::path tPath(fullPath);
+
+			// If path is not absolute, append it to model directory
+			if (!tPath.is_absolute()) {
+				texture.path = (mPath.parent_path() / tPath).string();
+			}
+			else {
+				texture.path = fullPath;
+			}
+		}
+	}
+	return texture;
+}
+
 TextureData loadMaterialTexture(const aiScene* scene, const aiMaterial* mat, const std::string& modelPath, aiTextureType type) {
 	TextureData texture{};
 	aiString path;
@@ -711,8 +752,8 @@ void processNode(aiNode* node, const aiScene* scene, glm::mat4 parentTransform, 
 					info.material.baseColorTextureIndex = textureCache[key];
 				}
 				else {
-					TextureData tex = loadMaterialTexture(scene, material, path, type);
-					if (tex.pixels) {
+					TextureData tex = prepareAssimpTextureInfo(scene, material, path, type);
+					if (!tex.path.empty() || tex.encodedData != nullptr) {
 						int newIdx = (int)result.textureData.size();
 						tex.isLinear = false;
 						result.textureData.push_back(tex);
@@ -729,8 +770,8 @@ void processNode(aiNode* node, const aiScene* scene, glm::mat4 parentTransform, 
 					info.material.normalTextureIndex = textureCache[key];
 				}
 				else {
-					TextureData tex = loadMaterialTexture(scene, material, path, aiTextureType_NORMALS);
-					if (tex.pixels) {
+					TextureData tex = prepareAssimpTextureInfo(scene, material, path, aiTextureType_NORMALS);
+					if (!tex.path.empty() || tex.encodedData != nullptr) {
 						int newIdx = (int)result.textureData.size();
 						tex.isLinear = true;
 						result.textureData.push_back(tex);
@@ -750,8 +791,8 @@ void processNode(aiNode* node, const aiScene* scene, glm::mat4 parentTransform, 
 				}
 				else {
 					// Use UNKNOWN type
-					TextureData tex = loadMaterialTexture(scene, material, path, aiTextureType_UNKNOWN);
-					if (tex.pixels) {
+					TextureData tex = prepareAssimpTextureInfo(scene, material, path, aiTextureType_UNKNOWN);
+					if (!tex.path.empty() || tex.encodedData != nullptr) {
 						int newIdx = (int)result.textureData.size();
 						tex.isLinear = true;
 						result.textureData.push_back(tex);
@@ -816,6 +857,24 @@ Mesh loadWithAssimp(const std::string& path) {
 
 	// Start recursion from the root node with an identity matrix
 	processNode(scene->mRootNode, scene, glm::mat4(1.0f), result, textureCache, path);
+
+	// --- ADDED: Async Texture Decoding ---
+	if (!result.textureData.empty()) {
+		std::cout << "Decoding " << result.textureData.size() << " Assimp textures in parallel...\n";
+
+		std::vector<std::future<void>> futures;
+		futures.reserve(result.textureData.size());
+
+		for (auto& tex : result.textureData) {
+			futures.push_back(std::async(std::launch::async, [&tex]() {
+				decodeTextureParallel(tex);
+				}));
+		}
+
+		for (auto& f : futures) {
+			f.wait();
+		}
+	}
 
 	return result;
 }
@@ -1156,8 +1215,8 @@ int main()
 	try {
 		// model = loadWithAssimp("models/sponza-palace/source/scene.glb");
 		// model = loadWithFastGltf("models/sponza-palace/source/scene.glb");
-		// model = loadWithAssimp("models/main_sponza/NewSponza_Main_glTF_003.gltf");
-		model = loadWithFastGltf("models/main_sponza/NewSponza_Main_glTF_003.gltf");
+		model = loadWithAssimp("models/main_sponza/NewSponza_Main_glTF_003.gltf");
+		// model = loadWithFastGltf("models/main_sponza/NewSponza_Main_glTF_003.gltf");
 		// model = loadWithAssimp("models/main_sponza/NewSponza_Main_Yup_003.fbx");
 		// model = loadWithAssimp("models/london-city/source/traffic_slam_2_map.glb");
 		// model = loadWithAssimp("models/dae-diorama-grandmas-house/source/Dae_diorama_upload/Dae_diorama_upload.fbx");
