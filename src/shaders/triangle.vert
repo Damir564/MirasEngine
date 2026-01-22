@@ -5,12 +5,13 @@
 layout(location = 0) in vec3 inPosition;
 layout(location = 1) in vec3 inNormal;   
 layout(location = 2) in vec2 inTexCoord; // [cite: 30]
-layout(location = 3) in vec3 inTangent; // [cite: 30]
+layout(location = 3) in vec4 inTangent; // [cite: 30]
 layout(location = 4) in vec3 inOffset;   // [cite: 31]
 
 layout(push_constant) uniform MeshData {
     mat4 view;
     mat4 proj;
+    vec4 cameraPos;
     vec4 baseColor;
     float metallic;
     float roughness;
@@ -43,8 +44,8 @@ void main()
     // 2. Transform Normal and Tangent by the same rotation
     // This ensures the TBN frame rotates with the geometry
     vec3 worldNormal = normalize(inNormal);
-    vec3 worldTangent = normalize(inTangent);
-    vec3 worldBitangent = cross(worldNormal, worldTangent);
+    vec3 worldTangent = normalize(inTangent.xyz);
+    vec3 worldBitangent = cross(worldNormal, worldTangent) * inTangent.w;
 
     // 3. Set Outputs
     fragWorldPos = vec3(worldPosition);

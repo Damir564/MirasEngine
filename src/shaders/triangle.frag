@@ -17,9 +17,11 @@ layout(set = 2, binding = 0) uniform sampler2D mrSampler;
 layout(push_constant) uniform MeshData {
     mat4 view;
     mat4 proj;
+    vec4 cameraPos;
     vec4 baseColor;
     float metallic;
     float roughness;
+    float time;
 } pc;
 
 layout(location = 0) out vec4 outColor;
@@ -73,10 +75,14 @@ void main() {
     float metallic = pc.metallic * mrSample.b;
     float roughness = pc.roughness * mrSample.g;
 
+    // DEBUG: Visualize metallic (red) and roughness (green)
+//    outColor = vec4(metallic, roughness, 0.0, 1.0);
+//    return;  // Skip normal rendering
+
     // 3. Lighting Setup
     vec3 L = normalize(vec3(-0.4, 0.8, -0.6)); // Light Direction
     // Approximate view pos (assuming camera at 0,0,100 or similar, pass actual cam pos for better accuracy)
-    vec3 V = normalize(vec3(0.0, 0.0, 0.0) - fragWorldPos);
+    vec3 V = normalize(pc.cameraPos.xyz - fragWorldPos);
     vec3 H = normalize(V + L);
 
     // 4. PBR Calculation
@@ -99,7 +105,8 @@ void main() {
     vec3 diffuse = kD * albedo / PI;
 
     vec3 ambient = vec3(0.05) * albedo;
-    vec3 color = ambient + (diffuse + specular) * NdotL * 2.0; // 2.0 = light intensity
+    float intensity = 2.0;
+    vec3 color = ambient + (diffuse + specular) * NdotL * intensity; // 2.0 = light intensity
 
     // Tone Mapping
     color = color / (color + vec3(1.0));

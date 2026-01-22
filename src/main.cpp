@@ -61,8 +61,9 @@ struct MeshPushConstants {
 	// camera
 	glm::mat4 view;
 	glm::mat4 proj;
+	alignas(16) glm::vec4 cameraPos;
 	// material
-	glm::vec4 baseColor{ 1.0f, 1.0f, 1.0f, 1.0f };
+	alignas(16) glm::vec4 baseColor{ 1.0f, 1.0f, 1.0f, 1.0f };
 	float metallic{ 0.0f };
 	float roughness{ 0.5f };
 	float time;
@@ -72,7 +73,7 @@ struct Vertex {
 	glm::vec3 position;
 	glm::vec3 normal;
 	glm::vec2 texCoord;
-	glm::vec3 tangent;
+	glm::vec4 tangent;
 
 	static vk::VertexInputBindingDescription2EXT getBindingDescription(uint32_t binding = 0) {
 		vk::VertexInputBindingDescription2EXT desc{};
@@ -107,7 +108,7 @@ struct Vertex {
 		// Tangent (Loc 3)
 		attributes[3].location = locationOffset + 3;
 		attributes[3].binding = 0;
-		attributes[3].format = vk::Format::eR32G32B32Sfloat;
+		attributes[3].format = vk::Format::eR32G32B32A32Sfloat;
 		attributes[3].offset = offsetof(Vertex, tangent);
 
 		// Instance buffer attribute
@@ -698,9 +699,14 @@ void processNode(aiNode* node, const aiScene* scene, glm::mat4 parentTransform, 
 			vertex.position = glm::vec3(pos);
 			vertex.normal = mesh->HasNormals() ? glm::normalize(normalMatrix * glm::vec3(mesh->mNormals[i].x, mesh->mNormals[i].y, mesh->mNormals[i].z)) : glm::vec3(0.0f);
 			vertex.texCoord = mesh->HasTextureCoords(0) ? glm::vec2(mesh->mTextureCoords[0][i].x, mesh->mTextureCoords[0][i].y) : glm::vec2(0.0f);
-			vertex.tangent = mesh->HasTangentsAndBitangents()
-				? glm::normalize(normalMatrix * glm::vec3(mesh->mTangents[i].x, mesh->mTangents[i].y, mesh->mTangents[i].z))
-				: glm::vec3(0.0f);
+			if (mesh->HasTangentsAndBitangents()) {
+				glm::vec3 T = glm::normalize(normalMatrix * glm::vec3(mesh->mTangents[i].x, mesh->mTangents[i].y, mesh->mTangents[i].z));
+				glm::vec3 B = glm::normalize(normalMatrix * glm::vec3(mesh->mBitangents[i].x, mesh->mBitangents[i].y, mesh->mBitangents[i].z));
+				glm::vec3 N = vertex.normal;
+				float handedness = (glm::dot(glm::cross(N, T), B) < 0.0f) ? -1.0f : 1.0f;
+				vertex.tangent = glm::vec4(T, handedness);
+			} else
+				vertex.tangent = glm::vec4(0.0f);
 			result.vertices.push_back(vertex);
 		}
 
@@ -730,8 +736,8 @@ void processNode(aiNode* node, const aiScene* scene, glm::mat4 parentTransform, 
 			}
 
 			// Default to non-metal for FBX
-			float metallic = 1.0f;
-			float roughness = 1.0f;
+			float metallic = 0.0f;
+			float roughness = 0.5f;
 
 			aiGetMaterialFloat(material, AI_MATKEY_METALLIC_FACTOR, &metallic);
 			aiGetMaterialFloat(material, AI_MATKEY_ROUGHNESS_FACTOR, &roughness);
@@ -995,7 +1001,7 @@ void processFastGltfNode(fastgltf::Asset& asset, size_t nodeIndex, const glm::ma
 			std::vector<glm::vec3> positions(vCount);
 			std::vector<glm::vec3> normals(vCount, glm::vec3(0.0f));
 			std::vector<glm::vec2> texcoords(vCount, glm::vec2(0.0f));
-			std::vector<glm::vec3> tangents(vCount, glm::vec3(0.0f));
+			std::vector<glm::vec4> tangents(vCount, glm::vec4(0.0f));
 
 			// Use fastgltf types for reading to ensure binary safety, then cast to GLM
 			fastgltf::iterateAccessorWithIndex<fastgltf::math::fvec3>(asset, posAccessor,
@@ -1018,7 +1024,7 @@ void processFastGltfNode(fastgltf::Asset& asset, size_t nodeIndex, const glm::ma
 			if (auto it = primitive.findAttribute("TANGENT"); it != primitive.attributes.end()) {
 				fastgltf::iterateAccessorWithIndex<fastgltf::math::fvec4>(asset, asset.accessors[it->accessorIndex],
 					[&](fastgltf::math::fvec4 v, size_t i) {
-						tangents[i] = glm::vec3(v.x(), v.y(), v.z());
+						tangents[i] = glm::vec4(v.x(), v.y(), v.z(), v.w());
 					});
 			}
 
@@ -1027,7 +1033,9 @@ void processFastGltfNode(fastgltf::Asset& asset, size_t nodeIndex, const glm::ma
 				Vertex v{};
 				v.position = glm::vec3(globalTransform * glm::vec4(positions[i], 1.0f));
 				v.normal = glm::normalize(normalMatrix * normals[i]);
-				v.tangent = glm::normalize(normalMatrix * tangents[i]);
+				glm::vec3 tXYZ = glm::vec3(tangents[i]);
+				glm::vec3 transformedTangent = glm::normalize(normalMatrix * tXYZ);
+				v.tangent = glm::vec4(transformedTangent, tangents[i].w);
 				v.texCoord = texcoords[i];
 				result.vertices.push_back(v);
 			}
@@ -1077,6 +1085,7 @@ void processFastGltfNode(fastgltf::Asset& asset, size_t nodeIndex, const glm::ma
 					else {
 						// LOAD TEXTURE HERE
 						TextureData tex = prepareTextureInfo(asset, asset.images[imgIdx], path);
+						tex.isLinear = true;
 						if (!tex.path.empty() || tex.encodedData != nullptr) {
 							int newIdx = (int)result.textureData.size();
 							result.textureData.push_back(tex);
@@ -1098,6 +1107,7 @@ void processFastGltfNode(fastgltf::Asset& asset, size_t nodeIndex, const glm::ma
 						}
 						else {
 							TextureData tex = prepareTextureInfo(asset, asset.images[imgIdx], path);
+							tex.isLinear = true;
 							if (!tex.path.empty() || tex.encodedData != nullptr) {
 								int newIdx = (int)result.textureData.size();
 								result.textureData.push_back(tex);
@@ -1215,8 +1225,8 @@ int main()
 	try {
 		// model = loadWithAssimp("models/sponza-palace/source/scene.glb");
 		// model = loadWithFastGltf("models/sponza-palace/source/scene.glb");
-		model = loadWithAssimp("models/main_sponza/NewSponza_Main_glTF_003.gltf");
-		// model = loadWithFastGltf("models/main_sponza/NewSponza_Main_glTF_003.gltf");
+		// model = loadWithAssimp("models/main_sponza/NewSponza_Main_glTF_003.gltf");
+		model = loadWithFastGltf("models/main_sponza/NewSponza_Main_glTF_003.gltf");
 		// model = loadWithAssimp("models/main_sponza/NewSponza_Main_Yup_003.fbx");
 		// model = loadWithAssimp("models/london-city/source/traffic_slam_2_map.glb");
 		// model = loadWithAssimp("models/dae-diorama-grandmas-house/source/Dae_diorama_upload/Dae_diorama_upload.fbx");
@@ -1307,14 +1317,29 @@ int main()
 	features13.dynamicRendering = VK_TRUE;
 	features13.pNext = &shaderObjectFeatures;
 
+	VkPhysicalDeviceVulkan12Features features12{};
+	features12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+	features12.timelineSemaphore = VK_TRUE;
+	features12.vulkanMemoryModel = VK_TRUE;
+	features12.vulkanMemoryModelDeviceScope = VK_TRUE;
+	features12.bufferDeviceAddress = VK_TRUE;
+	features12.scalarBlockLayout = VK_TRUE;
+	features12.storageBuffer8BitAccess = VK_TRUE;
+
+	VkPhysicalDeviceFeatures coreFeatures{};
+	coreFeatures.fragmentStoresAndAtomics = VK_TRUE;
+	coreFeatures.vertexPipelineStoresAndAtomics = VK_TRUE;
+	coreFeatures.shaderInt64 = VK_TRUE;
+
 	vkb::PhysicalDeviceSelector selector{ vkbInstance };
 	auto physRet = selector
 		.set_minimum_version(1, 4)
 		.add_required_extension(vk::EXTShaderObjectExtensionName)
 		.add_required_extension_features(shaderObjectFeatures)
+		.set_required_features(coreFeatures)
+		.set_required_features_12(features12)
 		.set_required_features_13(features13)
 		.set_surface(surface)
-		// .add_required_extension_features(VkPhysicalDeviceFeatures{ .samplerAnisotropy = VK_TRUE })
 		.select();
 
 	if (!physRet) {
@@ -1585,7 +1610,7 @@ int main()
 
 		TextureData mrTexData;
 		mrTexData.width = 1; mrTexData.height = 1; mrTexData.channels = 4;
-		unsigned char mrPixels[] = { 0, 255, 0, 255 };
+		unsigned char mrPixels[] = { 0, 128, 0, 255 };
 		mrTexData.pixels = mrPixels;
 
 		auto defaultMrTexture = std::make_unique<TextureImage>(
@@ -1598,12 +1623,12 @@ int main()
 
 		vk::DescriptorPoolSize poolSize{};
 		poolSize.type = vk::DescriptorType::eCombinedImageSampler;
-		poolSize.descriptorCount = (totalTextures + 2) * 3;
+		poolSize.descriptorCount = (totalTextures + 2); // *3;
 
 		vk::DescriptorPoolCreateInfo poolInfo{};
 		poolInfo.poolSizeCount = 1;
 		poolInfo.pPoolSizes = &poolSize;
-		poolInfo.maxSets = (totalTextures + 2) * 3;
+		poolInfo.maxSets = (totalTextures + 2); // *3;
 
 		vk::UniqueDescriptorPool descriptorPool = device.createDescriptorPoolUnique(poolInfo).value;
 
@@ -1830,9 +1855,7 @@ int main()
 			if (keys[SDL_SCANCODE_A]) camera.position -= right * camera.speed * dt * cameraAmpilfier;
 			if (keys[SDL_SCANCODE_D]) camera.position += right * camera.speed * dt * cameraAmpilfier;
 			if (keys[SDL_SCANCODE_S]) camera.position -= front * camera.speed * dt * cameraAmpilfier;
-				
 	
-
 			vk::SwapchainKHR swapchainHPP(vkbSwapchain.swapchain);
 
 			(void)device.waitForFences(inFlightFences[currentFrame].get(), VK_TRUE, UINT64_MAX);
@@ -1995,6 +2018,7 @@ int main()
 				0,
 				vk::IndexType::eUint32
 			);
+			pc.cameraPos = glm::vec4(camera.position, 0.0);
 			pc.view = getView(camera);
 			pc.proj = getProjection(1280.0f, 720.0f);
 			pc.time = time;
