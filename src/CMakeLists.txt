@@ -1,7 +1,7 @@
 add_executable (engine 
   vma.cpp
   main.cpp
-   vk_globals.cpp)
+   vk_globals.cpp pch.h types.h types.cpp "VulkanContext.h" "VulkanContext.cpp" "VulkanResources.h" "VulkanResources.cpp" "ModelLoader.h" "ModelLoader.cpp" "Renderer.h" "Renderer.cpp")
 
 if (CMAKE_VERSION VERSION_GREATER 3.12)
   set_property(TARGET engine PROPERTY CXX_STANDARD 20)
