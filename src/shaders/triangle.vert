@@ -11,17 +11,21 @@ layout(location = 4) in vec3 inOffset;   // [cite: 31]
 layout(push_constant) uniform MeshData {
     mat4 view;
     mat4 proj;
+    mat4 lightSpaceMatrix;
     vec4 cameraPos;
+    vec4 lightDir;
     vec4 baseColor;
     float metallic;
     float roughness;
     float time;
+    float shadowBias;
 } pc;
 
 layout(location = 0) out vec3 fragWorldPos;
 layout(location = 1) out vec3 fragNormal;
 layout(location = 2) out vec2 fragTexCoord;
 layout(location = 3) out mat3 TBN; // NEW: Output TBN matrix
+layout(location = 6) out vec4 fragPosLightSpace;
 
 void main()
 {
@@ -52,4 +56,6 @@ void main()
     fragNormal = worldNormal;
     fragTexCoord = inTexCoord;
     TBN = mat3(worldTangent, worldBitangent, worldNormal);
+
+    fragPosLightSpace = pc.lightSpaceMatrix * worldPosition;
 }

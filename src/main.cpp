@@ -61,12 +61,15 @@ struct MeshPushConstants {
 	// camera
 	glm::mat4 view;
 	glm::mat4 proj;
+	glm::mat4 lightSpaceMatrix;
 	alignas(16) glm::vec4 cameraPos;
+	alignas(16) glm::vec4 lightDir;
 	// material
 	alignas(16) glm::vec4 baseColor{ 1.0f, 1.0f, 1.0f, 1.0f };
 	float metallic{ 0.0f };
 	float roughness{ 0.5f };
 	float time;
+	float shadowBias{ 0.005f };
 };
 
 struct Vertex {
@@ -120,6 +123,136 @@ struct Vertex {
 		return attributes;
 	}
 };
+
+constexpr uint32_t SHADOW_MAP_SIZE = 2048;
+
+struct ShadowMapResources {
+	VkImage image = VK_NULL_HANDLE;
+	VmaAllocation allocation = VK_NULL_HANDLE;
+	vk::ImageView view;
+	vk::Sampler sampler;
+};
+
+struct DirectionalLight {
+	glm::vec3 direction{ -0.5f, -1.0f, -0.3f };
+	glm::vec3 color{ 1.0f, 1.0f, 1.0f };
+	float intensity{ 1.0f };
+};
+
+struct ShadowPushConstants {
+	glm::mat4 lightSpaceMatrix;
+};
+
+glm::mat4 calculateLightSpaceMatrix(const DirectionalLight& light, const glm::vec3& sceneCenter, float sceneRadius) {
+	// Normalize light direction
+	glm::vec3 lightDir = glm::normalize(light.direction);
+
+	// Position the light "camera" far enough to see the whole scene
+	glm::vec3 lightPos = sceneCenter - lightDir * sceneRadius * 2.0f;
+
+	// Light view matrix (looking at scene center)
+	glm::mat4 lightView = glm::lookAt(lightPos, sceneCenter, glm::vec3(0.0f, 1.0f, 0.0f));
+
+	// Orthographic projection for directional light
+	// Size based on scene radius
+	float orthoSize = sceneRadius * 1.5f;
+	glm::mat4 lightProj = glm::ortho(
+		-orthoSize, orthoSize,    // left, right
+		-orthoSize, orthoSize,    // bottom, top
+		0.1f, sceneRadius * 4.0f  // near, far
+	);
+
+	// Vulkan clip space fix (Y flip)
+	lightProj[1][1] *= -1;
+
+	return lightProj * lightView;
+}
+
+struct SceneBounds {
+	glm::vec3 center{ 0.0f };
+	float radius{ 100.0f };
+};
+
+SceneBounds calculateSceneBounds(const std::vector<Vertex>& vertices) {
+	if (vertices.empty()) {
+		return {};
+	}
+
+	glm::vec3 minBounds{ FLT_MAX };
+	glm::vec3 maxBounds{ -FLT_MAX };
+
+	for (const auto& v : vertices) {
+		minBounds = glm::min(minBounds, v.position);
+		maxBounds = glm::max(maxBounds, v.position);
+	}
+
+	SceneBounds bounds;
+	bounds.center = (minBounds + maxBounds) * 0.5f;
+	bounds.radius = glm::length(maxBounds - minBounds) * 0.5f;
+
+	return bounds;
+}
+
+ShadowMapResources createShadowMap(VmaAllocator allocator, vk::Device device) {
+	ShadowMapResources shadow{};
+
+	// 1. Create Depth Image
+	VkImageCreateInfo imageInfo{};
+	imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+	imageInfo.imageType = VK_IMAGE_TYPE_2D;
+	imageInfo.format = VK_FORMAT_D32_SFLOAT;
+	imageInfo.extent = { SHADOW_MAP_SIZE, SHADOW_MAP_SIZE, 1 };
+	imageInfo.mipLevels = 1;
+	imageInfo.arrayLayers = 1;
+	imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+	imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+	imageInfo.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+	imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+	imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+	VmaAllocationCreateInfo allocInfo{};
+	allocInfo.usage = VMA_MEMORY_USAGE_GPU_ONLY;
+
+	if (vmaCreateImage(allocator, &imageInfo, &allocInfo,
+		&shadow.image, &shadow.allocation, nullptr) != VK_SUCCESS) {
+		throw std::runtime_error("Failed to create shadow map image");
+	}
+
+	// 2. Create Image View
+	vk::ImageViewCreateInfo viewInfo{};
+	viewInfo.image = vk::Image(shadow.image);
+	viewInfo.viewType = vk::ImageViewType::e2D;
+	viewInfo.format = vk::Format::eD32Sfloat;
+	viewInfo.subresourceRange.aspectMask = vk::ImageAspectFlagBits::eDepth;
+	viewInfo.subresourceRange.baseMipLevel = 0;
+	viewInfo.subresourceRange.levelCount = 1;
+	viewInfo.subresourceRange.baseArrayLayer = 0;
+	viewInfo.subresourceRange.layerCount = 1;
+
+	shadow.view = device.createImageView(viewInfo).value;
+
+	// 3. Create Shadow Sampler (with depth comparison)
+	vk::SamplerCreateInfo samplerInfo{};
+	samplerInfo.magFilter = vk::Filter::eLinear;
+	samplerInfo.minFilter = vk::Filter::eLinear;
+	samplerInfo.addressModeU = vk::SamplerAddressMode::eClampToBorder;
+	samplerInfo.addressModeV = vk::SamplerAddressMode::eClampToBorder;
+	samplerInfo.addressModeW = vk::SamplerAddressMode::eClampToBorder;
+	samplerInfo.borderColor = vk::BorderColor::eFloatOpaqueWhite;
+	samplerInfo.compareEnable = VK_TRUE;
+	samplerInfo.compareOp = vk::CompareOp::eLessOrEqual;
+	samplerInfo.mipmapMode = vk::SamplerMipmapMode::eNearest;
+
+	shadow.sampler = device.createSampler(samplerInfo).value;
+
+	return shadow;
+}
+
+void destroyShadowMap(ShadowMapResources& shadow, VmaAllocator allocator, vk::Device device) {
+	if (shadow.sampler) device.destroySampler(shadow.sampler);
+	if (shadow.view) device.destroyImageView(shadow.view);
+	if (shadow.image) vmaDestroyImage(allocator, shadow.image, shadow.allocation);
+}
 
 class VertexBuffer {
 public:
@@ -1238,6 +1371,17 @@ int main()
 		return -1;
 	}
 
+	SceneBounds sceneBounds = calculateSceneBounds(model.vertices);
+	std::cout << "Scene center: " << sceneBounds.center.x << ", "
+		<< sceneBounds.center.y << ", " << sceneBounds.center.z
+		<< " radius: " << sceneBounds.radius << "\n";
+
+	// Initialize directional light
+	DirectionalLight sunLight;
+	sunLight.direction = glm::normalize(glm::vec3(-0.5f, -1.0f, -0.3f));
+	sunLight.color = glm::vec3(1.0f, 0.98f, 0.95f);
+	sunLight.intensity = 1.0f;
+
 	// ------------------------
 	// 2. Initialize volk
 	// ------------------------
@@ -1407,6 +1551,16 @@ int main()
 	}
 
 	std::cout << "SDL3 + Vulkan instance, device, and VMA initialized successfully!\n";
+
+	ShadowMapResources shadowMap;
+	try {
+		shadowMap = createShadowMap(allocator, device);
+		std::cout << "Shadow map created: " << SHADOW_MAP_SIZE << "x" << SHADOW_MAP_SIZE << "\n";
+	}
+	catch (const std::exception& e) {
+		std::cerr << "Failed to create shadow map: " << e.what() << "\n";
+		return -1;
+	}
 
 	std::unique_ptr<VertexBuffer> vertexBuffer;
 	std::unique_ptr<IndexBuffer> indexBuffer;
@@ -1623,12 +1777,12 @@ int main()
 
 		vk::DescriptorPoolSize poolSize{};
 		poolSize.type = vk::DescriptorType::eCombinedImageSampler;
-		poolSize.descriptorCount = (totalTextures + 2); // *3;
+		poolSize.descriptorCount = (totalTextures + 4); // *3;
 
 		vk::DescriptorPoolCreateInfo poolInfo{};
 		poolInfo.poolSizeCount = 1;
 		poolInfo.pPoolSizes = &poolSize;
-		poolInfo.maxSets = (totalTextures + 2); // *3;
+		poolInfo.maxSets = (totalTextures + 4); // *3;
 
 		vk::UniqueDescriptorPool descriptorPool = device.createDescriptorPoolUnique(poolInfo).value;
 
@@ -1684,6 +1838,31 @@ int main()
 		vk::DescriptorSet defaultMrSet = device.allocateDescriptorSets(defaultMrAllocInfo).value[0];
 		updateDescriptorSet(defaultMrSet, defaultMrTexture->getView());
 
+		vk::DescriptorSetAllocateInfo shadowMapAllocInfo{};
+		shadowMapAllocInfo.descriptorPool = descriptorPool.get();
+		shadowMapAllocInfo.descriptorSetCount = 1;
+		shadowMapAllocInfo.pSetLayouts = &descriptorSetLayout.get();
+
+		vk::DescriptorSet shadowMapDescriptorSet = device.allocateDescriptorSets(shadowMapAllocInfo).value[0];
+
+		// Update shadow map descriptor (uses the shadow sampler with depth comparison)
+		{
+			vk::DescriptorImageInfo shadowImageInfo{};
+			shadowImageInfo.imageLayout = vk::ImageLayout::eDepthStencilReadOnlyOptimal;
+			shadowImageInfo.imageView = shadowMap.view;
+			shadowImageInfo.sampler = shadowMap.sampler;
+
+			vk::WriteDescriptorSet shadowWrite{};
+			shadowWrite.dstSet = shadowMapDescriptorSet;
+			shadowWrite.dstBinding = 0;
+			shadowWrite.dstArrayElement = 0;
+			shadowWrite.descriptorType = vk::DescriptorType::eCombinedImageSampler;
+			shadowWrite.descriptorCount = 1;
+			shadowWrite.pImageInfo = &shadowImageInfo;
+
+			device.updateDescriptorSets(1, &shadowWrite, 0, nullptr);
+		}
+
 		// ------------------------
 		// 12. Semaphores and Fences
 		// ------------------------
@@ -1721,6 +1900,16 @@ int main()
 			SDL_Quit();
 			return -1;
 		}
+		std::vector<uint32_t> shadowVertCode, shadowFragCode;
+		try {
+			shadowVertCode = loadSpirv("shaders/shadow.vert.spv");
+			shadowFragCode = loadSpirv("shaders/shadow.frag.spv");
+			std::cout << "Shadow shaders loaded successfully\n";
+		}
+		catch (const std::exception& e) {
+			std::cerr << "Failed to load shadow shaders: " << e.what() << "\n";
+			return -1;
+		}
 		// ------------------------
 		// 16. Create Pipeline Layout
 		// ------------------------
@@ -1733,6 +1922,7 @@ int main()
 
 		vk::DescriptorSetLayout layouts[] = { 
 			descriptorSetLayout.get()
+			, descriptorSetLayout.get()
 			, descriptorSetLayout.get()
 			, descriptorSetLayout.get() };
 
@@ -1747,7 +1937,7 @@ int main()
 			.setPName("main")
 			.setPushConstantRangeCount(1)
 			.setPPushConstantRanges(allRanges)
-			.setSetLayoutCount(3)
+			.setSetLayoutCount(4)
 			.setPSetLayouts(layouts);
 
 		vk::ShaderCreateInfoEXT fragInfo{};
@@ -1759,18 +1949,61 @@ int main()
 			.setPName("main")
 			.setPushConstantRangeCount(1)
 			.setPPushConstantRanges(allRanges)
-			.setSetLayoutCount(3)
+			.setSetLayoutCount(4)
 			.setPSetLayouts(layouts);
 
 		vk::ShaderEXT vertShader, fragShader;
 		vertShader = device.createShaderEXT(vertInfo).value;
 		fragShader = device.createShaderEXT(fragInfo).value;
 
+		vk::PushConstantRange shadowPcRange{};
+		shadowPcRange.stageFlags = vk::ShaderStageFlagBits::eVertex;
+		shadowPcRange.offset = 0;
+		shadowPcRange.size = sizeof(ShadowPushConstants);
+
+		// Shadow shader create info (no descriptor sets needed for basic shadow pass)
+		vk::ShaderCreateInfoEXT shadowVertInfo{};
+		shadowVertInfo.setStage(vk::ShaderStageFlagBits::eVertex)
+			.setNextStage(vk::ShaderStageFlagBits::eFragment)
+			.setFlags(vk::ShaderCreateFlagBitsEXT::eLinkStage)
+			.setCodeType(vk::ShaderCodeTypeEXT::eSpirv)
+			.setCodeSize(shadowVertCode.size() * sizeof(shadowVertCode.front()))
+			.setPCode(shadowVertCode.data())
+			.setPName("main")
+			.setPushConstantRangeCount(1)
+			.setPPushConstantRanges(&shadowPcRange)
+			.setSetLayoutCount(0)
+			.setPSetLayouts(nullptr);
+
+		vk::ShaderCreateInfoEXT shadowFragInfo{};
+		shadowFragInfo.setStage(vk::ShaderStageFlagBits::eFragment)
+			.setFlags(vk::ShaderCreateFlagBitsEXT::eLinkStage)
+			.setCodeType(vk::ShaderCodeTypeEXT::eSpirv)
+			.setCodeSize(shadowFragCode.size() * sizeof(shadowFragCode.front()))
+			.setPCode(shadowFragCode.data())
+			.setPName("main")
+			.setPushConstantRangeCount(1)
+			.setPPushConstantRanges(&shadowPcRange)
+			.setSetLayoutCount(0)
+			.setPSetLayouts(nullptr);
+
+		vk::ShaderEXT shadowVertShader = device.createShaderEXT(shadowVertInfo).value;
+		vk::ShaderEXT shadowFragShader = device.createShaderEXT(shadowFragInfo).value;
+
+		// Shadow pipeline layout
+		vk::PipelineLayoutCreateInfo shadowLayoutInfo{};
+		shadowLayoutInfo.setPushConstantRangeCount(1);
+		shadowLayoutInfo.setPPushConstantRanges(&shadowPcRange);
+
+		vk::PipelineLayout shadowPipelineLayout = device.createPipelineLayout(shadowLayoutInfo).value;
+
+		std::cout << "Shadow pipeline created successfully\n";
+
 
 		std::vector<vk::PushConstantRange> pushRanges = { pcRange };
 		vk::PipelineLayoutCreateInfo pipelineLayoutInfo{};
 		pipelineLayoutInfo.setPushConstantRanges(pushRanges);
-		pipelineLayoutInfo.setSetLayoutCount(3);
+		pipelineLayoutInfo.setSetLayoutCount(4);
 		pipelineLayoutInfo.setPSetLayouts(layouts);
 		// arrays for binding shaders
 		vk::PipelineLayout pipelineLayout;
@@ -1781,6 +2014,9 @@ int main()
 			std::cerr << "Failed to create pipeline layout: " << e.what() << "\n";
 			device.destroyShaderEXT(vertShader);
 			device.destroyShaderEXT(fragShader);
+			device.destroyShaderEXT(shadowVertShader);
+			device.destroyShaderEXT(shadowFragShader);
+			device.destroyPipelineLayout(shadowPipelineLayout);
 			vmaDestroyAllocator(allocator);
 			vkb::destroy_swapchain(vkbSwapchain);
 			vkb::destroy_device(vkbDevice);
@@ -1880,6 +2116,131 @@ int main()
 			vk::CommandBuffer cmd = commandBuffers[currentFrame].get();
 			(void)cmd.reset();
 			(void)cmd.begin({ vk::CommandBufferUsageFlagBits::eOneTimeSubmit });
+
+			{
+				// Calculate light space matrix
+				glm::mat4 lightSpaceMatrix = calculateLightSpaceMatrix(sunLight, sceneBounds.center, sceneBounds.radius);
+
+				// Transition shadow map to depth attachment
+				vk::ImageMemoryBarrier2 shadowBarrier{};
+				shadowBarrier.setSrcStageMask(vk::PipelineStageFlagBits2::eFragmentShader)
+					.setSrcAccessMask(vk::AccessFlagBits2::eShaderRead)
+					.setDstStageMask(vk::PipelineStageFlagBits2::eEarlyFragmentTests)
+					.setDstAccessMask(vk::AccessFlagBits2::eDepthStencilAttachmentWrite)
+					.setOldLayout(vk::ImageLayout::eUndefined)
+					.setNewLayout(vk::ImageLayout::eDepthAttachmentOptimal)
+					.setImage(vk::Image(shadowMap.image))
+					.setSubresourceRange({ vk::ImageAspectFlagBits::eDepth, 0, 1, 0, 1 });
+
+				vk::DependencyInfo shadowDepInfo{};
+				shadowDepInfo.setImageMemoryBarriers(shadowBarrier);
+				cmd.pipelineBarrier2(shadowDepInfo);
+
+				// Shadow depth attachment
+				vk::RenderingAttachmentInfo shadowDepthAttachment{};
+				shadowDepthAttachment.setImageView(shadowMap.view)
+					.setImageLayout(vk::ImageLayout::eDepthAttachmentOptimal)
+					.setLoadOp(vk::AttachmentLoadOp::eClear)
+					.setStoreOp(vk::AttachmentStoreOp::eStore)
+					.setClearValue(vk::ClearValue(vk::ClearDepthStencilValue{ 1.0f, 0 }));
+
+				// Begin shadow rendering (depth only, no color)
+				vk::RenderingInfo shadowRenderInfo{};
+				shadowRenderInfo.setRenderArea({ {0, 0}, {SHADOW_MAP_SIZE, SHADOW_MAP_SIZE} })
+					.setLayerCount(1)
+					.setColorAttachmentCount(0)  // No color attachments
+					.setPDepthAttachment(&shadowDepthAttachment);
+
+				cmd.beginRendering(shadowRenderInfo);
+
+				// Bind shadow shaders
+				vk::ShaderStageFlagBits shadowStages[] = {
+					vk::ShaderStageFlagBits::eVertex,
+					vk::ShaderStageFlagBits::eFragment
+				};
+				vk::ShaderEXT shadowShaders[] = { shadowVertShader, shadowFragShader };
+				cmd.bindShadersEXT(2, shadowStages, shadowShaders);
+
+				// Set shadow pass state
+				const vk::Viewport shadowViewport{ 0, 0, (float)SHADOW_MAP_SIZE, (float)SHADOW_MAP_SIZE, 0.f, 1.f };
+				const vk::Rect2D shadowRect{ {0, 0}, {SHADOW_MAP_SIZE, SHADOW_MAP_SIZE} };
+
+				cmd.setViewportWithCount(1, &shadowViewport);
+				cmd.setScissorWithCount(1, &shadowRect);
+				cmd.setPrimitiveTopology(vk::PrimitiveTopology::eTriangleList);
+				cmd.setRasterizerDiscardEnable(false);
+				cmd.setCullMode(vk::CullModeFlagBits::eFront);  // Front-face culling reduces shadow acne
+				cmd.setFrontFace(vk::FrontFace::eCounterClockwise);
+				cmd.setDepthTestEnable(true);
+				cmd.setDepthWriteEnable(true);
+				cmd.setDepthCompareOp(vk::CompareOp::eLessOrEqual);
+				cmd.setDepthBiasEnable(true);
+				cmd.setDepthBias(1.25f, 0.0f, 1.75f);  // Helps reduce shadow acne
+				cmd.setStencilTestEnable(false);
+				cmd.setPolygonModeEXT(vk::PolygonMode::eFill);
+				cmd.setRasterizationSamplesEXT(vk::SampleCountFlagBits::e1);
+				vk::SampleMask shadowMask = ~0u;
+				cmd.setSampleMaskEXT(vk::SampleCountFlagBits::e1, &shadowMask);
+				cmd.setAlphaToCoverageEnableEXT(VK_FALSE);
+				cmd.setPrimitiveRestartEnable(VK_FALSE);
+
+				// Set vertex input
+				auto attributesArray = Vertex::getAttributeDescriptions(0);
+				vk::VertexInputBindingDescription2EXT instanceBinding{};
+				instanceBinding.binding = 1;
+				instanceBinding.stride = sizeof(InstanceData);
+				instanceBinding.inputRate = vk::VertexInputRate::eInstance;
+				instanceBinding.divisor = 1;
+				vk::VertexInputBindingDescription2EXT bindingDescs[2] = {
+					Vertex::getBindingDescription(0),
+					instanceBinding
+				};
+				cmd.setVertexInputEXT(2, bindingDescs, static_cast<uint32_t>(attributesArray.size()), attributesArray.data());
+
+				// Bind buffers
+				vk::DeviceSize offsets[2] = { 0, 0 };
+				vk::Buffer buffers[2] = { vertexBuffer->getBuffer(), instanceBuffer->getBuffer() };
+				vk::DeviceSize sizes[2] = { sizeof(Vertex) * model.vertices.size(), sizeof(InstanceData) * instances.size() };
+				vk::DeviceSize strides[2] = { sizeof(Vertex), sizeof(InstanceData) };
+				cmd.bindVertexBuffers2(0, 2, buffers, offsets, sizes, strides);
+				cmd.bindIndexBuffer(indexBuffer->getBuffer(), 0, vk::IndexType::eUint32);
+
+				// Shadow push constants
+				ShadowPushConstants shadowPc{};
+				shadowPc.lightSpaceMatrix = lightSpaceMatrix;
+
+				// Draw all submeshes
+				for (const auto& sub : model.submeshes) {
+					cmd.pushConstants(
+						shadowPipelineLayout,
+						vk::ShaderStageFlagBits::eVertex,
+						0,
+						sizeof(ShadowPushConstants),
+						&shadowPc
+					);
+
+					cmd.drawIndexed(
+						sub.indexCount,
+						instanceBuffer->getInstanceCount(),
+						sub.indexOffset,
+						sub.vertexOffset,
+						0
+					);
+				}
+
+				cmd.endRendering();
+
+				// Transition shadow map for shader reading
+				shadowBarrier.setSrcStageMask(vk::PipelineStageFlagBits2::eLateFragmentTests)
+					.setSrcAccessMask(vk::AccessFlagBits2::eDepthStencilAttachmentWrite)
+					.setDstStageMask(vk::PipelineStageFlagBits2::eFragmentShader)
+					.setDstAccessMask(vk::AccessFlagBits2::eShaderRead)
+					.setOldLayout(vk::ImageLayout::eDepthAttachmentOptimal)
+					.setNewLayout(vk::ImageLayout::eDepthStencilReadOnlyOptimal);
+
+				shadowDepInfo.setImageMemoryBarriers(shadowBarrier);
+				cmd.pipelineBarrier2(shadowDepInfo);
+			}
 
 			// Transition the swapchain image from UNDEFINED to COLOR_ATTACHMENT_OPTIMAL
 			vk::ImageMemoryBarrier2 layoutBarrier;
@@ -2018,10 +2379,15 @@ int main()
 				0,
 				vk::IndexType::eUint32
 			);
+			glm::mat4 lightSpaceMatrix = calculateLightSpaceMatrix(sunLight, sceneBounds.center, sceneBounds.radius);
+
 			pc.cameraPos = glm::vec4(camera.position, 0.0);
 			pc.view = getView(camera);
 			pc.proj = getProjection(1280.0f, 720.0f);
+			pc.lightSpaceMatrix = lightSpaceMatrix;
+			pc.lightDir = glm::vec4(sunLight.direction, 0.0f);
 			pc.time = time;
+			pc.shadowBias = 0.005f;
 			//int submeshCounter = 0;
 			for (const auto& sub : model.submeshes) {
 				//++submeshCounter;
@@ -2088,6 +2454,14 @@ int main()
 					pipelineLayout,
 					2, // Set 2
 					1, &mrSet,
+					0, nullptr
+				);
+
+				cmd.bindDescriptorSets(
+					vk::PipelineBindPoint::eGraphics,
+					pipelineLayout,
+					3,  // Set 3
+					1, &shadowMapDescriptorSet,
 					0, nullptr
 				);
 
@@ -2160,6 +2534,9 @@ int main()
 		{
 			device.destroyShaderEXT(vertShader);
 			device.destroyShaderEXT(fragShader);
+			device.destroyShaderEXT(shadowVertShader);
+			device.destroyShaderEXT(shadowFragShader);
+			device.destroyPipelineLayout(shadowPipelineLayout);
 			device.destroyPipelineLayout(pipelineLayout);
 			device.destroyImageView(depthImageView);
 		}
@@ -2169,6 +2546,7 @@ int main()
 	indexBuffer.reset();
 	instanceBuffer.reset();
 	vmaDestroyImage(allocator, depthImage, depthAlloc);
+	destroyShadowMap(shadowMap, allocator, device);
 	vmaDestroyAllocator(allocator);
 	vkbSwapchain.destroy_image_views(swapchainImageViews);
 	vkb::destroy_swapchain(vkbSwapchain);

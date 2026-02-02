@@ -6,6 +6,7 @@ layout(location = 0) in vec3 fragWorldPos;
 layout(location = 1) in vec3 fragNormal;
 layout(location = 2) in vec2 fragTexCoord;
 layout(location = 3) in mat3 TBN;
+layout(location = 6) in vec4 fragPosLightSpace;
 
 // Set 0: Base Color
 layout(set = 0, binding = 0) uniform sampler2D baseColorSampler;
@@ -14,19 +15,57 @@ layout(set = 1, binding = 0) uniform sampler2D normalMapSampler;
 // Set 2: Metallic-Roughness Map
 layout(set = 2, binding = 0) uniform sampler2D mrSampler;
 
+layout(set = 3, binding = 0) uniform sampler2DShadow shadowMapSampler;
+
 layout(push_constant) uniform MeshData {
     mat4 view;
     mat4 proj;
+    mat4 lightSpaceMatrix;
     vec4 cameraPos;
+    vec4 lightDir;
     vec4 baseColor;
     float metallic;
     float roughness;
     float time;
+    float shadowBias;
 } pc;
 
 layout(location = 0) out vec4 outColor;
 
 const float PI = 3.14159265359;
+
+float calculateShadow(vec4 fragPosLightSpace, vec3 N, vec3 L) {
+    // Perspective divide
+    vec3 projCoords = fragPosLightSpace.xyz / fragPosLightSpace.w;
+    
+    // Transform to [0,1] range (Vulkan depth is already 0-1)
+    projCoords.xy = projCoords.xy * 0.5 + 0.5;
+    
+    // Check if outside shadow map
+    if (projCoords.x < 0.0 || projCoords.x > 1.0 ||
+        projCoords.y < 0.0 || projCoords.y > 1.0 ||
+        projCoords.z < 0.0 || projCoords.z > 1.0) {
+        return 1.0; // Not in shadow
+    }
+    
+    // Slope-scaled bias
+    float bias = max(pc.shadowBias * (1.0 - dot(N, L)), pc.shadowBias * 0.1);
+    
+    // PCF (Percentage Closer Filtering) for soft shadows
+    float shadow = 0.0;
+    vec2 texelSize = 1.0 / textureSize(shadowMapSampler, 0);
+    
+    for (int x = -1; x <= 1; ++x) {
+        for (int y = -1; y <= 1; ++y) {
+            vec2 offset = vec2(x, y) * texelSize;
+            // sampler2DShadow returns 0 or 1 based on comparison
+            shadow += texture(shadowMapSampler, vec3(projCoords.xy + offset, projCoords.z - bias));
+        }
+    }
+    shadow /= 9.0;
+    
+    return shadow;
+}
 
 // ============================================
 // PBR Functions
@@ -86,17 +125,17 @@ vec3 calcLight(vec3 N, vec3 V, vec3 L, vec3 lightColor, float lightIntensity,
 // ============================================
 // Point light attenuation
 // ============================================
-vec3 calcPointLight(vec3 N, vec3 V, vec3 lightPos, vec3 lightColor, float lightIntensity,
-                    vec3 worldPos, vec3 albedo, float metallic, float roughness, vec3 F0) {
-    vec3 L = lightPos - worldPos;
-    float distance = length(L);
-    L = normalize(L);
-    
-    // Attenuation (inverse square with minimum)
-    float attenuation = 1.0 / (1.0 + 0.09 * distance + 0.032 * distance * distance);
-    
-    return calcLight(N, V, L, lightColor, lightIntensity * attenuation, albedo, metallic, roughness, F0);
-}
+//vec3 calcPointLight(vec3 N, vec3 V, vec3 lightPos, vec3 lightColor, float lightIntensity,
+//                    vec3 worldPos, vec3 albedo, float metallic, float roughness, vec3 F0) {
+//    vec3 L = lightPos - worldPos;
+//    float distance = length(L);
+//    L = normalize(L);
+//    
+//    // Attenuation (inverse square with minimum)
+//    float attenuation = 1.0 / (1.0 + 0.09 * distance + 0.032 * distance * distance);
+//    
+//    return calcLight(N, V, L, lightColor, lightIntensity * attenuation, albedo, metallic, roughness, F0);
+//}
 
 void main() {
     // ========================================
@@ -126,6 +165,9 @@ void main() {
     vec3 F0 = vec3(0.04); 
     F0 = mix(F0, albedo, metallic);
 
+    vec3 sunDir = normalize(-pc.lightDir.xyz);  // Light direction points TO the light
+    float shadow = calculateShadow(fragPosLightSpace, N, sunDir);
+
     // ========================================
     // 3. Lighting Accumulation
     // ========================================
@@ -133,10 +175,10 @@ void main() {
 
     // --- Key Light (Main Sun/Directional) ---
     {
-        vec3 lightDir = normalize(vec3(0.5, 1.0, 0.3));
+        vec3 lightDir = sunDir;
         vec3 lightColor = vec3(1.0, 0.98, 0.95);  // Slightly warm white
         float intensity = 3.0;  // ⬆️ Increased from 2.0
-        Lo += calcLight(N, V, lightDir, lightColor, intensity, albedo, metallic, roughness, F0);
+        Lo += calcLight(N, V, lightDir, lightColor, intensity, albedo, metallic, roughness, F0) * shadow;
     }
 
     // --- Fill Light (Softer, opposite side) ---
