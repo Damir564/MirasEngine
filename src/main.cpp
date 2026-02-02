@@ -14,7 +14,11 @@ int main() {
         {
 
             Renderer renderer(ctx, window);
-            renderer.loadModel("models/main_sponza/NewSponza_Main_glTF_003.gltf");
+            // renderer.loadModel("models/main_sponza/NewSponza_Main_glTF_003.gltf");
+            // renderer.loadModel("models/school/school.obj");
+            // renderer.loadModel("models/tomsk_school/tomsk_school.obj");
+            // renderer.loadModel("models/tree/tree.glb");
+            renderer.loadModel("models/bus_stop/Untitled.glb");
 
             Camera camera;
             bool running = true;

@@ -22,4 +22,8 @@ public:
 
     // Data
     MeshData meshData;
+
+private:
+    void loadGLTF(const std::string& path);
+    void loadOBJ(const std::string& path);
 };
