@@ -60,19 +60,23 @@ glm::mat4 getProjection(float width, float height) {
 	return proj;
 }
 
-struct MeshPushConstants {
-	// camera
+struct FrameUBO {
 	glm::mat4 view;
 	glm::mat4 proj;
 	glm::mat4 lightSpaceMatrix;
-	alignas(16) glm::vec4 cameraPos;
-	alignas(16) glm::vec4 lightDir;
-	// material
-	alignas(16) glm::vec4 baseColor{ 1.0f, 1.0f, 1.0f, 1.0f };
-	float metallic{ 0.0f };
-	float roughness{ 0.5f };
+	glm::vec4 cameraPos;
+	glm::vec4 lightDir;
 	float time;
-	float shadowBias{ 0.005f };
+	float shadowBias;
+	float padding[2];  // Pad to 16-byte alignment
+};
+
+struct MeshPushConstants {
+	glm::vec4 baseColor{ 1.0f, 1.0f, 1.0f, 1.0f };  // 16 bytes
+	float metallic{ 0.0f };                          // 4 bytes
+	float roughness{ 0.5f };                         // 4 bytes
+	float alphaCutoff{ 0.5f };                       // 4 bytes
+	int alphaMode{ 0 };                              // 4 bytes
 };
 
 struct Vertex {
@@ -143,7 +147,9 @@ struct DirectionalLight {
 };
 
 struct ShadowPushConstants {
-	glm::mat4 lightSpaceMatrix;
+	float alphaCutoff;      // 4 bytes
+	int alphaMode;          // 4 bytes
+	float padding[2];       // 8 bytes for alignment
 };
 
 glm::mat4 calculateLightSpaceMatrix(const DirectionalLight& light, const glm::vec3& sceneCenter, float sceneRadius) {
@@ -465,6 +471,12 @@ private:
 	uint32_t m_instanceCount;
 };
 
+struct UBOBuffer {
+	VkBuffer buffer = VK_NULL_HANDLE;
+	VmaAllocation allocation = VK_NULL_HANDLE;
+	void* mapped = nullptr;
+};
+
 // Holds raw CPU pixel data
 struct TextureData {
 	int width, height, channels;
@@ -743,7 +755,11 @@ std::vector<uint32_t> loadSpirv(const std::filesystem::path& path)
 	return code;
 }
 
-
+enum class AlphaMode : int {
+	OPAQUE = 0,    // Fully opaque, ignore alpha
+	MASK = 1,      // Alpha testing with cutoff
+	BLEND = 2      // Alpha blending (transparency)
+};
 
 struct Material {
 	glm::vec4 baseColorFactor{ 1.0f };
@@ -752,6 +768,8 @@ struct Material {
 	int baseColorTextureIndex = -1;
 	int normalTextureIndex = -1;
 	int metallicRoughnessTextureIndex = -1;
+	float alphaCutoff{ 0.5f };
+	AlphaMode alphaMode{ AlphaMode::OPAQUE };
 };
 
 struct SubmeshInfo {
@@ -920,6 +938,27 @@ void processNode(aiNode* node, const aiScene* scene, glm::mat4 parentTransform, 
 			}
 			else if (AI_SUCCESS == aiGetMaterialColor(material, AI_MATKEY_COLOR_DIFFUSE, &color)) {
 				info.material.baseColorFactor = glm::vec4(color.r, color.g, color.b, color.a);
+			}
+
+			float opacity = 1.0f;
+			aiGetMaterialFloat(material, AI_MATKEY_OPACITY, &opacity);
+			info.material.baseColorFactor.a *= opacity;
+
+			// Check for transparent color
+			aiColor4D transparentColor;
+			if (AI_SUCCESS == aiGetMaterialColor(material, AI_MATKEY_COLOR_TRANSPARENT, &transparentColor)) {
+				float avgTransparency = (transparentColor.r + transparentColor.g + transparentColor.b) / 3.0f;
+				if (avgTransparency > 0.01f) {
+					info.material.baseColorFactor.a *= (1.0f - avgTransparency);
+				}
+			}
+
+			// Determine alpha mode
+			if (info.material.baseColorFactor.a < 0.99f) {
+				info.material.alphaMode = AlphaMode::BLEND;
+			}
+			else {
+				info.material.alphaMode = AlphaMode::OPAQUE;
 			}
 
 			// Default to non-metal for FBX
@@ -1176,28 +1215,25 @@ void processNodeForObj(aiNode* node, const aiScene* scene, glm::mat4 parentTrans
 					diffuseColor.r,
 					diffuseColor.g,
 					diffuseColor.b,
-					diffuseColor.a
+					1.0f  // FORCE alpha to 1.0, we'll handle transparency separately
 				);
 			}
 
-			// B. Shininess to Roughness conversion (OBJ uses Ns for shininess)
+			// B. Shininess to Roughness conversion
 			float shininess = 0.0f;
 			if (AI_SUCCESS == aiGetMaterialFloat(material, AI_MATKEY_SHININESS, &shininess)) {
-				// Convert shininess (0-1000) to roughness (0-1)
-				// Higher shininess = lower roughness
 				info.material.roughnessFactor = 1.0f - glm::clamp(shininess / 1000.0f, 0.0f, 1.0f);
 			}
 			else {
 				info.material.roughnessFactor = 0.5f;
 			}
 
-			// C. OBJ doesn't have metallic, default to 0
+			// C. OBJ doesn't have metallic
 			info.material.metallicFactor = 0.0f;
 
-			// D. Diffuse/Albedo Texture (map_Kd in MTL)
+			// D. Diffuse/Albedo Texture
 			{
 				aiString texPath;
-				// Try DIFFUSE first (standard OBJ)
 				if (material->GetTexture(aiTextureType_DIFFUSE, 0, &texPath) == AI_SUCCESS) {
 					std::string key = std::string("diffuse:") + texPath.C_Str();
 
@@ -1210,7 +1246,7 @@ void processNodeForObj(aiNode* node, const aiScene* scene, glm::mat4 parentTrans
 						TextureData tex = prepareObjTextureInfo(material, path, aiTextureType_DIFFUSE);
 						if (!tex.path.empty()) {
 							int newIdx = static_cast<int>(result.textureData.size());
-							tex.isLinear = false; // sRGB for color textures
+							tex.isLinear = false;
 							result.textureData.push_back(tex);
 							textureCache[key] = newIdx;
 							info.material.baseColorTextureIndex = newIdx;
@@ -1219,13 +1255,53 @@ void processNodeForObj(aiNode* node, const aiScene* scene, glm::mat4 parentTrans
 				}
 			}
 
-			// E. Normal Map (map_Bump or map_Kn in MTL)
+			// E. Handle Opacity/Transparency CORRECTLY for OBJ
+			float finalOpacity = 1.0f;
+
+			// Method 1: Check 'd' (dissolve/opacity) - this is the correct way
+			float opacity = 1.0f;
+			if (AI_SUCCESS == aiGetMaterialFloat(material, AI_MATKEY_OPACITY, &opacity)) {
+				finalOpacity = opacity;
+			}
+
+			// Method 2: Check 'Tr' (transparency) - BUT be careful!
+			// Many exporters incorrectly use Tr=1.0 to mean "opaque"
+			float transparency = 0.0f;
+			if (AI_SUCCESS == aiGetMaterialFloat(material, AI_MATKEY_TRANSPARENCYFACTOR, &transparency)) {
+				// Only treat as transparent if Tr is between 0 and 1 (exclusive)
+				// Tr=0.0 means opaque, Tr=1.0 is often ALSO used to mean opaque (incorrectly)
+				if (transparency > 0.001f && transparency < 0.999f) {
+					finalOpacity = 1.0f - transparency;
+				}
+				// If Tr == 1.0, assume it's the buggy "opaque" usage, keep finalOpacity as is
+			}
+
+			// Method 3: Check transparent color
+			aiColor4D transparentColor;
+			if (AI_SUCCESS == aiGetMaterialColor(material, AI_MATKEY_COLOR_TRANSPARENT, &transparentColor)) {
+				float avgTransparency = (transparentColor.r + transparentColor.g + transparentColor.b) / 3.0f;
+				if (avgTransparency > 0.01f && avgTransparency < 0.99f) {
+					finalOpacity *= (1.0f - avgTransparency);
+				}
+			}
+
+			// Apply final opacity
+			info.material.baseColorFactor.a = finalOpacity;
+
+			// Determine alpha mode
+			if (finalOpacity < 0.99f) {
+				info.material.alphaMode = AlphaMode::BLEND;
+			}
+			else {
+				info.material.alphaMode = AlphaMode::OPAQUE;
+			}
+
+			// F. Normal Map
 			{
 				aiString texPath;
-				// Try NORMALS first, then HEIGHT (bump maps)
 				aiTextureType normalType = aiTextureType_NORMALS;
 				if (material->GetTextureCount(aiTextureType_NORMALS) == 0) {
-					normalType = aiTextureType_HEIGHT; // Bump map fallback
+					normalType = aiTextureType_HEIGHT;
 				}
 
 				if (material->GetTexture(normalType, 0, &texPath) == AI_SUCCESS) {
@@ -1240,7 +1316,7 @@ void processNodeForObj(aiNode* node, const aiScene* scene, glm::mat4 parentTrans
 						TextureData tex = prepareObjTextureInfo(material, path, normalType);
 						if (!tex.path.empty()) {
 							int newIdx = static_cast<int>(result.textureData.size());
-							tex.isLinear = true; // Linear for normal maps
+							tex.isLinear = true;
 							result.textureData.push_back(tex);
 							textureCache[key] = newIdx;
 							info.material.normalTextureIndex = newIdx;
@@ -1249,7 +1325,7 @@ void processNodeForObj(aiNode* node, const aiScene* scene, glm::mat4 parentTrans
 				}
 			}
 
-			// F. Specular Map (map_Ks in MTL) - Use as metallic-roughness approximation
+			// G. Specular Map (as metallic-roughness approximation)
 			{
 				aiString texPath;
 				if (material->GetTexture(aiTextureType_SPECULAR, 0, &texPath) == AI_SUCCESS) {
@@ -1559,6 +1635,26 @@ void processFastGltfNode(fastgltf::Asset& asset, size_t nodeIndex, const glm::ma
 				sub.material.metallicFactor = pbr.metallicFactor;
 				sub.material.roughnessFactor = pbr.roughnessFactor;
 
+				switch (material.alphaMode) {
+				case fastgltf::AlphaMode::Opaque:
+					sub.material.alphaMode = AlphaMode::OPAQUE;
+					break;
+				case fastgltf::AlphaMode::Mask:
+					sub.material.alphaMode = AlphaMode::MASK;
+					sub.material.alphaCutoff = material.alphaCutoff;
+					break;
+				case fastgltf::AlphaMode::Blend:
+					sub.material.alphaMode = AlphaMode::BLEND;
+					break;
+				}
+
+				// If base color has alpha < 1.0 and mode is opaque, 
+				// consider it as blend mode
+				if (sub.material.alphaMode == AlphaMode::OPAQUE &&
+					sub.material.baseColorFactor.a < 0.99f) {
+					sub.material.alphaMode = AlphaMode::BLEND;
+				}
+
 				// 1. Base Color Texture
 				if (pbr.baseColorTexture.has_value() && asset.textures[pbr.baseColorTexture.value().textureIndex].imageIndex.has_value()) {
 					size_t imgIdx = asset.textures[pbr.baseColorTexture.value().textureIndex].imageIndex.value();
@@ -1701,6 +1797,58 @@ Mesh loadWithFastGltf(const std::string& path) {
 	return result;
 }
 
+struct RenderSubmesh {
+	size_t submeshIndex;
+	float distanceToCamera;
+	bool isTransparent;
+};
+
+// Function to sort submeshes for proper transparency rendering
+std::vector<RenderSubmesh> sortSubmeshesForRendering(
+	const std::vector<SubmeshInfo>& submeshes,
+	const std::vector<Vertex>& vertices,
+	const glm::vec3& cameraPos)
+{
+	std::vector<RenderSubmesh> renderList;
+	renderList.reserve(submeshes.size());
+
+	for (size_t i = 0; i < submeshes.size(); ++i) {
+		const auto& sub = submeshes[i];
+
+		// Calculate center of submesh (approximate using first vertex)
+		glm::vec3 center(0.0f);
+		if (sub.vertexOffset < vertices.size()) {
+			center = vertices[sub.vertexOffset].position;
+		}
+
+		RenderSubmesh rs;
+		rs.submeshIndex = i;
+		rs.distanceToCamera = glm::length(center - cameraPos);
+		rs.isTransparent = (static_cast<int>(sub.material.alphaMode) == 2); // BLEND mode
+
+		renderList.push_back(rs);
+	}
+
+	// Sort: opaque first (front-to-back), then transparent (back-to-front)
+	std::sort(renderList.begin(), renderList.end(),
+		[](const RenderSubmesh& a, const RenderSubmesh& b) {
+			// Opaque objects first
+			if (a.isTransparent != b.isTransparent) {
+				return !a.isTransparent; // opaque comes first
+			}
+			// For opaque: front-to-back (smaller distance first)
+			// For transparent: back-to-front (larger distance first)
+			if (a.isTransparent) {
+				return a.distanceToCamera > b.distanceToCamera;
+			}
+			else {
+				return a.distanceToCamera < b.distanceToCamera;
+			}
+		});
+
+	return renderList;
+}
+
 int main()
 {
 	// ------------------------
@@ -1748,6 +1896,18 @@ int main()
 	std::cout << "Scene center: " << sceneBounds.center.x << ", "
 		<< sceneBounds.center.y << ", " << sceneBounds.center.z
 		<< " radius: " << sceneBounds.radius << "\n";
+
+	std::cout << "First 5 submesh materials:\n";
+	for (int i = 0; i < std::min(5, (int)model.submeshes.size()); i++) {
+		auto& m = model.submeshes[i].material;
+		std::cout << "  Sub " << i << ": baseColor=("
+			<< m.baseColorFactor.r << ", "
+			<< m.baseColorFactor.g << ", "
+			<< m.baseColorFactor.b << ", "
+			<< m.baseColorFactor.a << ") "
+			<< "alphaMode=" << static_cast<int>(m.alphaMode)
+			<< " cutoff=" << m.alphaCutoff << "\n";
+	}
 
 	// Initialize directional light
 	DirectionalLight sunLight;
@@ -2069,6 +2229,29 @@ int main()
 		auto allocatedCommandBuffers = device.allocateCommandBuffersUnique(commandAllocInfo);
 		std::vector<vk::UniqueCommandBuffer> commandBuffers = std::move(allocatedCommandBuffers.value);
 
+		std::vector<UBOBuffer> frameUBOs(MAX_FRAMES_IN_FLIGHT);
+
+		for (int i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
+			VkBufferCreateInfo bufferInfo{};
+			bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+			bufferInfo.size = sizeof(FrameUBO);
+			bufferInfo.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
+			bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+			VmaAllocationCreateInfo uboAllocInfo{};
+			uboAllocInfo.usage = VMA_MEMORY_USAGE_CPU_TO_GPU;
+			uboAllocInfo.flags = VMA_ALLOCATION_CREATE_MAPPED_BIT;
+
+			VmaAllocationInfo allocationInfo{};
+			if (vmaCreateBuffer(allocator, &bufferInfo, &uboAllocInfo,
+				&frameUBOs[i].buffer, &frameUBOs[i].allocation,
+				&allocationInfo) != VK_SUCCESS) {
+				throw std::runtime_error("Failed to create UBO buffer");
+			}
+			frameUBOs[i].mapped = allocationInfo.pMappedData;
+		}
+		std::cout << "Created " << MAX_FRAMES_IN_FLIGHT << " UBO buffers\n";
+
 		// ------------------------
 		// 13. Upload Textures
 		// ------------------------
@@ -2116,6 +2299,19 @@ int main()
 
 		vk::UniqueDescriptorSetLayout descriptorSetLayout = device.createDescriptorSetLayoutUnique(layoutInfo).value;
 
+		vk::DescriptorSetLayoutBinding uboBinding{};
+		uboBinding.binding = 0;
+		uboBinding.descriptorType = vk::DescriptorType::eUniformBuffer;
+		uboBinding.descriptorCount = 1;
+		uboBinding.stageFlags = vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment;
+		uboBinding.pImmutableSamplers = nullptr;
+
+		vk::DescriptorSetLayoutCreateInfo uboLayoutInfo{};
+		uboLayoutInfo.bindingCount = 1;
+		uboLayoutInfo.pBindings = &uboBinding;
+
+		vk::UniqueDescriptorSetLayout uboDescriptorSetLayout = device.createDescriptorSetLayoutUnique(uboLayoutInfo).value;
+
 		// 1. Create a 1x1 White Default Texture (Fallback)
 		TextureData whiteTexData;
 		whiteTexData.width = 1; whiteTexData.height = 1; whiteTexData.channels = 4;
@@ -2148,14 +2344,15 @@ int main()
 		// We need 1 set for the default texture + 1 set per loaded texture
 		uint32_t totalTextures = 1 + (uint32_t)gpuTextures.size();
 
-		vk::DescriptorPoolSize poolSize{};
-		poolSize.type = vk::DescriptorType::eCombinedImageSampler;
-		poolSize.descriptorCount = (totalTextures + 4); // *3;
+		std::vector<vk::DescriptorPoolSize> poolSizes = {
+		{ vk::DescriptorType::eCombinedImageSampler, totalTextures + 4 },
+		{ vk::DescriptorType::eUniformBuffer, static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT) }
+		};
 
 		vk::DescriptorPoolCreateInfo poolInfo{};
-		poolInfo.poolSizeCount = 1;
-		poolInfo.pPoolSizes = &poolSize;
-		poolInfo.maxSets = (totalTextures + 4); // *3;
+		poolInfo.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
+		poolInfo.pPoolSizes = poolSizes.data();
+		poolInfo.maxSets = totalTextures + 4 + MAX_FRAMES_IN_FLIGHT;
 
 		vk::UniqueDescriptorPool descriptorPool = device.createDescriptorPoolUnique(poolInfo).value;
 
@@ -2236,6 +2433,33 @@ int main()
 			device.updateDescriptorSets(1, &shadowWrite, 0, nullptr);
 		}
 
+		std::vector<vk::DescriptorSet> uboDescriptorSets(MAX_FRAMES_IN_FLIGHT);
+
+		for (int i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
+			vk::DescriptorSetAllocateInfo uboAllocInfo{};
+			uboAllocInfo.descriptorPool = descriptorPool.get();
+			uboAllocInfo.descriptorSetCount = 1;
+			uboAllocInfo.pSetLayouts = &uboDescriptorSetLayout.get();
+
+			uboDescriptorSets[i] = device.allocateDescriptorSets(uboAllocInfo).value[0];
+
+			vk::DescriptorBufferInfo bufferInfo{};
+			bufferInfo.buffer = vk::Buffer(frameUBOs[i].buffer);
+			bufferInfo.offset = 0;
+			bufferInfo.range = sizeof(FrameUBO);
+
+			vk::WriteDescriptorSet descriptorWrite{};
+			descriptorWrite.dstSet = uboDescriptorSets[i];
+			descriptorWrite.dstBinding = 0;
+			descriptorWrite.dstArrayElement = 0;
+			descriptorWrite.descriptorType = vk::DescriptorType::eUniformBuffer;
+			descriptorWrite.descriptorCount = 1;
+			descriptorWrite.pBufferInfo = &bufferInfo;
+
+			device.updateDescriptorSets(1, &descriptorWrite, 0, nullptr);
+		}
+		std::cout << "UBO descriptor sets created\n";
+
 		// ------------------------
 		// 12. Semaphores and Fences
 		// ------------------------
@@ -2286,20 +2510,22 @@ int main()
 		// ------------------------
 		// 16. Create Pipeline Layout
 		// ------------------------
+		// Push constant range - now only 32 bytes
 		vk::PushConstantRange pcRange{};
 		pcRange.stageFlags = vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment;
 		pcRange.offset = 0;
 		pcRange.size = sizeof(MeshPushConstants);
 
-		vk::PushConstantRange allRanges[] = { pcRange };
+		// Layouts: Set 0 = UBO, Sets 1-4 = Textures
+		vk::DescriptorSetLayout layouts[] = {
+			uboDescriptorSetLayout.get(),     // Set 0: Frame UBO
+			descriptorSetLayout.get(),         // Set 1: Base Color
+			descriptorSetLayout.get(),         // Set 2: Normal Map
+			descriptorSetLayout.get(),         // Set 3: Metallic-Roughness
+			descriptorSetLayout.get()          // Set 4: Shadow Map
+		};
 
-		vk::DescriptorSetLayout layouts[] = { 
-			descriptorSetLayout.get()
-			, descriptorSetLayout.get()
-			, descriptorSetLayout.get()
-			, descriptorSetLayout.get() };
-
-		// shader create info
+		// Main shader create info
 		vk::ShaderCreateInfoEXT vertInfo{};
 		vertInfo.setStage(vk::ShaderStageFlagBits::eVertex)
 			.setNextStage(vk::ShaderStageFlagBits::eFragment)
@@ -2309,8 +2535,8 @@ int main()
 			.setPCode(vertCode.data())
 			.setPName("main")
 			.setPushConstantRangeCount(1)
-			.setPPushConstantRanges(allRanges)
-			.setSetLayoutCount(4)
+			.setPPushConstantRanges(&pcRange)
+			.setSetLayoutCount(5)
 			.setPSetLayouts(layouts);
 
 		vk::ShaderCreateInfoEXT fragInfo{};
@@ -2321,20 +2547,25 @@ int main()
 			.setPCode(fragCode.data())
 			.setPName("main")
 			.setPushConstantRangeCount(1)
-			.setPPushConstantRanges(allRanges)
-			.setSetLayoutCount(4)
+			.setPPushConstantRanges(&pcRange)
+			.setSetLayoutCount(5)
 			.setPSetLayouts(layouts);
 
-		vk::ShaderEXT vertShader, fragShader;
-		vertShader = device.createShaderEXT(vertInfo).value;
-		fragShader = device.createShaderEXT(fragInfo).value;
+		vk::ShaderEXT vertShader = device.createShaderEXT(vertInfo).value;
+		vk::ShaderEXT fragShader = device.createShaderEXT(fragInfo).value;
 
+		// Shadow push constant range - MUST include both VERTEX and FRAGMENT stages
 		vk::PushConstantRange shadowPcRange{};
-		shadowPcRange.stageFlags = vk::ShaderStageFlagBits::eVertex;
+		shadowPcRange.stageFlags = vk::ShaderStageFlagBits::eFragment;
 		shadowPcRange.offset = 0;
 		shadowPcRange.size = sizeof(ShadowPushConstants);
 
-		// Shadow shader create info (no descriptor sets needed for basic shadow pass)
+		// Shadow layouts: Set 0 = UBO (for lightSpaceMatrix), Set 1 = Base Color (for alpha testing)
+		vk::DescriptorSetLayout shadowLayouts[] = {
+			uboDescriptorSetLayout.get(),
+			descriptorSetLayout.get()
+		};
+
 		vk::ShaderCreateInfoEXT shadowVertInfo{};
 		shadowVertInfo.setStage(vk::ShaderStageFlagBits::eVertex)
 			.setNextStage(vk::ShaderStageFlagBits::eFragment)
@@ -2345,8 +2576,8 @@ int main()
 			.setPName("main")
 			.setPushConstantRangeCount(1)
 			.setPPushConstantRanges(&shadowPcRange)
-			.setSetLayoutCount(0)
-			.setPSetLayouts(nullptr);
+			.setSetLayoutCount(2)
+			.setPSetLayouts(shadowLayouts);
 
 		vk::ShaderCreateInfoEXT shadowFragInfo{};
 		shadowFragInfo.setStage(vk::ShaderStageFlagBits::eFragment)
@@ -2357,8 +2588,8 @@ int main()
 			.setPName("main")
 			.setPushConstantRangeCount(1)
 			.setPPushConstantRanges(&shadowPcRange)
-			.setSetLayoutCount(0)
-			.setPSetLayouts(nullptr);
+			.setSetLayoutCount(2)
+			.setPSetLayouts(shadowLayouts);
 
 		vk::ShaderEXT shadowVertShader = device.createShaderEXT(shadowVertInfo).value;
 		vk::ShaderEXT shadowFragShader = device.createShaderEXT(shadowFragInfo).value;
@@ -2367,38 +2598,21 @@ int main()
 		vk::PipelineLayoutCreateInfo shadowLayoutInfo{};
 		shadowLayoutInfo.setPushConstantRangeCount(1);
 		shadowLayoutInfo.setPPushConstantRanges(&shadowPcRange);
+		shadowLayoutInfo.setSetLayoutCount(2);
+		shadowLayoutInfo.setPSetLayouts(shadowLayouts);
 
 		vk::PipelineLayout shadowPipelineLayout = device.createPipelineLayout(shadowLayoutInfo).value;
 
-		std::cout << "Shadow pipeline created successfully\n";
-
-
-		std::vector<vk::PushConstantRange> pushRanges = { pcRange };
+		// Main pipeline layout
 		vk::PipelineLayoutCreateInfo pipelineLayoutInfo{};
-		pipelineLayoutInfo.setPushConstantRanges(pushRanges);
-		pipelineLayoutInfo.setSetLayoutCount(4);
+		pipelineLayoutInfo.setPushConstantRangeCount(1);
+		pipelineLayoutInfo.setPPushConstantRanges(&pcRange);
+		pipelineLayoutInfo.setSetLayoutCount(5);
 		pipelineLayoutInfo.setPSetLayouts(layouts);
-		// arrays for binding shaders
-		vk::PipelineLayout pipelineLayout;
-		try {
-			pipelineLayout = device.createPipelineLayout(pipelineLayoutInfo).value;
-		}
-		catch (const std::exception& e) {
-			std::cerr << "Failed to create pipeline layout: " << e.what() << "\n";
-			device.destroyShaderEXT(vertShader);
-			device.destroyShaderEXT(fragShader);
-			device.destroyShaderEXT(shadowVertShader);
-			device.destroyShaderEXT(shadowFragShader);
-			device.destroyPipelineLayout(shadowPipelineLayout);
-			vmaDestroyAllocator(allocator);
-			vkb::destroy_swapchain(vkbSwapchain);
-			vkb::destroy_device(vkbDevice);
-			vkb::destroy_surface(vkbInstance, surface);
-			vkb::destroy_instance(vkbInstance);
-			SDL_DestroyWindow(window);
-			SDL_Quit();
-			return -1;
-		}
+
+		vk::PipelineLayout pipelineLayout = device.createPipelineLayout(pipelineLayoutInfo).value;
+
+		std::cout << "Pipeline layouts created successfully\n";
 
 		// ------------------------
 		// 8. Main loop
@@ -2485,13 +2699,24 @@ int main()
 				return -1;
 			}
 
+			FrameUBO frameData{};
+			frameData.view = getView(camera);
+			frameData.proj = getProjection(1280.0f, 720.0f);
+			frameData.lightSpaceMatrix = calculateLightSpaceMatrix(sunLight, sceneBounds.center, sceneBounds.radius);
+			frameData.cameraPos = glm::vec4(camera.position, 0.0f);
+			frameData.lightDir = glm::vec4(sunLight.direction, 0.0f);
+			frameData.time = time;
+			frameData.shadowBias = 0.005f;
+
+			memcpy(frameUBOs[currentFrame].mapped, &frameData, sizeof(FrameUBO));
+
 			// Record command buffer to clear blue
 			vk::CommandBuffer cmd = commandBuffers[currentFrame].get();
 			(void)cmd.reset();
 			(void)cmd.begin({ vk::CommandBufferUsageFlagBits::eOneTimeSubmit });
 
+			// Shadow pass
 			{
-				// Calculate light space matrix
 				glm::mat4 lightSpaceMatrix = calculateLightSpaceMatrix(sunLight, sceneBounds.center, sceneBounds.radius);
 
 				// Transition shadow map to depth attachment
@@ -2517,11 +2742,10 @@ int main()
 					.setStoreOp(vk::AttachmentStoreOp::eStore)
 					.setClearValue(vk::ClearValue(vk::ClearDepthStencilValue{ 1.0f, 0 }));
 
-				// Begin shadow rendering (depth only, no color)
 				vk::RenderingInfo shadowRenderInfo{};
 				shadowRenderInfo.setRenderArea({ {0, 0}, {SHADOW_MAP_SIZE, SHADOW_MAP_SIZE} })
 					.setLayerCount(1)
-					.setColorAttachmentCount(0)  // No color attachments
+					.setColorAttachmentCount(0)
 					.setPDepthAttachment(&shadowDepthAttachment);
 
 				cmd.beginRendering(shadowRenderInfo);
@@ -2542,13 +2766,13 @@ int main()
 				cmd.setScissorWithCount(1, &shadowRect);
 				cmd.setPrimitiveTopology(vk::PrimitiveTopology::eTriangleList);
 				cmd.setRasterizerDiscardEnable(false);
-				cmd.setCullMode(vk::CullModeFlagBits::eFront);  // Front-face culling reduces shadow acne
+				cmd.setCullMode(vk::CullModeFlagBits::eFront);
 				cmd.setFrontFace(vk::FrontFace::eCounterClockwise);
 				cmd.setDepthTestEnable(true);
 				cmd.setDepthWriteEnable(true);
 				cmd.setDepthCompareOp(vk::CompareOp::eLessOrEqual);
 				cmd.setDepthBiasEnable(true);
-				cmd.setDepthBias(1.25f, 0.0f, 1.75f);  // Helps reduce shadow acne
+				cmd.setDepthBias(1.25f, 0.0f, 1.75f);
 				cmd.setStencilTestEnable(false);
 				cmd.setPolygonModeEXT(vk::PolygonMode::eFill);
 				cmd.setRasterizationSamplesEXT(vk::SampleCountFlagBits::e1);
@@ -2578,19 +2802,35 @@ int main()
 				cmd.bindVertexBuffers2(0, 2, buffers, offsets, sizes, strides);
 				cmd.bindIndexBuffer(indexBuffer->getBuffer(), 0, vk::IndexType::eUint32);
 
-				// Shadow push constants
-				ShadowPushConstants shadowPc{};
-				shadowPc.lightSpaceMatrix = lightSpaceMatrix;
+				// Bind UBO at set 0
+				cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, shadowPipelineLayout, 0, 1,
+					&uboDescriptorSets[currentFrame], 0, nullptr);
 
-				// Draw all submeshes
+				// Draw all non-blend submeshes
 				for (const auto& sub : model.submeshes) {
+					if (sub.material.alphaMode == AlphaMode::BLEND)
+						continue;
+
+					ShadowPushConstants shadowPc{};
+					shadowPc.alphaCutoff = sub.material.alphaCutoff;
+					shadowPc.alphaMode = static_cast<int>(sub.material.alphaMode);
+
 					cmd.pushConstants(
 						shadowPipelineLayout,
-						vk::ShaderStageFlagBits::eVertex,
+						vk::ShaderStageFlagBits::eFragment,
 						0,
 						sizeof(ShadowPushConstants),
 						&shadowPc
 					);
+
+					// Bind base color texture for alpha testing
+					if (sub.material.alphaMode == AlphaMode::MASK && sub.material.baseColorTextureIndex >= 0) {
+						vk::DescriptorSet baseColorSet = textureDescriptorSets[sub.material.baseColorTextureIndex + 1];
+						cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, shadowPipelineLayout, 1, 1, &baseColorSet, 0, nullptr);
+					}
+					else {
+						cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, shadowPipelineLayout, 1, 1, &textureDescriptorSets[0], 0, nullptr);
+					}
 
 					cmd.drawIndexed(
 						sub.indexCount,
@@ -2754,23 +2994,48 @@ int main()
 			);
 			glm::mat4 lightSpaceMatrix = calculateLightSpaceMatrix(sunLight, sceneBounds.center, sceneBounds.radius);
 
-			pc.cameraPos = glm::vec4(camera.position, 0.0);
-			pc.view = getView(camera);
-			pc.proj = getProjection(1280.0f, 720.0f);
-			pc.lightSpaceMatrix = lightSpaceMatrix;
-			pc.lightDir = glm::vec4(sunLight.direction, 0.0f);
-			pc.time = time;
-			pc.shadowBias = 0.005f;
-			//int submeshCounter = 0;
-			for (const auto& sub : model.submeshes) {
-				//++submeshCounter;
-				//if (submeshCounter % 2) continue;
+			cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipelineLayout, 0, 1,
+				&uboDescriptorSets[currentFrame], 0, nullptr);
+
+			// Sort submeshes for proper transparency rendering
+			auto sortedSubmeshes = sortSubmeshesForRendering(model.submeshes, model.vertices, camera.position);
+			bool currentlyBlending = false;
+
+			for (const auto& renderSub : sortedSubmeshes) {
+				const auto& sub = model.submeshes[renderSub.submeshIndex];
+
+				bool needsBlending = (sub.material.alphaMode == AlphaMode::BLEND);
+
+				if (needsBlending != currentlyBlending) {
+					currentlyBlending = needsBlending;
+
+					if (needsBlending) {
+						cmd.setColorBlendEnableEXT(0, VK_TRUE);
+
+						vk::ColorBlendEquationEXT blendEquation{};
+						blendEquation.srcColorBlendFactor = vk::BlendFactor::eSrcAlpha;
+						blendEquation.dstColorBlendFactor = vk::BlendFactor::eOneMinusSrcAlpha;
+						blendEquation.colorBlendOp = vk::BlendOp::eAdd;
+						blendEquation.srcAlphaBlendFactor = vk::BlendFactor::eOne;
+						blendEquation.dstAlphaBlendFactor = vk::BlendFactor::eOneMinusSrcAlpha;
+						blendEquation.alphaBlendOp = vk::BlendOp::eAdd;
+						cmd.setColorBlendEquationEXT(0, 1, &blendEquation);
+
+						cmd.setDepthWriteEnable(VK_FALSE);
+					}
+					else {
+						cmd.setColorBlendEnableEXT(0, VK_FALSE);
+						cmd.setDepthWriteEnable(VK_TRUE);
+					}
+				}
+
+				MeshPushConstants pc{};
 				pc.baseColor = sub.material.baseColorFactor;
 				pc.metallic = sub.material.metallicFactor;
 				pc.roughness = sub.material.roughnessFactor;
-				//pc.baseColor = glm::vec4(1.0f);
-				//pc.metallic = 0.0f;             // Non-metal (easier to see initially)
-				//pc.roughness = 0.5f;
+				pc.alphaCutoff = sub.material.alphaCutoff;
+				pc.alphaMode = static_cast<int>(sub.material.alphaMode);
+
 				cmd.pushConstants(
 					pipelineLayout,
 					vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment,
@@ -2779,72 +3044,36 @@ int main()
 					&pc
 				);
 
-				// base color
-				vk::DescriptorSet baseColorSet;
-				if (sub.material.baseColorTextureIndex >= 0) {
-					// Index + 1 because set[0] is the default white texture
-					baseColorSet = textureDescriptorSets[sub.material.baseColorTextureIndex + 1];
-				}
-				else {
-					baseColorSet = textureDescriptorSets[0];
-				}
+				// Bind textures at sets 1-4
+				vk::DescriptorSet baseColorSet = (sub.material.baseColorTextureIndex >= 0)
+					? textureDescriptorSets[sub.material.baseColorTextureIndex + 1]
+					: textureDescriptorSets[0];
+				cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipelineLayout, 1, 1, &baseColorSet, 0, nullptr);
 
-				cmd.bindDescriptorSets(
-					vk::PipelineBindPoint::eGraphics,
-					pipelineLayout, // This must be the layout that includes the descriptorSetLayout
-					0,
-					1, &baseColorSet,
-					0, nullptr
-				);
+				vk::DescriptorSet normalSet = (sub.material.normalTextureIndex >= 0)
+					? textureDescriptorSets[sub.material.normalTextureIndex + 1]
+					: defaultNormalSet;
+				cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipelineLayout, 2, 1, &normalSet, 0, nullptr);
 
-				//normal
-				vk::DescriptorSet normalSet;
-				if (sub.material.normalTextureIndex >= 0) {
-					normalSet = textureDescriptorSets[sub.material.normalTextureIndex + 1];
-				}
-				else {
-					normalSet = defaultNormalSet;
-				}
-				cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics
-					, pipelineLayout
-					, 1
-					, 1
-					, &normalSet
-					, 0
-					, nullptr);
+				vk::DescriptorSet mrSet = (sub.material.metallicRoughnessTextureIndex >= 0)
+					? textureDescriptorSets[sub.material.metallicRoughnessTextureIndex + 1]
+					: defaultMrSet;
+				cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipelineLayout, 3, 1, &mrSet, 0, nullptr);
 
-				vk::DescriptorSet mrSet;
-				if (sub.material.metallicRoughnessTextureIndex >= 0) {
-					// Offset by +1 because textureDescriptorSets[0] is default white
-					mrSet = textureDescriptorSets[sub.material.metallicRoughnessTextureIndex + 1];
-				}
-				else {
-					mrSet = defaultMrSet;
-				}
-
-				cmd.bindDescriptorSets(
-					vk::PipelineBindPoint::eGraphics,
-					pipelineLayout,
-					2, // Set 2
-					1, &mrSet,
-					0, nullptr
-				);
-
-				cmd.bindDescriptorSets(
-					vk::PipelineBindPoint::eGraphics,
-					pipelineLayout,
-					3,  // Set 3
-					1, &shadowMapDescriptorSet,
-					0, nullptr
-				);
+				cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipelineLayout, 4, 1, &shadowMapDescriptorSet, 0, nullptr);
 
 				cmd.drawIndexed(
-					sub.indexCount,      // number of indices
-					instanceBuffer->getInstanceCount(),  // number of instances
-					sub.indexOffset,     // first index
-					sub.vertexOffset,    // vertex offset (baseVertex)
-					0                    // first instance
+					sub.indexCount,
+					instanceBuffer->getInstanceCount(),
+					sub.indexOffset,
+					sub.vertexOffset,
+					0
 				);
+			}
+
+			if (currentlyBlending) {
+				cmd.setColorBlendEnableEXT(0, VK_FALSE);
+				cmd.setDepthWriteEnable(VK_TRUE);
 			}
 
 			cmd.endRendering();
@@ -2912,6 +3141,11 @@ int main()
 			device.destroyPipelineLayout(shadowPipelineLayout);
 			device.destroyPipelineLayout(pipelineLayout);
 			device.destroyImageView(depthImageView);
+		}
+		for (auto& ubo : frameUBOs) {
+			if (ubo.buffer) {
+				vmaDestroyBuffer(allocator, ubo.buffer, ubo.allocation);
+			}
 		}
 	};
 
