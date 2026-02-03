@@ -1,4 +1,7 @@
 ﻿#include <iostream>
+#include <mutex>
+#include <thread>
+#include <atomic>
 #include <vulkan/vulkan.hpp>
 #include <volk.h>
 #include <SDL3/SDL.h>
@@ -483,26 +486,73 @@ struct TextureData {
 };
 
 void decodeTextureParallel(TextureData& tex) {
+	// Skip if already loaded
+	if (tex.pixels != nullptr) {
+		return;
+	}
+
 	if (tex.encodedData != nullptr && tex.encodedSize > 0) {
-		// Load from Memory (Embedded)
+		// Load from Memory (Embedded - for FBX/glTF)
 		tex.pixels = stbi_load_from_memory(
 			tex.encodedData,
 			static_cast<int>(tex.encodedSize),
 			&tex.width, &tex.height, &tex.channels, 4);
 	}
 	else if (!tex.path.empty()) {
-		// Load from File
+		// Load from File (OBJ and external references)
+
+		// Normalize path separators
+		std::string normalizedPath = tex.path;
+		std::replace(normalizedPath.begin(), normalizedPath.end(), '\\', '/');
+
 		tex.pixels = stbi_load(
-			tex.path.c_str(),
+			normalizedPath.c_str(),
 			&tex.width, &tex.height, &tex.channels, 4);
+
+		// If failed, try some fallback paths
+		if (!tex.pixels) {
+			// Try lowercase extension
+			std::filesystem::path p(normalizedPath);
+			std::string ext = p.extension().string();
+			std::string lowerExt = ext;
+			std::transform(lowerExt.begin(), lowerExt.end(), lowerExt.begin(), ::tolower);
+
+			if (ext != lowerExt) {
+				std::string altPath = p.parent_path().string() + "/" +
+					p.stem().string() + lowerExt;
+				tex.pixels = stbi_load(altPath.c_str(), &tex.width, &tex.height, &tex.channels, 4);
+			}
+
+			// Try common image formats
+			if (!tex.pixels) {
+				std::vector<std::string> extensions = { ".png", ".jpg", ".jpeg", ".tga", ".bmp" };
+				std::string basePath = p.parent_path().string() + "/" + p.stem().string();
+
+				for (const auto& tryExt : extensions) {
+					std::string altPath = basePath + tryExt;
+					tex.pixels = stbi_load(altPath.c_str(), &tex.width, &tex.height, &tex.channels, 4);
+					if (tex.pixels) {
+						std::cout << "  Found texture at: " << altPath << "\n";
+						break;
+					}
+				}
+			}
+		}
 	}
 
 	if (!tex.pixels) {
 		std::cerr << "Texture failed to load: " << (tex.path.empty() ? "Embedded" : tex.path) << "\n";
-		// Create a 1x1 magenta fallback so the app doesn't crash
-		tex.width = 1; tex.height = 1; tex.channels = 4;
+		// Create a 1x1 magenta fallback
+		tex.width = 1;
+		tex.height = 1;
+		tex.channels = 4;
 		tex.pixels = (unsigned char*)malloc(4);
-		tex.pixels[0] = 255; tex.pixels[1] = 0; tex.pixels[2] = 255; tex.pixels[3] = 255;
+		if (tex.pixels) {
+			tex.pixels[0] = 255;  // R
+			tex.pixels[1] = 0;    // G
+			tex.pixels[2] = 255;  // B
+			tex.pixels[3] = 255;  // A
+		}
 	}
 }
 
@@ -806,7 +856,9 @@ const int MAX_NODES = 1000000000;
 int g_NodesCounter = 0;
 
 void processNode(aiNode* node, const aiScene* scene, glm::mat4 parentTransform, Mesh& result,
-	std::unordered_map<std::string, int>& textureCache, const std::string& path) {
+	std::unordered_map<std::string, int>& textureCache, const std::string& path,
+	std::mutex& textureCacheMutex) {  // NEW: Added mutex parameter
+
 	++g_NodesCounter;
 
 	// 1. Transform
@@ -838,8 +890,10 @@ void processNode(aiNode* node, const aiScene* scene, glm::mat4 parentTransform, 
 				glm::vec3 N = vertex.normal;
 				float handedness = (glm::dot(glm::cross(N, T), B) < 0.0f) ? -1.0f : 1.0f;
 				vertex.tangent = glm::vec4(T, handedness);
-			} else
+			}
+			else {
 				vertex.tangent = glm::vec4(0.0f);
+			}
 			result.vertices.push_back(vertex);
 		}
 
@@ -847,9 +901,9 @@ void processNode(aiNode* node, const aiScene* scene, glm::mat4 parentTransform, 
 		for (unsigned int i = 0; i < mesh->mNumFaces; ++i) {
 			const aiFace& face = mesh->mFaces[i];
 			if (face.mNumIndices != 3) continue;
+			result.indices.push_back(face.mIndices[0]);
 			result.indices.push_back(face.mIndices[1]);
 			result.indices.push_back(face.mIndices[2]);
-			result.indices.push_back(face.mIndices[0]);
 		}
 
 		vertexOffset += mesh->mNumVertices;
@@ -887,6 +941,10 @@ void processNode(aiNode* node, const aiScene* scene, glm::mat4 parentTransform, 
 
 			if (material->GetTexture(type, 0, &texPath) == AI_SUCCESS) {
 				std::string key = texPath.C_Str();
+
+				// THREAD-SAFE: Lock mutex before accessing textureCache
+				std::lock_guard<std::mutex> lock(textureCacheMutex);
+
 				if (textureCache.find(key) != textureCache.end()) {
 					info.material.baseColorTextureIndex = textureCache[key];
 				}
@@ -905,6 +963,10 @@ void processNode(aiNode* node, const aiScene* scene, glm::mat4 parentTransform, 
 			// C. Normal Map
 			if (material->GetTexture(aiTextureType_NORMALS, 0, &texPath) == AI_SUCCESS) {
 				std::string key = texPath.C_Str();
+
+				// THREAD-SAFE: Lock mutex before accessing textureCache
+				std::lock_guard<std::mutex> lock(textureCacheMutex);
+
 				if (textureCache.find(key) != textureCache.end()) {
 					info.material.normalTextureIndex = textureCache[key];
 				}
@@ -920,16 +982,17 @@ void processNode(aiNode* node, const aiScene* scene, glm::mat4 parentTransform, 
 				}
 			}
 
-			// D. Metallic-Roughness (NEW: Support for glTF via Assimp)
-			// Assimp maps the glTF packed texture to aiTextureType_UNKNOWN (index 0) usually.
-			// We check UNKNOWN. If loading FBX, this is usually empty, so it's safe.
+			// D. Metallic-Roughness
 			if (material->GetTexture(aiTextureType_UNKNOWN, 0, &texPath) == AI_SUCCESS) {
 				std::string key = texPath.C_Str();
+
+				// THREAD-SAFE: Lock mutex before accessing textureCache
+				std::lock_guard<std::mutex> lock(textureCacheMutex);
+
 				if (textureCache.find(key) != textureCache.end()) {
 					info.material.metallicRoughnessTextureIndex = textureCache[key];
 				}
 				else {
-					// Use UNKNOWN type
 					TextureData tex = prepareAssimpTextureInfo(scene, material, path, aiTextureType_UNKNOWN);
 					if (!tex.path.empty() || tex.encodedData != nullptr) {
 						int newIdx = (int)result.textureData.size();
@@ -945,8 +1008,9 @@ void processNode(aiNode* node, const aiScene* scene, glm::mat4 parentTransform, 
 		result.submeshes.push_back(info);
 	}
 
+	// Recurse into children - pass the mutex along
 	for (unsigned int i = 0; i < node->mNumChildren; ++i) {
-		processNode(node->mChildren[i], scene, globalTransform, result, textureCache, path);
+		processNode(node->mChildren[i], scene, globalTransform, result, textureCache, path, textureCacheMutex);
 	}
 }
 
@@ -965,54 +1029,362 @@ void calculateTotalAssimpVertices(const aiNode* node, const aiScene* scene, size
 	}
 }
 
+TextureData prepareObjTextureInfo(const aiMaterial* mat, const std::string& modelPath, aiTextureType type) {
+	TextureData texture{};
+	aiString texPath;
+
+	if (mat->GetTexture(type, 0, &texPath) == AI_SUCCESS) {
+		std::string rawPath = texPath.C_Str();
+
+		// OBJ/MTL files always reference external files, never embedded
+		std::filesystem::path modelDir = std::filesystem::path(modelPath).parent_path();
+		std::filesystem::path texturePath(rawPath);
+
+		// Handle different path formats in MTL files
+		if (texturePath.is_absolute()) {
+			texture.path = texturePath.string();
+		}
+		else {
+			// Try direct path first
+			std::filesystem::path fullPath = modelDir / texturePath;
+
+			// If not found, try just the filename (common in OBJ exports)
+			if (!std::filesystem::exists(fullPath)) {
+				fullPath = modelDir / texturePath.filename();
+			}
+
+			// Also check common texture subdirectories
+			if (!std::filesystem::exists(fullPath)) {
+				for (const auto& subdir : { "textures", "Textures", "tex", "maps", "Materials" }) {
+					auto tryPath = modelDir / subdir / texturePath.filename();
+					if (std::filesystem::exists(tryPath)) {
+						fullPath = tryPath;
+						break;
+					}
+				}
+			}
+
+			texture.path = fullPath.string();
+		}
+
+		// Debug output
+		if (!std::filesystem::exists(texture.path)) {
+			std::cerr << "Warning: Texture not found: " << texture.path << "\n";
+		}
+	}
+
+	return texture;
+}
+
+void processNodeForObj(aiNode* node, const aiScene* scene, glm::mat4 parentTransform, Mesh& result,
+	std::unordered_map<std::string, int>& textureCache, const std::string& path,
+	std::mutex& textureCacheMutex) {
+
+	// 1. Transform
+	glm::mat4 nodeTransform = aiMatrix4x4ToGlm(node->mTransformation);
+	glm::mat4 globalTransform = parentTransform * nodeTransform;
+	glm::mat3 normalMatrix = glm::transpose(glm::inverse(glm::mat3(globalTransform)));
+
+	for (unsigned int m = 0; m < node->mNumMeshes; ++m) {
+		const aiMesh* mesh = scene->mMeshes[node->mMeshes[m]];
+
+		uint32_t vertexOffset = static_cast<uint32_t>(result.vertices.size());
+		uint32_t indexOffset = static_cast<uint32_t>(result.indices.size());
+
+		SubmeshInfo info{};
+		info.vertexOffset = vertexOffset;
+		info.indexOffset = indexOffset;
+		info.indexCount = mesh->mNumFaces * 3;
+
+		// 2. Vertices
+		for (unsigned int i = 0; i < mesh->mNumVertices; ++i) {
+			Vertex vertex{};
+			glm::vec4 pos = globalTransform * glm::vec4(
+				mesh->mVertices[i].x,
+				mesh->mVertices[i].y,
+				mesh->mVertices[i].z,
+				1.0f
+			);
+			vertex.position = glm::vec3(pos);
+
+			if (mesh->HasNormals()) {
+				vertex.normal = glm::normalize(normalMatrix * glm::vec3(
+					mesh->mNormals[i].x,
+					mesh->mNormals[i].y,
+					mesh->mNormals[i].z
+				));
+			}
+			else {
+				vertex.normal = glm::vec3(0.0f, 1.0f, 0.0f);
+			}
+
+			if (mesh->HasTextureCoords(0)) {
+				vertex.texCoord = glm::vec2(
+					mesh->mTextureCoords[0][i].x,
+					mesh->mTextureCoords[0][i].y
+				);
+			}
+			else {
+				vertex.texCoord = glm::vec2(0.0f);
+			}
+
+			if (mesh->HasTangentsAndBitangents()) {
+				glm::vec3 T = glm::normalize(normalMatrix * glm::vec3(
+					mesh->mTangents[i].x,
+					mesh->mTangents[i].y,
+					mesh->mTangents[i].z
+				));
+				glm::vec3 B = glm::normalize(normalMatrix * glm::vec3(
+					mesh->mBitangents[i].x,
+					mesh->mBitangents[i].y,
+					mesh->mBitangents[i].z
+				));
+				glm::vec3 N = vertex.normal;
+				float handedness = (glm::dot(glm::cross(N, T), B) < 0.0f) ? -1.0f : 1.0f;
+				vertex.tangent = glm::vec4(T, handedness);
+			}
+			else {
+				vertex.tangent = glm::vec4(1.0f, 0.0f, 0.0f, 1.0f);
+			}
+
+			result.vertices.push_back(vertex);
+		}
+
+		// 3. Indices - Use correct winding order for OBJ
+		for (unsigned int i = 0; i < mesh->mNumFaces; ++i) {
+			const aiFace& face = mesh->mFaces[i];
+			if (face.mNumIndices != 3) continue;
+
+			// Standard winding order (CCW)
+			result.indices.push_back(face.mIndices[0]);
+			result.indices.push_back(face.mIndices[1]);
+			result.indices.push_back(face.mIndices[2]);
+		}
+
+		// 4. Materials - OBJ/MTL specific handling
+		if (mesh->mMaterialIndex < scene->mNumMaterials) {
+			aiMaterial* material = scene->mMaterials[mesh->mMaterialIndex];
+
+			// Get material name for debugging
+			aiString matName;
+			material->Get(AI_MATKEY_NAME, matName);
+
+			// A. Base Color/Diffuse Color
+			aiColor4D diffuseColor(1.0f, 1.0f, 1.0f, 1.0f);
+			if (AI_SUCCESS == aiGetMaterialColor(material, AI_MATKEY_COLOR_DIFFUSE, &diffuseColor)) {
+				info.material.baseColorFactor = glm::vec4(
+					diffuseColor.r,
+					diffuseColor.g,
+					diffuseColor.b,
+					diffuseColor.a
+				);
+			}
+
+			// B. Shininess to Roughness conversion (OBJ uses Ns for shininess)
+			float shininess = 0.0f;
+			if (AI_SUCCESS == aiGetMaterialFloat(material, AI_MATKEY_SHININESS, &shininess)) {
+				// Convert shininess (0-1000) to roughness (0-1)
+				// Higher shininess = lower roughness
+				info.material.roughnessFactor = 1.0f - glm::clamp(shininess / 1000.0f, 0.0f, 1.0f);
+			}
+			else {
+				info.material.roughnessFactor = 0.5f;
+			}
+
+			// C. OBJ doesn't have metallic, default to 0
+			info.material.metallicFactor = 0.0f;
+
+			// D. Diffuse/Albedo Texture (map_Kd in MTL)
+			{
+				aiString texPath;
+				// Try DIFFUSE first (standard OBJ)
+				if (material->GetTexture(aiTextureType_DIFFUSE, 0, &texPath) == AI_SUCCESS) {
+					std::string key = std::string("diffuse:") + texPath.C_Str();
+
+					std::lock_guard<std::mutex> lock(textureCacheMutex);
+					auto it = textureCache.find(key);
+					if (it != textureCache.end()) {
+						info.material.baseColorTextureIndex = it->second;
+					}
+					else {
+						TextureData tex = prepareObjTextureInfo(material, path, aiTextureType_DIFFUSE);
+						if (!tex.path.empty()) {
+							int newIdx = static_cast<int>(result.textureData.size());
+							tex.isLinear = false; // sRGB for color textures
+							result.textureData.push_back(tex);
+							textureCache[key] = newIdx;
+							info.material.baseColorTextureIndex = newIdx;
+						}
+					}
+				}
+			}
+
+			// E. Normal Map (map_Bump or map_Kn in MTL)
+			{
+				aiString texPath;
+				// Try NORMALS first, then HEIGHT (bump maps)
+				aiTextureType normalType = aiTextureType_NORMALS;
+				if (material->GetTextureCount(aiTextureType_NORMALS) == 0) {
+					normalType = aiTextureType_HEIGHT; // Bump map fallback
+				}
+
+				if (material->GetTexture(normalType, 0, &texPath) == AI_SUCCESS) {
+					std::string key = std::string("normal:") + texPath.C_Str();
+
+					std::lock_guard<std::mutex> lock(textureCacheMutex);
+					auto it = textureCache.find(key);
+					if (it != textureCache.end()) {
+						info.material.normalTextureIndex = it->second;
+					}
+					else {
+						TextureData tex = prepareObjTextureInfo(material, path, normalType);
+						if (!tex.path.empty()) {
+							int newIdx = static_cast<int>(result.textureData.size());
+							tex.isLinear = true; // Linear for normal maps
+							result.textureData.push_back(tex);
+							textureCache[key] = newIdx;
+							info.material.normalTextureIndex = newIdx;
+						}
+					}
+				}
+			}
+
+			// F. Specular Map (map_Ks in MTL) - Use as metallic-roughness approximation
+			{
+				aiString texPath;
+				if (material->GetTexture(aiTextureType_SPECULAR, 0, &texPath) == AI_SUCCESS) {
+					std::string key = std::string("specular:") + texPath.C_Str();
+
+					std::lock_guard<std::mutex> lock(textureCacheMutex);
+					auto it = textureCache.find(key);
+					if (it != textureCache.end()) {
+						info.material.metallicRoughnessTextureIndex = it->second;
+					}
+					else {
+						TextureData tex = prepareObjTextureInfo(material, path, aiTextureType_SPECULAR);
+						if (!tex.path.empty()) {
+							int newIdx = static_cast<int>(result.textureData.size());
+							tex.isLinear = true;
+							result.textureData.push_back(tex);
+							textureCache[key] = newIdx;
+							info.material.metallicRoughnessTextureIndex = newIdx;
+						}
+					}
+				}
+			}
+		}
+
+		result.submeshes.push_back(info);
+	}
+
+	// Recurse into children
+	for (unsigned int i = 0; i < node->mNumChildren; ++i) {
+		processNodeForObj(node->mChildren[i], scene, globalTransform, result, textureCache, path, textureCacheMutex);
+	}
+}
+
 Mesh loadWithAssimp(const std::string& path) {
 	Assimp::Importer importer;
 
-	const aiScene* scene = importer.ReadFile(
-		path,
-		aiProcess_Triangulate 
-		| aiProcess_FlipUVs 
-		| aiProcess_CalcTangentSpace 
-		| aiProcess_GenSmoothNormals
-		| aiProcess_GlobalScale
-	);
+	// Determine file extension
+	std::filesystem::path filePath(path);
+	std::string ext = filePath.extension().string();
+	std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+
+	bool isObjFile = (ext == ".obj");
+
+	// Configure import flags
+	unsigned int importFlags =
+		aiProcess_Triangulate |
+		aiProcess_CalcTangentSpace |
+		aiProcess_GenSmoothNormals |
+		aiProcess_JoinIdenticalVertices;
+
+	// OBJ-specific flags
+	if (isObjFile) {
+		// Don't flip UVs for OBJ - they typically have correct orientation
+		// Add optimization for large OBJ files
+		importFlags |= aiProcess_OptimizeMeshes;
+		importFlags |= aiProcess_OptimizeGraph;
+	}
+	else {
+		// For other formats (FBX, glTF via Assimp)
+		importFlags |= aiProcess_FlipUVs;
+		importFlags |= aiProcess_GlobalScale;
+	}
+
+	const aiScene* scene = importer.ReadFile(path, importFlags);
 
 	if (!scene || !scene->HasMeshes()) {
-		throw std::runtime_error("Failed to load model: " + path);
+		throw std::runtime_error("Failed to load model: " + path + "\nAssimp error: " + importer.GetErrorString());
 	}
+
+	std::cout << "Loading with Assimp: " << path << "\n";
+	std::cout << "  Meshes: " << scene->mNumMeshes << "\n";
+	std::cout << "  Materials: " << scene->mNumMaterials << "\n";
+	std::cout << "  Textures (embedded): " << scene->mNumTextures << "\n";
 
 	Mesh result;
 
+	// Pre-calculate total vertices/indices for reservation
 	size_t totalVerts = 0;
 	size_t totalIndices = 0;
-
-	// Calculate exact counts to prevent std::vector reallocation resizing
 	calculateTotalAssimpVertices(scene->mRootNode, scene, totalVerts, totalIndices);
 
 	result.vertices.reserve(totalVerts);
 	result.indices.reserve(totalIndices);
 
+	std::cout << "  Expected vertices: " << totalVerts << ", indices: " << totalIndices << "\n";
+
 	std::unordered_map<std::string, int> textureCache;
+	std::mutex textureCacheMutex;
 
-	// Start recursion from the root node with an identity matrix
-	processNode(scene->mRootNode, scene, glm::mat4(1.0f), result, textureCache, path);
+	// Process nodes based on file type
+	if (isObjFile) {
+		processNodeForObj(scene->mRootNode, scene, glm::mat4(1.0f), result, textureCache, path, textureCacheMutex);
+	}
+	else {
+		// Use original processNode for FBX/glTF
+		processNode(scene->mRootNode, scene, glm::mat4(1.0f), result, textureCache, path, textureCacheMutex);
+	}
 
-	// --- ADDED: Async Texture Decoding ---
+	std::cout << "  Loaded vertices: " << result.vertices.size() << ", indices: " << result.indices.size() << "\n";
+	std::cout << "  Submeshes: " << result.submeshes.size() << "\n";
+	std::cout << "  Textures to load: " << result.textureData.size() << "\n";
+
+	// Parallel texture decoding
 	if (!result.textureData.empty()) {
-		std::cout << "Decoding " << result.textureData.size() << " Assimp textures in parallel...\n";
+		std::cout << "Decoding " << result.textureData.size() << " textures in parallel...\n";
+
+		// Use hardware concurrency for thread count
+		unsigned int numThreads = std::thread::hardware_concurrency();
+		if (numThreads == 0) numThreads = 4;
 
 		std::vector<std::future<void>> futures;
 		futures.reserve(result.textureData.size());
 
-		for (auto& tex : result.textureData) {
-			futures.push_back(std::async(std::launch::async, [&tex]() {
+		// Track progress
+		std::atomic<int> loadedCount{ 0 };
+		int totalTextures = static_cast<int>(result.textureData.size());
+
+		for (size_t i = 0; i < result.textureData.size(); ++i) {
+			futures.push_back(std::async(std::launch::async, [&result, i, &loadedCount, totalTextures]() {
+				TextureData& tex = result.textureData[i];
 				decodeTextureParallel(tex);
+
+				int loaded = ++loadedCount;
+				if (loaded % 10 == 0 || loaded == totalTextures) {
+					std::cout << "  Texture progress: " << loaded << "/" << totalTextures << "\n";
+				}
 				}));
 		}
 
+		// Wait for all texture loads to complete
 		for (auto& f : futures) {
 			f.wait();
 		}
+
+		std::cout << "All textures decoded.\n";
 	}
 
 	return result;
@@ -1359,7 +1731,8 @@ int main()
 		// model = loadWithAssimp("models/sponza-palace/source/scene.glb");
 		// model = loadWithFastGltf("models/sponza-palace/source/scene.glb");
 		// model = loadWithAssimp("models/main_sponza/NewSponza_Main_glTF_003.gltf");
-		model = loadWithFastGltf("models/main_sponza/NewSponza_Main_glTF_003.gltf");
+		// model = loadWithFastGltf("models/main_sponza/NewSponza_Main_glTF_003.gltf");
+		model = loadWithAssimp("models/tomsk_school/tomsk_school.obj");
 		// model = loadWithAssimp("models/main_sponza/NewSponza_Main_Yup_003.fbx");
 		// model = loadWithAssimp("models/london-city/source/traffic_slam_2_map.glb");
 		// model = loadWithAssimp("models/dae-diorama-grandmas-house/source/Dae_diorama_upload/Dae_diorama_upload.fbx");
