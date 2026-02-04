@@ -26,6 +26,7 @@
 #include <fastgltf/glm_element_traits.hpp>
 #include <fastgltf/tools.hpp>
 #include <future>
+#define IMGUI_IMPL_VULKAN_NO_PROTOTYPES
 #include "imgui.h"
 #include "backends/imgui_impl_sdl3.h"
 #include "backends/imgui_impl_vulkan.h"
@@ -591,6 +592,11 @@ TextureData prepareTextureInfo(const fastgltf::Asset& asset, const fastgltf::Ima
 			auto& buffer = asset.buffers[bufferView.bufferIndex];
 
 			std::visit(fastgltf::visitor{
+				[&](const fastgltf::sources::Vector& bufferVector) {
+					texData.encodedData = reinterpret_cast<const unsigned char*>(bufferVector.bytes.data() + bufferView.byteOffset);
+					texData.encodedSize = bufferView.byteLength;
+				},
+				// Handle "Array" just in case (older versions or specific configs)
 				[&](const fastgltf::sources::Array& bufferArray) {
 					texData.encodedData = reinterpret_cast<const unsigned char*>(bufferArray.bytes.data() + bufferView.byteOffset);
 					texData.encodedSize = bufferView.byteLength;
@@ -1580,31 +1586,75 @@ void processFastGltfNode(fastgltf::Asset& asset, size_t nodeIndex, const glm::ma
 				for (size_t i = 0; i < posAccessor.count; ++i) localIndices.push_back((uint32_t)i);
 			}
 
-			// === DATA ARRAYS (Read into Safe Types) ===
+			// === DATA ARRAYS ===
 			size_t vCount = posAccessor.count;
 			std::vector<glm::vec3> positions(vCount);
+			// Initialize with 0
 			std::vector<glm::vec3> normals(vCount, glm::vec3(0.0f));
 			std::vector<glm::vec2> texcoords(vCount, glm::vec2(0.0f));
-			std::vector<glm::vec4> tangents(vCount, glm::vec4(0.0f));
+			// Initialize tangents to valid vector to avoid NaN in normalization later
+			std::vector<glm::vec4> tangents(vCount, glm::vec4(1.0f, 0.0f, 0.0f, 1.0f));
 
-			// Use fastgltf types for reading to ensure binary safety, then cast to GLM
+			// Load Positions
 			fastgltf::iterateAccessorWithIndex<fastgltf::math::fvec3>(asset, posAccessor,
 				[&](fastgltf::math::fvec3 v, size_t i) {
 					positions[i] = glm::vec3(v.x(), v.y(), v.z());
 				});
 
+			// Load Normals (if they exist)
+			bool hasNormals = false;
 			if (auto it = primitive.findAttribute("NORMAL"); it != primitive.attributes.end()) {
+				hasNormals = true;
 				fastgltf::iterateAccessorWithIndex<fastgltf::math::fvec3>(asset, asset.accessors[it->accessorIndex],
 					[&](fastgltf::math::fvec3 v, size_t i) {
 						normals[i] = glm::vec3(v.x(), v.y(), v.z());
 					});
 			}
+
+			// === GENERATE NORMALS IF MISSING ===
+			if (!hasNormals) {
+				// Iterate over triangles to calculate face normals
+				for (size_t i = 0; i < localIndices.size(); i += 3) {
+					// Protect against out of bounds if index count isn't multiple of 3
+					if (i + 2 >= localIndices.size()) break;
+
+					uint32_t i0 = localIndices[i];
+					uint32_t i1 = localIndices[i + 1];
+					uint32_t i2 = localIndices[i + 2];
+
+					glm::vec3 p0 = positions[i0];
+					glm::vec3 p1 = positions[i1];
+					glm::vec3 p2 = positions[i2];
+
+					glm::vec3 edge1 = p1 - p0;
+					glm::vec3 edge2 = p2 - p0;
+					// Cross product gives the normal perpendicular to the face
+					glm::vec3 faceNormal = glm::normalize(glm::cross(edge1, edge2));
+
+					// Accumulate normals (smooth shading approximation)
+					normals[i0] += faceNormal;
+					normals[i1] += faceNormal;
+					normals[i2] += faceNormal;
+				}
+
+				// Normalize results
+				for (auto& n : normals) {
+					if (glm::length(n) > 0.0001f)
+						n = glm::normalize(n);
+					else
+						n = glm::vec3(0.0f, 1.0f, 0.0f); // Fallback
+				}
+			}
+
+			// Load UVs
 			if (auto it = primitive.findAttribute("TEXCOORD_0"); it != primitive.attributes.end()) {
 				fastgltf::iterateAccessorWithIndex<fastgltf::math::fvec2>(asset, asset.accessors[it->accessorIndex],
 					[&](fastgltf::math::fvec2 v, size_t i) {
 						texcoords[i] = glm::vec2(v.x(), v.y());
 					});
 			}
+
+			// Load Tangents
 			if (auto it = primitive.findAttribute("TANGENT"); it != primitive.attributes.end()) {
 				fastgltf::iterateAccessorWithIndex<fastgltf::math::fvec4>(asset, asset.accessors[it->accessorIndex],
 					[&](fastgltf::math::fvec4 v, size_t i) {
@@ -1616,19 +1666,30 @@ void processFastGltfNode(fastgltf::Asset& asset, size_t nodeIndex, const glm::ma
 			for (size_t i = 0; i < vCount; ++i) {
 				Vertex v{};
 				v.position = glm::vec3(globalTransform * glm::vec4(positions[i], 1.0f));
+
+				// Apply Normal Matrix
 				v.normal = glm::normalize(normalMatrix * normals[i]);
+
+				// Handle Tangents safely
 				glm::vec3 tXYZ = glm::vec3(tangents[i]);
-				glm::vec3 transformedTangent = glm::normalize(normalMatrix * tXYZ);
-				v.tangent = glm::vec4(transformedTangent, tangents[i].w);
+				// Only normalize if length is valid to prevent NaN
+				if (glm::length(tXYZ) > 0.0001f) {
+					glm::vec3 transformedTangent = glm::normalize(normalMatrix * tXYZ);
+					v.tangent = glm::vec4(transformedTangent, tangents[i].w);
+				}
+				else {
+					v.tangent = glm::vec4(1.0f, 0.0f, 0.0f, 1.0f);
+				}
+
 				v.texCoord = texcoords[i];
 				result.vertices.push_back(v);
 			}
 
 			for (uint32_t idx : localIndices) {
-				result.indices.push_back(idx); //+ sub.vertexOffset);
+				result.indices.push_back(idx);
 			}
 
-			// === MATERIALS ===
+			// === MATERIALS (Existing logic) ===
 			if (primitive.materialIndex.has_value()) {
 				const auto& material = asset.materials[primitive.materialIndex.value()];
 				auto& pbr = material.pbrData;
@@ -1651,23 +1712,19 @@ void processFastGltfNode(fastgltf::Asset& asset, size_t nodeIndex, const glm::ma
 					break;
 				}
 
-				// If base color has alpha < 1.0 and mode is opaque, 
-				// consider it as blend mode
 				if (sub.material.alphaMode == AlphaMode::OPAQUE &&
 					sub.material.baseColorFactor.a < 0.99f) {
 					sub.material.alphaMode = AlphaMode::BLEND;
 				}
 
-				// 1. Base Color Texture
+				// Texture loading logic (same as your previous code)
 				if (pbr.baseColorTexture.has_value() && asset.textures[pbr.baseColorTexture.value().textureIndex].imageIndex.has_value()) {
 					size_t imgIdx = asset.textures[pbr.baseColorTexture.value().textureIndex].imageIndex.value();
 					std::string key = "base:" + std::to_string(imgIdx);
-
 					if (textureCache.find(key) != textureCache.end()) {
 						sub.material.baseColorTextureIndex = textureCache[key];
 					}
 					else {
-						// LOAD TEXTURE HERE
 						TextureData tex = prepareTextureInfo(asset, asset.images[imgIdx], path);
 						if (!tex.path.empty() || tex.encodedData != nullptr) {
 							int newIdx = (int)result.textureData.size();
@@ -1678,16 +1735,13 @@ void processFastGltfNode(fastgltf::Asset& asset, size_t nodeIndex, const glm::ma
 					}
 				}
 
-				// 2. Normal Texture
 				if (material.normalTexture.has_value() && asset.textures[material.normalTexture.value().textureIndex].imageIndex.has_value()) {
 					size_t imgIdx = asset.textures[material.normalTexture.value().textureIndex].imageIndex.value();
 					std::string key = "norm:" + std::to_string(imgIdx);
-
 					if (textureCache.find(key) != textureCache.end()) {
 						sub.material.normalTextureIndex = textureCache[key];
 					}
 					else {
-						// LOAD TEXTURE HERE
 						TextureData tex = prepareTextureInfo(asset, asset.images[imgIdx], path);
 						tex.isLinear = true;
 						if (!tex.path.empty() || tex.encodedData != nullptr) {
@@ -1699,13 +1753,11 @@ void processFastGltfNode(fastgltf::Asset& asset, size_t nodeIndex, const glm::ma
 					}
 				}
 
-				// 3. Metallic-Roughness (NEW)
 				if (pbr.metallicRoughnessTexture.has_value()) {
 					size_t texIndex = pbr.metallicRoughnessTexture.value().textureIndex;
 					if (asset.textures[texIndex].imageIndex.has_value()) {
 						size_t imgIdx = asset.textures[texIndex].imageIndex.value();
 						std::string key = "mr:" + std::to_string(imgIdx);
-
 						if (textureCache.find(key) != textureCache.end()) {
 							sub.material.metallicRoughnessTextureIndex = textureCache[key];
 						}
@@ -1884,6 +1936,8 @@ int main()
 		// model = loadWithAssimp("models/main_sponza/NewSponza_Main_glTF_003.gltf");
 		// model = loadWithFastGltf("models/main_sponza/NewSponza_Main_glTF_003.gltf");
 		model = loadWithAssimp("models/tomsk_school/tomsk_school.obj");
+		// model = loadWithFastGltf("models/tree/tree.glb");
+		// model = loadWithFastGltf("models/bus_stop/Untitled.glb");
 		// model = loadWithAssimp("models/main_sponza/NewSponza_Main_Yup_003.fbx");
 		// model = loadWithAssimp("models/london-city/source/traffic_slam_2_map.glb");
 		// model = loadWithAssimp("models/dae-diorama-grandmas-house/source/Dae_diorama_upload/Dae_diorama_upload.fbx");
@@ -2617,6 +2671,84 @@ int main()
 
 		std::cout << "Pipeline layouts created successfully\n";
 
+		// ============================================
+// IMGUI SETUP - For ImGui v1.92.5-docking
+// ============================================
+
+// Create descriptor pool for ImGui
+		VkDescriptorPoolSize imguiPoolSizes[] = {
+			{ VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1 }
+		};
+
+		VkDescriptorPoolCreateInfo imguiPoolInfo = {};
+		imguiPoolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+		imguiPoolInfo.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
+		imguiPoolInfo.maxSets = 1;
+		imguiPoolInfo.poolSizeCount = 1;
+		imguiPoolInfo.pPoolSizes = imguiPoolSizes;
+
+		VkDescriptorPool imguiDescriptorPool;
+		if (vkCreateDescriptorPool(vkDevice, &imguiPoolInfo, nullptr, &imguiDescriptorPool) != VK_SUCCESS) {
+			throw std::runtime_error("Failed to create ImGui descriptor pool");
+		}
+
+		// Initialize ImGui
+		IMGUI_CHECKVERSION();
+		ImGui::CreateContext();
+		ImGuiIO& io = ImGui::GetIO();
+		io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+		io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
+
+		ImGui::StyleColorsDark();
+
+		// Setup Platform/Renderer backends
+		ImGui_ImplSDL3_InitForVulkan(window);
+
+		// Setup PipelineRenderingCreateInfo for dynamic rendering
+		VkFormat colorFormat = VK_FORMAT_B8G8R8A8_SRGB;
+
+		VkPipelineRenderingCreateInfoKHR pipelineRenderingInfo = {};
+		pipelineRenderingInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO_KHR;
+		pipelineRenderingInfo.colorAttachmentCount = 1;
+		pipelineRenderingInfo.pColorAttachmentFormats = &colorFormat;
+		pipelineRenderingInfo.depthAttachmentFormat = VK_FORMAT_UNDEFINED;  // No depth for ImGui overlay
+		pipelineRenderingInfo.stencilAttachmentFormat = VK_FORMAT_UNDEFINED;
+
+		// Zero-initialize as required
+		ImGui_ImplVulkan_InitInfo initInfo = {};
+		initInfo.ApiVersion = VK_API_VERSION_1_4;  // Or VK_API_VERSION_1_3
+		initInfo.Instance = vkInstance;
+		initInfo.PhysicalDevice = vkbPhys.physical_device;
+		initInfo.Device = vkDevice;
+		initInfo.QueueFamily = graphicsQueueIndex;
+		initInfo.Queue = VkQueue(graphicsQueue);
+		initInfo.DescriptorPool = imguiDescriptorPool;
+		initInfo.MinImageCount = swapchainImageCount;
+		initInfo.ImageCount = swapchainImageCount;
+
+		// Dynamic rendering setup
+		initInfo.UseDynamicRendering = true;
+		initInfo.PipelineInfoMain.RenderPass = VK_NULL_HANDLE;
+		initInfo.PipelineInfoMain.Subpass = 0;
+		initInfo.PipelineInfoMain.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
+		initInfo.PipelineInfoMain.PipelineRenderingCreateInfo = pipelineRenderingInfo;
+
+		// VkInstance inst = vkInstance;
+		auto testFn = vkGetInstanceProcAddr(vkInstance, "vkCmdBeginRendering");
+		std::cout << "vkCmdBeginRendering address: " << (void*)testFn << std::endl;
+
+		if (testFn == nullptr) {
+			std::cerr << "ERROR: vkGetInstanceProcAddr returns null for vkCmdBeginRendering!\n";
+		}
+
+		ImGui_ImplVulkan_LoadFunctions(VK_API_VERSION_1_4, [](const char* function_name, void* user_data) {
+			return vkGetInstanceProcAddr((VkInstance)user_data, function_name);
+			}, vkInstance);
+
+		ImGui_ImplVulkan_Init(&initInfo);
+
+		std::cout << "ImGui v1.92.5-docking initialized successfully!\n";
+
 		// ------------------------
 		// 8. Main loop
 		// ------------------------
@@ -2637,50 +2769,104 @@ int main()
 			float dt = (currentTime - lastTime) / 1000.0f; // convert ms to seconds
 			lastTime = currentTime;
 			while (SDL_PollEvent(&event)) {
+				// Let ImGui process events FIRST
+				ImGui_ImplSDL3_ProcessEvent(&event);
+
+				// Get IO to check if ImGui wants input
+				ImGuiIO& imguiIO = ImGui::GetIO();
+
 				bool shiftHeld =
 					(event.key.mod & SDL_KMOD_LSHIFT) ||
 					(event.key.mod & SDL_KMOD_RSHIFT);
 				const bool* keys = SDL_GetKeyboardState(nullptr);
-				if (event.type == SDL_EVENT_QUIT || keys[SDL_SCANCODE_ESCAPE])
+
+				if (event.type == SDL_EVENT_QUIT)
 					running = false;
 
-				if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat) {
-					if (event.key.scancode == SDL_SCANCODE_ESCAPE)
-						running = false;
+				// Only handle keyboard if ImGui doesn't want it
+				if (!imguiIO.WantCaptureKeyboard) {
+					if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat) {
+						if (event.key.scancode == SDL_SCANCODE_ESCAPE)
+							running = false;
 
-
-					if (shiftHeld) {
-						cameraAmpilfier = 4.0f;
-						if(event.key.scancode == SDL_SCANCODE_GRAVE) {
-							mouseEnabled = !mouseEnabled;
-							SDL_SetWindowRelativeMouseMode(window, mouseEnabled);
+						if (shiftHeld) {
+							cameraAmpilfier = 4.0f;
+							if (event.key.scancode == SDL_SCANCODE_GRAVE) {
+								mouseEnabled = !mouseEnabled;
+								SDL_SetWindowRelativeMouseMode(window, mouseEnabled);
+							}
 						}
 					}
+					if (event.type == SDL_EVENT_KEY_UP && !event.key.repeat) {
+						if (!shiftHeld)
+							cameraAmpilfier = 1.0f;
+					}
 				}
-				if (event.type == SDL_EVENT_KEY_UP && !event.key.repeat) {
-					if (!shiftHeld)
-						cameraAmpilfier = 1.0f;
-				}
-				if (mouseEnabled && event.type == SDL_EVENT_MOUSE_MOTION) {
-					camera.yaw += event.motion.xrel * camera.sensitivity;
-					camera.pitch -= event.motion.yrel * camera.sensitivity;
-					camera.pitch = glm::clamp(camera.pitch, -89.0f, 89.0f);
+
+				// Only handle mouse if ImGui doesn't want it
+				if (!imguiIO.WantCaptureMouse) {
+					if (mouseEnabled && event.type == SDL_EVENT_MOUSE_MOTION) {
+						camera.yaw += event.motion.xrel * camera.sensitivity;
+						camera.pitch -= event.motion.yrel * camera.sensitivity;
+						camera.pitch = glm::clamp(camera.pitch, -89.0f, 89.0f);
+					}
 				}
 			}
-			const bool* keys = SDL_GetKeyboardState(nullptr);
-			glm::vec3 front{
-				cos(glm::radians(camera.yaw)) * cos(glm::radians(camera.pitch)),
-				sin(glm::radians(camera.pitch)),
-				sin(glm::radians(camera.yaw)) * cos(glm::radians(camera.pitch))
-			};
-			front = glm::normalize(front);
 
-			glm::vec3 right = glm::normalize(glm::cross(front, glm::vec3(0, 1, 0)));
+			// Camera movement - only if ImGui doesn't want keyboard
+			ImGuiIO& imguiIO = ImGui::GetIO();
+			if (!imguiIO.WantCaptureKeyboard) {
+				const bool* keys = SDL_GetKeyboardState(nullptr);
+				glm::vec3 front{
+					cos(glm::radians(camera.yaw)) * cos(glm::radians(camera.pitch)),
+					sin(glm::radians(camera.pitch)),
+					sin(glm::radians(camera.yaw)) * cos(glm::radians(camera.pitch))
+				};
+				front = glm::normalize(front);
+				glm::vec3 right = glm::normalize(glm::cross(front, glm::vec3(0, 1, 0)));
 
-			if (keys[SDL_SCANCODE_W]) camera.position += front * camera.speed * dt * cameraAmpilfier;
-			if (keys[SDL_SCANCODE_A]) camera.position -= right * camera.speed * dt * cameraAmpilfier;
-			if (keys[SDL_SCANCODE_D]) camera.position += right * camera.speed * dt * cameraAmpilfier;
-			if (keys[SDL_SCANCODE_S]) camera.position -= front * camera.speed * dt * cameraAmpilfier;
+				if (keys[SDL_SCANCODE_W]) camera.position += front * camera.speed * dt * cameraAmpilfier;
+				if (keys[SDL_SCANCODE_A]) camera.position -= right * camera.speed * dt * cameraAmpilfier;
+				if (keys[SDL_SCANCODE_D]) camera.position += right * camera.speed * dt * cameraAmpilfier;
+				if (keys[SDL_SCANCODE_S]) camera.position -= front * camera.speed * dt * cameraAmpilfier;
+			}
+			// ImGUI
+			ImGui_ImplVulkan_NewFrame();
+			ImGui_ImplSDL3_NewFrame();
+			ImGui::NewFrame();
+
+			// ============================================
+			// IMGUI WIDGETS - Your Hello World Window
+			// ============================================
+			ImGui::Begin("Hello World!");
+
+			ImGui::Text("Welcome to Dear ImGui with Vulkan!");
+			ImGui::Separator();
+
+			// Some example widgets
+			static char textBuffer[256] = "Hello, World!";
+			ImGui::InputText("Edit me", textBuffer, sizeof(textBuffer));
+
+			static float sliderValue = 0.5f;
+			ImGui::SliderFloat("Slider", &sliderValue, 0.0f, 1.0f);
+
+			static int clickCount = 0;
+			if (ImGui::Button("Click me!")) {
+				clickCount++;
+			}
+			ImGui::SameLine();
+			ImGui::Text("Clicked %d times", clickCount);
+
+			ImGui::Separator();
+			ImGui::Text("Camera: (%.2f, %.2f, %.2f)",
+				camera.position.x, camera.position.y, camera.position.z);
+			ImGui::Text("FPS: %.1f", ImGui::GetIO().Framerate);
+
+			ImGui::End();
+
+			// Finalize ImGui frame (must call before RenderDrawData)
+			ImGui::Render();
+			ImDrawData* drawData = ImGui::GetDrawData();
 	
 			vk::SwapchainKHR swapchainHPP(vkbSwapchain.swapchain);
 
@@ -3081,6 +3267,26 @@ int main()
 
 			cmd.endRendering();
 
+			{
+				// Begin new rendering pass for ImGui overlay
+				vk::RenderingAttachmentInfo imguiColorAttachment{};
+				imguiColorAttachment.setImageView(swapchainImageViews[imageIndex])
+					.setImageLayout(vk::ImageLayout::eColorAttachmentOptimal)
+					.setLoadOp(vk::AttachmentLoadOp::eLoad)   // LOAD to preserve scene!
+					.setStoreOp(vk::AttachmentStoreOp::eStore);
+
+				vk::RenderingInfo imguiRenderInfo{};
+				imguiRenderInfo.setRenderArea({ {0, 0}, {1280, 720} })
+					.setLayerCount(1)
+					.setColorAttachments(imguiColorAttachment);
+
+				cmd.beginRendering(imguiRenderInfo);
+
+				// Record ImGui draw commands
+				ImGui_ImplVulkan_RenderDrawData(drawData, cmd);
+
+				cmd.endRendering();
+			}
 
 			// Transition from COLOR_ATTACHMENT_OPTIMAL to PRESENT_SRC_KHR
 			layoutBarrier.setSrcStageMask(vk::PipelineStageFlagBits2::eColorAttachmentOutput)
@@ -3134,6 +3340,11 @@ int main()
 			time += 0.001f;
 		}
 		(void)device.waitIdle();
+
+		ImGui_ImplVulkan_Shutdown();
+		ImGui_ImplSDL3_Shutdown();
+		ImGui::DestroyContext();
+		vkDestroyDescriptorPool(vkDevice, imguiDescriptorPool, nullptr);
 
 		if (device)
 		{

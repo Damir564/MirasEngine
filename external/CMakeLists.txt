@@ -120,6 +120,8 @@ FetchContent_Declare(
 
 set(FASTGLTF_COMPILE_AS_CPP20 ON CACHE BOOL "" FORCE)
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+
+add_compile_definitions(IMGUI_IMPL_VULKAN_NO_PROTOTYPES)
 # ============================
 # Make everything available
 # ============================
