@@ -25,6 +25,7 @@ target_link_libraries(engine PRIVATE
     assimp
     stb_image
     fastgltf::fastgltf
+    imgui
 )
 
 

@@ -26,6 +26,9 @@
 #include <fastgltf/glm_element_traits.hpp>
 #include <fastgltf/tools.hpp>
 #include <future>
+#include "imgui.h"
+#include "backends/imgui_impl_sdl3.h"
+#include "backends/imgui_impl_vulkan.h"
 
 struct Camera {
 	glm::vec3 position{ 0.0f, 0.0f, 0.0f };

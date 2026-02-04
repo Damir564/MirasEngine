@@ -111,6 +111,13 @@ FetchContent_Declare(
     GIT_SHALLOW TRUE
 )
 
+FetchContent_Declare(
+    imgui
+    GIT_REPOSITORY https://github.com/ocornut/imgui.git
+    GIT_TAG v1.92.5-docking
+    GIT_SHALLOW TRUE
+)
+
 set(FASTGLTF_COMPILE_AS_CPP20 ON CACHE BOOL "" FORCE)
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 # ============================
@@ -126,8 +133,24 @@ FetchContent_MakeAvailable(
   assimp
   stb
   fastgltf
+  imgui
 )
 
+add_library(imgui STATIC
+    ${imgui_SOURCE_DIR}/imgui.cpp
+    ${imgui_SOURCE_DIR}/imgui_demo.cpp
+    ${imgui_SOURCE_DIR}/imgui_draw.cpp
+    ${imgui_SOURCE_DIR}/imgui_tables.cpp
+    ${imgui_SOURCE_DIR}/imgui_widgets.cpp
+    # Add the specific backends for your stack
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_sdl3.cpp
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_vulkan.cpp
+)
+
+target_include_directories(imgui PUBLIC
+    ${imgui_SOURCE_DIR}           # For "imgui.h"
+    ${imgui_SOURCE_DIR}/backends  # For "imgui_impl_sdl3.h" etc
+)
 
 add_library(stb_image STATIC
     stb_image.cpp
@@ -135,4 +158,9 @@ add_library(stb_image STATIC
 
 target_include_directories(stb_image
     PUBLIC ${stb_SOURCE_DIR}
+)
+
+target_link_libraries(imgui PUBLIC
+    SDL3::SDL3
+    Vulkan::Headers 
 )
