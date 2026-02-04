@@ -490,15 +490,21 @@ struct TextureData {
 	const unsigned char* encodedData = nullptr;
 	size_t encodedSize = 0;
 
-	// Helper to free CPU memory
+	bool fromCache = false;
+
+	bool isLinear = false;
+
 	void free() {
 		if (pixels) {
-			stbi_image_free(pixels);
+			if (fromCache) {
+				::free(pixels); // Standard C free
+			}
+			else {
+				stbi_image_free(pixels); // STB free
+			}
 			pixels = nullptr;
 		}
 	}
-
-	bool isLinear = false;
 };
 
 void decodeTextureParallel(TextureData& tex) {
@@ -793,6 +799,113 @@ struct Mesh {
 	std::vector<uint32_t> indices;
 	std::vector<SubmeshInfo> submeshes;
 	std::vector<TextureData> textureData;
+};
+
+struct ModelCacheHeader {
+	uint32_t magic = 0x564B4D44; // "VKMD"
+	uint32_t version = 2;        // Version 2 (includes textures)
+	uint64_t vertexCount;
+	uint64_t indexCount;
+	uint64_t submeshCount;
+	uint64_t textureCount;
+};
+
+class ModelSerializer {
+public:
+	static bool IsCacheValid(const std::string& sourcePath, const std::string& cachePath) {
+		namespace fs = std::filesystem;
+		if (!fs::exists(cachePath)) return false;
+		if (!fs::exists(sourcePath)) return false;
+		return fs::last_write_time(cachePath) > fs::last_write_time(sourcePath);
+	}
+
+	static bool SaveToCache(const std::string& cachePath, const Mesh& model) {
+		std::ofstream file(cachePath, std::ios::binary);
+		if (!file.is_open()) return false;
+
+		ModelCacheHeader header{};
+		header.vertexCount = model.vertices.size();
+		header.indexCount = model.indices.size();
+		header.submeshCount = model.submeshes.size();
+		header.textureCount = model.textureData.size();
+
+		file.write(reinterpret_cast<const char*>(&header), sizeof(header));
+
+		if (header.vertexCount > 0)
+			file.write(reinterpret_cast<const char*>(model.vertices.data()), header.vertexCount * sizeof(Vertex));
+		if (header.indexCount > 0)
+			file.write(reinterpret_cast<const char*>(model.indices.data()), header.indexCount * sizeof(uint32_t));
+		if (header.submeshCount > 0)
+			file.write(reinterpret_cast<const char*>(model.submeshes.data()), header.submeshCount * sizeof(SubmeshInfo));
+
+		// Save Textures (Raw Decoded Data)
+		// This makes the cache file large, but load time is essentially disk read speed (0 cpu decode)
+		for (const auto& tex : model.textureData) {
+			file.write(reinterpret_cast<const char*>(&tex.width), sizeof(int));
+			file.write(reinterpret_cast<const char*>(&tex.height), sizeof(int));
+			file.write(reinterpret_cast<const char*>(&tex.channels), sizeof(int));
+
+			bool linear = tex.isLinear;
+			file.write(reinterpret_cast<const char*>(&linear), sizeof(bool));
+
+			// Save raw pixels
+			size_t dataSize = tex.width * tex.height * 4; // We force 4 channels in loader
+			if (tex.pixels) {
+				file.write(reinterpret_cast<const char*>(tex.pixels), dataSize);
+			}
+			else {
+				// Should not happen if decodeTextureParallel ran, but handle gracefully
+				std::vector<unsigned char> dummy(dataSize, 255);
+				file.write(reinterpret_cast<const char*>(dummy.data()), dataSize);
+			}
+		}
+
+		file.close();
+		return true;
+	}
+
+	static bool LoadFromCache(const std::string& cachePath, Mesh& outModel) {
+		std::ifstream file(cachePath, std::ios::binary);
+		if (!file.is_open()) return false;
+
+		ModelCacheHeader header{};
+		file.read(reinterpret_cast<char*>(&header), sizeof(header));
+
+		if (header.magic != 0x564B4D44 || header.version != 2) return false;
+
+		outModel.vertices.resize(header.vertexCount);
+		outModel.indices.resize(header.indexCount);
+		outModel.submeshes.resize(header.submeshCount);
+		outModel.textureData.resize(header.textureCount);
+
+		if (header.vertexCount > 0)
+			file.read(reinterpret_cast<char*>(outModel.vertices.data()), header.vertexCount * sizeof(Vertex));
+		if (header.indexCount > 0)
+			file.read(reinterpret_cast<char*>(outModel.indices.data()), header.indexCount * sizeof(uint32_t));
+		if (header.submeshCount > 0)
+			file.read(reinterpret_cast<char*>(outModel.submeshes.data()), header.submeshCount * sizeof(SubmeshInfo));
+
+		// Load Textures
+		for (size_t i = 0; i < header.textureCount; i++) {
+			TextureData& tex = outModel.textureData[i];
+			file.read(reinterpret_cast<char*>(&tex.width), sizeof(int));
+			file.read(reinterpret_cast<char*>(&tex.height), sizeof(int));
+			file.read(reinterpret_cast<char*>(&tex.channels), sizeof(int));
+
+			bool linear;
+			file.read(reinterpret_cast<char*>(&linear), sizeof(bool));
+			tex.isLinear = linear;
+
+			size_t dataSize = tex.width * tex.height * 4;
+			tex.pixels = (unsigned char*)malloc(dataSize); // standard malloc, free later
+			tex.fromCache = true;
+			file.read(reinterpret_cast<char*>(tex.pixels), dataSize);
+
+			// We don't restore 'path' or 'encodedData' because we have the raw pixels now
+		}
+
+		return true;
+	}
 };
 
 TextureData prepareAssimpTextureInfo(const aiScene* scene, const aiMaterial* mat, const std::string& modelPath, aiTextureType type) {
@@ -1904,6 +2017,57 @@ std::vector<RenderSubmesh> sortSubmeshesForRendering(
 	return renderList;
 }
 
+Mesh loadModelSmart(const std::string& path) {
+	std::string cachePath = path + ".cache";
+	Mesh result;
+	bool loadedFromCache = false;
+
+	// 1. Try Cache
+	if (ModelSerializer::IsCacheValid(path, cachePath)) {
+		std::cout << "[CACHE] Found valid cache for: " << path << ". Loading... ";
+		auto start = std::chrono::high_resolution_clock::now();
+
+		if (ModelSerializer::LoadFromCache(cachePath, result)) {
+			auto end = std::chrono::high_resolution_clock::now();
+			std::chrono::duration<float, std::milli> duration = end - start;
+			std::cout << "Done (" << duration.count() << "ms)\n";
+			loadedFromCache = true;
+		}
+		else {
+			std::cout << "Failed (Corruption?)\n";
+		}
+	}
+
+	// 2. Fallback to Parse
+	if (!loadedFromCache) {
+		std::cout << "[PARSE] Parsing source file: " << path << " ...\n";
+
+		std::filesystem::path p(path);
+		std::string ext = p.extension().string();
+		std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+
+		if (ext == ".gltf" || ext == ".glb") {
+			// Prefer FastGLTF for GLTF/GLB (if implemented)
+			result = loadWithFastGltf(path); // Uncomment if FastGLTF functions are defined
+			// result = loadWithAssimp(path);    // Fallback to Assimp for now based on snippet availability
+		}
+		else {
+			result = loadWithAssimp(path);
+		}
+
+		// 3. Save to Cache (Result has decoded textures now)
+		std::cout << "[CACHE] Saving cache to: " << cachePath << " ... ";
+		if (ModelSerializer::SaveToCache(cachePath, result)) {
+			std::cout << "Done.\n";
+		}
+		else {
+			std::cout << "Failed.\n";
+		}
+	}
+
+	return result;
+}
+
 int main()
 {
 	// ------------------------
@@ -1931,11 +2095,12 @@ int main()
 
 	Mesh model;
 	try {
+		model = loadModelSmart("models/tomsk_school/tomsk_school.obj");
 		// model = loadWithAssimp("models/sponza-palace/source/scene.glb");
 		// model = loadWithFastGltf("models/sponza-palace/source/scene.glb");
 		// model = loadWithAssimp("models/main_sponza/NewSponza_Main_glTF_003.gltf");
 		// model = loadWithFastGltf("models/main_sponza/NewSponza_Main_glTF_003.gltf");
-		model = loadWithAssimp("models/tomsk_school/tomsk_school.obj");
+		// model = loadWithAssimp("models/tomsk_school/tomsk_school.obj");
 		// model = loadWithFastGltf("models/tree/tree.glb");
 		// model = loadWithFastGltf("models/bus_stop/Untitled.glb");
 		// model = loadWithAssimp("models/main_sponza/NewSponza_Main_Yup_003.fbx");
