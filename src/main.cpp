@@ -3226,8 +3226,8 @@ int main()
 
 			// Transition depth image
 			vk::ImageMemoryBarrier2 depthBarrier{};
-			depthBarrier.setSrcStageMask(vk::PipelineStageFlagBits2::eTopOfPipe)
-				.setSrcAccessMask(vk::AccessFlagBits2::eNone)
+			depthBarrier.setSrcStageMask(vk::PipelineStageFlagBits2::eEarlyFragmentTests | vk::PipelineStageFlagBits2::eLateFragmentTests)
+				.setSrcAccessMask(vk::AccessFlagBits2::eDepthStencilAttachmentWrite)
 				.setDstStageMask(vk::PipelineStageFlagBits2::eEarlyFragmentTests)
 				.setDstAccessMask(vk::AccessFlagBits2::eDepthStencilAttachmentWrite)
 				.setOldLayout(vk::ImageLayout::eUndefined)
