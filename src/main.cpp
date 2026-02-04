@@ -157,25 +157,35 @@ struct ShadowPushConstants {
 };
 
 glm::mat4 calculateLightSpaceMatrix(const DirectionalLight& light, const glm::vec3& sceneCenter, float sceneRadius) {
-	// Normalize light direction
 	glm::vec3 lightDir = glm::normalize(light.direction);
 
-	// Position the light "camera" far enough to see the whole scene
-	glm::vec3 lightPos = sceneCenter - lightDir * sceneRadius * 2.0f;
+	// Create stable up vector
+	glm::vec3 up = glm::vec3(0.0f, 1.0f, 0.0f);
+	if (glm::abs(glm::dot(lightDir, up)) > 0.99f) {
+		up = glm::vec3(0.0f, 0.0f, 1.0f);
+	}
 
-	// Light view matrix (looking at scene center)
-	glm::mat4 lightView = glm::lookAt(lightPos, sceneCenter, glm::vec3(0.0f, 1.0f, 0.0f));
+	// Position light very far from scene
+	float lightDistance = sceneRadius * 5.0f;
+	glm::vec3 lightPos = sceneCenter - lightDir * lightDistance;
 
-	// Orthographic projection for directional light
-	// Size based on scene radius
-	float orthoSize = sceneRadius * 1.5f;
+	glm::mat4 lightView = glm::lookAt(lightPos, sceneCenter, up);
+
+	// Make ortho bounds much larger to capture everything
+	float orthoSize = sceneRadius * 3.0f;
+
+	// CRITICAL: Near plane must allow geometry between light and scene center
+	// Far plane must extend past the entire scene
+	float nearPlane = 0.1f;
+	float farPlane = lightDistance + sceneRadius * 2.0f;
+
 	glm::mat4 lightProj = glm::ortho(
-		-orthoSize, orthoSize,    // left, right
-		-orthoSize, orthoSize,    // bottom, top
-		0.1f, sceneRadius * 4.0f  // near, far
+		-orthoSize, orthoSize,
+		-orthoSize, orthoSize,
+		nearPlane, farPlane
 	);
 
-	// Vulkan clip space fix (Y flip)
+	// Vulkan Y-flip
 	lightProj[1][1] *= -1;
 
 	return lightProj * lightView;
@@ -186,22 +196,49 @@ struct SceneBounds {
 	float radius{ 100.0f };
 };
 
-SceneBounds calculateSceneBounds(const std::vector<Vertex>& vertices) {
+struct InstanceData {
+	glm::vec3 offset; // Offset for this instance
+};
+
+SceneBounds calculateSceneBounds(const std::vector<Vertex>& vertices,
+	const std::vector<InstanceData>& instances) {
 	if (vertices.empty()) {
-		return {};
+		return { glm::vec3(0.0f), 100.0f };
 	}
 
 	glm::vec3 minBounds{ FLT_MAX };
 	glm::vec3 maxBounds{ -FLT_MAX };
 
-	for (const auto& v : vertices) {
-		minBounds = glm::min(minBounds, v.position);
-		maxBounds = glm::max(maxBounds, v.position);
+	if (instances.empty()) {
+		// No instances - just use raw vertex positions
+		for (const auto& v : vertices) {
+			minBounds = glm::min(minBounds, v.position);
+			maxBounds = glm::max(maxBounds, v.position);
+		}
+	}
+	else {
+		// With instances - compute bounds for all instanced positions
+		for (const auto& inst : instances) {
+			for (const auto& v : vertices) {
+				glm::vec3 worldPos = v.position + inst.offset;
+				minBounds = glm::min(minBounds, worldPos);
+				maxBounds = glm::max(maxBounds, worldPos);
+			}
+		}
 	}
 
 	SceneBounds bounds;
 	bounds.center = (minBounds + maxBounds) * 0.5f;
 	bounds.radius = glm::length(maxBounds - minBounds) * 0.5f;
+
+	// Add generous padding
+	bounds.radius *= 1.5f;
+
+	std::cout << "Scene bounds: center=(" << bounds.center.x << ", "
+		<< bounds.center.y << ", " << bounds.center.z
+		<< ") radius=" << bounds.radius << std::endl;
+	std::cout << "  Min: (" << minBounds.x << ", " << minBounds.y << ", " << minBounds.z << ")" << std::endl;
+	std::cout << "  Max: (" << maxBounds.x << ", " << maxBounds.y << ", " << maxBounds.z << ")" << std::endl;
 
 	return bounds;
 }
@@ -419,9 +456,7 @@ private:
 	uint32_t     m_indexCount;
 };
 
-struct InstanceData {
-	glm::vec3 offset; // Offset for this instance
-};
+
 
 // Example: 4 instances, spread out
 std::vector<InstanceData> instances = {
@@ -2095,7 +2130,7 @@ int main()
 
 	Mesh model;
 	try {
-		model = loadModelSmart("models/tomsk_school/tomsk_school.obj");
+		model = loadModelSmart("models/tomsk_school/tomsk_school3.obj");
 		// model = loadWithAssimp("models/sponza-palace/source/scene.glb");
 		// model = loadWithFastGltf("models/sponza-palace/source/scene.glb");
 		// model = loadWithAssimp("models/main_sponza/NewSponza_Main_glTF_003.gltf");
@@ -2114,7 +2149,7 @@ int main()
 		return -1;
 	}
 
-	SceneBounds sceneBounds = calculateSceneBounds(model.vertices);
+	SceneBounds sceneBounds = calculateSceneBounds(model.vertices, instances);
 	std::cout << "Scene center: " << sceneBounds.center.x << ", "
 		<< sceneBounds.center.y << ", " << sceneBounds.center.z
 		<< " radius: " << sceneBounds.radius << "\n";
@@ -2133,7 +2168,7 @@ int main()
 
 	// Initialize directional light
 	DirectionalLight sunLight;
-	sunLight.direction = glm::normalize(glm::vec3(-0.5f, -1.0f, -0.3f));
+	sunLight.direction = glm::normalize(glm::vec3(-0.8f, -0.3f, -0.3f));
 	sunLight.color = glm::vec3(1.0f, 0.98f, 0.95f);
 	sunLight.intensity = 1.0f;
 

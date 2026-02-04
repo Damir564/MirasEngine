@@ -43,26 +43,47 @@ const int ALPHA_MODE_MASK = 1;
 const int ALPHA_MODE_BLEND = 2;
 
 float calculateShadow(vec4 fragPosLightSpace, vec3 N, vec3 L) {
+    // Perspective divide
     vec3 projCoords = fragPosLightSpace.xyz / fragPosLightSpace.w;
+    
+    // Transform from [-1,1] to [0,1] for X and Y only
+    // Z is already in [0,1] for Vulkan after the ortho projection with Y-flip
     projCoords.xy = projCoords.xy * 0.5 + 0.5;
 
+    // DEBUG OUTPUT - uncomment to test
+     // Return RED if outside X bounds
+     if (projCoords.x < 0.0 || projCoords.x > 1.0) return -1.0;
+     // Return GREEN if outside Y bounds  
+     if (projCoords.y < 0.0 || projCoords.y > 1.0) return -2.0;
+    //  Return BLUE if outside Z bounds
+     if (projCoords.z < 0.0 || projCoords.z > 1.0) return -3.0;
+    
+    // Check if outside shadow map - return fully lit
     if (projCoords.x < 0.0 || projCoords.x > 1.0 ||
-        projCoords.y < 0.0 || projCoords.y > 1.0 ||
-        projCoords.z < 0.0 || projCoords.z > 1.0) {
+        projCoords.y < 0.0 || projCoords.y > 1.0) {
+        return 1.0;
+    }
+    
+    // If behind the light's far plane or in front of near plane, return lit
+    if (projCoords.z > 1.0 || projCoords.z < 0.0) {
         return 1.0;
     }
 
+    // Slope-scale bias
     float bias = max(ubo.shadowBias * (1.0 - dot(N, L)), ubo.shadowBias * 0.1);
-
+    
+    // PCF sampling
     float shadow = 0.0;
     vec2 texelSize = 1.0 / textureSize(shadowMapSampler, 0);
-
+    
     for (int x = -1; x <= 1; ++x) {
         for (int y = -1; y <= 1; ++y) {
             vec2 offset = vec2(x, y) * texelSize;
+            // For sampler2DShadow, the comparison is: texture returns 1.0 if projCoords.z - bias < sampled depth
             shadow += texture(shadowMapSampler, vec3(projCoords.xy + offset, projCoords.z - bias));
         }
     }
+    
     return shadow / 9.0;
 }
 
@@ -137,6 +158,32 @@ void main() {
 
     vec3 sunDir = normalize(-ubo.lightDir.xyz);
     float shadow = calculateShadow(fragPosLightSpace, N, sunDir);
+
+     // OPTION 1: Show shadow value directly (white=lit, black=shadow)
+//     outColor = vec4(vec3(shadow), 1.0);
+//     return;
+
+// OPTION 2: Show light space UV coordinates
+//     vec3 projCoords = fragPosLightSpace.xyz / fragPosLightSpace.w;
+//     projCoords.xy = projCoords.xy * 0.5 + 0.5;
+//     outColor = vec4(projCoords.xy, 0.0, 1.0);
+//     return;
+
+    // OPTION 3: Show light space depth
+//     vec3 projCoords = fragPosLightSpace.xyz / fragPosLightSpace.w;
+//     projCoords.xy = projCoords.xy * 0.5 + 0.5;
+//     outColor = vec4(vec3(projCoords.z), 1.0);
+//     return;
+
+    // OPTION 4: Show out-of-bounds areas
+//     vec3 projCoords = fragPosLightSpace.xyz / fragPosLightSpace.w;
+//     projCoords.xy = projCoords.xy * 0.5 + 0.5;
+//     vec3 debugColor = vec3(0.0, 1.0, 0.0); // green = in bounds
+//     if (projCoords.x < 0.0 || projCoords.x > 1.0) debugColor = vec3(1.0, 0.0, 0.0); // red
+//     if (projCoords.y < 0.0 || projCoords.y > 1.0) debugColor = vec3(0.0, 0.0, 1.0); // blue
+//     if (projCoords.z < 0.0 || projCoords.z > 1.0) debugColor = vec3(1.0, 1.0, 0.0); // yellow
+//     outColor = vec4(debugColor, 1.0);
+//     return;
 
     vec3 Lo = vec3(0.0);
     Lo += calcLight(N, V, sunDir, vec3(1.0, 0.98, 0.95), 3.0, albedo, metallic, roughness, F0) * shadow;
