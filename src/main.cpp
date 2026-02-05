@@ -19,8 +19,6 @@
 #include <assimp/scene.h>
 #include <assimp/postprocess.h>
 #include "stb_image.h"
-//#define FASTGLTF_USE_CUSTOM_SMALLVECTOR 0
-//#define FASTGLTF_ENABLE_GLM_EXT 1 
 #define FASTGLTF_USE_STD_MODULE 0
 #include <fastgltf/core.hpp>
 #include <fastgltf/glm_element_traits.hpp>
@@ -30,39 +28,11 @@
 #include "imgui.h"
 #include "backends/imgui_impl_sdl3.h"
 #include "backends/imgui_impl_vulkan.h"
-
-struct Camera {
-	glm::vec3 position{ 0.0f, 0.0f, 0.0f };
-	float yaw = -90.0f; // look forward
-	float pitch = 0.0f;
-	float speed = 10.0f; 
-	float sensitivity = 0.1f;
-};
-
-glm::mat4 getView(const Camera& cam) {
-	glm::vec3 front{
-		cos(glm::radians(cam.yaw)) * cos(glm::radians(cam.pitch)),
-		sin(glm::radians(cam.pitch)),
-		sin(glm::radians(cam.yaw)) * cos(glm::radians(cam.pitch))
-	};
-
-	return glm::lookAt(
-		cam.position,
-		cam.position + glm::normalize(front),
-		glm::vec3(0, 1, 0)
-	);
-}
-
-glm::mat4 getProjection(float width, float height) {
-	glm::mat4 proj = glm::perspective(
-		glm::radians(60.0f),
-		width / height,
-		0.1f,
-		10000.0f
-	);
-	proj[1][1] *= -1; // Vulkan clip space fix
-	return proj;
-}
+#include "engine/Buffers.h"
+#include "engine/Camera.h"
+#include "engine/Shadow.h"
+#include "engine/ModelTypes.h"
+#include "engine/ModelManager.h"
 
 struct FrameUBO {
 	glm::mat4 view;
@@ -81,465 +51,6 @@ struct MeshPushConstants {
 	float roughness{ 0.5f };                         // 4 bytes
 	float alphaCutoff{ 0.5f };                       // 4 bytes
 	int alphaMode{ 0 };                              // 4 bytes
-};
-
-struct Vertex {
-	glm::vec3 position;
-	glm::vec3 normal;
-	glm::vec2 texCoord;
-	glm::vec4 tangent;
-
-	static vk::VertexInputBindingDescription2EXT getBindingDescription(uint32_t binding = 0) {
-		vk::VertexInputBindingDescription2EXT desc{};
-		desc.binding = binding;
-		desc.stride = sizeof(Vertex);
-		desc.inputRate = vk::VertexInputRate::eVertex;
-		desc.divisor = 1;
-		return desc;
-	}
-
-	static std::array<vk::VertexInputAttributeDescription2EXT, 5> getAttributeDescriptions(uint32_t locationOffset = 0) {
-		std::array<vk::VertexInputAttributeDescription2EXT, 5> attributes{};
-
-		// position
-		attributes[0].location = locationOffset + 0;
-		attributes[0].binding = 0;
-		attributes[0].format = vk::Format::eR32G32B32Sfloat;
-		attributes[0].offset = offsetof(Vertex, position);
-
-		// normal
-		attributes[1].location = locationOffset + 1;
-		attributes[1].binding = 0;
-		attributes[1].format = vk::Format::eR32G32B32Sfloat;
-		attributes[1].offset = offsetof(Vertex, normal);
-
-		// texCoord
-		attributes[2].location = locationOffset + 2;
-		attributes[2].binding = 0;
-		attributes[2].format = vk::Format::eR32G32Sfloat;
-		attributes[2].offset = offsetof(Vertex, texCoord);
-
-		// Tangent (Loc 3)
-		attributes[3].location = locationOffset + 3;
-		attributes[3].binding = 0;
-		attributes[3].format = vk::Format::eR32G32B32A32Sfloat;
-		attributes[3].offset = offsetof(Vertex, tangent);
-
-		// Instance buffer attribute
-		attributes[4].location = locationOffset + 4;             // matches shader
-		attributes[4].binding = 1;              // instance buffer binding
-		attributes[4].format = vk::Format::eR32G32B32Sfloat; // vec3
-		attributes[4].offset = 0;               // offset inside InstanceData struct
-
-		return attributes;
-	}
-};
-
-constexpr uint32_t SHADOW_MAP_SIZE = 2048;
-
-struct ShadowMapResources {
-	VkImage image = VK_NULL_HANDLE;
-	VmaAllocation allocation = VK_NULL_HANDLE;
-	vk::ImageView view;
-	vk::Sampler sampler;
-};
-
-struct DirectionalLight {
-	glm::vec3 direction{ -0.5f, -1.0f, -0.3f };
-	glm::vec3 color{ 1.0f, 1.0f, 1.0f };
-	float intensity{ 1.0f };
-};
-
-struct ShadowPushConstants {
-	float alphaCutoff;      // 4 bytes
-	int alphaMode;          // 4 bytes
-	float padding[2];       // 8 bytes for alignment
-};
-
-glm::mat4 calculateLightSpaceMatrix(const DirectionalLight& light, const glm::vec3& sceneCenter, float sceneRadius) {
-	glm::vec3 lightDir = glm::normalize(light.direction);
-
-	// Create stable up vector
-	glm::vec3 up = glm::vec3(0.0f, 1.0f, 0.0f);
-	if (glm::abs(glm::dot(lightDir, up)) > 0.99f) {
-		up = glm::vec3(0.0f, 0.0f, 1.0f);
-	}
-
-	// Position light very far from scene
-	float lightDistance = sceneRadius * 5.0f;
-	glm::vec3 lightPos = sceneCenter - lightDir * lightDistance;
-
-	glm::mat4 lightView = glm::lookAt(lightPos, sceneCenter, up);
-
-	// Make ortho bounds much larger to capture everything
-	float orthoSize = sceneRadius * 3.0f;
-
-	// CRITICAL: Near plane must allow geometry between light and scene center
-	// Far plane must extend past the entire scene
-	float nearPlane = 0.1f;
-	float farPlane = lightDistance + sceneRadius * 2.0f;
-
-	glm::mat4 lightProj = glm::ortho(
-		-orthoSize, orthoSize,
-		-orthoSize, orthoSize,
-		nearPlane, farPlane
-	);
-
-	// Vulkan Y-flip
-	lightProj[1][1] *= -1;
-
-	return lightProj * lightView;
-}
-
-struct SceneBounds {
-	glm::vec3 center{ 0.0f };
-	float radius{ 100.0f };
-};
-
-struct InstanceData {
-	glm::vec3 offset; // Offset for this instance
-};
-
-SceneBounds calculateSceneBounds(const std::vector<Vertex>& vertices,
-	const std::vector<InstanceData>& instances) {
-	if (vertices.empty()) {
-		return { glm::vec3(0.0f), 100.0f };
-	}
-
-	glm::vec3 minBounds{ FLT_MAX };
-	glm::vec3 maxBounds{ -FLT_MAX };
-
-	if (instances.empty()) {
-		// No instances - just use raw vertex positions
-		for (const auto& v : vertices) {
-			minBounds = glm::min(minBounds, v.position);
-			maxBounds = glm::max(maxBounds, v.position);
-		}
-	}
-	else {
-		// With instances - compute bounds for all instanced positions
-		for (const auto& inst : instances) {
-			for (const auto& v : vertices) {
-				glm::vec3 worldPos = v.position + inst.offset;
-				minBounds = glm::min(minBounds, worldPos);
-				maxBounds = glm::max(maxBounds, worldPos);
-			}
-		}
-	}
-
-	SceneBounds bounds;
-	bounds.center = (minBounds + maxBounds) * 0.5f;
-	bounds.radius = glm::length(maxBounds - minBounds) * 0.5f;
-
-	// Add generous padding
-	bounds.radius *= 1.5f;
-
-	std::cout << "Scene bounds: center=(" << bounds.center.x << ", "
-		<< bounds.center.y << ", " << bounds.center.z
-		<< ") radius=" << bounds.radius << std::endl;
-	std::cout << "  Min: (" << minBounds.x << ", " << minBounds.y << ", " << minBounds.z << ")" << std::endl;
-	std::cout << "  Max: (" << maxBounds.x << ", " << maxBounds.y << ", " << maxBounds.z << ")" << std::endl;
-
-	return bounds;
-}
-
-ShadowMapResources createShadowMap(VmaAllocator allocator, vk::Device device) {
-	ShadowMapResources shadow{};
-
-	// 1. Create Depth Image
-	VkImageCreateInfo imageInfo{};
-	imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-	imageInfo.imageType = VK_IMAGE_TYPE_2D;
-	imageInfo.format = VK_FORMAT_D32_SFLOAT;
-	imageInfo.extent = { SHADOW_MAP_SIZE, SHADOW_MAP_SIZE, 1 };
-	imageInfo.mipLevels = 1;
-	imageInfo.arrayLayers = 1;
-	imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
-	imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
-	imageInfo.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-	imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-	imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-
-	VmaAllocationCreateInfo allocInfo{};
-	allocInfo.usage = VMA_MEMORY_USAGE_GPU_ONLY;
-
-	if (vmaCreateImage(allocator, &imageInfo, &allocInfo,
-		&shadow.image, &shadow.allocation, nullptr) != VK_SUCCESS) {
-		throw std::runtime_error("Failed to create shadow map image");
-	}
-
-	// 2. Create Image View
-	vk::ImageViewCreateInfo viewInfo{};
-	viewInfo.image = vk::Image(shadow.image);
-	viewInfo.viewType = vk::ImageViewType::e2D;
-	viewInfo.format = vk::Format::eD32Sfloat;
-	viewInfo.subresourceRange.aspectMask = vk::ImageAspectFlagBits::eDepth;
-	viewInfo.subresourceRange.baseMipLevel = 0;
-	viewInfo.subresourceRange.levelCount = 1;
-	viewInfo.subresourceRange.baseArrayLayer = 0;
-	viewInfo.subresourceRange.layerCount = 1;
-
-	shadow.view = device.createImageView(viewInfo).value;
-
-	// 3. Create Shadow Sampler (with depth comparison)
-	vk::SamplerCreateInfo samplerInfo{};
-	samplerInfo.magFilter = vk::Filter::eLinear;
-	samplerInfo.minFilter = vk::Filter::eLinear;
-	samplerInfo.addressModeU = vk::SamplerAddressMode::eClampToBorder;
-	samplerInfo.addressModeV = vk::SamplerAddressMode::eClampToBorder;
-	samplerInfo.addressModeW = vk::SamplerAddressMode::eClampToBorder;
-	samplerInfo.borderColor = vk::BorderColor::eFloatOpaqueWhite;
-	samplerInfo.compareEnable = VK_TRUE;
-	samplerInfo.compareOp = vk::CompareOp::eLessOrEqual;
-	samplerInfo.mipmapMode = vk::SamplerMipmapMode::eNearest;
-
-	shadow.sampler = device.createSampler(samplerInfo).value;
-
-	return shadow;
-}
-
-void destroyShadowMap(ShadowMapResources& shadow, VmaAllocator allocator, vk::Device device) {
-	if (shadow.sampler) device.destroySampler(shadow.sampler);
-	if (shadow.view) device.destroyImageView(shadow.view);
-	if (shadow.image) vmaDestroyImage(allocator, shadow.image, shadow.allocation);
-}
-
-class VertexBuffer {
-public:
-	VertexBuffer(VmaAllocator allocator,
-		vk::Device device,
-		const std::vector<Vertex>& vertices)
-		: m_allocator(allocator), m_device(device), m_vertexCount(static_cast<uint32_t>(vertices.size()))
-	{
-		VkBufferCreateInfo bufferInfo{};
-		bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-		bufferInfo.size = sizeof(Vertex) * vertices.size();
-		bufferInfo.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
-		bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-
-		VmaAllocationCreateInfo allocInfo{};
-		allocInfo.usage = VMA_MEMORY_USAGE_CPU_TO_GPU;  // Changed to CPU_TO_GPU
-		allocInfo.requiredFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-		allocInfo.flags = VMA_ALLOCATION_CREATE_MAPPED_BIT; // auto-mapped
-
-		VkBuffer rawBuffer;
-		if (vmaCreateBuffer(m_allocator, &bufferInfo, &allocInfo, &rawBuffer, &m_allocation, nullptr) != VK_SUCCESS) {
-			throw std::runtime_error("Failed to create vertex buffer");
-		}
-
-		m_buffer = vk::Buffer(rawBuffer);
-
-		// Copy vertex data
-		void* mapped;
-		vmaMapMemory(m_allocator, m_allocation, &mapped);
-		memcpy(mapped, vertices.data(), sizeof(Vertex) * vertices.size());
-		vmaUnmapMemory(m_allocator, m_allocation);
-	}
-
-	~VertexBuffer() {
-		cleanup();
-		//if (m_buffer && m_allocation) {
-		//	vmaDestroyBuffer(m_allocator, VkBuffer(m_buffer), m_allocation);
-		//}
-	}
-
-	// Disable copy (unique ownership)
-	VertexBuffer(const VertexBuffer&) = delete;
-	VertexBuffer& operator=(const VertexBuffer&) = delete;
-
-	// Enable move
-	VertexBuffer(VertexBuffer&& other) noexcept
-		: m_allocator(other.m_allocator),
-		m_device(other.m_device),
-		m_buffer(other.m_buffer),
-		m_allocation(other.m_allocation),
-		m_vertexCount(other.m_vertexCount)
-	{
-		other.m_buffer = nullptr;
-		other.m_allocation = nullptr;
-		other.m_vertexCount = 0;
-	}
-
-	VertexBuffer& operator=(VertexBuffer&& other) noexcept {
-		if (this != &other) {
-			cleanup();
-			m_allocator = other.m_allocator;
-			m_device = other.m_device;
-			m_buffer = other.m_buffer;
-			m_allocation = other.m_allocation;
-			m_vertexCount = other.m_vertexCount;
-
-			other.m_buffer = nullptr;
-			other.m_allocation = nullptr;
-			other.m_vertexCount = 0;
-		}
-		return *this;
-	}
-
-	vk::Buffer& getBuffer() { return m_buffer; }
-	uint32_t getVertexCount() const { return m_vertexCount; }
-
-private:
-	void cleanup() {
-		if (m_buffer && m_allocation) {
-			vmaDestroyBuffer(m_allocator, VkBuffer(m_buffer), m_allocation);
-			m_buffer = nullptr;
-			m_allocation = nullptr;
-		}
-	}
-
-	VmaAllocator m_allocator;
-	vk::Device m_device;
-	vk::Buffer m_buffer;
-	VmaAllocation m_allocation;
-	uint32_t m_vertexCount;
-};
-
-class IndexBuffer {
-public:
-	IndexBuffer(VmaAllocator allocator,
-		vk::Device device,
-		const std::vector<uint32_t>& indices)
-		: m_allocator(allocator), m_device(device),
-		m_indexCount(static_cast<uint32_t>(indices.size()))
-	{
-		VkBufferCreateInfo bufferInfo{};
-		bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-		bufferInfo.size = sizeof(uint32_t) * indices.size();
-		bufferInfo.usage = VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
-		bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-
-		VmaAllocationCreateInfo allocInfo{};
-		allocInfo.usage = VMA_MEMORY_USAGE_CPU_TO_GPU;
-		allocInfo.requiredFlags =
-			VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-			VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-		allocInfo.flags = VMA_ALLOCATION_CREATE_MAPPED_BIT;
-
-		VkBuffer rawBuffer;
-		if (vmaCreateBuffer(
-			m_allocator,
-			&bufferInfo,
-			&allocInfo,
-			&rawBuffer,
-			&m_allocation,
-			nullptr) != VK_SUCCESS)
-		{
-			throw std::runtime_error("Failed to create index buffer");
-		}
-
-		m_buffer = vk::Buffer(rawBuffer);
-
-		void* mapped;
-		vmaMapMemory(m_allocator, m_allocation, &mapped);
-		memcpy(mapped, indices.data(), bufferInfo.size);
-		vmaUnmapMemory(m_allocator, m_allocation);
-	}
-
-	~IndexBuffer() {
-		if (m_buffer && m_allocation) {
-			vmaDestroyBuffer(
-				m_allocator,
-				VkBuffer(m_buffer),
-				m_allocation);
-		}
-	}
-
-	vk::Buffer getBuffer() const { return m_buffer; }
-	uint32_t getIndexCount() const { return m_indexCount; }
-
-private:
-	VmaAllocator m_allocator;
-	vk::Device   m_device;
-	vk::Buffer   m_buffer;
-	VmaAllocation m_allocation;
-	uint32_t     m_indexCount;
-};
-
-
-
-// Example: 4 instances, spread out
-std::vector<InstanceData> instances = {
-	{{0.0f, 0.0f, 0.0f}},
-	//{{ 0.5f, -0.4f}},
-	//{{-0.5f, 0.4f}},
-	//{{ 0.5f, 0.4f}}
-};
-
-class InstanceBuffer {
-public:
-	InstanceBuffer(VmaAllocator allocator, vk::Device device, const std::vector<InstanceData>& data)
-		: m_allocator(allocator), m_device(device), m_instanceCount(static_cast<uint32_t>(data.size()))
-	{
-		VkBufferCreateInfo bufferInfo{};
-		bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-		bufferInfo.size = sizeof(InstanceData) * data.size();
-		bufferInfo.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
-		bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-
-		VmaAllocationCreateInfo allocInfo{};
-		allocInfo.usage = VMA_MEMORY_USAGE_CPU_TO_GPU;
-		allocInfo.requiredFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-		allocInfo.flags = VMA_ALLOCATION_CREATE_MAPPED_BIT;
-
-		VkBuffer rawBuffer;
-		if (vmaCreateBuffer(m_allocator, &bufferInfo, &allocInfo, &rawBuffer, &m_allocation, nullptr) != VK_SUCCESS)
-			throw std::runtime_error("Failed to create instance buffer");
-
-		m_buffer = vk::Buffer(rawBuffer);
-
-		void* mapped;
-		vmaMapMemory(m_allocator, m_allocation, &mapped);
-		memcpy(mapped, data.data(), sizeof(InstanceData) * data.size());
-		vmaUnmapMemory(m_allocator, m_allocation);
-	}
-
-	~InstanceBuffer() {
-		if (m_buffer && m_allocation)
-			vmaDestroyBuffer(m_allocator, VkBuffer(m_buffer), m_allocation);
-	}
-
-	vk::Buffer getBuffer() const { return m_buffer; }
-	uint32_t getInstanceCount() const { return m_instanceCount; }
-
-private:
-	VmaAllocator m_allocator;
-	vk::Device m_device;
-	vk::Buffer m_buffer;
-	VmaAllocation m_allocation;
-	uint32_t m_instanceCount;
-};
-
-struct UBOBuffer {
-	VkBuffer buffer = VK_NULL_HANDLE;
-	VmaAllocation allocation = VK_NULL_HANDLE;
-	void* mapped = nullptr;
-};
-
-// Holds raw CPU pixel data
-struct TextureData {
-	int width, height, channels;
-	unsigned char* pixels = nullptr;
-	std::string path;
-
-	const unsigned char* encodedData = nullptr;
-	size_t encodedSize = 0;
-
-	bool fromCache = false;
-
-	bool isLinear = false;
-
-	void free() {
-		if (pixels) {
-			if (fromCache) {
-				::free(pixels); // Standard C free
-			}
-			else {
-				stbi_image_free(pixels); // STB free
-			}
-			pixels = nullptr;
-		}
-	}
 };
 
 void decodeTextureParallel(TextureData& tex) {
@@ -651,144 +162,6 @@ TextureData prepareTextureInfo(const fastgltf::Asset& asset, const fastgltf::Ima
 	return texData;
 }
 
-class TextureImage {
-public:
-	TextureImage(VmaAllocator allocator, vk::Device device, vk::CommandPool cmdPool, vk::Queue queue, const TextureData& data, vk::Format format)
-		: m_allocator(allocator), m_device(device) {
-
-		vk::DeviceSize imageSize = data.width * data.height * 4;
-
-		// 1. Staging Buffer
-		VkBufferCreateInfo stagingInfo = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
-		stagingInfo.size = imageSize;
-		stagingInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-		VmaAllocationCreateInfo stagingAllocInfo = {};
-		stagingAllocInfo.usage = VMA_MEMORY_USAGE_CPU_ONLY;
-
-		VkBuffer stagingBuffer;
-		VmaAllocation stagingAlloc;
-		vmaCreateBuffer(allocator, &stagingInfo, &stagingAllocInfo, &stagingBuffer, &stagingAlloc, nullptr);
-
-		void* mapped;
-		vmaMapMemory(allocator, stagingAlloc, &mapped);
-		memcpy(mapped, data.pixels, static_cast<size_t>(imageSize));
-		vmaUnmapMemory(allocator, stagingAlloc);
-
-		// 2. Create Image (GPU)
-		VkImageCreateInfo imageInfo = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
-		imageInfo.imageType = VK_IMAGE_TYPE_2D;
-		imageInfo.extent.width = data.width;
-		imageInfo.extent.height = data.height;
-		imageInfo.extent.depth = 1;
-		imageInfo.mipLevels = 1;
-		imageInfo.arrayLayers = 1;
-		imageInfo.format = static_cast<VkFormat>(format);
-		imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
-		imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-		imageInfo.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-		imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
-		imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-
-		VmaAllocationCreateInfo imageAllocInfo = {};
-		imageAllocInfo.usage = VMA_MEMORY_USAGE_GPU_ONLY;
-
-		VkImage rawImage;
-		vmaCreateImage(allocator, &imageInfo, &imageAllocInfo, &rawImage, &m_allocation, nullptr);
-		m_image = vk::Image(rawImage);
-
-		// 3. Transition & Copy (Immediate Submit)
-		vk::CommandBufferAllocateInfo allocInfo(cmdPool, vk::CommandBufferLevel::ePrimary, 1);
-		vk::UniqueCommandBuffer cmd = std::move(device.allocateCommandBuffersUnique(allocInfo).value[0]);
-
-		cmd->begin(vk::CommandBufferBeginInfo(vk::CommandBufferUsageFlagBits::eOneTimeSubmit));
-
-		// Transition Undefined -> TransferDst
-		transitionLayout(cmd.get(), vk::ImageLayout::eUndefined, vk::ImageLayout::eTransferDstOptimal);
-
-		// Copy Buffer -> Image
-		vk::BufferImageCopy region{};
-		region.imageSubresource = { vk::ImageAspectFlagBits::eColor, 0, 0, 1 };
-		region.imageExtent = vk::Extent3D{ (uint32_t)data.width, (uint32_t)data.height, 1 };
-		cmd->copyBufferToImage(vk::Buffer(stagingBuffer), m_image, vk::ImageLayout::eTransferDstOptimal, 1, &region);
-
-		// Transition TransferDst -> ShaderReadOnly
-		transitionLayout(cmd.get(), vk::ImageLayout::eTransferDstOptimal, vk::ImageLayout::eShaderReadOnlyOptimal);
-
-		cmd->end();
-		vk::SubmitInfo submitInfo{};
-		submitInfo.setCommandBufferCount(1);
-		submitInfo.setPCommandBuffers(&cmd.get());
-		queue.submit(submitInfo, nullptr);
-		queue.waitIdle();
-
-		vmaDestroyBuffer(allocator, stagingBuffer, stagingAlloc);
-
-		// 4. Create View
-		vk::ImageViewCreateInfo viewInfo{};
-		viewInfo.image = m_image;
-		viewInfo.viewType = vk::ImageViewType::e2D;
-		viewInfo.format = format;
-		viewInfo.subresourceRange.aspectMask = vk::ImageAspectFlagBits::eColor;
-		viewInfo.subresourceRange.levelCount = 1;
-		viewInfo.subresourceRange.layerCount = 1;
-		m_view = device.createImageView(viewInfo).value;
-	}
-
-	~TextureImage() {
-		if (m_view) m_device.destroyImageView(m_view);
-		if (m_image) vmaDestroyImage(m_allocator, VkImage(m_image), m_allocation);
-	}
-
-	// Disable copy
-	TextureImage(const TextureImage&) = delete;
-	TextureImage& operator=(const TextureImage&) = delete;
-
-	// Enable move
-	TextureImage(TextureImage&& other) noexcept
-		: m_allocator(other.m_allocator), m_device(other.m_device), m_image(other.m_image),
-		m_allocation(other.m_allocation), m_view(other.m_view) {
-		other.m_image = nullptr; other.m_view = nullptr;
-	}
-
-	vk::ImageView getView() { return m_view; }
-
-private:
-	void transitionLayout(vk::CommandBuffer cmd, vk::ImageLayout oldLayout, vk::ImageLayout newLayout) {
-		vk::ImageMemoryBarrier barrier{};
-		barrier.oldLayout = oldLayout;
-		barrier.newLayout = newLayout;
-		barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-		barrier.image = m_image;
-		barrier.subresourceRange.aspectMask = vk::ImageAspectFlagBits::eColor;
-		barrier.subresourceRange.levelCount = 1;
-		barrier.subresourceRange.layerCount = 1;
-
-		vk::PipelineStageFlags sourceStage;
-		vk::PipelineStageFlags destinationStage;
-
-		if (oldLayout == vk::ImageLayout::eUndefined && newLayout == vk::ImageLayout::eTransferDstOptimal) {
-			barrier.srcAccessMask = vk::AccessFlagBits::eNone;
-			barrier.dstAccessMask = vk::AccessFlagBits::eTransferWrite;
-			sourceStage = vk::PipelineStageFlagBits::eTopOfPipe;
-			destinationStage = vk::PipelineStageFlagBits::eTransfer;
-		}
-		else if (oldLayout == vk::ImageLayout::eTransferDstOptimal && newLayout == vk::ImageLayout::eShaderReadOnlyOptimal) {
-			barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
-			barrier.dstAccessMask = vk::AccessFlagBits::eShaderRead;
-			sourceStage = vk::PipelineStageFlagBits::eTransfer;
-			destinationStage = vk::PipelineStageFlagBits::eFragmentShader;
-		}
-		cmd.pipelineBarrier(sourceStage, destinationStage, {}, 0, nullptr, 0, nullptr, 1, &barrier);
-	}
-
-	VmaAllocator m_allocator;
-	vk::Device m_device;
-	vk::Image m_image;
-	VmaAllocation m_allocation;
-	vk::ImageView m_view;
-};
-
 std::vector<uint32_t> loadSpirv(const std::filesystem::path& path)
 {
 	std::ifstream file(path, std::ios::binary | std::ios::ate);
@@ -804,37 +177,6 @@ std::vector<uint32_t> loadSpirv(const std::filesystem::path& path)
 	file.read(reinterpret_cast<char*>(code.data()), size);
 	return code;
 }
-
-enum class AlphaMode : int {
-	OPAQUE = 0,    // Fully opaque, ignore alpha
-	MASK = 1,      // Alpha testing with cutoff
-	BLEND = 2      // Alpha blending (transparency)
-};
-
-struct Material {
-	glm::vec4 baseColorFactor{ 1.0f };
-	float metallicFactor{ 1.0f };
-	float roughnessFactor{ 1.0f };
-	int baseColorTextureIndex = -1;
-	int normalTextureIndex = -1;
-	int metallicRoughnessTextureIndex = -1;
-	float alphaCutoff{ 0.5f };
-	AlphaMode alphaMode{ AlphaMode::OPAQUE };
-};
-
-struct SubmeshInfo {
-	uint32_t indexOffset;   // starting index in the global index buffer
-	uint32_t indexCount;    // number of indices
-	uint32_t vertexOffset;  // optional: starting vertex (needed if using drawIndexed with baseVertex)
-	Material material;
-};
-
-struct Mesh {
-	std::vector<Vertex> vertices;
-	std::vector<uint32_t> indices;
-	std::vector<SubmeshInfo> submeshes;
-	std::vector<TextureData> textureData;
-};
 
 struct ModelCacheHeader {
 	uint32_t magic = 0x564B4D44; // "VKMD"
@@ -1644,7 +986,7 @@ TextureData loadTexture(const fastgltf::Asset& asset, const fastgltf::Image& ima
 		[&](const fastgltf::sources::Array& array) {
 			// 2. Load from Embedded Array (e.g. base64 decoded)
 			texData.pixels = stbi_load_from_memory(
-				reinterpret_cast<const stbi_uc*>(array.bytes.data()),
+				reinterpret_cast<const unsigned char*>(array.bytes.data()),
 				static_cast<int>(array.bytes.size()),
 				&texData.width, &texData.height, &texData.channels, 4);
 		},
@@ -1655,7 +997,7 @@ TextureData loadTexture(const fastgltf::Asset& asset, const fastgltf::Image& ima
 
 			std::visit(fastgltf::visitor{
 				[&](const fastgltf::sources::Array& bufferArray) {
-					const stbi_uc* data = reinterpret_cast<const stbi_uc*>(bufferArray.bytes.data() + bufferView.byteOffset);
+					const unsigned char* data = reinterpret_cast<const unsigned char*>(bufferArray.bytes.data() + bufferView.byteOffset);
 					texData.pixels = stbi_load_from_memory(
 						data,
 						static_cast<int>(bufferView.byteLength),
@@ -2018,35 +1360,25 @@ std::vector<RenderSubmesh> sortSubmeshesForRendering(
 	for (size_t i = 0; i < submeshes.size(); ++i) {
 		const auto& sub = submeshes[i];
 
-		// Calculate center of submesh (approximate using first vertex)
-		glm::vec3 center(0.0f);
-		if (sub.vertexOffset < vertices.size()) {
-			center = vertices[sub.vertexOffset].position;
-		}
-
+		// Use submesh index as approximate distance (or compute from bounds later)
 		RenderSubmesh rs;
 		rs.submeshIndex = i;
-		rs.distanceToCamera = glm::length(center - cameraPos);
-		rs.isTransparent = (static_cast<int>(sub.material.alphaMode) == 2); // BLEND mode
+		rs.distanceToCamera = 0.0f;  // Simplified - opaque/transparent sorting still works
+		rs.isTransparent = (static_cast<int>(sub.material.alphaMode) == 2);
 
 		renderList.push_back(rs);
 	}
 
-	// Sort: opaque first (front-to-back), then transparent (back-to-front)
+	// Sort: opaque first, then transparent
 	std::sort(renderList.begin(), renderList.end(),
 		[](const RenderSubmesh& a, const RenderSubmesh& b) {
-			// Opaque objects first
 			if (a.isTransparent != b.isTransparent) {
-				return !a.isTransparent; // opaque comes first
+				return !a.isTransparent;
 			}
-			// For opaque: front-to-back (smaller distance first)
-			// For transparent: back-to-front (larger distance first)
 			if (a.isTransparent) {
 				return a.distanceToCamera > b.distanceToCamera;
 			}
-			else {
-				return a.distanceToCamera < b.distanceToCamera;
-			}
+			return a.distanceToCamera < b.distanceToCamera;
 		});
 
 	return renderList;
@@ -2126,44 +1458,6 @@ int main()
 		std::cerr << "SDL_CreateWindow failed: " << SDL_GetError() << "\n";
 		SDL_Quit();
 		return -1;
-	}
-
-	Mesh model;
-	try {
-		model = loadModelSmart("models/tomsk_school/tomsk_school3.obj");
-		// model = loadWithAssimp("models/sponza-palace/source/scene.glb");
-		// model = loadWithFastGltf("models/sponza-palace/source/scene.glb");
-		// model = loadWithAssimp("models/main_sponza/NewSponza_Main_glTF_003.gltf");
-		// model = loadWithFastGltf("models/main_sponza/NewSponza_Main_glTF_003.gltf");
-		// model = loadWithAssimp("models/tomsk_school/tomsk_school.obj");
-		// model = loadWithFastGltf("models/tree/tree.glb");
-		// model = loadWithFastGltf("models/bus_stop/Untitled.glb");
-		// model = loadWithAssimp("models/main_sponza/NewSponza_Main_Yup_003.fbx");
-		// model = loadWithAssimp("models/london-city/source/traffic_slam_2_map.glb");
-		// model = loadWithAssimp("models/dae-diorama-grandmas-house/source/Dae_diorama_upload/Dae_diorama_upload.fbx");
-		// model = loadWithAssimp("models/polygon-mini-free/source/model.obj");
-		// model = loadWithAssimp("models/figure-embodying-the-element-silver/Ag_rechte_f Figur_lowres.obj");
-	}
-	catch (const std::exception& e) {
-		std::cerr << "Error loading GLB: " << e.what() << "\n";
-		return -1;
-	}
-
-	SceneBounds sceneBounds = calculateSceneBounds(model.vertices, instances);
-	std::cout << "Scene center: " << sceneBounds.center.x << ", "
-		<< sceneBounds.center.y << ", " << sceneBounds.center.z
-		<< " radius: " << sceneBounds.radius << "\n";
-
-	std::cout << "First 5 submesh materials:\n";
-	for (int i = 0; i < std::min(5, (int)model.submeshes.size()); i++) {
-		auto& m = model.submeshes[i].material;
-		std::cout << "  Sub " << i << ": baseColor=("
-			<< m.baseColorFactor.r << ", "
-			<< m.baseColorFactor.g << ", "
-			<< m.baseColorFactor.b << ", "
-			<< m.baseColorFactor.a << ") "
-			<< "alphaMode=" << static_cast<int>(m.alphaMode)
-			<< " cutoff=" << m.alphaCutoff << "\n";
 	}
 
 	// Initialize directional light
@@ -2352,19 +1646,6 @@ int main()
 		return -1;
 	}
 
-	std::unique_ptr<VertexBuffer> vertexBuffer;
-	std::unique_ptr<IndexBuffer> indexBuffer;
-	std::unique_ptr<InstanceBuffer> instanceBuffer;
-
-	try {
-		vertexBuffer = std::make_unique<VertexBuffer>(allocator, device, model.vertices);
-		indexBuffer = std::make_unique<IndexBuffer>(allocator, device, model.indices);
-		instanceBuffer = std::make_unique<InstanceBuffer>(allocator, device, instances);
-	}
-	catch (const std::exception& e) {
-		std::cerr << "Failed to create buffers: " << e.what() << "\n";
-		return -1;
-	}
 	// ------------------------
 	// 10. Create Swapchain
 	// ------------------------
@@ -2509,29 +1790,12 @@ int main()
 		}
 		std::cout << "Created " << MAX_FRAMES_IN_FLIGHT << " UBO buffers\n";
 
-		// ------------------------
-		// 13. Upload Textures
-		// ------------------------
-		std::vector<std::unique_ptr<TextureImage>> gpuTextures;
-
-		std::cout << "Uploading " << model.textureData.size() << " textures...\n";
-		for (auto& cpuTex : model.textureData) {
-			vk::Format fmt = cpuTex.isLinear ? vk::Format::eR8G8B8A8Unorm : vk::Format::eR8G8B8A8Srgb;
-			gpuTextures.push_back(std::make_unique<TextureImage>(
-				allocator, device, commandPool.get(), graphicsQueue, cpuTex, fmt
-			));
-			// Free CPU memory now that it's on GPU
-			cpuTex.free();
-		}
-		// 1. Create Texture Sampler (Common for all textures)
 		vk::SamplerCreateInfo samplerInfo{};
 		samplerInfo.magFilter = vk::Filter::eLinear;
 		samplerInfo.minFilter = vk::Filter::eLinear;
 		samplerInfo.addressModeU = vk::SamplerAddressMode::eRepeat;
 		samplerInfo.addressModeV = vk::SamplerAddressMode::eRepeat;
 		samplerInfo.addressModeW = vk::SamplerAddressMode::eRepeat;
-		// samplerInfo.anisotropyEnable = VK_TRUE;
-		// samplerInfo.maxAnisotropy = 16.0f; // Ensure your physical device supports this!
 		samplerInfo.anisotropyEnable = VK_FALSE;
 		samplerInfo.maxAnisotropy = 1.0f;
 		samplerInfo.borderColor = vk::BorderColor::eIntOpaqueBlack;
@@ -2541,8 +1805,7 @@ int main()
 
 		vk::UniqueSampler textureSampler = device.createSamplerUnique(samplerInfo).value;
 
-		// 2. Create Descriptor Set Layout
-		// Binding 0: Combined Image Sampler (Fragment Shader)
+		// 2. Texture Descriptor Set Layout
 		vk::DescriptorSetLayoutBinding samplerLayoutBinding{};
 		samplerLayoutBinding.binding = 0;
 		samplerLayoutBinding.descriptorCount = 1;
@@ -2556,6 +1819,7 @@ int main()
 
 		vk::UniqueDescriptorSetLayout descriptorSetLayout = device.createDescriptorSetLayoutUnique(layoutInfo).value;
 
+		// 3. UBO Descriptor Set Layout
 		vk::DescriptorSetLayoutBinding uboBinding{};
 		uboBinding.binding = 0;
 		uboBinding.descriptorType = vk::DescriptorType::eUniformBuffer;
@@ -2569,102 +1833,21 @@ int main()
 
 		vk::UniqueDescriptorSetLayout uboDescriptorSetLayout = device.createDescriptorSetLayoutUnique(uboLayoutInfo).value;
 
-		// 1. Create a 1x1 White Default Texture (Fallback)
-		TextureData whiteTexData;
-		whiteTexData.width = 1; whiteTexData.height = 1; whiteTexData.channels = 4;
-		unsigned char whitePixels[] = { 255, 255, 255, 255 };
-		whiteTexData.pixels = whitePixels; // No need to free this specifically
-
-		auto defaultTexture = std::make_unique<TextureImage>(
-			allocator, device, commandPool.get(), graphicsQueue, whiteTexData, vk::Format::eR8G8B8A8Srgb
-		);
-
-		TextureData normalTexData;
-		normalTexData.width = 1; normalTexData.height = 1; normalTexData.channels = 4;
-		unsigned char normalPixels[] = { 128, 128, 255, 255 };
-		normalTexData.pixels = normalPixels;
-
-		auto defaultNormalTexture = std::make_unique<TextureImage>(
-			allocator, device, commandPool.get(), graphicsQueue, normalTexData, vk::Format::eR8G8B8A8Unorm
-		);
-
-		TextureData mrTexData;
-		mrTexData.width = 1; mrTexData.height = 1; mrTexData.channels = 4;
-		unsigned char mrPixels[] = { 0, 128, 0, 255 };
-		mrTexData.pixels = mrPixels;
-
-		auto defaultMrTexture = std::make_unique<TextureImage>(
-			allocator, device, commandPool.get(), graphicsQueue, mrTexData, vk::Format::eR8G8B8A8Unorm
-		);
-
-		// 2. Create Descriptor Pool
-		// We need 1 set for the default texture + 1 set per loaded texture
-		uint32_t totalTextures = 1 + (uint32_t)gpuTextures.size();
-
+		// 4. Descriptor Pool
 		std::vector<vk::DescriptorPoolSize> poolSizes = {
-		{ vk::DescriptorType::eCombinedImageSampler, totalTextures + 4 },
-		{ vk::DescriptorType::eUniformBuffer, static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT) }
+			{ vk::DescriptorType::eCombinedImageSampler, 1000 },
+			{ vk::DescriptorType::eUniformBuffer, static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT) + 10 }
 		};
 
 		vk::DescriptorPoolCreateInfo poolInfo{};
+		poolInfo.flags = vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet;
 		poolInfo.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
 		poolInfo.pPoolSizes = poolSizes.data();
-		poolInfo.maxSets = totalTextures + 4 + MAX_FRAMES_IN_FLIGHT;
+		poolInfo.maxSets = 1100;
 
 		vk::UniqueDescriptorPool descriptorPool = device.createDescriptorPoolUnique(poolInfo).value;
 
-		// 3. Allocate Descriptor Sets
-		std::vector<vk::DescriptorSetLayout> layoutsVector(totalTextures, descriptorSetLayout.get());
-		vk::DescriptorSetAllocateInfo defaultBaseColorAllocInfo{};
-		defaultBaseColorAllocInfo.descriptorPool = descriptorPool.get();
-		defaultBaseColorAllocInfo.descriptorSetCount = totalTextures;
-		defaultBaseColorAllocInfo.pSetLayouts = layoutsVector.data();
-
-		std::vector<vk::DescriptorSet> textureDescriptorSets = device.allocateDescriptorSets(defaultBaseColorAllocInfo).value;
-
-		// 4. Update Descriptor Sets
-		// Function to write texture to a specific set index
-		auto updateDescriptorSet = [&](vk::DescriptorSet set, vk::ImageView view) {
-			vk::DescriptorImageInfo imageInfo{};
-			imageInfo.imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal;
-			imageInfo.imageView = view;
-			imageInfo.sampler = textureSampler.get();
-
-			vk::WriteDescriptorSet descriptorWrite{};
-			descriptorWrite.dstSet = set;
-			descriptorWrite.dstBinding = 0;
-			descriptorWrite.dstArrayElement = 0;
-			descriptorWrite.descriptorType = vk::DescriptorType::eCombinedImageSampler;
-			descriptorWrite.descriptorCount = 1;
-			descriptorWrite.pImageInfo = &imageInfo;
-
-			device.updateDescriptorSets(1, &descriptorWrite, 0, nullptr);
-			};
-
-		// Update Default Set (Index 0)
-		updateDescriptorSet(textureDescriptorSets[0], defaultTexture->getView());
-
-		vk::DescriptorSetAllocateInfo defaultNormalAllocInfo{};
-		defaultNormalAllocInfo.descriptorPool = descriptorPool.get();
-		defaultNormalAllocInfo.descriptorSetCount = 1;
-		defaultNormalAllocInfo.pSetLayouts = &descriptorSetLayout.get();
-
-		vk::DescriptorSet defaultNormalSet = device.allocateDescriptorSets(defaultNormalAllocInfo).value[0];
-		updateDescriptorSet(defaultNormalSet, defaultNormalTexture->getView());
-
-		// Update Loaded Textures (Indices 1 to N)
-		for (size_t i = 0; i < gpuTextures.size(); i++) {
-			updateDescriptorSet(textureDescriptorSets[i + 1], gpuTextures[i]->getView());
-		}
-
-		vk::DescriptorSetAllocateInfo defaultMrAllocInfo{};
-		defaultMrAllocInfo.descriptorPool = descriptorPool.get();
-		defaultMrAllocInfo.descriptorSetCount = 1;
-		defaultMrAllocInfo.pSetLayouts = &descriptorSetLayout.get();
-
-		vk::DescriptorSet defaultMrSet = device.allocateDescriptorSets(defaultMrAllocInfo).value[0];
-		updateDescriptorSet(defaultMrSet, defaultMrTexture->getView());
-
+		// 5. Shadow Map Descriptor Set
 		vk::DescriptorSetAllocateInfo shadowMapAllocInfo{};
 		shadowMapAllocInfo.descriptorPool = descriptorPool.get();
 		shadowMapAllocInfo.descriptorSetCount = 1;
@@ -2672,7 +1855,7 @@ int main()
 
 		vk::DescriptorSet shadowMapDescriptorSet = device.allocateDescriptorSets(shadowMapAllocInfo).value[0];
 
-		// Update shadow map descriptor (uses the shadow sampler with depth comparison)
+		// Update shadow map descriptor
 		{
 			vk::DescriptorImageInfo shadowImageInfo{};
 			shadowImageInfo.imageLayout = vk::ImageLayout::eDepthStencilReadOnlyOptimal;
@@ -2690,6 +1873,7 @@ int main()
 			device.updateDescriptorSets(1, &shadowWrite, 0, nullptr);
 		}
 
+		// 6. UBO Descriptor Sets
 		std::vector<vk::DescriptorSet> uboDescriptorSets(MAX_FRAMES_IN_FLIGHT);
 
 		for (int i = 0; i < MAX_FRAMES_IN_FLIGHT; ++i) {
@@ -2870,6 +2054,23 @@ int main()
 		vk::PipelineLayout pipelineLayout = device.createPipelineLayout(pipelineLayoutInfo).value;
 
 		std::cout << "Pipeline layouts created successfully\n";
+		std::unique_ptr<ModelManager> modelManager;
+		try {
+			modelManager = std::make_unique<ModelManager>(
+				allocator, device, commandPool.get(), graphicsQueue,
+				descriptorPool.get(), descriptorSetLayout.get(), textureSampler.get()
+			);
+			std::cout << "ModelManager created successfully\n";
+		}
+		catch (const std::exception& e) {
+			std::cerr << "Failed to create ModelManager: " << e.what() << "\n";
+			return -1;
+		}
+
+		// Track current scene bounds (updated when models change)
+		SceneBounds sceneBounds;
+		sceneBounds.center = glm::vec3(0.0f);
+		sceneBounds.radius = 100.0f;  // Default radius
 
 		// ============================================
 // IMGUI SETUP - For ImGui v1.92.5-docking
@@ -3035,32 +2236,134 @@ int main()
 			ImGui_ImplSDL3_NewFrame();
 			ImGui::NewFrame();
 
+			modelManager->update();
+
 			// ============================================
-			// IMGUI WIDGETS - Your Hello World Window
+			// MODEL MANAGER UI
 			// ============================================
-			ImGui::Begin("Hello World!");
+			ImGui::Begin("Model Manager");
 
-			ImGui::Text("Welcome to Dear ImGui with Vulkan!");
-			ImGui::Separator();
-
-			// Some example widgets
-			static char textBuffer[256] = "Hello, World!";
-			ImGui::InputText("Edit me", textBuffer, sizeof(textBuffer));
-
-			static float sliderValue = 0.5f;
-			ImGui::SliderFloat("Slider", &sliderValue, 0.0f, 1.0f);
-
-			static int clickCount = 0;
-			if (ImGui::Button("Click me!")) {
-				clickCount++;
-			}
-			ImGui::SameLine();
-			ImGui::Text("Clicked %d times", clickCount);
-
-			ImGui::Separator();
+			ImGui::Text("FPS: %.1f", ImGui::GetIO().Framerate);
 			ImGui::Text("Camera: (%.2f, %.2f, %.2f)",
 				camera.position.x, camera.position.y, camera.position.z);
-			ImGui::Text("FPS: %.1f", ImGui::GetIO().Framerate);
+			ImGui::Separator();
+
+			// Quick Load Buttons
+			ImGui::Text("Quick Load:");
+			if (ImGui::Button("Load Sponza")) {
+				modelManager->loadModelAsync("models/main_sponza/NewSponza_Main_glTF_003.gltf", "Sponza");
+			}
+			ImGui::SameLine();
+			if (ImGui::Button("Load School")) {
+				modelManager->loadModelAsync("models/tomsk_school/tomsk_school3.obj", "School");
+			}
+			ImGui::SameLine();
+			if (ImGui::Button("Load Bus Stop")) {
+				modelManager->loadModelAsync("models/bus_stop/Untitled.glb", "BusStop");
+			}
+
+			// Custom path input
+			static char modelPath[512] = "models/";
+			ImGui::InputText("Model Path", modelPath, sizeof(modelPath));
+			if (ImGui::Button("Load Custom")) {
+				modelManager->loadModelAsync(modelPath);
+			}
+
+			ImGui::Separator();
+
+			// Loading tasks
+			const auto& tasks = modelManager->getLoadingTasks();
+			if (!tasks.empty()) {
+				ImGui::Text("Loading:");
+				for (const auto& task : tasks) {
+					const char* stateStr = "Unknown";
+					switch (task.state) {
+					case LoadingState::LoadingCPU: stateStr = "Parsing..."; break;
+					case LoadingState::UploadingGPU: stateStr = "Uploading..."; break;
+					case LoadingState::Failed: stateStr = "FAILED"; break;
+					default: break;
+					}
+					ImGui::BulletText("%s - %s", task.name.c_str(), stateStr);
+				}
+				ImGui::Separator();
+			}
+
+			// Loaded Models
+			ImGui::Text("Loaded Models: %zu", modelManager->getModels().size());
+			const auto& models = modelManager->getModels();
+			static int selectedModel = -1;
+
+			for (size_t i = 0; i < models.size(); ++i) {
+				const auto& model = models[i];
+				ImGui::PushID(static_cast<int>(i));
+
+				bool isSelected = (selectedModel == static_cast<int>(i));
+				if (ImGui::Selectable(model->name.c_str(), isSelected)) {
+					selectedModel = static_cast<int>(i);
+				}
+
+				// Right-click context menu
+				if (ImGui::BeginPopupContextItem()) {
+					if (ImGui::MenuItem("Create Instance")) {
+						modelManager->createInstance(i, camera.position + glm::vec3(0, 0, -5));
+					}
+					if (ImGui::MenuItem("Create at Origin")) {
+						modelManager->createInstance(i, glm::vec3(0.0f));
+					}
+					ImGui::Separator();
+					if (ImGui::MenuItem("Unload")) {
+						modelManager->unloadModel(i);
+						selectedModel = -1;
+					}
+					ImGui::EndPopup();
+				}
+
+				ImGui::SameLine();
+				ImGui::TextDisabled("(%zu verts, %zu tex)",
+					model->vertexCount, model->textures.size());
+
+				ImGui::PopID();
+			}
+
+			ImGui::Separator();
+
+			// Instances
+			ImGui::Text("Scene Instances: %zu", modelManager->getInstances().size());
+			auto& instances = modelManager->getInstances();
+			static int selectedInstance = -1;
+
+			for (size_t i = 0; i < instances.size(); ++i) {
+				auto& inst = instances[i];
+				ImGui::PushID(static_cast<int>(i) + 10000);
+
+				ImGui::Checkbox("##vis", &inst.visible);
+				ImGui::SameLine();
+
+				bool isSelected = (selectedInstance == static_cast<int>(i));
+				if (ImGui::Selectable(inst.name.c_str(), isSelected)) {
+					selectedInstance = static_cast<int>(i);
+				}
+
+				if (ImGui::BeginPopupContextItem()) {
+					if (ImGui::MenuItem("Delete")) {
+						modelManager->removeInstance(i);
+						selectedInstance = -1;
+					}
+					ImGui::EndPopup();
+				}
+
+				ImGui::PopID();
+			}
+
+			// Instance Inspector
+			if (selectedInstance >= 0 && selectedInstance < static_cast<int>(instances.size())) {
+				ImGui::Separator();
+				ImGui::Text("Transform:");
+				auto& inst = instances[selectedInstance];
+				ImGui::DragFloat3("Position", &inst.position[0], 0.1f);
+				ImGui::DragFloat3("Rotation", &inst.rotation[0], 1.0f);
+				ImGui::DragFloat3("Scale", &inst.scale[0], 0.01f, 0.01f, 100.0f);
+			}
 
 			ImGui::End();
 
@@ -3183,51 +2486,61 @@ int main()
 				};
 				cmd.setVertexInputEXT(2, bindingDescs, static_cast<uint32_t>(attributesArray.size()), attributesArray.data());
 
-				// Bind buffers
-				vk::DeviceSize offsets[2] = { 0, 0 };
-				vk::Buffer buffers[2] = { vertexBuffer->getBuffer(), instanceBuffer->getBuffer() };
-				vk::DeviceSize sizes[2] = { sizeof(Vertex) * model.vertices.size(), sizeof(InstanceData) * instances.size() };
-				vk::DeviceSize strides[2] = { sizeof(Vertex), sizeof(InstanceData) };
-				cmd.bindVertexBuffers2(0, 2, buffers, offsets, sizes, strides);
-				cmd.bindIndexBuffer(indexBuffer->getBuffer(), 0, vk::IndexType::eUint32);
-
-				// Bind UBO at set 0
 				cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, shadowPipelineLayout, 0, 1,
 					&uboDescriptorSets[currentFrame], 0, nullptr);
 
-				// Draw all non-blend submeshes
-				for (const auto& sub : model.submeshes) {
-					if (sub.material.alphaMode == AlphaMode::BLEND)
-						continue;
+				// Draw shadow pass for all model instances
+				const auto& shadowInstances = modelManager->getInstances();
 
-					ShadowPushConstants shadowPc{};
-					shadowPc.alphaCutoff = sub.material.alphaCutoff;
-					shadowPc.alphaMode = static_cast<int>(sub.material.alphaMode);
+				for (const auto& inst : shadowInstances) {
+					if (!inst.visible) continue;
 
-					cmd.pushConstants(
-						shadowPipelineLayout,
-						vk::ShaderStageFlagBits::eFragment,
-						0,
-						sizeof(ShadowPushConstants),
-						&shadowPc
-					);
+					GPUModel* gpuModel = modelManager->getModel(inst.modelIndex);
+					if (!gpuModel || !gpuModel->isValid()) continue;
 
-					// Bind base color texture for alpha testing
-					if (sub.material.alphaMode == AlphaMode::MASK && sub.material.baseColorTextureIndex >= 0) {
-						vk::DescriptorSet baseColorSet = textureDescriptorSets[sub.material.baseColorTextureIndex + 1];
-						cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, shadowPipelineLayout, 1, 1, &baseColorSet, 0, nullptr);
+					// Bind vertex/index buffers for this model
+					vk::Buffer modelBuffers[1] = { gpuModel->vertexBuffer->getBuffer() };
+					vk::DeviceSize modelOffsets[1] = { 0 };
+					vk::DeviceSize modelSizes[1] = { sizeof(Vertex) * gpuModel->vertexCount };
+					vk::DeviceSize modelStrides[1] = { sizeof(Vertex) };
+
+					vk::VertexInputBindingDescription2EXT singleBinding = Vertex::getBindingDescription(0);
+					cmd.setVertexInputEXT(1, &singleBinding,
+						static_cast<uint32_t>(attributesArray.size()), attributesArray.data());
+
+					cmd.bindVertexBuffers2(0, 1, modelBuffers, modelOffsets, modelSizes, modelStrides);
+					cmd.bindIndexBuffer(gpuModel->indexBuffer->getBuffer(), 0, vk::IndexType::eUint32);
+
+					// Draw all non-blend submeshes for shadow
+					for (const auto& sub : gpuModel->submeshes) {
+						if (sub.material.alphaMode == AlphaMode::BLEND)
+							continue;
+
+						ShadowPushConstants shadowPc{};
+						shadowPc.alphaCutoff = sub.material.alphaCutoff;
+						shadowPc.alphaMode = static_cast<int>(sub.material.alphaMode);
+
+						cmd.pushConstants(
+							shadowPipelineLayout,
+							vk::ShaderStageFlagBits::eFragment,
+							0,
+							sizeof(ShadowPushConstants),
+							&shadowPc
+						);
+
+						// Bind base color texture for alpha testing
+						if (sub.material.alphaMode == AlphaMode::MASK && sub.material.baseColorTextureIndex >= 0 &&
+							sub.material.baseColorTextureIndex < static_cast<int>(gpuModel->textureDescriptorSets.size())) {
+							vk::DescriptorSet baseColorSet = gpuModel->textureDescriptorSets[sub.material.baseColorTextureIndex];
+							cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, shadowPipelineLayout, 1, 1, &baseColorSet, 0, nullptr);
+						}
+						else {
+							vk::DescriptorSet defaultSet = modelManager->getDefaultBaseColorSet();
+							cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, shadowPipelineLayout, 1, 1, &defaultSet, 0, nullptr);
+						}
+
+						cmd.drawIndexed(sub.indexCount, 1, sub.indexOffset, sub.vertexOffset, 0);
 					}
-					else {
-						cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, shadowPipelineLayout, 1, 1, &textureDescriptorSets[0], 0, nullptr);
-					}
-
-					cmd.drawIndexed(
-						sub.indexCount,
-						instanceBuffer->getInstanceCount(),
-						sub.indexOffset,
-						sub.vertexOffset,
-						0
-					);
 				}
 
 				cmd.endRendering();
@@ -3357,112 +2670,113 @@ int main()
 			// vk::VertexInputBindingDescription2EXT bindings[2]{ binding, instanceBinding };
 			cmd.setVertexInputEXT(2, bindingDescs, static_cast<uint32_t>(attributesArray.size()), attributesArray.data());
 
-			// Bind buffers
-			vk::DeviceSize offsets[2] = { 0, 0 };
-			vk::Buffer buffers[2] = {
-				vertexBuffer->getBuffer(),
-				instanceBuffer->getBuffer()
-			};
-			vk::DeviceSize sizes[2] = { sizeof(Vertex) * model.vertices.size(), sizeof(InstanceData) * instances.size() };
-			vk::DeviceSize strides[2] = { sizeof(Vertex), sizeof(InstanceData) };
-			//vk::DeviceSize stride = sizeof(Vertex); // Make sure this >= sum of attribute sizes
-			//vk::DeviceSize size = sizeof(Vertex) * vertices.size(); // Make sure this >= sum of attribute sizes
-
-			cmd.bindVertexBuffers2(
-				0
-				, 2
-				, buffers
-				, offsets
-				, sizes
-				, strides);
-
-			cmd.bindIndexBuffer(
-				indexBuffer->getBuffer(),
-				0,
-				vk::IndexType::eUint32
-			);
-			glm::mat4 lightSpaceMatrix = calculateLightSpaceMatrix(sunLight, sceneBounds.center, sceneBounds.radius);
 
 			cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipelineLayout, 0, 1,
 				&uboDescriptorSets[currentFrame], 0, nullptr);
 
-			// Sort submeshes for proper transparency rendering
-			auto sortedSubmeshes = sortSubmeshesForRendering(model.submeshes, model.vertices, camera.position);
-			bool currentlyBlending = false;
+			const auto& modelInstances = modelManager->getInstances();
 
-			for (const auto& renderSub : sortedSubmeshes) {
-				const auto& sub = model.submeshes[renderSub.submeshIndex];
+			for (const auto& inst : modelInstances) {
+				if (!inst.visible) continue;
 
-				bool needsBlending = (sub.material.alphaMode == AlphaMode::BLEND);
+				GPUModel* gpuModel = modelManager->getModel(inst.modelIndex);
+				if (!gpuModel || !gpuModel->isValid()) continue;
 
-				if (needsBlending != currentlyBlending) {
-					currentlyBlending = needsBlending;
+				// Bind vertex/index buffers for this model
+				vk::Buffer modelBuffers[1] = { gpuModel->vertexBuffer->getBuffer() };
+				vk::DeviceSize modelOffsets[1] = { 0 };
+				vk::DeviceSize modelSizes[1] = { sizeof(Vertex) * gpuModel->vertexCount };
+				vk::DeviceSize modelStrides[1] = { sizeof(Vertex) };
 
-					if (needsBlending) {
-						cmd.setColorBlendEnableEXT(0, VK_TRUE);
+				// Update vertex input for single buffer (no instancing for now)
+				vk::VertexInputBindingDescription2EXT singleBinding = Vertex::getBindingDescription(0);
+				cmd.setVertexInputEXT(1, &singleBinding,
+					static_cast<uint32_t>(attributesArray.size()), attributesArray.data());
 
-						vk::ColorBlendEquationEXT blendEquation{};
-						blendEquation.srcColorBlendFactor = vk::BlendFactor::eSrcAlpha;
-						blendEquation.dstColorBlendFactor = vk::BlendFactor::eOneMinusSrcAlpha;
-						blendEquation.colorBlendOp = vk::BlendOp::eAdd;
-						blendEquation.srcAlphaBlendFactor = vk::BlendFactor::eOne;
-						blendEquation.dstAlphaBlendFactor = vk::BlendFactor::eOneMinusSrcAlpha;
-						blendEquation.alphaBlendOp = vk::BlendOp::eAdd;
-						cmd.setColorBlendEquationEXT(0, 1, &blendEquation);
+				cmd.bindVertexBuffers2(0, 1, modelBuffers, modelOffsets, modelSizes, modelStrides);
+				cmd.bindIndexBuffer(gpuModel->indexBuffer->getBuffer(), 0, vk::IndexType::eUint32);
 
-						cmd.setDepthWriteEnable(VK_FALSE);
+				// Get instance transform
+				glm::mat4 instanceTransform = inst.getTransformMatrix();
+
+				// Sort submeshes
+				auto sortedSubmeshes = sortSubmeshesForRendering(
+					gpuModel->submeshes,
+					std::vector<Vertex>(), // Empty - we don't have CPU vertices anymore
+					camera.position
+				);
+
+				bool currentlyBlending = false;
+
+				for (const auto& renderSub : sortedSubmeshes) {
+					const auto& sub = gpuModel->submeshes[renderSub.submeshIndex];
+
+					bool needsBlending = (sub.material.alphaMode == AlphaMode::BLEND);
+
+					if (needsBlending != currentlyBlending) {
+						currentlyBlending = needsBlending;
+
+						if (needsBlending) {
+							cmd.setColorBlendEnableEXT(0, VK_TRUE);
+							vk::ColorBlendEquationEXT blendEquation{};
+							blendEquation.srcColorBlendFactor = vk::BlendFactor::eSrcAlpha;
+							blendEquation.dstColorBlendFactor = vk::BlendFactor::eOneMinusSrcAlpha;
+							blendEquation.colorBlendOp = vk::BlendOp::eAdd;
+							blendEquation.srcAlphaBlendFactor = vk::BlendFactor::eOne;
+							blendEquation.dstAlphaBlendFactor = vk::BlendFactor::eOneMinusSrcAlpha;
+							blendEquation.alphaBlendOp = vk::BlendOp::eAdd;
+							cmd.setColorBlendEquationEXT(0, 1, &blendEquation);
+							cmd.setDepthWriteEnable(VK_FALSE);
+						}
+						else {
+							cmd.setColorBlendEnableEXT(0, VK_FALSE);
+							cmd.setDepthWriteEnable(VK_TRUE);
+						}
 					}
-					else {
-						cmd.setColorBlendEnableEXT(0, VK_FALSE);
-						cmd.setDepthWriteEnable(VK_TRUE);
-					}
+
+					// Push constants
+					MeshPushConstants pc{};
+					pc.baseColor = sub.material.baseColorFactor;
+					pc.metallic = sub.material.metallicFactor;
+					pc.roughness = sub.material.roughnessFactor;
+					pc.alphaCutoff = sub.material.alphaCutoff;
+					pc.alphaMode = static_cast<int>(sub.material.alphaMode);
+
+					cmd.pushConstants(
+						pipelineLayout,
+						vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment,
+						0, sizeof(MeshPushConstants), &pc
+					);
+
+					// Bind textures
+					vk::DescriptorSet baseColorSet = (sub.material.baseColorTextureIndex >= 0 &&
+						sub.material.baseColorTextureIndex < static_cast<int>(gpuModel->textureDescriptorSets.size()))
+						? gpuModel->textureDescriptorSets[sub.material.baseColorTextureIndex]
+						: modelManager->getDefaultBaseColorSet();
+					cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipelineLayout, 1, 1, &baseColorSet, 0, nullptr);
+
+					vk::DescriptorSet normalSet = (sub.material.normalTextureIndex >= 0 &&
+						sub.material.normalTextureIndex < static_cast<int>(gpuModel->textureDescriptorSets.size()))
+						? gpuModel->textureDescriptorSets[sub.material.normalTextureIndex]
+						: modelManager->getDefaultNormalSet();
+					cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipelineLayout, 2, 1, &normalSet, 0, nullptr);
+
+					vk::DescriptorSet mrSet = (sub.material.metallicRoughnessTextureIndex >= 0 &&
+						sub.material.metallicRoughnessTextureIndex < static_cast<int>(gpuModel->textureDescriptorSets.size()))
+						? gpuModel->textureDescriptorSets[sub.material.metallicRoughnessTextureIndex]
+						: modelManager->getDefaultMRSet();
+					cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipelineLayout, 3, 1, &mrSet, 0, nullptr);
+
+					cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipelineLayout, 4, 1, &shadowMapDescriptorSet, 0, nullptr);
+
+					// Draw
+					cmd.drawIndexed(sub.indexCount, 1, sub.indexOffset, sub.vertexOffset, 0);
 				}
 
-				MeshPushConstants pc{};
-				pc.baseColor = sub.material.baseColorFactor;
-				pc.metallic = sub.material.metallicFactor;
-				pc.roughness = sub.material.roughnessFactor;
-				pc.alphaCutoff = sub.material.alphaCutoff;
-				pc.alphaMode = static_cast<int>(sub.material.alphaMode);
-
-				cmd.pushConstants(
-					pipelineLayout,
-					vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment,
-					0,
-					sizeof(MeshPushConstants),
-					&pc
-				);
-
-				// Bind textures at sets 1-4
-				vk::DescriptorSet baseColorSet = (sub.material.baseColorTextureIndex >= 0)
-					? textureDescriptorSets[sub.material.baseColorTextureIndex + 1]
-					: textureDescriptorSets[0];
-				cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipelineLayout, 1, 1, &baseColorSet, 0, nullptr);
-
-				vk::DescriptorSet normalSet = (sub.material.normalTextureIndex >= 0)
-					? textureDescriptorSets[sub.material.normalTextureIndex + 1]
-					: defaultNormalSet;
-				cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipelineLayout, 2, 1, &normalSet, 0, nullptr);
-
-				vk::DescriptorSet mrSet = (sub.material.metallicRoughnessTextureIndex >= 0)
-					? textureDescriptorSets[sub.material.metallicRoughnessTextureIndex + 1]
-					: defaultMrSet;
-				cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipelineLayout, 3, 1, &mrSet, 0, nullptr);
-
-				cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipelineLayout, 4, 1, &shadowMapDescriptorSet, 0, nullptr);
-
-				cmd.drawIndexed(
-					sub.indexCount,
-					instanceBuffer->getInstanceCount(),
-					sub.indexOffset,
-					sub.vertexOffset,
-					0
-				);
-			}
-
-			if (currentlyBlending) {
-				cmd.setColorBlendEnableEXT(0, VK_FALSE);
-				cmd.setDepthWriteEnable(VK_TRUE);
+				if (currentlyBlending) {
+					cmd.setColorBlendEnableEXT(0, VK_FALSE);
+					cmd.setDepthWriteEnable(VK_TRUE);
+				}
 			}
 
 			cmd.endRendering();
@@ -3561,11 +2875,9 @@ int main()
 				vmaDestroyBuffer(allocator, ubo.buffer, ubo.allocation);
 			}
 		}
+		modelManager.reset();
 	};
 
-	vertexBuffer.reset();
-	indexBuffer.reset();
-	instanceBuffer.reset();
 	vmaDestroyImage(allocator, depthImage, depthAlloc);
 	destroyShadowMap(shadowMap, allocator, device);
 	vmaDestroyAllocator(allocator);
