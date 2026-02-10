@@ -46,7 +46,6 @@ struct FrameUBO {
 };
 
 struct MeshPushConstants {
-	glm::mat4 modelMatrix{ 1.0f };
 	glm::vec4 baseColor{ 1.0f, 1.0f, 1.0f, 1.0f };  // 16 bytes
 	float metallic{ 0.0f };                          // 4 bytes
 	float roughness{ 0.5f };                         // 4 bytes
@@ -2335,7 +2334,6 @@ int main()
 
 			for (size_t i = 0; i < instances.size(); ++i) {
 				auto& inst = instances[i];
-				pc.modelMatrix = inst.getTransformMatrix();
 				ImGui::PushID(static_cast<int>(i) + 10000);
 
 				ImGui::Checkbox("##vis", &inst.visible);
