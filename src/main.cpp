@@ -2344,11 +2344,17 @@ int main()
 							auto& inst = modelManager->getInstances()[gizmo.selectedInstance];
 							float gizmoScale = getGizmoScale(inst.position, camera.position,
 								0.15f, projMat);
-							float scaledAxisLength = 2.0f * gizmoScale;
 
-							GizmoAxis hitAxis = pickGizmoAxis(ray, inst.position, scaledAxisLength,
-								20.0f,  // 20 pixel pick radius - generous for usability
-								viewMat, projMat, 1280.0f, 720.0f);
+							// FIX: Pass mouse pixel coords directly and the gizmoScale
+							// (pickGizmoAxis internally computes worldAxisLength = 2.0f * gizmoScale
+							//  which matches the rendered geometry: vertices at 0..2.0 scaled by gizmoScale)
+							GizmoAxis hitAxis = pickGizmoAxis(
+								glm::vec2(mx, my),     // <-- direct pixel coordinates
+								inst.position,
+								gizmoScale,            // <-- same scale used for rendering
+								20.0f,                 // pick radius in pixels
+								viewMat, projMat,
+								1280.0f, 720.0f);
 
 							if (hitAxis != GizmoAxis::None) {
 								gizmo.activeAxis = hitAxis;
@@ -2576,9 +2582,14 @@ int main()
 						if (ImGui::MenuItem("Unload")) {
 							if (gizmo.selectedInstance >= 0) {
 								const auto& insts = modelManager->getInstances();
-								if (gizmo.selectedInstance < static_cast<int>(insts.size()) &&
-									insts[gizmo.selectedInstance].modelIndex == i) {
+								if (gizmo.selectedInstance >= static_cast<int>(insts.size())) {
 									gizmo.deselect();
+								}
+								else {
+									GPUModel* model = modelManager->getModel(insts[gizmo.selectedInstance].modelIndex);
+									if (!model || !model->isValid()) {
+										gizmo.deselect();  // <-- THIS might be firing!
+									}
 								}
 							}
 							modelManager->unloadModel(i);

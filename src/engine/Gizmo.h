@@ -117,13 +117,12 @@ inline bool rayIntersectsTransformedAABB(const Ray& ray,
     return rayIntersectsAABB(localRay, localMin, localMax, tOut);
 }
 
-// Project a 3D point to screen pixel coordinates
 inline glm::vec2 worldToScreen(const glm::vec3& worldPos,
     const glm::mat4& vp,
     float screenWidth, float screenHeight)
 {
     glm::vec4 clip = vp * glm::vec4(worldPos, 1.0f);
-    if (clip.w <= 0.0001f) return glm::vec2(-10000.0f); // Behind camera
+    if (clip.w <= 0.0001f) return glm::vec2(-10000.0f);
     glm::vec3 ndc = glm::vec3(clip) / clip.w;
     return glm::vec2(
         (ndc.x * 0.5f + 0.5f) * screenWidth,
@@ -131,7 +130,6 @@ inline glm::vec2 worldToScreen(const glm::vec3& worldPos,
     );
 }
 
-// Distance from a 2D point to a 2D line segment, returns parametric t along segment
 inline float pointToSegment2D(const glm::vec2& point,
     const glm::vec2& segA, const glm::vec2& segB,
     float& segT)
@@ -149,10 +147,13 @@ inline float pointToSegment2D(const glm::vec2& point,
     return glm::length(point - closest);
 }
 
-// Pick gizmo axis entirely in screen space - much more reliable
-inline GizmoAxis pickGizmoAxis(const Ray& ray,
+// =====================================================
+// FIX: Pass mouse pixel coordinates directly instead of
+// trying to reconstruct them from the ray
+// =====================================================
+inline GizmoAxis pickGizmoAxis(const glm::vec2& mousePixel,  // <-- CHANGED: direct pixel coords
     const glm::vec3& gizmoCenter,
-    float axisLength,
+    float gizmoScale,          // <-- CHANGED: pass the actual scale used for rendering
     float pickRadiusPixels,
     const glm::mat4& view,
     const glm::mat4& proj,
@@ -176,43 +177,25 @@ inline GizmoAxis pickGizmoAxis(const Ray& ray,
     glm::vec4 centerClip = vp * glm::vec4(gizmoCenter, 1.0f);
     if (centerClip.w <= 0.0f) return GizmoAxis::None;
 
-    // Get mouse position in screen pixels from ray
-    // The ray origin projected to screen IS the mouse position
-    glm::vec2 mousePixel = worldToScreen(ray.origin + ray.direction * 0.1f, vp, screenWidth, screenHeight);
-
-    // Actually, we should use the click position directly. Since the ray was constructed
-    // from the mouse position, we can reconstruct it:
-    // But it's more reliable to project a near-plane point.
-    // The ray origin in perspective projection IS the camera position,
-    // so we need to use NDC coordinates instead.
-
-    // Reconstruct mouse pixel from ray direction
-    glm::vec4 rayPointClip = vp * glm::vec4(ray.origin + ray.direction, 1.0f);
-    if (rayPointClip.w <= 0.0f) return GizmoAxis::None;
-    glm::vec3 rayPointNDC = glm::vec3(rayPointClip) / rayPointClip.w;
-    mousePixel = glm::vec2(
-        (rayPointNDC.x * 0.5f + 0.5f) * screenWidth,
-        (1.0f - (rayPointNDC.y * 0.5f + 0.5f)) * screenHeight
-    );
-
     float bestDist = pickRadiusPixels;
     GizmoAxis bestAxis = GizmoAxis::None;
 
-    for (auto& a : axes) {
-        glm::vec3 axisEnd = gizmoCenter + a.dir * axisLength;
+    // The gizmo geometry has axes of length 2.0f (from generateTranslateGizmoLines)
+    // The renderer scales the entire gizmo by gizmoScale
+    // So the world-space axis endpoint is at: gizmoCenter + dir * 2.0f * gizmoScale
+    float worldAxisLength = 2.0f * gizmoScale;
 
-        // Project both endpoints to screen
+    for (auto& a : axes) {
+        glm::vec3 axisEnd = gizmoCenter + a.dir * worldAxisLength;
+
         glm::vec2 screenStart = worldToScreen(gizmoCenter, vp, screenWidth, screenHeight);
         glm::vec2 screenEnd = worldToScreen(axisEnd, vp, screenWidth, screenHeight);
 
-        // Skip if either point is behind camera (indicated by large negative coords)
         if (screenStart.x < -5000.0f || screenEnd.x < -5000.0f) continue;
 
-        // Skip if the axis has zero screen length (pointing directly at/away from camera)
         float screenLen = glm::length(screenEnd - screenStart);
-        if (screenLen < 2.0f) continue; // Less than 2 pixels - can't pick this
+        if (screenLen < 2.0f) continue;
 
-        // Find pixel distance from mouse to the screen-space line segment
         float segT;
         float pixelDist = pointToSegment2D(mousePixel, screenStart, screenEnd, segT);
 
@@ -241,7 +224,6 @@ struct GizmoVertex {
 
 inline std::vector<GizmoVertex> generateTranslateGizmoLines(float length = 2.0f) {
     return {
-        // X axis - Red
         {{ 0, 0, 0 }, { 1, 0, 0 }},
         {{ length, 0, 0 }, { 1, 0, 0 }},
         {{ length, 0, 0 }, { 1, 0, 0 }},
@@ -249,7 +231,6 @@ inline std::vector<GizmoVertex> generateTranslateGizmoLines(float length = 2.0f)
         {{ length, 0, 0 }, { 1, 0, 0 }},
         {{ length - 0.2f, -0.1f, 0 }, { 1, 0, 0 }},
 
-        // Y axis - Green
         {{ 0, 0, 0 }, { 0, 1, 0 }},
         {{ 0, length, 0 }, { 0, 1, 0 }},
         {{ 0, length, 0 }, { 0, 1, 0 }},
@@ -257,7 +238,6 @@ inline std::vector<GizmoVertex> generateTranslateGizmoLines(float length = 2.0f)
         {{ 0, length, 0 }, { 0, 1, 0 }},
         {{ -0.1f, length - 0.2f, 0 }, { 0, 1, 0 }},
 
-        // Z axis - Blue
         {{ 0, 0, 0 }, { 0, 0, 1 }},
         {{ 0, 0, length }, { 0, 0, 1 }},
         {{ 0, 0, length }, { 0, 0, 1 }},
