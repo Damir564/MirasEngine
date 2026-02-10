@@ -34,6 +34,7 @@
 #include "engine/ModelTypes.h"
 #include "engine/ModelManager.h"
 #include "engine/Gizmo.h"
+#include "engine/SceneSerializer.h"
 
 struct FrameUBO {
 	glm::mat4 view;
@@ -2243,6 +2244,10 @@ int main()
 		bool rightMouseHeld = false;
 		SDL_SetWindowRelativeMouseMode(window, mouseEnabled);
 		bool running = true;
+		static char sceneSavePath[512] = "scene.scn";
+		static char sceneLoadPath[512] = "scene.scn";
+		bool pendingSceneLoad = false;
+		SceneSerializer::LoadedScene pendingScene;
 		SDL_Event event;
 		uint32_t currentFrame = 0;
 		MeshPushConstants pc{};
@@ -2533,7 +2538,48 @@ int main()
 				ImGui::NewFrame();
 
 				modelManager->update();
+				if (pendingSceneLoad) {
+					const auto& loadingTasks = modelManager->getLoadingTasks();
+					const auto& loadedModels = modelManager->getModels();
 
+					// Check if all models finished loading
+					bool allDone = loadingTasks.empty() && !loadedModels.empty();
+
+					// Also check if expected model count matches
+					if (allDone && loadedModels.size() >= pendingScene.models.size()) {
+						// Build map from file model index to manager model index by matching paths
+						std::vector<int> fileToManager(pendingScene.models.size(), -1);
+
+						for (size_t fi = 0; fi < pendingScene.models.size(); ++fi) {
+							for (size_t mi = 0; mi < loadedModels.size(); ++mi) {
+								if (loadedModels[mi] && loadedModels[mi]->isValid() &&
+									loadedModels[mi]->sourcePath == pendingScene.models[fi].path) {
+									fileToManager[fi] = static_cast<int>(mi);
+									break;
+								}
+							}
+						}
+
+						// Create all instances
+						for (const auto& inst : pendingScene.instances) {
+							if (inst.fileModelIndex >= fileToManager.size()) continue;
+							int managerIdx = fileToManager[inst.fileModelIndex];
+							if (managerIdx < 0) continue;
+
+							size_t newIdx = modelManager->createInstance(
+								static_cast<size_t>(managerIdx), inst.position);
+
+							auto& newInst = modelManager->getInstances()[newIdx];
+							newInst.name = inst.name;
+							newInst.rotation = inst.rotation;
+							newInst.scale = inst.scale;
+							newInst.visible = inst.visible;
+						}
+
+						pendingSceneLoad = false;
+						std::cout << "[SCENE] All instances created\n";
+					}
+				}
 				// ============================================
 				// MODEL MANAGER UI
 				// ============================================
@@ -2542,6 +2588,82 @@ int main()
 				ImGui::Text("FPS: %.1f", ImGui::GetIO().Framerate);
 				ImGui::Text("Camera: (%.2f, %.2f, %.2f)",
 					camera.position.x, camera.position.y, camera.position.z);
+				ImGui::Separator();
+
+				// ============================================
+// SCENE SAVE / LOAD
+// ============================================
+				ImGui::Text("Scene File:");
+				ImGui::InputText("##scenepath", sceneSavePath, sizeof(sceneSavePath));
+
+				if (ImGui::Button("Save Scene")) {
+					if (SceneSerializer::Save(sceneSavePath, *modelManager)) {
+						std::cout << "[SCENE] Scene saved successfully\n";
+					}
+					else {
+						std::cerr << "[SCENE] Failed to save scene\n";
+					}
+				}
+				ImGui::SameLine();
+				if (ImGui::Button("Load Scene")) {
+					auto loaded = SceneSerializer::Load(sceneSavePath);
+					if (loaded.valid) {
+						// Clear current scene
+						gizmo.deselect();
+						device.waitIdle();
+
+						// Clear all instances
+						auto& currentInstances = modelManager->getInstances();
+						while (!currentInstances.empty()) {
+							modelManager->removeInstance(currentInstances.size() - 1);
+						}
+
+						// Unload all models
+						while (!modelManager->getModels().empty()) {
+							modelManager->unloadModel(modelManager->getModels().size() - 1);
+						}
+
+						// Load models from scene file
+						// Map from file model index -> modelManager model index
+						std::vector<int> fileToManagerIndex(loaded.models.size(), -1);
+
+						for (size_t i = 0; i < loaded.models.size(); ++i) {
+							// Check if model file exists
+							std::ifstream testFile(loaded.models[i].path);
+							if (!testFile.good()) {
+								std::cerr << "[SCENE] Model file not found: " << loaded.models[i].path << "\n";
+								continue;
+							}
+							testFile.close();
+
+							modelManager->loadModelAsync(loaded.models[i].path, loaded.models[i].name);
+							// The model index will be assigned when loading completes
+							// For now store the expected index
+							fileToManagerIndex[i] = static_cast<int>(i);
+						}
+
+						// Store pending scene data to create instances after models finish loading
+						pendingSceneLoad = true;
+						pendingScene = loaded;
+
+						std::cout << "[SCENE] Loading " << loaded.models.size() << " models...\n";
+					}
+				}
+				ImGui::SameLine();
+				if (ImGui::Button("Clear Scene")) {
+					gizmo.deselect();
+					device.waitIdle();
+
+					auto& currentInstances = modelManager->getInstances();
+					while (!currentInstances.empty()) {
+						modelManager->removeInstance(currentInstances.size() - 1);
+					}
+
+					while (!modelManager->getModels().empty()) {
+						modelManager->unloadModel(modelManager->getModels().size() - 1);
+					}
+				}
+
 				ImGui::Separator();
 
 				// Quick Load Buttons
@@ -2712,6 +2834,41 @@ int main()
 			}
 			else {
 				modelManager->update();
+
+				// Handle pending scene load even when GUI is hidden
+				if (pendingSceneLoad) {
+					const auto& loadingTasks = modelManager->getLoadingTasks();
+					const auto& loadedModels = modelManager->getModels();
+
+					bool allDone = loadingTasks.empty() && !loadedModels.empty();
+					if (allDone && loadedModels.size() >= pendingScene.models.size()) {
+						std::vector<int> fileToManager(pendingScene.models.size(), -1);
+						for (size_t fi = 0; fi < pendingScene.models.size(); ++fi) {
+							for (size_t mi = 0; mi < loadedModels.size(); ++mi) {
+								if (loadedModels[mi] && loadedModels[mi]->isValid() &&
+									loadedModels[mi]->sourcePath == pendingScene.models[fi].path) {
+									fileToManager[fi] = static_cast<int>(mi);
+									break;
+								}
+							}
+						}
+						for (const auto& inst : pendingScene.instances) {
+							if (inst.fileModelIndex >= fileToManager.size()) continue;
+							int managerIdx = fileToManager[inst.fileModelIndex];
+							if (managerIdx < 0) continue;
+							size_t newIdx = modelManager->createInstance(
+								static_cast<size_t>(managerIdx), inst.position);
+							auto& newInst = modelManager->getInstances()[newIdx];
+							newInst.name = inst.name;
+							newInst.rotation = inst.rotation;
+							newInst.scale = inst.scale;
+							newInst.visible = inst.visible;
+						}
+						pendingSceneLoad = false;
+						std::cout << "[SCENE] All instances created\n";
+					}
+				}
+
 				drawData = nullptr;
 			}
 			vk::SwapchainKHR swapchainHPP(vkbSwapchain.swapchain);
