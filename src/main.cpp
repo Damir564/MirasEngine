@@ -2240,6 +2240,7 @@ int main()
 		// ------------------------
 		Camera camera;
 		bool mouseEnabled = true;
+		bool rightMouseHeld = false;
 		SDL_SetWindowRelativeMouseMode(window, mouseEnabled);
 		bool running = true;
 		SDL_Event event;
@@ -2327,7 +2328,8 @@ int main()
 					}
 				}
 				if (!mouseEnabled) {
-					if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN && event.button.button == SDL_BUTTON_LEFT) {
+					if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN && event.button.button == SDL_BUTTON_LEFT 
+						&& !ImGui::GetIO().WantCaptureMouse) {
 						float mx = event.button.x;
 						float my = event.button.y;
 
@@ -2338,34 +2340,43 @@ int main()
 						bool clickedOnGizmo = false;
 
 						// First: try clicking on gizmo axis
-						if (gizmo.selectedInstance >= 0 && gizmo.mode != GizmoMode::None &&
-							gizmo.selectedInstance < static_cast<int>(modelManager->getInstances().size())) {
+						if (gizmo.selectedInstance >= 0 && gizmo.mode != GizmoMode::None && gizmo.selectedInstance < static_cast<int>(modelManager->getInstances().size())) {
 
-							auto& inst = modelManager->getInstances()[gizmo.selectedInstance];
-							float gizmoScale = getGizmoScale(inst.position, camera.position,
-								0.15f, projMat);
+    auto& inst = modelManager->getInstances()[gizmo.selectedInstance];
+    float gizmoScaleVal = getGizmoScale(inst.position, camera.position,
+        0.15f, projMat);
 
-							// FIX: Pass mouse pixel coords directly and the gizmoScale
-							// (pickGizmoAxis internally computes worldAxisLength = 2.0f * gizmoScale
-							//  which matches the rendered geometry: vertices at 0..2.0 scaled by gizmoScale)
-							GizmoAxis hitAxis = pickGizmoAxis(
-								glm::vec2(mx, my),     // <-- direct pixel coordinates
-								inst.position,
-								gizmoScale,            // <-- same scale used for rendering
-								20.0f,                 // pick radius in pixels
-								viewMat, projMat,
-								1280.0f, 720.0f);
+    GizmoAxis hitAxis = GizmoAxis::None;
 
-							if (hitAxis != GizmoAxis::None) {
-								gizmo.activeAxis = hitAxis;
-								gizmo.isDragging = true;
-								gizmo.dragStart = glm::vec2(mx, my);
-								gizmo.originalPosition = inst.position;
-								gizmo.originalRotation = inst.rotation;
-								gizmo.originalScale = inst.scale;
-								clickedOnGizmo = true;
-							}
-						}
+    if (gizmo.mode == GizmoMode::Rotate) {
+        hitAxis = pickRotateGizmoAxis(
+            glm::vec2(mx, my),
+            inst.position,
+            gizmoScaleVal,
+            15.0f,
+            viewMat, projMat,
+            1280.0f, 720.0f);
+    }
+    else {
+        hitAxis = pickGizmoAxis(
+            glm::vec2(mx, my),
+            inst.position,
+            gizmoScaleVal,
+            20.0f,
+            viewMat, projMat,
+            1280.0f, 720.0f);
+    }
+
+    if (hitAxis != GizmoAxis::None) {
+        gizmo.activeAxis = hitAxis;
+        gizmo.isDragging = true;
+        gizmo.dragStart = glm::vec2(mx, my);
+        gizmo.originalPosition = inst.position;
+        gizmo.originalRotation = inst.rotation;
+        gizmo.originalScale = inst.scale;
+        clickedOnGizmo = true;
+    }
+}
 
 						// Second: if not clicking gizmo, try picking a model
 						if (!clickedOnGizmo) {
@@ -2471,8 +2482,25 @@ int main()
 				}
 
 				// Only handle mouse if ImGui doesn't want it
-				if (mouseEnabled || !imguiIO.WantCaptureMouse) {
-					if (mouseEnabled && event.type == SDL_EVENT_MOUSE_MOTION) {
+				if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN && event.button.button == SDL_BUTTON_RIGHT) {
+					if (!mouseEnabled && !imguiIO.WantCaptureMouse) {
+						rightMouseHeld = true;
+					}
+				}
+				if (event.type == SDL_EVENT_MOUSE_BUTTON_UP && event.button.button == SDL_BUTTON_RIGHT) {
+					rightMouseHeld = false;
+				}
+
+				// Camera rotation
+				if (event.type == SDL_EVENT_MOUSE_MOTION) {
+					if (mouseEnabled) {
+						// Camera mode: always rotate
+						camera.yaw += event.motion.xrel * camera.sensitivity;
+						camera.pitch -= event.motion.yrel * camera.sensitivity;
+						camera.pitch = glm::clamp(camera.pitch, -89.0f, 89.0f);
+					}
+					else if (rightMouseHeld) {
+						// GUI mode: rotate while holding right mouse button
 						camera.yaw += event.motion.xrel * camera.sensitivity;
 						camera.pitch -= event.motion.yrel * camera.sensitivity;
 						camera.pitch = glm::clamp(camera.pitch, -89.0f, 89.0f);
@@ -2611,7 +2639,6 @@ int main()
 				// Instances
 				ImGui::Text("Scene Instances: %zu", modelManager->getInstances().size());
 				auto& instances = modelManager->getInstances();
-				static int selectedInstance = -1;
 
 				for (size_t i = 0; i < instances.size(); ++i) {
 					auto& inst = instances[i];
@@ -2620,9 +2647,10 @@ int main()
 					ImGui::Checkbox("##vis", &inst.visible);
 					ImGui::SameLine();
 
-					bool isSelected = (selectedInstance == static_cast<int>(i));
+					// Use gizmo.selectedInstance as single source of truth
+					bool isSelected = (gizmo.selectedInstance == static_cast<int>(i));
 					if (ImGui::Selectable(inst.name.c_str(), isSelected)) {
-						selectedInstance = static_cast<int>(i);
+						gizmo.select(static_cast<int>(i));
 					}
 
 					if (ImGui::BeginPopupContextItem()) {
@@ -2634,7 +2662,6 @@ int main()
 								gizmo.selectedInstance--;
 							}
 							modelManager->removeInstance(i);
-							selectedInstance = -1;
 						}
 						ImGui::EndPopup();
 					}
@@ -2642,19 +2669,11 @@ int main()
 					ImGui::PopID();
 				}
 
-				// Instance Inspector
-				if (selectedInstance >= 0 && selectedInstance < static_cast<int>(instances.size())) {
-					ImGui::Separator();
-					ImGui::Text("Transform:");
-					auto& inst = instances[selectedInstance];
-					ImGui::DragFloat3("Position", &inst.position[0], 0.1f);
-					ImGui::DragFloat3("Rotation", &inst.rotation[0], 1.0f);
-					ImGui::DragFloat3("Scale", &inst.scale[0], 0.01f, 0.01f, 100.0f);
-				}
-
+				// Single unified inspector
 				ImGui::Separator();
 				if (gizmo.selectedInstance >= 0 &&
 					gizmo.selectedInstance < static_cast<int>(instances.size())) {
+
 					auto& sel = instances[gizmo.selectedInstance];
 					ImGui::Text("Selected: %s", sel.name.c_str());
 
@@ -2663,6 +2682,12 @@ int main()
 					if (gizmo.mode == GizmoMode::Rotate) modeStr = "Rotate (2)";
 					if (gizmo.mode == GizmoMode::Scale) modeStr = "Scale (3)";
 					ImGui::Text("Gizmo: %s", modeStr);
+
+					if (ImGui::Button("Translate")) gizmo.mode = GizmoMode::Translate;
+					ImGui::SameLine();
+					if (ImGui::Button("Rotate")) gizmo.mode = GizmoMode::Rotate;
+					ImGui::SameLine();
+					if (ImGui::Button("Scale")) gizmo.mode = GizmoMode::Scale;
 
 					ImGui::DragFloat3("Position", &sel.position[0], 0.1f);
 					ImGui::DragFloat3("Rotation", &sel.rotation[0], 1.0f);
@@ -2673,9 +2698,11 @@ int main()
 					}
 				}
 				else {
-					ImGui::Text("Click on model to select (mouse visible)");
-					ImGui::Text("Then press 1/2/3 for Transform/Rotate/Scale");
+					ImGui::Text("Click on model to select (in viewport)");
+					ImGui::Text("Or click instance in list above");
+					ImGui::Text("Keys 1/2/3 for Translate/Rotate/Scale");
 				}
+
 
 				ImGui::End();
 
@@ -3079,9 +3106,10 @@ int main()
 				}
 			}
 
-			if (!mouseEnabled && gizmo.selectedInstance >= 0 &&
+			if (gizmo.selectedInstance >= 0 &&
 				gizmo.selectedInstance < static_cast<int>(modelManager->getInstances().size()) &&
-				gizmo.mode != GizmoMode::None) {
+				gizmo.mode != GizmoMode::None &&
+				modelManager->getInstances()[gizmo.selectedInstance].visible) {
 
 				auto& gizmoInst = modelManager->getInstances()[gizmo.selectedInstance];
 

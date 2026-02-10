@@ -238,6 +238,97 @@ inline float getGizmoScale(const glm::vec3& gizmoPos, const glm::vec3& cameraPos
     return dist * tanHalfFov * desiredScreenSize;
 }
 
+inline float pointToCircle2D(const glm::vec2& point,
+    const glm::vec2& center, float radius)
+{
+    float dist = glm::length(point - center);
+    return std::abs(dist - radius);
+}
+
+// Pick rotation gizmo axis by testing against screen-space circles
+inline GizmoAxis pickRotateGizmoAxis(const glm::vec2& mousePixel,
+    const glm::vec3& gizmoCenter,
+    float gizmoScale,
+    float pickRadiusPixels,
+    const glm::mat4& view,
+    const glm::mat4& proj,
+    float screenWidth,
+    float screenHeight,
+    int segments = 32)
+{
+    struct AxisCandidate {
+        GizmoAxis axis;
+    };
+
+    glm::mat4 vp = proj * view;
+
+    glm::vec4 centerClip = vp * glm::vec4(gizmoCenter, 1.0f);
+    if (centerClip.w <= 0.0f) return GizmoAxis::None;
+
+    // The rotation gizmo geometry uses radius = 1.5f, scaled by gizmoScale
+    float worldRadius = 1.5f * gizmoScale;
+    float step = 2.0f * 3.14159265f / segments;
+
+    float bestDist = pickRadiusPixels;
+    GizmoAxis bestAxis = GizmoAxis::None;
+
+    // Test X ring (YZ plane circle)
+    for (int i = 0; i < segments; ++i) {
+        float a0 = i * step, a1 = (i + 1) * step;
+        glm::vec3 p0 = gizmoCenter + glm::vec3(0, cosf(a0), sinf(a0)) * worldRadius;
+        glm::vec3 p1 = gizmoCenter + glm::vec3(0, cosf(a1), sinf(a1)) * worldRadius;
+
+        glm::vec2 s0 = worldToScreen(p0, vp, screenWidth, screenHeight);
+        glm::vec2 s1 = worldToScreen(p1, vp, screenWidth, screenHeight);
+        if (s0.x < -5000.0f || s1.x < -5000.0f) continue;
+
+        float segT;
+        float dist = pointToSegment2D(mousePixel, s0, s1, segT);
+        if (dist < bestDist) {
+            bestDist = dist;
+            bestAxis = GizmoAxis::X;
+        }
+    }
+
+    // Test Y ring (XZ plane circle)
+    for (int i = 0; i < segments; ++i) {
+        float a0 = i * step, a1 = (i + 1) * step;
+        glm::vec3 p0 = gizmoCenter + glm::vec3(cosf(a0), 0, sinf(a0)) * worldRadius;
+        glm::vec3 p1 = gizmoCenter + glm::vec3(cosf(a1), 0, sinf(a1)) * worldRadius;
+
+        glm::vec2 s0 = worldToScreen(p0, vp, screenWidth, screenHeight);
+        glm::vec2 s1 = worldToScreen(p1, vp, screenWidth, screenHeight);
+        if (s0.x < -5000.0f || s1.x < -5000.0f) continue;
+
+        float segT;
+        float dist = pointToSegment2D(mousePixel, s0, s1, segT);
+        if (dist < bestDist) {
+            bestDist = dist;
+            bestAxis = GizmoAxis::Y;
+        }
+    }
+
+    // Test Z ring (XY plane circle)
+    for (int i = 0; i < segments; ++i) {
+        float a0 = i * step, a1 = (i + 1) * step;
+        glm::vec3 p0 = gizmoCenter + glm::vec3(cosf(a0), sinf(a0), 0) * worldRadius;
+        glm::vec3 p1 = gizmoCenter + glm::vec3(cosf(a1), sinf(a1), 0) * worldRadius;
+
+        glm::vec2 s0 = worldToScreen(p0, vp, screenWidth, screenHeight);
+        glm::vec2 s1 = worldToScreen(p1, vp, screenWidth, screenHeight);
+        if (s0.x < -5000.0f || s1.x < -5000.0f) continue;
+
+        float segT;
+        float dist = pointToSegment2D(mousePixel, s0, s1, segT);
+        if (dist < bestDist) {
+            bestDist = dist;
+            bestAxis = GizmoAxis::Z;
+        }
+    }
+
+    return bestAxis;
+}
+
 struct GizmoVertex {
     glm::vec3 position;
     glm::vec3 color;
