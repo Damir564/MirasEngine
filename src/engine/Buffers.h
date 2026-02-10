@@ -1,4 +1,12 @@
 #pragma once
+#include <vulkan/vulkan.hpp>
+#include <glm/glm.hpp>
+#include <glm/gtc/quaternion.hpp>
+#include <volk.h>
+#include <VkBootstrap.h>
+#include <vk_mem_alloc.h>
+#include <string>
+#include <vector>
 #include "Vertex.h"
 #include "ModelInstance.h"
 

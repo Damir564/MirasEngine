@@ -46,6 +46,7 @@ struct FrameUBO {
 };
 
 struct MeshPushConstants {
+	glm::mat4 modelMatrix{ 1.0f };
 	glm::vec4 baseColor{ 1.0f, 1.0f, 1.0f, 1.0f };  // 16 bytes
 	float metallic{ 0.0f };                          // 4 bytes
 	float roughness{ 0.5f };                         // 4 bytes
@@ -2334,6 +2335,7 @@ int main()
 
 			for (size_t i = 0; i < instances.size(); ++i) {
 				auto& inst = instances[i];
+				pc.modelMatrix = inst.getTransformMatrix();
 				ImGui::PushID(static_cast<int>(i) + 10000);
 
 				ImGui::Checkbox("##vis", &inst.visible);
@@ -2473,18 +2475,10 @@ int main()
 				cmd.setAlphaToCoverageEnableEXT(VK_FALSE);
 				cmd.setPrimitiveRestartEnable(VK_FALSE);
 
-				// Set vertex input
-				auto attributesArray = Vertex::getAttributeDescriptions(0);
-				vk::VertexInputBindingDescription2EXT instanceBinding{};
-				instanceBinding.binding = 1;
-				instanceBinding.stride = sizeof(InstanceData);
-				instanceBinding.inputRate = vk::VertexInputRate::eInstance;
-				instanceBinding.divisor = 1;
-				vk::VertexInputBindingDescription2EXT bindingDescs[2] = {
-					Vertex::getBindingDescription(0),
-					instanceBinding
-				};
-				cmd.setVertexInputEXT(2, bindingDescs, static_cast<uint32_t>(attributesArray.size()), attributesArray.data());
+				auto shadowAttribs = Vertex::getVertexOnlyAttributes(0);
+				vk::VertexInputBindingDescription2EXT shadowBinding = Vertex::getBindingDescription(0);
+				cmd.setVertexInputEXT(1, &shadowBinding,
+					static_cast<uint32_t>(shadowAttribs.size()), shadowAttribs.data());
 
 				cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, shadowPipelineLayout, 0, 1,
 					&uboDescriptorSets[currentFrame], 0, nullptr);
@@ -2506,7 +2500,7 @@ int main()
 
 					vk::VertexInputBindingDescription2EXT singleBinding = Vertex::getBindingDescription(0);
 					cmd.setVertexInputEXT(1, &singleBinding,
-						static_cast<uint32_t>(attributesArray.size()), attributesArray.data());
+						static_cast<uint32_t>(shadowAttribs.size()), shadowAttribs.data());
 
 					cmd.bindVertexBuffers2(0, 1, modelBuffers, modelOffsets, modelSizes, modelStrides);
 					cmd.bindIndexBuffer(gpuModel->indexBuffer->getBuffer(), 0, vk::IndexType::eUint32);
@@ -2654,21 +2648,10 @@ int main()
 			cmd.setScissorWithCount(1, &rect);
 			cmd.setPrimitiveRestartEnable(VK_FALSE);
 
-			auto attributesArray = Vertex::getAttributeDescriptions(0);
-
-			// If using instance buffer as second binding, keep it:
-			vk::VertexInputBindingDescription2EXT instanceBinding{};
-			instanceBinding.binding = 1;
-			instanceBinding.stride = sizeof(InstanceData);
-			instanceBinding.inputRate = vk::VertexInputRate::eInstance;
-			instanceBinding.divisor = 1;
-			vk::VertexInputBindingDescription2EXT bindingDescs[2] = {
-				Vertex::getBindingDescription(0), // Main geometry
-				// If you use instances:
-				instanceBinding
-			};
-			// vk::VertexInputBindingDescription2EXT bindings[2]{ binding, instanceBinding };
-			cmd.setVertexInputEXT(2, bindingDescs, static_cast<uint32_t>(attributesArray.size()), attributesArray.data());
+			auto mainAttribs = Vertex::getVertexOnlyAttributes(0);
+			vk::VertexInputBindingDescription2EXT mainBinding = Vertex::getBindingDescription(0);
+			cmd.setVertexInputEXT(1, &mainBinding,
+				static_cast<uint32_t>(mainAttribs.size()), mainAttribs.data());
 
 
 			cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipelineLayout, 0, 1,
@@ -2691,7 +2674,7 @@ int main()
 				// Update vertex input for single buffer (no instancing for now)
 				vk::VertexInputBindingDescription2EXT singleBinding = Vertex::getBindingDescription(0);
 				cmd.setVertexInputEXT(1, &singleBinding,
-					static_cast<uint32_t>(attributesArray.size()), attributesArray.data());
+					static_cast<uint32_t>(mainAttribs.size()), mainAttribs.data());
 
 				cmd.bindVertexBuffers2(0, 1, modelBuffers, modelOffsets, modelSizes, modelStrides);
 				cmd.bindIndexBuffer(gpuModel->indexBuffer->getBuffer(), 0, vk::IndexType::eUint32);

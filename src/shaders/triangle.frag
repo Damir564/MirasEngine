@@ -52,11 +52,11 @@ float calculateShadow(vec4 fragPosLightSpace, vec3 N, vec3 L) {
 
     // DEBUG OUTPUT - uncomment to test
      // Return RED if outside X bounds
-     if (projCoords.x < 0.0 || projCoords.x > 1.0) return -1.0;
+//     if (projCoords.x < 0.0 || projCoords.x > 1.0) return -1.0;
      // Return GREEN if outside Y bounds  
-     if (projCoords.y < 0.0 || projCoords.y > 1.0) return -2.0;
+//     if (projCoords.y < 0.0 || projCoords.y > 1.0) return -2.0;
     //  Return BLUE if outside Z bounds
-     if (projCoords.z < 0.0 || projCoords.z > 1.0) return -3.0;
+//     if (projCoords.z < 0.0 || projCoords.z > 1.0) return -3.0;
     
     // Check if outside shadow map - return fully lit
     if (projCoords.x < 0.0 || projCoords.x > 1.0 ||

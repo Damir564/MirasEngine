@@ -5,7 +5,6 @@ layout(location = 0) in vec3 inPosition;
 layout(location = 1) in vec3 inNormal;
 layout(location = 2) in vec2 inTexCoord;
 layout(location = 3) in vec4 inTangent;
-layout(location = 4) in vec3 inOffset;
 
 // Set 0: Frame UBO
 layout(set = 0, binding = 0) uniform FrameUBO {
@@ -34,8 +33,7 @@ layout(location = 3) out mat3 TBN;
 layout(location = 6) out vec4 fragPosLightSpace;
 
 void main() {
-    vec3 pos = inPosition + inOffset;
-    vec4 worldPosition = vec4(pos, 1.0);
+    vec4 worldPosition = vec4(inPosition, 1.0);
 
     gl_Position = ubo.proj * ubo.view * worldPosition;
 
