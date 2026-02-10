@@ -19,6 +19,7 @@ layout(set = 0, binding = 0) uniform FrameUBO {
 
 // Push constants - per-material data only
 layout(push_constant) uniform MeshData {
+    mat4 modelMatrix;
     vec4 baseColor;
     float metallic;
     float roughness;
@@ -33,12 +34,13 @@ layout(location = 3) out mat3 TBN;
 layout(location = 6) out vec4 fragPosLightSpace;
 
 void main() {
-    vec4 worldPosition = vec4(inPosition, 1.0);
-
+    vec4 worldPosition = pc.modelMatrix * vec4(inPosition, 1.0);
     gl_Position = ubo.proj * ubo.view * worldPosition;
 
-    vec3 worldNormal = normalize(inNormal);
-    vec3 worldTangent = normalize(inTangent.xyz);
+    mat3 normalMatrix = transpose(inverse(mat3(pc.modelMatrix)));
+
+    vec3 worldNormal = normalize(normalMatrix * inNormal);
+    vec3 worldTangent = normalize(normalMatrix * inTangent.xyz);
     vec3 worldBitangent = cross(worldNormal, worldTangent) * inTangent.w;
 
     fragWorldPos = vec3(worldPosition);

@@ -17,9 +17,16 @@ layout(set = 0, binding = 0) uniform FrameUBO {
     float shadowBias;
 } ubo;
 
+layout(push_constant) uniform ShadowData {
+    mat4 modelMatrix;
+    float alphaCutoff;
+    int alphaMode;
+} pc;
+
 layout(location = 0) out vec2 fragTexCoord;
 
 void main() {
-    gl_Position = ubo.lightSpaceMatrix * vec4(inPosition, 1.0);
+    vec4 worldPos = pc.modelMatrix * vec4(inPosition, 1.0);
+    gl_Position = ubo.lightSpaceMatrix * worldPos;
     fragTexCoord = inTexCoord;
 }

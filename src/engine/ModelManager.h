@@ -29,25 +29,27 @@ struct GPUModel {
 
     glm::vec3 boundsCenter{ 0.0f };
     float boundsRadius{ 1.0f };
+    glm::vec3 boundsMin{ 0.0f };
+    glm::vec3 boundsMax{ 0.0f };
 
     bool isValid() const { return vertexBuffer != nullptr && indexBuffer != nullptr; }
 };
 
 struct ModelInstance {
-    size_t modelIndex;
+    size_t modelIndex = 0;
+    std::string name;
     glm::vec3 position{ 0.0f };
     glm::vec3 rotation{ 0.0f };
     glm::vec3 scale{ 1.0f };
     bool visible = true;
-    std::string name;
 
     glm::mat4 getTransformMatrix() const {
-        glm::mat4 t = glm::translate(glm::mat4(1.0f), position);
-        t = glm::rotate(t, glm::radians(rotation.x), glm::vec3(1, 0, 0));
-        t = glm::rotate(t, glm::radians(rotation.y), glm::vec3(0, 1, 0));
-        t = glm::rotate(t, glm::radians(rotation.z), glm::vec3(0, 0, 1));
-        t = glm::scale(t, scale);
-        return t;
+        glm::mat4 T = glm::translate(glm::mat4(1.0f), position);
+        glm::mat4 R = glm::mat4_cast(
+            glm::quat(glm::radians(rotation))
+        );
+        glm::mat4 S = glm::scale(glm::mat4(1.0f), scale);
+        return T * R * S;
     }
 };
 

@@ -7,6 +7,7 @@ layout(location = 0) in vec2 fragTexCoord;
 layout(set = 1, binding = 0) uniform sampler2D baseColorSampler;
 
 layout(push_constant) uniform ShadowData {
+    mat4 modelMatrix;
     float alphaCutoff;
     int alphaMode;
 } pc;

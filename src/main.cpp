@@ -33,6 +33,7 @@
 #include "engine/Shadow.h"
 #include "engine/ModelTypes.h"
 #include "engine/ModelManager.h"
+#include "engine/Gizmo.h"
 
 struct FrameUBO {
 	glm::mat4 view;
@@ -46,6 +47,7 @@ struct FrameUBO {
 };
 
 struct MeshPushConstants {
+	glm::mat4 modelMatrix{ 1.0f };					// 64 bytes
 	glm::vec4 baseColor{ 1.0f, 1.0f, 1.0f, 1.0f };  // 16 bytes
 	float metallic{ 0.0f };                          // 4 bytes
 	float roughness{ 0.5f };                         // 4 bytes
@@ -1558,6 +1560,7 @@ int main()
 	coreFeatures.fragmentStoresAndAtomics = VK_TRUE;
 	coreFeatures.vertexPipelineStoresAndAtomics = VK_TRUE;
 	coreFeatures.shaderInt64 = VK_TRUE;
+	coreFeatures.wideLines = VK_TRUE;
 
 	vkb::PhysicalDeviceSelector selector{ vkbInstance };
 	auto physRet = selector
@@ -1997,7 +2000,7 @@ int main()
 
 		// Shadow push constant range - MUST include both VERTEX and FRAGMENT stages
 		vk::PushConstantRange shadowPcRange{};
-		shadowPcRange.stageFlags = vk::ShaderStageFlagBits::eFragment;
+		shadowPcRange.stageFlags = vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment;
 		shadowPcRange.offset = 0;
 		shadowPcRange.size = sizeof(ShadowPushConstants);
 
@@ -2072,11 +2075,93 @@ int main()
 		sceneBounds.center = glm::vec3(0.0f);
 		sceneBounds.radius = 100.0f;  // Default radius
 
-		// ============================================
-// IMGUI SETUP - For ImGui v1.92.5-docking
-// ============================================
+		// ========================
+// GIZMO SETUP
+// ========================
+		Gizmo gizmo;
 
-// Create descriptor pool for ImGui
+		// Load gizmo shaders
+		std::vector<uint32_t> gizmoVertCode = loadSpirv("shaders/gizmo.vert.spv");
+		std::vector<uint32_t> gizmoFragCode = loadSpirv("shaders/gizmo.frag.spv");
+
+		// Gizmo push constant (just model matrix)
+		vk::PushConstantRange gizmoPcRange{};
+		gizmoPcRange.stageFlags = vk::ShaderStageFlagBits::eVertex;
+		gizmoPcRange.offset = 0;
+		gizmoPcRange.size = sizeof(glm::mat4);
+
+		vk::DescriptorSetLayout gizmoLayouts[] = { uboDescriptorSetLayout.get() };
+
+		vk::ShaderCreateInfoEXT gizmoVertInfo{};
+		gizmoVertInfo.setStage(vk::ShaderStageFlagBits::eVertex)
+			.setNextStage(vk::ShaderStageFlagBits::eFragment)
+			.setFlags(vk::ShaderCreateFlagBitsEXT::eLinkStage)
+			.setCodeType(vk::ShaderCodeTypeEXT::eSpirv)
+			.setCodeSize(gizmoVertCode.size() * sizeof(uint32_t))
+			.setPCode(gizmoVertCode.data())
+			.setPName("main")
+			.setPushConstantRangeCount(1)
+			.setPPushConstantRanges(&gizmoPcRange)
+			.setSetLayoutCount(1)
+			.setPSetLayouts(gizmoLayouts);
+
+		vk::ShaderCreateInfoEXT gizmoFragInfo{};
+		gizmoFragInfo.setStage(vk::ShaderStageFlagBits::eFragment)
+			.setFlags(vk::ShaderCreateFlagBitsEXT::eLinkStage)
+			.setCodeType(vk::ShaderCodeTypeEXT::eSpirv)
+			.setCodeSize(gizmoFragCode.size() * sizeof(uint32_t))
+			.setPCode(gizmoFragCode.data())
+			.setPName("main")
+			.setPushConstantRangeCount(1)
+			.setPPushConstantRanges(&gizmoPcRange)
+			.setSetLayoutCount(1)
+			.setPSetLayouts(gizmoLayouts);
+
+		vk::ShaderEXT gizmoVertShader = device.createShaderEXT(gizmoVertInfo).value;
+		vk::ShaderEXT gizmoFragShader = device.createShaderEXT(gizmoFragInfo).value;
+
+		vk::PipelineLayoutCreateInfo gizmoLayoutInfo{};
+		gizmoLayoutInfo.setPushConstantRangeCount(1);
+		gizmoLayoutInfo.setPPushConstantRanges(&gizmoPcRange);
+		gizmoLayoutInfo.setSetLayoutCount(1);
+		gizmoLayoutInfo.setPSetLayouts(gizmoLayouts);
+
+		vk::PipelineLayout gizmoPipelineLayout = device.createPipelineLayout(gizmoLayoutInfo).value;
+
+		// Create gizmo vertex buffers
+		auto translateLines = generateTranslateGizmoLines(2.0f);
+		auto rotateLines = generateRotateGizmoLines(32, 1.5f);
+		auto scaleLines = generateScaleGizmoLines(2.0f);
+
+		auto createGizmoBuffer = [&](const std::vector<GizmoVertex>& data) -> std::pair<vk::Buffer, VmaAllocation> {
+			VkBufferCreateInfo bufInfo{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+			bufInfo.size = sizeof(GizmoVertex) * data.size();
+			bufInfo.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
+			VmaAllocationCreateInfo allocCI{};
+			allocCI.usage = VMA_MEMORY_USAGE_CPU_TO_GPU;
+			allocCI.requiredFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+
+			VkBuffer raw;
+			VmaAllocation alloc;
+			vmaCreateBuffer(allocator, &bufInfo, &allocCI, &raw, &alloc, nullptr);
+			void* mapped;
+			vmaMapMemory(allocator, alloc, &mapped);
+			memcpy(mapped, data.data(), bufInfo.size);
+			vmaUnmapMemory(allocator, alloc);
+			return { vk::Buffer(raw), alloc };
+			};
+
+		auto [translateBuffer, translateAlloc] = createGizmoBuffer(translateLines);
+		auto [rotateBuffer, rotateAlloc] = createGizmoBuffer(rotateLines);
+		auto [scaleBuffer, scaleAlloc] = createGizmoBuffer(scaleLines);
+
+		std::cout << "Gizmo system initialized\n";
+
+		// ============================================
+		// IMGUI SETUP - For ImGui v1.92.5-docking
+		// ============================================
+
+		// Create descriptor pool for ImGui
 		VkDescriptorPoolSize imguiPoolSizes[] = {
 			{ VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1 }
 		};
@@ -2171,7 +2256,8 @@ int main()
 			lastTime = currentTime;
 			while (SDL_PollEvent(&event)) {
 				// Let ImGui process events FIRST
-				ImGui_ImplSDL3_ProcessEvent(&event);
+				if (!mouseEnabled)
+					ImGui_ImplSDL3_ProcessEvent(&event);
 
 				// Get IO to check if ImGui wants input
 				ImGuiIO& imguiIO = ImGui::GetIO();
@@ -2185,7 +2271,7 @@ int main()
 					running = false;
 
 				// Only handle keyboard if ImGui doesn't want it
-				if (!imguiIO.WantCaptureKeyboard) {
+				if (mouseEnabled || !imguiIO.WantCaptureKeyboard) {
 					if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat) {
 						if (event.key.scancode == SDL_SCANCODE_ESCAPE)
 							running = false;
@@ -2197,15 +2283,189 @@ int main()
 								SDL_SetWindowRelativeMouseMode(window, mouseEnabled);
 							}
 						}
+						if (gizmo.selectedInstance >= 0) {
+							const auto& insts = modelManager->getInstances();
+							if (gizmo.selectedInstance >= static_cast<int>(insts.size())) {
+								gizmo.deselect();
+							}
+							else {
+								// Also check if the model is still valid
+								GPUModel* model = modelManager->getModel(insts[gizmo.selectedInstance].modelIndex);
+								if (!model || !model->isValid()) {
+									gizmo.deselect();
+								}
+							}
+						}
+						// ========== GIZMO MODE KEYS ==========
+						if (!mouseEnabled && gizmo.selectedInstance >= 0) {
+							if (event.key.scancode == SDL_SCANCODE_1) {
+								gizmo.mode = GizmoMode::Translate;
+							}
+							if (event.key.scancode == SDL_SCANCODE_2) {
+								gizmo.mode = GizmoMode::Rotate;
+							}
+							if (event.key.scancode == SDL_SCANCODE_3) {
+								gizmo.mode = GizmoMode::Scale;
+							}
+							if (event.key.scancode == SDL_SCANCODE_DELETE) {
+								int toDelete = gizmo.selectedInstance;
+								gizmo.deselect();
+								modelManager->removeInstance(gizmo.selectedInstance);
+							}
+						}
+						// Deselect with Escape (when GUI visible)
+						if (!mouseEnabled && event.key.scancode == SDL_SCANCODE_ESCAPE) {
+							if (gizmo.selectedInstance >= 0) {
+								gizmo.deselect();
+								running = true; // Override the quit from escape
+							}
+						}
 					}
 					if (event.type == SDL_EVENT_KEY_UP && !event.key.repeat) {
 						if (!shiftHeld)
 							cameraAmpilfier = 1.0f;
 					}
 				}
+				if (!mouseEnabled) {
+					if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN && event.button.button == SDL_BUTTON_LEFT) {
+						float mx = event.button.x;
+						float my = event.button.y;
+
+						glm::mat4 viewMat = getView(camera);
+						glm::mat4 projMat = getProjection(1280.0f, 720.0f);
+						Ray ray = screenToWorldRay(mx, my, 1280.0f, 720.0f, viewMat, projMat);
+
+						bool clickedOnGizmo = false;
+
+						// First: try clicking on gizmo axis
+						if (gizmo.selectedInstance >= 0 && gizmo.mode != GizmoMode::None &&
+							gizmo.selectedInstance < static_cast<int>(modelManager->getInstances().size())) {
+
+							auto& inst = modelManager->getInstances()[gizmo.selectedInstance];
+							float gizmoScale = getGizmoScale(inst.position, camera.position,
+								0.15f, projMat);
+							float scaledAxisLength = 2.0f * gizmoScale;
+
+							GizmoAxis hitAxis = pickGizmoAxis(ray, inst.position, scaledAxisLength,
+								20.0f,  // 20 pixel pick radius - generous for usability
+								viewMat, projMat, 1280.0f, 720.0f);
+
+							if (hitAxis != GizmoAxis::None) {
+								gizmo.activeAxis = hitAxis;
+								gizmo.isDragging = true;
+								gizmo.dragStart = glm::vec2(mx, my);
+								gizmo.originalPosition = inst.position;
+								gizmo.originalRotation = inst.rotation;
+								gizmo.originalScale = inst.scale;
+								clickedOnGizmo = true;
+							}
+						}
+
+						// Second: if not clicking gizmo, try picking a model
+						if (!clickedOnGizmo) {
+							float bestT = 1e30f;
+							int bestInstance = -1;
+							const auto& instances = modelManager->getInstances();
+
+							for (size_t i = 0; i < instances.size(); ++i) {
+								if (!instances[i].visible) continue;
+								GPUModel* model = modelManager->getModel(instances[i].modelIndex);
+								if (!model) continue;
+
+								glm::mat4 instanceTransform = instances[i].getTransformMatrix();
+
+								float t;
+								if (rayIntersectsTransformedAABB(ray,
+									model->boundsMin, model->boundsMax,
+									instanceTransform, t))
+								{
+									if (t < bestT) {
+										bestT = t;
+										bestInstance = static_cast<int>(i);
+									}
+								}
+							}
+
+							if (bestInstance >= 0) {
+								gizmo.select(bestInstance);
+							}
+							else {
+								gizmo.deselect();
+							}
+						}
+					}
+
+					if (event.type == SDL_EVENT_MOUSE_BUTTON_UP && event.button.button == SDL_BUTTON_LEFT) {
+						gizmo.isDragging = false;
+						gizmo.activeAxis = GizmoAxis::None;
+					}
+
+					if (event.type == SDL_EVENT_MOUSE_MOTION && gizmo.isDragging &&
+						gizmo.selectedInstance >= 0 &&
+						gizmo.selectedInstance < static_cast<int>(modelManager->getInstances().size())) {
+
+						auto& inst = modelManager->getInstances()[gizmo.selectedInstance];
+						glm::vec2 currentMouse(event.motion.x, event.motion.y);
+						glm::vec2 delta = currentMouse - gizmo.dragStart;
+
+						glm::mat4 viewMat = getView(camera);
+						glm::mat4 projMat = getProjection(1280.0f, 720.0f);
+						glm::mat4 vp = projMat * viewMat;
+
+						// Determine axis direction
+						glm::vec3 axisMask(0.0f);
+						if (gizmo.activeAxis == GizmoAxis::X) axisMask = glm::vec3(1, 0, 0);
+						if (gizmo.activeAxis == GizmoAxis::Y) axisMask = glm::vec3(0, 1, 0);
+						if (gizmo.activeAxis == GizmoAxis::Z) axisMask = glm::vec3(0, 0, 1);
+
+						// Project the axis direction to screen space to find the best mouse direction
+						glm::vec2 pixelCenter = worldToScreen(gizmo.originalPosition, vp, 1280.0f, 720.0f);
+						glm::vec2 pixelAxisEnd = worldToScreen(gizmo.originalPosition + axisMask, vp, 1280.0f, 720.0f);
+
+						glm::vec2 screenAxisDir = pixelAxisEnd - pixelCenter;
+						float screenAxisLen = glm::length(screenAxisDir);
+
+						if (screenAxisLen < 1.0f) {
+							// Axis is pointing directly at camera, use fallback
+							screenAxisDir = glm::vec2(1.0f, 0.0f);
+							screenAxisLen = 1.0f;
+						}
+						screenAxisDir /= screenAxisLen;
+
+						// Project mouse delta onto screen-space axis direction
+						float mouseDotAxis = glm::dot(delta, screenAxisDir);
+
+						// Convert pixel movement to world units:
+						// screenAxisLen pixels = 1 world unit at the object's depth
+						float worldUnitsPerPixel = 1.0f / screenAxisLen;
+						float worldMovement = mouseDotAxis * worldUnitsPerPixel;
+
+						switch (gizmo.mode) {
+						case GizmoMode::Translate: {
+							inst.position = gizmo.originalPosition + axisMask * worldMovement;
+							break;
+						}
+						case GizmoMode::Rotate: {
+							// Rotation: use a fixed angular speed per pixel
+							float degreesPerPixel = 0.5f;
+							float rotationDegrees = mouseDotAxis * degreesPerPixel;
+							inst.rotation = gizmo.originalRotation + axisMask * rotationDegrees;
+							break;
+						}
+						case GizmoMode::Scale: {
+							// Scale: proportional to mouse movement
+							float scalePerPixel = 0.01f;
+							float scaleChange = mouseDotAxis * scalePerPixel;
+							inst.scale = glm::max(gizmo.originalScale + axisMask * scaleChange, glm::vec3(0.01f));
+							break;
+						}
+						default: break;
+						}
+					}
+				}
 
 				// Only handle mouse if ImGui doesn't want it
-				if (!imguiIO.WantCaptureMouse) {
+				if (mouseEnabled || !imguiIO.WantCaptureMouse) {
 					if (mouseEnabled && event.type == SDL_EVENT_MOUSE_MOTION) {
 						camera.yaw += event.motion.xrel * camera.sensitivity;
 						camera.pitch -= event.motion.yrel * camera.sensitivity;
@@ -2216,7 +2476,7 @@ int main()
 
 			// Camera movement - only if ImGui doesn't want keyboard
 			ImGuiIO& imguiIO = ImGui::GetIO();
-			if (!imguiIO.WantCaptureKeyboard) {
+			if (mouseEnabled || !imguiIO.WantCaptureKeyboard) {
 				const bool* keys = SDL_GetKeyboardState(nullptr);
 				glm::vec3 front{
 					cos(glm::radians(camera.yaw)) * cos(glm::radians(camera.pitch)),
@@ -2232,145 +2492,190 @@ int main()
 				if (keys[SDL_SCANCODE_S]) camera.position -= front * camera.speed * dt * cameraAmpilfier;
 			}
 			// ImGUI
-			ImGui_ImplVulkan_NewFrame();
-			ImGui_ImplSDL3_NewFrame();
-			ImGui::NewFrame();
+			ImDrawData* drawData = nullptr;
+			if (!mouseEnabled) {
+				ImGui_ImplVulkan_NewFrame();
+				ImGui_ImplSDL3_NewFrame();
+				ImGui::NewFrame();
 
-			modelManager->update();
+				modelManager->update();
 
-			// ============================================
-			// MODEL MANAGER UI
-			// ============================================
-			ImGui::Begin("Model Manager");
+				// ============================================
+				// MODEL MANAGER UI
+				// ============================================
+				ImGui::Begin("Model Manager");
 
-			ImGui::Text("FPS: %.1f", ImGui::GetIO().Framerate);
-			ImGui::Text("Camera: (%.2f, %.2f, %.2f)",
-				camera.position.x, camera.position.y, camera.position.z);
-			ImGui::Separator();
-
-			// Quick Load Buttons
-			ImGui::Text("Quick Load:");
-			if (ImGui::Button("Load Sponza")) {
-				modelManager->loadModelAsync("models/main_sponza/NewSponza_Main_glTF_003.gltf", "Sponza");
-			}
-			ImGui::SameLine();
-			if (ImGui::Button("Load School")) {
-				modelManager->loadModelAsync("models/tomsk_school/tomsk_school3.obj", "School");
-			}
-			ImGui::SameLine();
-			if (ImGui::Button("Load Bus Stop")) {
-				modelManager->loadModelAsync("models/bus_stop/Untitled.glb", "BusStop");
-			}
-
-			// Custom path input
-			static char modelPath[512] = "models/";
-			ImGui::InputText("Model Path", modelPath, sizeof(modelPath));
-			if (ImGui::Button("Load Custom")) {
-				modelManager->loadModelAsync(modelPath);
-			}
-
-			ImGui::Separator();
-
-			// Loading tasks
-			const auto& tasks = modelManager->getLoadingTasks();
-			if (!tasks.empty()) {
-				ImGui::Text("Loading:");
-				for (const auto& task : tasks) {
-					const char* stateStr = "Unknown";
-					switch (task.state) {
-					case LoadingState::LoadingCPU: stateStr = "Parsing..."; break;
-					case LoadingState::UploadingGPU: stateStr = "Uploading..."; break;
-					case LoadingState::Failed: stateStr = "FAILED"; break;
-					default: break;
-					}
-					ImGui::BulletText("%s - %s", task.name.c_str(), stateStr);
-				}
+				ImGui::Text("FPS: %.1f", ImGui::GetIO().Framerate);
+				ImGui::Text("Camera: (%.2f, %.2f, %.2f)",
+					camera.position.x, camera.position.y, camera.position.z);
 				ImGui::Separator();
-			}
 
-			// Loaded Models
-			ImGui::Text("Loaded Models: %zu", modelManager->getModels().size());
-			const auto& models = modelManager->getModels();
-			static int selectedModel = -1;
-
-			for (size_t i = 0; i < models.size(); ++i) {
-				const auto& model = models[i];
-				ImGui::PushID(static_cast<int>(i));
-
-				bool isSelected = (selectedModel == static_cast<int>(i));
-				if (ImGui::Selectable(model->name.c_str(), isSelected)) {
-					selectedModel = static_cast<int>(i);
+				// Quick Load Buttons
+				ImGui::Text("Quick Load:");
+				if (ImGui::Button("Load Sponza")) {
+					modelManager->loadModelAsync("models/main_sponza/NewSponza_Main_glTF_003.gltf", "Sponza");
+				}
+				ImGui::SameLine();
+				if (ImGui::Button("Load School")) {
+					modelManager->loadModelAsync("models/tomsk_school/tomsk_school3.obj", "School");
+				}
+				ImGui::SameLine();
+				if (ImGui::Button("Load Bus Stop")) {
+					modelManager->loadModelAsync("models/bus_stop/Untitled.glb", "BusStop");
 				}
 
-				// Right-click context menu
-				if (ImGui::BeginPopupContextItem()) {
-					if (ImGui::MenuItem("Create Instance")) {
-						modelManager->createInstance(i, camera.position + glm::vec3(0, 0, -5));
-					}
-					if (ImGui::MenuItem("Create at Origin")) {
-						modelManager->createInstance(i, glm::vec3(0.0f));
+				// Custom path input
+				static char modelPath[512] = "models/";
+				ImGui::InputText("Model Path", modelPath, sizeof(modelPath));
+				if (ImGui::Button("Load Custom")) {
+					modelManager->loadModelAsync(modelPath);
+				}
+
+				ImGui::Separator();
+
+				// Loading tasks
+				const auto& tasks = modelManager->getLoadingTasks();
+				if (!tasks.empty()) {
+					ImGui::Text("Loading:");
+					for (const auto& task : tasks) {
+						const char* stateStr = "Unknown";
+						switch (task.state) {
+						case LoadingState::LoadingCPU: stateStr = "Parsing..."; break;
+						case LoadingState::UploadingGPU: stateStr = "Uploading..."; break;
+						case LoadingState::Failed: stateStr = "FAILED"; break;
+						default: break;
+						}
+						ImGui::BulletText("%s - %s", task.name.c_str(), stateStr);
 					}
 					ImGui::Separator();
-					if (ImGui::MenuItem("Unload")) {
-						modelManager->unloadModel(i);
-						selectedModel = -1;
+				}
+
+				// Loaded Models
+				ImGui::Text("Loaded Models: %zu", modelManager->getModels().size());
+				const auto& models = modelManager->getModels();
+				static int selectedModel = -1;
+
+				for (size_t i = 0; i < models.size(); ++i) {
+					const auto& model = models[i];
+					ImGui::PushID(static_cast<int>(i));
+
+					bool isSelected = (selectedModel == static_cast<int>(i));
+					if (ImGui::Selectable(model->name.c_str(), isSelected)) {
+						selectedModel = static_cast<int>(i);
 					}
-					ImGui::EndPopup();
-				}
 
-				ImGui::SameLine();
-				ImGui::TextDisabled("(%zu verts, %zu tex)",
-					model->vertexCount, model->textures.size());
-
-				ImGui::PopID();
-			}
-
-			ImGui::Separator();
-
-			// Instances
-			ImGui::Text("Scene Instances: %zu", modelManager->getInstances().size());
-			auto& instances = modelManager->getInstances();
-			static int selectedInstance = -1;
-
-			for (size_t i = 0; i < instances.size(); ++i) {
-				auto& inst = instances[i];
-				ImGui::PushID(static_cast<int>(i) + 10000);
-
-				ImGui::Checkbox("##vis", &inst.visible);
-				ImGui::SameLine();
-
-				bool isSelected = (selectedInstance == static_cast<int>(i));
-				if (ImGui::Selectable(inst.name.c_str(), isSelected)) {
-					selectedInstance = static_cast<int>(i);
-				}
-
-				if (ImGui::BeginPopupContextItem()) {
-					if (ImGui::MenuItem("Delete")) {
-						modelManager->removeInstance(i);
-						selectedInstance = -1;
+					// Right-click context menu
+					if (ImGui::BeginPopupContextItem()) {
+						if (ImGui::MenuItem("Create Instance")) {
+							modelManager->createInstance(i, camera.position + glm::vec3(0, 0, -5));
+						}
+						if (ImGui::MenuItem("Create at Origin")) {
+							modelManager->createInstance(i, glm::vec3(0.0f));
+						}
+						ImGui::Separator();
+						if (ImGui::MenuItem("Unload")) {
+							if (gizmo.selectedInstance >= 0) {
+								const auto& insts = modelManager->getInstances();
+								if (gizmo.selectedInstance < static_cast<int>(insts.size()) &&
+									insts[gizmo.selectedInstance].modelIndex == i) {
+									gizmo.deselect();
+								}
+							}
+							modelManager->unloadModel(i);
+							selectedModel = -1;
+							gizmo.deselect();
+						}
+						ImGui::EndPopup();
 					}
-					ImGui::EndPopup();
+
+					ImGui::SameLine();
+					ImGui::TextDisabled("(%zu verts, %zu tex)",
+						model->vertexCount, model->textures.size());
+
+					ImGui::PopID();
 				}
 
-				ImGui::PopID();
-			}
-
-			// Instance Inspector
-			if (selectedInstance >= 0 && selectedInstance < static_cast<int>(instances.size())) {
 				ImGui::Separator();
-				ImGui::Text("Transform:");
-				auto& inst = instances[selectedInstance];
-				ImGui::DragFloat3("Position", &inst.position[0], 0.1f);
-				ImGui::DragFloat3("Rotation", &inst.rotation[0], 1.0f);
-				ImGui::DragFloat3("Scale", &inst.scale[0], 0.01f, 0.01f, 100.0f);
+
+				// Instances
+				ImGui::Text("Scene Instances: %zu", modelManager->getInstances().size());
+				auto& instances = modelManager->getInstances();
+				static int selectedInstance = -1;
+
+				for (size_t i = 0; i < instances.size(); ++i) {
+					auto& inst = instances[i];
+					ImGui::PushID(static_cast<int>(i) + 10000);
+
+					ImGui::Checkbox("##vis", &inst.visible);
+					ImGui::SameLine();
+
+					bool isSelected = (selectedInstance == static_cast<int>(i));
+					if (ImGui::Selectable(inst.name.c_str(), isSelected)) {
+						selectedInstance = static_cast<int>(i);
+					}
+
+					if (ImGui::BeginPopupContextItem()) {
+						if (ImGui::MenuItem("Delete")) {
+							if (gizmo.selectedInstance == static_cast<int>(i)) {
+								gizmo.deselect();
+							}
+							else if (gizmo.selectedInstance > static_cast<int>(i)) {
+								gizmo.selectedInstance--;
+							}
+							modelManager->removeInstance(i);
+							selectedInstance = -1;
+						}
+						ImGui::EndPopup();
+					}
+
+					ImGui::PopID();
+				}
+
+				// Instance Inspector
+				if (selectedInstance >= 0 && selectedInstance < static_cast<int>(instances.size())) {
+					ImGui::Separator();
+					ImGui::Text("Transform:");
+					auto& inst = instances[selectedInstance];
+					ImGui::DragFloat3("Position", &inst.position[0], 0.1f);
+					ImGui::DragFloat3("Rotation", &inst.rotation[0], 1.0f);
+					ImGui::DragFloat3("Scale", &inst.scale[0], 0.01f, 0.01f, 100.0f);
+				}
+
+				ImGui::Separator();
+				if (gizmo.selectedInstance >= 0 &&
+					gizmo.selectedInstance < static_cast<int>(instances.size())) {
+					auto& sel = instances[gizmo.selectedInstance];
+					ImGui::Text("Selected: %s", sel.name.c_str());
+
+					const char* modeStr = "None";
+					if (gizmo.mode == GizmoMode::Translate) modeStr = "Translate (1)";
+					if (gizmo.mode == GizmoMode::Rotate) modeStr = "Rotate (2)";
+					if (gizmo.mode == GizmoMode::Scale) modeStr = "Scale (3)";
+					ImGui::Text("Gizmo: %s", modeStr);
+
+					ImGui::DragFloat3("Position", &sel.position[0], 0.1f);
+					ImGui::DragFloat3("Rotation", &sel.rotation[0], 1.0f);
+					ImGui::DragFloat3("Scale", &sel.scale[0], 0.01f, 0.01f, 100.0f);
+
+					if (ImGui::Button("Deselect")) {
+						gizmo.deselect();
+					}
+				}
+				else {
+					ImGui::Text("Click on model to select (mouse visible)");
+					ImGui::Text("Then press 1/2/3 for Transform/Rotate/Scale");
+				}
+
+				ImGui::End();
+
+				// Finalize ImGui frame (must call before RenderDrawData)
+				ImGui::Render();
+				drawData = ImGui::GetDrawData();
 			}
-
-			ImGui::End();
-
-			// Finalize ImGui frame (must call before RenderDrawData)
-			ImGui::Render();
-			ImDrawData* drawData = ImGui::GetDrawData();
-	
+			else {
+				modelManager->update();
+				drawData = nullptr;
+			}
 			vk::SwapchainKHR swapchainHPP(vkbSwapchain.swapchain);
 
 			(void)device.waitForFences(inFlightFences[currentFrame].get(), VK_TRUE, UINT64_MAX);
@@ -2490,6 +2795,8 @@ int main()
 					GPUModel* gpuModel = modelManager->getModel(inst.modelIndex);
 					if (!gpuModel || !gpuModel->isValid()) continue;
 
+					glm::mat4 instanceTransform = inst.getTransformMatrix();
+
 					// Bind vertex/index buffers for this model
 					vk::Buffer modelBuffers[1] = { gpuModel->vertexBuffer->getBuffer() };
 					vk::DeviceSize modelOffsets[1] = { 0 };
@@ -2509,12 +2816,13 @@ int main()
 							continue;
 
 						ShadowPushConstants shadowPc{};
+						shadowPc.modelMatrix = instanceTransform;
 						shadowPc.alphaCutoff = sub.material.alphaCutoff;
 						shadowPc.alphaMode = static_cast<int>(sub.material.alphaMode);
 
 						cmd.pushConstants(
 							shadowPipelineLayout,
-							vk::ShaderStageFlagBits::eFragment,
+							vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment,
 							0,
 							sizeof(ShadowPushConstants),
 							&shadowPc
@@ -2663,6 +2971,8 @@ int main()
 				GPUModel* gpuModel = modelManager->getModel(inst.modelIndex);
 				if (!gpuModel || !gpuModel->isValid()) continue;
 
+				glm::mat4 instanceTransform = inst.getTransformMatrix();
+
 				// Bind vertex/index buffers for this model
 				vk::Buffer modelBuffers[1] = { gpuModel->vertexBuffer->getBuffer() };
 				vk::DeviceSize modelOffsets[1] = { 0 };
@@ -2677,13 +2987,10 @@ int main()
 				cmd.bindVertexBuffers2(0, 1, modelBuffers, modelOffsets, modelSizes, modelStrides);
 				cmd.bindIndexBuffer(gpuModel->indexBuffer->getBuffer(), 0, vk::IndexType::eUint32);
 
-				// Get instance transform
-				glm::mat4 instanceTransform = inst.getTransformMatrix();
-
 				// Sort submeshes
 				auto sortedSubmeshes = sortSubmeshesForRendering(
 					gpuModel->submeshes,
-					std::vector<Vertex>(), // Empty - we don't have CPU vertices anymore
+					std::vector<Vertex>(), 
 					camera.position
 				);
 
@@ -2717,6 +3024,7 @@ int main()
 
 					// Push constants
 					MeshPushConstants pc{};
+					pc.modelMatrix = instanceTransform;
 					pc.baseColor = sub.material.baseColorFactor;
 					pc.metallic = sub.material.metallicFactor;
 					pc.roughness = sub.material.roughnessFactor;
@@ -2760,9 +3068,101 @@ int main()
 				}
 			}
 
+			if (!mouseEnabled && gizmo.selectedInstance >= 0 &&
+				gizmo.selectedInstance < static_cast<int>(modelManager->getInstances().size()) &&
+				gizmo.mode != GizmoMode::None) {
+
+				auto& gizmoInst = modelManager->getInstances()[gizmo.selectedInstance];
+
+				// Bind gizmo shaders
+				vk::ShaderStageFlagBits gizmoStages[] = {
+					vk::ShaderStageFlagBits::eVertex,
+					vk::ShaderStageFlagBits::eFragment
+				};
+				vk::ShaderEXT gizmoShaders[] = { gizmoVertShader, gizmoFragShader };
+				cmd.bindShadersEXT(2, gizmoStages, gizmoShaders);
+
+				// Set state for line rendering
+				cmd.setPrimitiveTopology(vk::PrimitiveTopology::eLineList);
+				cmd.setLineWidth(3.0f);
+				cmd.setCullMode(vk::CullModeFlagBits::eNone);
+				cmd.setDepthTestEnable(false);  // Draw on top of everything
+				cmd.setDepthWriteEnable(false);
+				cmd.setColorBlendEnableEXT(0, VK_FALSE);
+
+				// Set vertex input for GizmoVertex
+				vk::VertexInputBindingDescription2EXT gizmoBinding{};
+				gizmoBinding.binding = 0;
+				gizmoBinding.stride = sizeof(GizmoVertex);
+				gizmoBinding.inputRate = vk::VertexInputRate::eVertex;
+				gizmoBinding.divisor = 1;
+
+				std::array<vk::VertexInputAttributeDescription2EXT, 2> gizmoAttribs{};
+				gizmoAttribs[0].location = 0;
+				gizmoAttribs[0].binding = 0;
+				gizmoAttribs[0].format = vk::Format::eR32G32B32Sfloat;
+				gizmoAttribs[0].offset = offsetof(GizmoVertex, position);
+
+				gizmoAttribs[1].location = 1;
+				gizmoAttribs[1].binding = 0;
+				gizmoAttribs[1].format = vk::Format::eR32G32B32Sfloat;
+				gizmoAttribs[1].offset = offsetof(GizmoVertex, color);
+
+				cmd.setVertexInputEXT(1, &gizmoBinding,
+					static_cast<uint32_t>(gizmoAttribs.size()), gizmoAttribs.data());
+
+				// Bind UBO
+				cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, gizmoPipelineLayout, 0, 1,
+					&uboDescriptorSets[currentFrame], 0, nullptr);
+
+				// Push gizmo transform (position only, no rotation for gizmo itself)
+				float gizmoScale = getGizmoScale(gizmoInst.position, camera.position,
+					0.15f, frameData.proj);
+				glm::mat4 gizmoTransform = glm::translate(glm::mat4(1.0f), gizmoInst.position)
+					* glm::scale(glm::mat4(1.0f), glm::vec3(gizmoScale));
+				cmd.pushConstants(gizmoPipelineLayout, vk::ShaderStageFlagBits::eVertex,
+					0, sizeof(glm::mat4), &gizmoTransform);
+
+				// Select which gizmo buffer to draw
+				vk::Buffer gizmoVB;
+				uint32_t gizmoVertexCount;
+
+				switch (gizmo.mode) {
+				case GizmoMode::Translate:
+					gizmoVB = translateBuffer;
+					gizmoVertexCount = static_cast<uint32_t>(translateLines.size());
+					break;
+				case GizmoMode::Rotate:
+					gizmoVB = rotateBuffer;
+					gizmoVertexCount = static_cast<uint32_t>(rotateLines.size());
+					break;
+				case GizmoMode::Scale:
+					gizmoVB = scaleBuffer;
+					gizmoVertexCount = static_cast<uint32_t>(scaleLines.size());
+					break;
+				default:
+					gizmoVB = translateBuffer;
+					gizmoVertexCount = 0;
+					break;
+				}
+
+				if (gizmoVertexCount > 0) {
+					vk::DeviceSize offset = 0;
+					vk::DeviceSize size = sizeof(GizmoVertex) * gizmoVertexCount;
+					vk::DeviceSize stride = sizeof(GizmoVertex);
+					cmd.bindVertexBuffers2(0, 1, &gizmoVB, &offset, &size, &stride);
+					cmd.draw(gizmoVertexCount, 1, 0, 0);
+				}
+
+				// Restore state for subsequent rendering
+				cmd.setDepthTestEnable(true);
+				cmd.setDepthWriteEnable(true);
+				cmd.setPrimitiveTopology(vk::PrimitiveTopology::eTriangleList);
+			}
+
 			cmd.endRendering();
 
-			{
+			if (drawData && drawData->TotalVtxCount > 0) {
 				// Begin new rendering pass for ImGui overlay
 				vk::RenderingAttachmentInfo imguiColorAttachment{};
 				imguiColorAttachment.setImageView(swapchainImageViews[imageIndex])
@@ -2857,6 +3257,12 @@ int main()
 			}
 		}
 		modelManager.reset();
+		device.destroyShaderEXT(gizmoVertShader);
+		device.destroyShaderEXT(gizmoFragShader);
+		device.destroyPipelineLayout(gizmoPipelineLayout);
+		vmaDestroyBuffer(allocator, VkBuffer(translateBuffer), translateAlloc);
+		vmaDestroyBuffer(allocator, VkBuffer(rotateBuffer), rotateAlloc);
+		vmaDestroyBuffer(allocator, VkBuffer(scaleBuffer), scaleAlloc);
 	};
 
 	vmaDestroyImage(allocator, depthImage, depthAlloc);

@@ -20,6 +20,7 @@ struct DirectionalLight {
 };
 
 struct ShadowPushConstants {
+	glm::mat4 modelMatrix{ 1.0f };	// 64 bytes
 	float alphaCutoff;      // 4 bytes
 	int alphaMode;          // 4 bytes
 	float padding[2];       // 8 bytes for alignment

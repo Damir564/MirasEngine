@@ -274,11 +274,20 @@ size_t ModelManager::uploadModelToGPU(Mesh& mesh, const std::string& name, const
         texData.free();
     }
 
-    // Calculate bounds
-    std::vector<InstanceData> dummyInstances = { { glm::vec3(0.0f) } };
-    SceneBounds bounds = calculateSceneBounds(mesh.vertices, dummyInstances);
-    gpuModel->boundsCenter = bounds.center;
-    gpuModel->boundsRadius = bounds.radius;
+    if (!mesh.vertices.empty()) {
+        glm::vec3 bmin(FLT_MAX);
+        glm::vec3 bmax(-FLT_MAX);
+
+        for (const auto& v : mesh.vertices) {
+            bmin = glm::min(bmin, v.position);
+            bmax = glm::max(bmax, v.position);
+        }
+
+        gpuModel->boundsMin = bmin;
+        gpuModel->boundsMax = bmax;
+        gpuModel->boundsCenter = (bmin + bmax) * 0.5f;
+        gpuModel->boundsRadius = glm::length(bmax - bmin) * 0.5f;
+    }
 
     size_t index = m_models.size();
     m_models.push_back(std::move(gpuModel));

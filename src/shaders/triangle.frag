@@ -28,6 +28,7 @@ layout(set = 3, binding = 0) uniform sampler2D mrSampler;
 layout(set = 4, binding = 0) uniform sampler2DShadow shadowMapSampler;
 
 layout(push_constant) uniform MeshData {
+    mat4 modelMatrix;
     vec4 baseColor;
     float metallic;
     float roughness;
