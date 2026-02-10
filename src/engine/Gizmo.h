@@ -49,15 +49,34 @@ struct Ray {
     glm::vec3 direction;
 };
 
+// ============================================================
+// Core coordinate conversion functions
+// All functions use the SAME convention:
+//   - Projection has Y flipped (proj[1][1] *= -1 for Vulkan)
+//   - Screen: (0,0) = top-left, Y increases downward
+//   - NDC after Vulkan flip: Y increases downward (matches screen)
+// ============================================================
+
+// Screen pixel coords -> NDC (accounting for Vulkan Y-flip in projection)
+// Since proj already flips Y, NDC Y increases downward just like screen Y.
+// So the mapping is simply: ndcX = 2*mx/w - 1, ndcY = 2*my/h - 1
+inline glm::vec2 screenToNDC(float mouseX, float mouseY,
+    float screenWidth, float screenHeight)
+{
+    return glm::vec2(
+        (2.0f * mouseX) / screenWidth - 1.0f,
+        (2.0f * mouseY) / screenHeight - 1.0f  // No flip needed - Vulkan proj already flips
+    );
+}
+
 inline Ray screenToWorldRay(float mouseX, float mouseY,
     float screenWidth, float screenHeight,
     const glm::mat4& view, const glm::mat4& proj)
 {
-    float x = (2.0f * mouseX) / screenWidth - 1.0f;
-    float y = 1.0f - (2.0f * mouseY) / screenHeight;
+    glm::vec2 ndc = screenToNDC(mouseX, mouseY, screenWidth, screenHeight);
 
-    glm::vec4 clipNear(x, y, 0.0f, 1.0f);
-    glm::vec4 clipFar(x, y, 1.0f, 1.0f);
+    glm::vec4 clipNear(ndc.x, ndc.y, 0.0f, 1.0f);
+    glm::vec4 clipFar(ndc.x, ndc.y, 1.0f, 1.0f);
 
     glm::mat4 invVP = glm::inverse(proj * view);
     glm::vec4 worldNear = invVP * clipNear;
@@ -69,6 +88,23 @@ inline Ray screenToWorldRay(float mouseX, float mouseY,
     ray.origin = glm::vec3(worldNear);
     ray.direction = glm::normalize(glm::vec3(worldFar - worldNear));
     return ray;
+}
+
+// World position -> screen pixel coords
+// Since proj already flips Y, NDC Y matches screen Y direction
+inline glm::vec2 worldToScreen(const glm::vec3& worldPos,
+    const glm::mat4& vp,
+    float screenWidth, float screenHeight)
+{
+    glm::vec4 clip = vp * glm::vec4(worldPos, 1.0f);
+    if (clip.w <= 0.0001f) return glm::vec2(-10000.0f);
+    glm::vec3 ndc = glm::vec3(clip) / clip.w;
+
+    // Direct mapping - no Y flip because proj already flipped Y
+    return glm::vec2(
+        (ndc.x * 0.5f + 0.5f) * screenWidth,
+        (ndc.y * 0.5f + 0.5f) * screenHeight
+    );
 }
 
 inline bool rayIntersectsAABB(const Ray& ray,
@@ -117,19 +153,6 @@ inline bool rayIntersectsTransformedAABB(const Ray& ray,
     return rayIntersectsAABB(localRay, localMin, localMax, tOut);
 }
 
-inline glm::vec2 worldToScreen(const glm::vec3& worldPos,
-    const glm::mat4& vp,
-    float screenWidth, float screenHeight)
-{
-    glm::vec4 clip = vp * glm::vec4(worldPos, 1.0f);
-    if (clip.w <= 0.0001f) return glm::vec2(-10000.0f);
-    glm::vec3 ndc = glm::vec3(clip) / clip.w;
-    return glm::vec2(
-        (ndc.x * 0.5f + 0.5f) * screenWidth,
-        (1.0f - (ndc.y * 0.5f + 0.5f)) * screenHeight
-    );
-}
-
 inline float pointToSegment2D(const glm::vec2& point,
     const glm::vec2& segA, const glm::vec2& segB,
     float& segT)
@@ -147,13 +170,12 @@ inline float pointToSegment2D(const glm::vec2& point,
     return glm::length(point - closest);
 }
 
-// =====================================================
-// FIX: Pass mouse pixel coordinates directly instead of
-// trying to reconstruct them from the ray
-// =====================================================
-inline GizmoAxis pickGizmoAxis(const glm::vec2& mousePixel,  // <-- CHANGED: direct pixel coords
+// Pick gizmo axis in screen space
+// mousePixel: direct SDL mouse coordinates
+// gizmoScale: the SAME scale value used in the gizmo render transform
+inline GizmoAxis pickGizmoAxis(const glm::vec2& mousePixel,
     const glm::vec3& gizmoCenter,
-    float gizmoScale,          // <-- CHANGED: pass the actual scale used for rendering
+    float gizmoScale,
     float pickRadiusPixels,
     const glm::mat4& view,
     const glm::mat4& proj,
@@ -173,16 +195,14 @@ inline GizmoAxis pickGizmoAxis(const glm::vec2& mousePixel,  // <-- CHANGED: dir
 
     glm::mat4 vp = proj * view;
 
-    // Check if gizmo center is behind camera
     glm::vec4 centerClip = vp * glm::vec4(gizmoCenter, 1.0f);
     if (centerClip.w <= 0.0f) return GizmoAxis::None;
 
     float bestDist = pickRadiusPixels;
     GizmoAxis bestAxis = GizmoAxis::None;
 
-    // The gizmo geometry has axes of length 2.0f (from generateTranslateGizmoLines)
-    // The renderer scales the entire gizmo by gizmoScale
-    // So the world-space axis endpoint is at: gizmoCenter + dir * 2.0f * gizmoScale
+    // The gizmo geometry has length 2.0f, scaled by gizmoScale in the model matrix
+    // The world-space endpoint is: gizmoCenter + dir * 2.0f * gizmoScale
     float worldAxisLength = 2.0f * gizmoScale;
 
     for (auto& a : axes) {
@@ -213,7 +233,8 @@ inline float getGizmoScale(const glm::vec3& gizmoPos, const glm::vec3& cameraPos
     const glm::mat4& proj = glm::mat4(1.0f))
 {
     float dist = glm::length(gizmoPos - cameraPos);
-    float tanHalfFov = 1.0f / proj[1][1];
+    // proj[1][1] is negative due to Vulkan flip, use abs
+    float tanHalfFov = 1.0f / std::abs(proj[1][1]);
     return dist * tanHalfFov * desiredScreenSize;
 }
 
