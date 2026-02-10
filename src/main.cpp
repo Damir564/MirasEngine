@@ -3106,7 +3106,8 @@ int main()
 				}
 			}
 
-			if (gizmo.selectedInstance >= 0 &&
+			if (!mouseEnabled &&
+				gizmo.selectedInstance >= 0 &&
 				gizmo.selectedInstance < static_cast<int>(modelManager->getInstances().size()) &&
 				gizmo.mode != GizmoMode::None &&
 				modelManager->getInstances()[gizmo.selectedInstance].visible) {
