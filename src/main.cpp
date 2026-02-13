@@ -35,6 +35,7 @@
 #include "engine/ModelManager.h"
 #include "engine/Gizmo.h"
 #include "engine/SceneSerializer.h"
+#include "engine/CameraAnimation.h"
 
 struct FrameUBO {
 	glm::mat4 view;
@@ -2158,6 +2159,81 @@ int main()
 
 		std::cout << "Gizmo system initialized\n";
 
+		// ========================
+// CAMERA ANIMATION SETUP
+// ========================
+		CameraAnimator cameraAnimator;
+
+		// Path visualization buffer (reused each frame when path is visible)
+		VkBuffer pathVisualizationBuffer = VK_NULL_HANDLE;
+		VmaAllocation pathVisualizationAlloc = VK_NULL_HANDLE;
+		uint32_t pathVisualizationVertexCount = 0;
+		bool showAnimationPath = true;
+
+		// Helper to rebuild path visualization buffer
+		auto rebuildPathVisualization = [&]() {
+			// Destroy old buffer
+			if (pathVisualizationBuffer != VK_NULL_HANDLE) {
+				vmaDestroyBuffer(allocator, pathVisualizationBuffer, pathVisualizationAlloc);
+				pathVisualizationBuffer = VK_NULL_HANDLE;
+				pathVisualizationAlloc = VK_NULL_HANDLE;
+				pathVisualizationVertexCount = 0;
+			}
+
+			auto pathPoints = cameraAnimator.generatePathPoints(30);
+			if (pathPoints.size() < 2) return;
+
+			// Convert to line segments (pairs of vertices)
+			std::vector<GizmoVertex> lineVerts;
+			lineVerts.reserve((pathPoints.size() - 1) * 2 + cameraAnimator.getPath().keyframes.size() * 6);
+
+			// Path lines (yellow)
+			for (size_t i = 0; i < pathPoints.size() - 1; ++i) {
+				lineVerts.push_back({ pathPoints[i], glm::vec3(1.0f, 1.0f, 0.0f) });
+				lineVerts.push_back({ pathPoints[i + 1], glm::vec3(1.0f, 1.0f, 0.0f) });
+			}
+
+			// Keyframe markers (small crosses, cyan for straight, magenta for curved)
+			const auto& keyframes = cameraAnimator.getPath().keyframes;
+			float crossSize = 0.3f;
+			for (const auto& kf : keyframes) {
+				glm::vec3 color = kf.useCurve ? glm::vec3(1.0f, 0.0f, 1.0f) : glm::vec3(0.0f, 1.0f, 1.0f);
+				// X cross
+				lineVerts.push_back({ kf.position - glm::vec3(crossSize, 0, 0), color });
+				lineVerts.push_back({ kf.position + glm::vec3(crossSize, 0, 0), color });
+				// Y cross
+				lineVerts.push_back({ kf.position - glm::vec3(0, crossSize, 0), color });
+				lineVerts.push_back({ kf.position + glm::vec3(0, crossSize, 0), color });
+				// Z cross
+				lineVerts.push_back({ kf.position - glm::vec3(0, 0, crossSize), color });
+				lineVerts.push_back({ kf.position + glm::vec3(0, 0, crossSize), color });
+
+				// Look direction line (green, short)
+				glm::vec3 lookDir = glm::normalize(kf.lookTarget - kf.position);
+				lineVerts.push_back({ kf.position, glm::vec3(0.0f, 1.0f, 0.0f) });
+				lineVerts.push_back({ kf.position + lookDir * 1.0f, glm::vec3(0.0f, 1.0f, 0.0f) });
+			}
+
+			if (lineVerts.empty()) return;
+
+			VkBufferCreateInfo bufInfo{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+			bufInfo.size = sizeof(GizmoVertex) * lineVerts.size();
+			bufInfo.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
+			VmaAllocationCreateInfo allocCI{};
+			allocCI.usage = VMA_MEMORY_USAGE_CPU_TO_GPU;
+			allocCI.requiredFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+
+			vmaCreateBuffer(allocator, &bufInfo, &allocCI, &pathVisualizationBuffer, &pathVisualizationAlloc, nullptr);
+			void* mapped;
+			vmaMapMemory(allocator, pathVisualizationAlloc, &mapped);
+			memcpy(mapped, lineVerts.data(), bufInfo.size);
+			vmaUnmapMemory(allocator, pathVisualizationAlloc);
+
+			pathVisualizationVertexCount = static_cast<uint32_t>(lineVerts.size());
+			};
+
+		std::cout << "Camera animation system initialized\n";
+
 		// ============================================
 		// IMGUI SETUP - For ImGui v1.92.5-docking
 		// ============================================
@@ -2497,7 +2573,8 @@ int main()
 				}
 
 				// Camera rotation
-				if (event.type == SDL_EVENT_MOUSE_MOTION) {
+				// if (event.type == SDL_EVENT_MOUSE_MOTION) {
+				if (event.type == SDL_EVENT_MOUSE_MOTION && !cameraAnimator.isPlaying()) {
 					if (mouseEnabled) {
 						// Camera mode: always rotate
 						camera.yaw += event.motion.xrel * camera.sensitivity;
@@ -2515,7 +2592,8 @@ int main()
 
 			// Camera movement - only if ImGui doesn't want keyboard
 			ImGuiIO& imguiIO = ImGui::GetIO();
-			if (mouseEnabled || !imguiIO.WantCaptureKeyboard) {
+			if ((mouseEnabled || !imguiIO.WantCaptureKeyboard) && !cameraAnimator.isPlaying()) {
+			// if (mouseEnabled || !imguiIO.WantCaptureKeyboard) {
 				const bool* keys = SDL_GetKeyboardState(nullptr);
 				glm::vec3 front{
 					cos(glm::radians(camera.yaw)) * cos(glm::radians(camera.pitch)),
@@ -2828,6 +2906,189 @@ int main()
 
 				ImGui::End();
 
+				// ============================================
+// CAMERA ANIMATION UI
+// ============================================
+				ImGui::Begin("Camera Animation");
+
+				auto& animPath = cameraAnimator.getPath();
+
+				// Path name
+				static char pathName[128] = "CameraPath1";
+				ImGui::InputText("Path Name", pathName, sizeof(pathName));
+				animPath.name = pathName;
+
+				ImGui::Separator();
+
+				// === PLAYBACK CONTROLS ===
+				ImGui::Text("Playback");
+
+				AnimationPlayState playState = cameraAnimator.getPlayState();
+				const char* stateText = "Stopped";
+				if (playState == AnimationPlayState::Playing) stateText = "Playing";
+				if (playState == AnimationPlayState::Paused) stateText = "Paused";
+				ImGui::Text("State: %s", stateText);
+
+				if (ImGui::Button("Play")) {
+					cameraAnimator.play();
+				}
+				ImGui::SameLine();
+				if (ImGui::Button("Pause")) {
+					cameraAnimator.pause();
+				}
+				ImGui::SameLine();
+				if (ImGui::Button("Stop")) {
+					cameraAnimator.stop();
+				}
+
+				float speed = cameraAnimator.getPlaybackSpeed();
+				if (ImGui::SliderFloat("Speed", &speed, 0.1f, 5.0f, "%.1fx")) {
+					cameraAnimator.setPlaybackSpeed(speed);
+				}
+
+				// Timeline scrubber
+				float currentTime = cameraAnimator.getCurrentTime();
+				float duration = cameraAnimator.getDuration();
+				if (duration > 0.0f) {
+					if (ImGui::SliderFloat("Timeline", &currentTime, 0.0f, duration, "%.2fs")) {
+						// Allow scrubbing when not playing
+						if (!cameraAnimator.isPlaying()) {
+							// Manually set time for preview
+							// We need a setter for this - using a small hack
+							cameraAnimator.stop();
+							// Force time through play+pause at the right moment
+							// Better: add a setCurrentTime method
+						}
+					}
+
+					// Progress bar
+					float progress = duration > 0.0f ? currentTime / duration : 0.0f;
+					ImGui::ProgressBar(progress, ImVec2(-1, 0),
+						(std::to_string((int)currentTime) + "s / " + std::to_string((int)duration) + "s").c_str());
+				}
+
+				ImGui::Checkbox("Loop", &animPath.loop);
+
+				ImGui::Separator();
+
+				// === ADD KEYFRAME ===
+				ImGui::Text("Add Keyframes");
+
+				static float newKeyframeTime = 0.0f;
+				static bool newKeyframeCurved = true;
+				ImGui::DragFloat("Time (s)", &newKeyframeTime, 0.1f, 0.0f, 600.0f, "%.1f s");
+				ImGui::Checkbox("Curved (Catmull-Rom)", &newKeyframeCurved);
+
+				if (ImGui::Button("Add Keyframe at Camera Position")) {
+					CameraKeyframe kf = CameraAnimator::makeKeyframe(
+						camera.position, camera.yaw, camera.pitch,
+						newKeyframeTime, newKeyframeCurved
+					);
+					cameraAnimator.addKeyframe(kf);
+
+					// Auto-increment time for next keyframe
+					newKeyframeTime += 2.0f;
+
+					rebuildPathVisualization();
+				}
+
+				if (ImGui::Button("Add Keyframe at Origin")) {
+					CameraKeyframe kf;
+					kf.position = glm::vec3(0.0f);
+					kf.lookTarget = glm::vec3(0.0f, 0.0f, -10.0f);
+					kf.timestamp = newKeyframeTime;
+					kf.useCurve = newKeyframeCurved;
+					cameraAnimator.addKeyframe(kf);
+					newKeyframeTime += 2.0f;
+					rebuildPathVisualization();
+				}
+
+				ImGui::Separator();
+
+				// === KEYFRAME LIST ===
+				ImGui::Text("Keyframes: %zu", animPath.keyframes.size());
+
+				bool pathModified = false;
+
+				for (size_t i = 0; i < animPath.keyframes.size(); ++i) {
+					auto& kf = animPath.keyframes[i];
+					ImGui::PushID(static_cast<int>(i));
+
+					bool nodeOpen = ImGui::TreeNode("", "KF %zu - %.1fs %s",
+						i, kf.timestamp, kf.useCurve ? "(Curve)" : "(Line)");
+
+					if (nodeOpen) {
+						if (ImGui::DragFloat3("Position", &kf.position[0], 0.1f)) pathModified = true;
+						if (ImGui::DragFloat3("Look At", &kf.lookTarget[0], 0.1f)) pathModified = true;
+						if (ImGui::DragFloat("Time", &kf.timestamp, 0.1f, 0.0f, 600.0f)) pathModified = true;
+						if (ImGui::Checkbox("Curved", &kf.useCurve)) pathModified = true;
+
+						if (ImGui::Button("Set to Camera")) {
+							kf = CameraAnimator::makeKeyframe(
+								camera.position, camera.yaw, camera.pitch,
+								kf.timestamp, kf.useCurve
+							);
+							pathModified = true;
+						}
+						ImGui::SameLine();
+						if (ImGui::Button("Go to")) {
+							// Move camera to this keyframe position
+							camera.position = kf.position;
+							float yaw, pitch;
+							CameraAnimator::makeKeyframe(kf.position, 0, 0, 0); // dummy
+							glm::vec3 dir = glm::normalize(kf.lookTarget - kf.position);
+							camera.yaw = glm::degrees(atan2(dir.z, dir.x));
+							camera.pitch = glm::degrees(asin(glm::clamp(dir.y, -1.0f, 1.0f)));
+						}
+						ImGui::SameLine();
+						if (ImGui::Button("Delete")) {
+							cameraAnimator.removeKeyframe(i);
+							pathModified = true;
+							ImGui::TreePop();
+							ImGui::PopID();
+							break; // List changed, exit loop
+						}
+
+						ImGui::TreePop();
+					}
+
+					ImGui::PopID();
+				}
+
+				if (pathModified) {
+					animPath.recalculateDuration();
+					rebuildPathVisualization();
+				}
+
+				ImGui::Separator();
+
+				// === VISUALIZATION ===
+				ImGui::Checkbox("Show Path", &showAnimationPath);
+
+				ImGui::Separator();
+
+				// === SAVE/LOAD ===
+				static char animSavePath[256] = "camera_path.cmap";
+				ImGui::InputText("Anim File", animSavePath, sizeof(animSavePath));
+
+				if (ImGui::Button("Save Path")) {
+					cameraAnimator.savePath(animSavePath);
+				}
+				ImGui::SameLine();
+				if (ImGui::Button("Load Path")) {
+					if (cameraAnimator.loadPath(animSavePath)) {
+						strncpy(pathName, cameraAnimator.getPath().name.c_str(), sizeof(pathName) - 1);
+						rebuildPathVisualization();
+					}
+				}
+				ImGui::SameLine();
+				if (ImGui::Button("Clear All")) {
+					cameraAnimator.clearKeyframes();
+					rebuildPathVisualization();
+				}
+
+				ImGui::End();
+
 				// Finalize ImGui frame (must call before RenderDrawData)
 				ImGui::Render();
 				drawData = ImGui::GetDrawData();
@@ -2889,6 +3150,18 @@ int main()
 			if (result != vk::Result::eSuccess && result != vk::Result::eSuboptimalKHR) {
 				std::cerr << "Failed to acquireNextImageKHR\n";
 				return -1;
+			}
+
+			// ============================================
+			// CAMERA ANIMATION UPDATE
+			// ============================================
+			bool animationControllingCamera = false;
+			if (cameraAnimator.update(dt)) {
+				CameraState camState = cameraAnimator.getCurrentState();
+				camera.position = camState.position;
+				camera.yaw = camState.yaw;
+				camera.pitch = camState.pitch;
+				animationControllingCamera = true;
 			}
 
 			FrameUBO frameData{};
@@ -3357,6 +3630,69 @@ int main()
 				cmd.setPrimitiveTopology(vk::PrimitiveTopology::eTriangleList);
 			}
 
+			// ============================================
+// CAMERA PATH VISUALIZATION
+// ============================================
+			if (!mouseEnabled && showAnimationPath && pathVisualizationBuffer != VK_NULL_HANDLE && pathVisualizationVertexCount > 0) {
+				// Bind gizmo shaders (reuse them for line rendering)
+				vk::ShaderStageFlagBits pathStages[] = {
+					vk::ShaderStageFlagBits::eVertex,
+					vk::ShaderStageFlagBits::eFragment
+				};
+				vk::ShaderEXT pathShaders[] = { gizmoVertShader, gizmoFragShader };
+				cmd.bindShadersEXT(2, pathStages, pathShaders);
+
+				// Set state for line rendering
+				cmd.setPrimitiveTopology(vk::PrimitiveTopology::eLineList);
+				cmd.setLineWidth(2.0f);
+				cmd.setCullMode(vk::CullModeFlagBits::eNone);
+				cmd.setDepthTestEnable(true);   // Depth test ON so path goes behind objects
+				cmd.setDepthWriteEnable(false);
+				cmd.setColorBlendEnableEXT(0, VK_FALSE);
+
+				// Set vertex input (same as gizmo)
+				vk::VertexInputBindingDescription2EXT pathBinding{};
+				pathBinding.binding = 0;
+				pathBinding.stride = sizeof(GizmoVertex);
+				pathBinding.inputRate = vk::VertexInputRate::eVertex;
+				pathBinding.divisor = 1;
+
+				std::array<vk::VertexInputAttributeDescription2EXT, 2> pathAttribs{};
+				pathAttribs[0].location = 0;
+				pathAttribs[0].binding = 0;
+				pathAttribs[0].format = vk::Format::eR32G32B32Sfloat;
+				pathAttribs[0].offset = offsetof(GizmoVertex, position);
+				pathAttribs[1].location = 1;
+				pathAttribs[1].binding = 0;
+				pathAttribs[1].format = vk::Format::eR32G32B32Sfloat;
+				pathAttribs[1].offset = offsetof(GizmoVertex, color);
+
+				cmd.setVertexInputEXT(1, &pathBinding,
+					static_cast<uint32_t>(pathAttribs.size()), pathAttribs.data());
+
+				// Bind UBO
+				cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, gizmoPipelineLayout, 0, 1,
+					&uboDescriptorSets[currentFrame], 0, nullptr);
+
+				// Identity transform (path is in world space)
+				glm::mat4 identity(1.0f);
+				cmd.pushConstants(gizmoPipelineLayout, vk::ShaderStageFlagBits::eVertex,
+					0, sizeof(glm::mat4), &identity);
+
+				// Bind and draw
+				vk::Buffer pathVB = vk::Buffer(pathVisualizationBuffer);
+				vk::DeviceSize pathOffset = 0;
+				vk::DeviceSize pathSize = sizeof(GizmoVertex) * pathVisualizationVertexCount;
+				vk::DeviceSize pathStride = sizeof(GizmoVertex);
+				cmd.bindVertexBuffers2(0, 1, &pathVB, &pathOffset, &pathSize, &pathStride);
+				cmd.draw(pathVisualizationVertexCount, 1, 0, 0);
+
+				// Restore state
+				cmd.setDepthTestEnable(true);
+				cmd.setDepthWriteEnable(true);
+				cmd.setPrimitiveTopology(vk::PrimitiveTopology::eTriangleList);
+			}
+
 			cmd.endRendering();
 
 			if (drawData && drawData->TotalVtxCount > 0) {
@@ -3460,7 +3796,11 @@ int main()
 		vmaDestroyBuffer(allocator, VkBuffer(translateBuffer), translateAlloc);
 		vmaDestroyBuffer(allocator, VkBuffer(rotateBuffer), rotateAlloc);
 		vmaDestroyBuffer(allocator, VkBuffer(scaleBuffer), scaleAlloc);
+		if (pathVisualizationBuffer != VK_NULL_HANDLE) {
+			vmaDestroyBuffer(allocator, pathVisualizationBuffer, pathVisualizationAlloc);
+		}
 	};
+
 
 	vmaDestroyImage(allocator, depthImage, depthAlloc);
 	destroyShadowMap(shadowMap, allocator, device);
