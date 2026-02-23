@@ -1,7 +1,20 @@
 add_executable (engine 
   vma.cpp
   main.cpp
-   vk_globals.cpp "engine/Buffers.h" "engine/Vertex.h" "engine/Camera.h" "engine/ModelInstance.h" "engine/Shadow.h" "engine/ModelTypes.h" "engine/ModelManager.h" "engine/ModelManager.cpp" "engine/Shadow.cpp" "engine/Gizmo.h" "engine/SceneSerializer.h" "engine/CameraAnimation.h" "engine/CameraAnimation.cpp")
+  vk_globals.cpp 
+  engine/Buffers.h 
+  engine/Vertex.h 
+  engine/Camera.h 
+  engine/ModelInstance.h 
+  engine/Shadow.h 
+  engine/ModelTypes.h 
+  engine/ModelManager.h 
+  engine/ModelManager.cpp 
+  engine/Shadow.cpp 
+  engine/Gizmo.h 
+  engine/SceneSerializer.h 
+  engine/CameraAnimation.h 
+  engine/CameraAnimation.cpp)
 
 if (CMAKE_VERSION VERSION_GREATER 3.12)
   set_property(TARGET engine PROPERTY CXX_STANDARD 20)
