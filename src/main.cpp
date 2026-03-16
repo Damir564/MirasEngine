@@ -1439,6 +1439,9 @@ Mesh loadModelSmart(const std::string& path) {
 	return result;
 }
 
+#define SCREEN_WIDTH 1600.0
+#define SCREEN_HEIGHT 900.0
+
 int main()
 {
 	// ------------------------
@@ -1454,7 +1457,7 @@ int main()
 
 	SDL_Window* window = SDL_CreateWindow(
 		"Vulkan SDL3",
-		1280, 720,
+		SCREEN_WIDTH, SCREEN_HEIGHT,
 		SDL_WINDOW_VULKAN
 	);
 
@@ -1656,7 +1659,7 @@ int main()
 	// ------------------------
 	vkb::SwapchainBuilder swapchain_builder{ vkbDevice };
 	auto swap_ret = swapchain_builder
-		.set_desired_extent(1280, 720)
+		.set_desired_extent(SCREEN_WIDTH, SCREEN_HEIGHT)
 		.set_desired_format(VkSurfaceFormatKHR{
 		VK_FORMAT_B8G8R8A8_SRGB,
 		VK_COLOR_SPACE_SRGB_NONLINEAR_KHR
@@ -1683,7 +1686,7 @@ int main()
 	// Image
 	vk::ImageCreateInfo depthImageInfo{};
 	depthImageInfo.imageType = vk::ImageType::e2D;
-	depthImageInfo.extent = vk::Extent3D{ 1280, 720, 1 };
+	depthImageInfo.extent = vk::Extent3D{ (int)SCREEN_WIDTH, (int)SCREEN_HEIGHT, 1 };
 	depthImageInfo.mipLevels = 1;
 	depthImageInfo.arrayLayers = 1;
 	depthImageInfo.format = depthFormat;
@@ -2415,8 +2418,8 @@ int main()
 						float my = event.button.y;
 
 						glm::mat4 viewMat = getView(camera);
-						glm::mat4 projMat = getProjection(1280.0f, 720.0f);
-						Ray ray = screenToWorldRay(mx, my, 1280.0f, 720.0f, viewMat, projMat);
+						glm::mat4 projMat = getProjection(SCREEN_WIDTH, SCREEN_HEIGHT);
+						Ray ray = screenToWorldRay(mx, my, SCREEN_WIDTH, SCREEN_HEIGHT, viewMat, projMat);
 
 						bool clickedOnGizmo = false;
 
@@ -2436,7 +2439,7 @@ int main()
             gizmoScaleVal,
             15.0f,
             viewMat, projMat,
-            1280.0f, 720.0f);
+			SCREEN_WIDTH, SCREEN_HEIGHT);
     }
     else {
         hitAxis = pickGizmoAxis(
@@ -2445,7 +2448,7 @@ int main()
             gizmoScaleVal,
             20.0f,
             viewMat, projMat,
-            1280.0f, 720.0f);
+			SCREEN_WIDTH, SCREEN_HEIGHT);
     }
 
     if (hitAxis != GizmoAxis::None) {
@@ -2507,7 +2510,7 @@ int main()
 						glm::vec2 delta = currentMouse - gizmo.dragStart;
 
 						glm::mat4 viewMat = getView(camera);
-						glm::mat4 projMat = getProjection(1280.0f, 720.0f);
+						glm::mat4 projMat = getProjection(SCREEN_WIDTH, SCREEN_HEIGHT);
 						glm::mat4 vp = projMat * viewMat;
 
 						// Determine axis direction
@@ -2517,8 +2520,8 @@ int main()
 						if (gizmo.activeAxis == GizmoAxis::Z) axisMask = glm::vec3(0, 0, 1);
 
 						// Project the axis direction to screen space to find the best mouse direction
-						glm::vec2 pixelCenter = worldToScreen(gizmo.originalPosition, vp, 1280.0f, 720.0f);
-						glm::vec2 pixelAxisEnd = worldToScreen(gizmo.originalPosition + axisMask, vp, 1280.0f, 720.0f);
+						glm::vec2 pixelCenter = worldToScreen(gizmo.originalPosition, vp, SCREEN_WIDTH, SCREEN_HEIGHT);
+						glm::vec2 pixelAxisEnd = worldToScreen(gizmo.originalPosition + axisMask, vp, SCREEN_WIDTH, SCREEN_HEIGHT);
 
 						glm::vec2 screenAxisDir = pixelAxisEnd - pixelCenter;
 						float screenAxisLen = glm::length(screenAxisDir);
@@ -3166,7 +3169,7 @@ int main()
 
 			FrameUBO frameData{};
 			frameData.view = getView(camera);
-			frameData.proj = getProjection(1280.0f, 720.0f);
+			frameData.proj = getProjection(SCREEN_WIDTH, SCREEN_HEIGHT);
 			frameData.lightSpaceMatrix = calculateLightSpaceMatrix(sunLight, sceneBounds.center, sceneBounds.radius);
 			frameData.cameraPos = glm::vec4(camera.position, 0.0f);
 			frameData.lightDir = glm::vec4(sunLight.direction, 0.0f);
@@ -3375,7 +3378,7 @@ int main()
 
 
 			vk::RenderingInfo renderInfo{};
-			renderInfo.setRenderArea({ {0,0},{1280,720} })
+			renderInfo.setRenderArea({ {0,0},{(int)SCREEN_WIDTH, (int)SCREEN_HEIGHT} })
 				.setLayerCount(1)
 				.setColorAttachments(colorAttachment)
 				.setPDepthAttachment(&depthAttachment);
@@ -3399,8 +3402,8 @@ int main()
 			
 
 
-			const vk::Viewport viewport{ 0, 0, 1280.f, 720.f, 0.f, 1.f };
-			const vk::Rect2D rect{ {0,0},{1280,720} };
+			const vk::Viewport viewport{ 0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, 0.f, 1.f };
+			const vk::Rect2D rect{ {0,0},{(int)SCREEN_WIDTH, (int)SCREEN_HEIGHT} };
 			cmd.setViewport(0, viewport);
 			cmd.setScissor(0, rect);
 			cmd.setRasterizerDiscardEnable(false);
@@ -3704,7 +3707,7 @@ int main()
 					.setStoreOp(vk::AttachmentStoreOp::eStore);
 
 				vk::RenderingInfo imguiRenderInfo{};
-				imguiRenderInfo.setRenderArea({ {0, 0}, {1280, 720} })
+				imguiRenderInfo.setRenderArea({ {0, 0}, {(int)SCREEN_WIDTH, (int)SCREEN_HEIGHT} })
 					.setLayerCount(1)
 					.setColorAttachments(imguiColorAttachment);
 
