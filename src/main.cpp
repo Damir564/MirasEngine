@@ -2320,7 +2320,7 @@ int main()
 		// 8. Main loop
 		// ------------------------
 		Camera camera;
-		bool mouseEnabled = true;
+		bool mouseEnabled = false;
 		bool rightMouseHeld = false;
 		SDL_SetWindowRelativeMouseMode(window, mouseEnabled);
 		bool running = true;
@@ -2677,6 +2677,7 @@ int main()
 				// ============================================
 				static const std::string SCENES_ROOT = ".";
 				static const std::string MODELS_ROOT = "models";
+				static const std::string ANIMS_ROOT = ".";
 
 				ImGui::Text("Scene File:");
 				ImGui::InputText("##scenepath", sceneSavePath, sizeof(sceneSavePath));
@@ -2800,18 +2801,18 @@ int main()
 
 				ImGui::Separator();
 
-				ImGui::Text("Quick Load:");
-				if (ImGui::Button("Load Sponza")) {
-					modelManager->loadModelAsync("models/main_sponza/NewSponza_Main_glTF_003.gltf", "Sponza");
-				}
-				ImGui::SameLine();
-				if (ImGui::Button("Load School")) {
-					modelManager->loadModelAsync("models/tomsk_school1/tomsk_school1.obj", "School");
-				}
-				ImGui::SameLine();
-				if (ImGui::Button("Load Bus Stop")) {
-					modelManager->loadModelAsync("models/bus_stop/Untitled.glb", "BusStop");
-				}
+				//ImGui::Text("Quick Load:");
+				//if (ImGui::Button("Load Sponza")) {
+				//	modelManager->loadModelAsync("models/main_sponza/NewSponza_Main_glTF_003.gltf", "Sponza");
+				//}
+				//ImGui::SameLine();
+				//if (ImGui::Button("Load School")) {
+				//	modelManager->loadModelAsync("models/tomsk_school1/tomsk_school1.obj", "School");
+				//}
+				//ImGui::SameLine();
+				//if (ImGui::Button("Load Bus Stop")) {
+				//	modelManager->loadModelAsync("models/bus_stop/Untitled.glb", "BusStop");
+				//}
 
 				static char modelPath[512] = "models/";
 				ImGui::InputText("Model Path", modelPath, sizeof(modelPath));
@@ -3231,6 +3232,44 @@ int main()
 				// === SAVE/LOAD ===
 				static char animSavePath[256] = "camera_path.cmap";
 				ImGui::InputText("Anim File", animSavePath, sizeof(animSavePath));
+
+
+				// --- Browse for Camera Animation ---
+				if (ImGui::Button("Browse##animation")) {
+					namespace fs = std::filesystem;
+					fs::create_directories(ANIMS_ROOT);
+					std::string absRoot = fs::weakly_canonical(fs::absolute(ANIMS_ROOT)).string();
+
+					IGFD::FileDialogConfig config;
+					config.path = absRoot;
+					config.countSelectionMax = 1;
+					config.flags = ImGuiFileDialogFlags_Modal;
+
+					ImGuiFileDialog::Instance()->OpenDialog(
+						"BrowseAnimDlg",
+						"Select camera animation",
+						".cmap",
+						config
+					);
+				}
+
+				if (ImGuiFileDialog::Instance()->Display("BrowseAnimDlg",
+					ImGuiWindowFlags_NoCollapse, dialogSize))
+				{
+					if (ImGuiFileDialog::Instance()->IsOk()) {
+						std::string selectedPath = ImGuiFileDialog::Instance()->GetFilePathName();
+
+						auto rel = makeRelativeIfInside(selectedPath, ANIMS_ROOT);
+						if (rel.has_value()) {
+							strncpy(animSavePath, rel.value().c_str(), sizeof(animSavePath) - 1);
+							animSavePath[sizeof(animSavePath) - 1] = '\0';
+						}
+						else {
+							std::cerr << "[ANIMS] File must be inside \"" << ANIMS_ROOT << "/\"\n";
+						}
+					}
+					ImGuiFileDialog::Instance()->Close();
+				}
 
 				if (ImGui::Button("Save Path")) {
 					cameraAnimator.savePath(animSavePath);
