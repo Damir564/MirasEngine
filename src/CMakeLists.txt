@@ -2,6 +2,7 @@ add_executable (engine
   vma.cpp
   main.cpp
   vk_globals.cpp 
+  engine/portable-file-dialogs.h 
   engine/Buffers.h 
   engine/Vertex.h 
   engine/Camera.h 
@@ -14,7 +15,7 @@ add_executable (engine
   engine/Gizmo.h 
   engine/SceneSerializer.h 
   engine/CameraAnimation.h 
-  engine/CameraAnimation.cpp)
+  engine/CameraAnimation.cpp "engine/FileDialog.h")
 
 if (CMAKE_VERSION VERSION_GREATER 3.12)
   set_property(TARGET engine PROPERTY CXX_STANDARD 20)

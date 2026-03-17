@@ -36,6 +36,7 @@
 #include "engine/Gizmo.h"
 #include "engine/SceneSerializer.h"
 #include "engine/CameraAnimation.h"
+#include "engine/FileDialog.h"
 
 struct FrameUBO {
 	glm::mat4 view;
