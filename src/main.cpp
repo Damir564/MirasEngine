@@ -3029,7 +3029,7 @@ int main()
 					ImGui::PopID();
 				}
 				// ImGui::TextDisabled("(Verts in scene %zu)",
-					vertexCount);
+//					vertexCount);
 				// Single unified inspector
 				ImGui::Separator();
 				if (gizmo.selectedInstance >= 0 &&
