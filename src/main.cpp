@@ -2323,8 +2323,8 @@ int main()
 		bool rightMouseHeld = false;
 		SDL_SetWindowRelativeMouseMode(window, mouseEnabled);
 		bool running = true;
-		static char sceneSavePath[512] = "scene.scn";
-		static char sceneLoadPath[512] = "scene.scn";
+		static char sceneSavePath[512] = "tomsk_school1.scn";
+		static char sceneLoadPath[512] = "tomsk_school1.scn";
 		bool pendingSceneLoad = false;
 		SceneSerializer::LoadedScene pendingScene;
 		SDL_Event event;
@@ -2672,8 +2672,8 @@ int main()
 				ImGui::Separator();
 
 				// ============================================
-// SCENE SAVE / LOAD
-// ============================================
+				// SCENE SAVE / LOAD
+				// ============================================
 				ImGui::Text("Scene File:");
 				ImGui::InputText("##scenepath", sceneSavePath, sizeof(sceneSavePath));
 
@@ -2754,7 +2754,7 @@ int main()
 				}
 				ImGui::SameLine();
 				if (ImGui::Button("Load School")) {
-					modelManager->loadModelAsync("models/tomsk_school/tomsk_school3.obj", "School");
+					modelManager->loadModelAsync("models/tomsk_school1/tomsk_school1.obj", "School");
 				}
 				ImGui::SameLine();
 				if (ImGui::Button("Load Bus Stop")) {
@@ -2910,8 +2910,8 @@ int main()
 				ImGui::End();
 
 				// ============================================
-// CAMERA ANIMATION UI
-// ============================================
+				// CAMERA ANIMATION UI
+				// ============================================
 				ImGui::Begin("Camera Animation");
 
 				auto& animPath = cameraAnimator.getPath();
