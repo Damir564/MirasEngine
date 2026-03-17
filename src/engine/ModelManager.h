@@ -85,7 +85,7 @@ public:
     size_t loadModelSync(const std::string& path, const std::string& name = "");
     void unloadModel(size_t modelIndex);
 
-    size_t createInstance(size_t modelIndex, const glm::vec3& position = glm::vec3(0.0f));
+    size_t createInstance(size_t modelIndex, const glm::vec3& position = glm::vec3(0.0f), const glm::vec3& rotation = glm::vec3(0.0f), const glm::vec3& scale = glm::vec3(1.0f));
     void removeInstance(size_t instanceIndex);
     ModelInstance* getInstance(size_t instanceIndex);
 

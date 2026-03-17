@@ -2675,72 +2675,124 @@ int main()
 				// ============================================
 				// SCENE SAVE / LOAD
 				// ============================================
+				static const std::string SCENES_ROOT = ".";
+				static const std::string MODELS_ROOT = "models";
+
 				ImGui::Text("Scene File:");
 				ImGui::InputText("##scenepath", sceneSavePath, sizeof(sceneSavePath));
 
+				// --- Browse for scene file (to load) ---
+				ImGui::SameLine();
+				if (ImGui::Button("Browse##scene")) {
+					namespace fs = std::filesystem;
+					fs::create_directories(SCENES_ROOT);
+					std::string absRoot = fs::weakly_canonical(fs::absolute(SCENES_ROOT)).string();
+
+					IGFD::FileDialogConfig config;
+					config.path = absRoot;
+					config.countSelectionMax = 1;
+					config.flags = ImGuiFileDialogFlags_Modal;
+
+					ImGuiFileDialog::Instance()->OpenDialog(
+						"BrowseSceneDlg",      // unique key
+						"Select Scene File",   // title
+						".scn",                // filter: ONLY .scn
+						config
+					);
+				}
+
+				// --- Save Scene (uses current path in text field) ---
 				if (ImGui::Button("Save Scene")) {
-					if (SceneSerializer::Save(sceneSavePath, *modelManager)) {
-						std::cout << "[SCENE] Scene saved successfully\n";
+					namespace fs = std::filesystem;
+					fs::path savePath(sceneSavePath);
+
+					// Auto-append .scn if no extension
+					if (!savePath.has_extension()) {
+						savePath += ".scn";
+						strncpy(sceneSavePath, savePath.string().c_str(), sizeof(sceneSavePath) - 1);
+						sceneSavePath[sizeof(sceneSavePath) - 1] = '\0';
+					}
+
+					std::string ext = savePath.extension().string();
+					if (ext != ".scn") {
+						std::cerr << "[SCENE] Invalid extension: " << ext << ". Use .scn\n";
 					}
 					else {
-						std::cerr << "[SCENE] Failed to save scene\n";
+						if (SceneSerializer::Save(sceneSavePath, *modelManager)) {
+							std::cout << "[SCENE] Scene saved successfully\n";
+						}
+						else {
+							std::cerr << "[SCENE] Failed to save scene\n";
+						}
 					}
 				}
+
 				ImGui::SameLine();
+
+				// --- Save As (opens dialog to pick save location) ---
+				if (ImGui::Button("Save As...")) {
+					namespace fs = std::filesystem;
+					fs::create_directories(SCENES_ROOT);
+					std::string absRoot = fs::weakly_canonical(fs::absolute(SCENES_ROOT)).string();
+
+					IGFD::FileDialogConfig config;
+					config.path = absRoot;
+					config.fileName = "untitled.scn";
+					config.countSelectionMax = 1;
+					config.flags = ImGuiFileDialogFlags_ConfirmOverwrite | ImGuiFileDialogFlags_Modal;
+
+					ImGuiFileDialog::Instance()->OpenDialog(
+						"SaveAsSceneDlg",
+						"Save Scene As",
+						".scn",
+						config
+					);
+				}
+
+				ImGui::SameLine();
+
+				// --- Load Scene (uses current path in text field) ---
 				if (ImGui::Button("Load Scene")) {
 					auto loaded = SceneSerializer::Load(sceneSavePath);
 					if (loaded.valid) {
-						// Clear current scene
 						gizmo.deselect();
 						device.waitIdle();
 
-						// Clear all instances
 						auto& currentInstances = modelManager->getInstances();
 						while (!currentInstances.empty()) {
 							modelManager->removeInstance(currentInstances.size() - 1);
 						}
-
-						// Unload all models
 						while (!modelManager->getModels().empty()) {
 							modelManager->unloadModel(modelManager->getModels().size() - 1);
 						}
 
-						// Load models from scene file
-						// Map from file model index -> modelManager model index
 						std::vector<int> fileToManagerIndex(loaded.models.size(), -1);
-
 						for (size_t i = 0; i < loaded.models.size(); ++i) {
-							// Check if model file exists
 							std::ifstream testFile(loaded.models[i].path);
 							if (!testFile.good()) {
 								std::cerr << "[SCENE] Model file not found: " << loaded.models[i].path << "\n";
 								continue;
 							}
 							testFile.close();
-
 							modelManager->loadModelAsync(loaded.models[i].path, loaded.models[i].name);
-							// The model index will be assigned when loading completes
-							// For now store the expected index
 							fileToManagerIndex[i] = static_cast<int>(i);
 						}
 
-						// Store pending scene data to create instances after models finish loading
 						pendingSceneLoad = true;
 						pendingScene = loaded;
-
 						std::cout << "[SCENE] Loading " << loaded.models.size() << " models...\n";
 					}
 				}
+
 				ImGui::SameLine();
+
 				if (ImGui::Button("Clear Scene")) {
 					gizmo.deselect();
 					device.waitIdle();
-
 					auto& currentInstances = modelManager->getInstances();
 					while (!currentInstances.empty()) {
 						modelManager->removeInstance(currentInstances.size() - 1);
 					}
-
 					while (!modelManager->getModels().empty()) {
 						modelManager->unloadModel(modelManager->getModels().size() - 1);
 					}
@@ -2748,7 +2800,6 @@ int main()
 
 				ImGui::Separator();
 
-				// Quick Load Buttons
 				ImGui::Text("Quick Load:");
 				if (ImGui::Button("Load Sponza")) {
 					modelManager->loadModelAsync("models/main_sponza/NewSponza_Main_glTF_003.gltf", "Sponza");
@@ -2762,14 +2813,111 @@ int main()
 					modelManager->loadModelAsync("models/bus_stop/Untitled.glb", "BusStop");
 				}
 
-				// Custom path input
 				static char modelPath[512] = "models/";
 				ImGui::InputText("Model Path", modelPath, sizeof(modelPath));
+
 				if (ImGui::Button("Load Custom")) {
 					modelManager->loadModelAsync(modelPath);
 				}
 
+				ImGui::SameLine();
+
+				// --- Browse for 3D model ---
+				if (ImGui::Button("Browse##model")) {
+					namespace fs = std::filesystem;
+					fs::create_directories(MODELS_ROOT);
+					std::string absRoot = fs::weakly_canonical(fs::absolute(MODELS_ROOT)).string();
+
+					IGFD::FileDialogConfig config;
+					config.path = absRoot;
+					config.countSelectionMax = 1;
+					config.flags = ImGuiFileDialogFlags_Modal;
+
+					ImGuiFileDialog::Instance()->OpenDialog(
+						"BrowseModelDlg",
+						"Select 3D Model",
+						"{.gltf,.glb,.obj}, .gltf,.glb,.obj",   // allowed model formats
+						config
+					);
+				}
+
 				ImGui::Separator();
+
+				ImVec2 dialogSize = ImVec2(600, 400);
+
+				if (ImGuiFileDialog::Instance()->Display("BrowseSceneDlg",
+					ImGuiWindowFlags_NoCollapse, dialogSize))
+				{
+					if (ImGuiFileDialog::Instance()->IsOk()) {
+						std::string selectedPath = ImGuiFileDialog::Instance()->GetFilePathName();
+
+						auto rel = makeRelativeIfInside(selectedPath, SCENES_ROOT);
+						if (rel.has_value()) {
+							strncpy(sceneSavePath, rel.value().c_str(), sizeof(sceneSavePath) - 1);
+							sceneSavePath[sizeof(sceneSavePath) - 1] = '\0';
+						}
+						else {
+							std::cerr << "[SCENE] File must be inside \"" << SCENES_ROOT << "/\"\n";
+						}
+					}
+					ImGuiFileDialog::Instance()->Close();
+				}
+
+				// --- Dialog: Save As Scene ---
+				if (ImGuiFileDialog::Instance()->Display("SaveAsSceneDlg",
+					ImGuiWindowFlags_NoCollapse, dialogSize))
+				{
+					if (ImGuiFileDialog::Instance()->IsOk()) {
+						std::string selectedPath = ImGuiFileDialog::Instance()->GetFilePathName();
+
+						// Enforce .scn extension
+						namespace fs = std::filesystem;
+						fs::path p(selectedPath);
+						if (!p.has_extension() || p.extension() != ".scn") {
+							p.replace_extension(".scn");
+						}
+
+						auto rel = makeRelativeIfInside(p.string(), SCENES_ROOT);
+						if (rel.has_value()) {
+							strncpy(sceneSavePath, rel.value().c_str(), sizeof(sceneSavePath) - 1);
+							sceneSavePath[sizeof(sceneSavePath) - 1] = '\0';
+
+							if (SceneSerializer::Save(sceneSavePath, *modelManager)) {
+								std::cout << "[SCENE] Scene saved to: " << sceneSavePath << "\n";
+							}
+							else {
+								std::cerr << "[SCENE] Failed to save scene\n";
+							}
+						}
+						else {
+							std::cerr << "[SCENE] Save location must be inside \"" << SCENES_ROOT << "/\"\n";
+						}
+					}
+					ImGuiFileDialog::Instance()->Close();
+				}
+
+				// --- Dialog: Browse Model ---
+				if (ImGuiFileDialog::Instance()->Display("BrowseModelDlg",
+					ImGuiWindowFlags_NoCollapse, dialogSize))
+				{
+					if (ImGuiFileDialog::Instance()->IsOk()) {
+						std::string selectedPath = ImGuiFileDialog::Instance()->GetFilePathName();
+
+						auto rel = makeRelativeIfInside(selectedPath, MODELS_ROOT);
+						if (rel.has_value()) {
+							strncpy(modelPath, rel.value().c_str(), sizeof(modelPath) - 1);
+							modelPath[sizeof(modelPath) - 1] = '\0';
+
+							namespace fs = std::filesystem;
+							std::string name = fs::path(modelPath).stem().string();
+							modelManager->loadModelAsync(modelPath, name);
+						}
+						else {
+							std::cerr << "[MODEL] File must be inside \"" << MODELS_ROOT << "/\"\n";
+						}
+					}
+					ImGuiFileDialog::Instance()->Close();
+				}
 
 				// Loading tasks
 				const auto& tasks = modelManager->getLoadingTasks();
@@ -2792,7 +2940,7 @@ int main()
 				ImGui::Text("Loaded Models: %zu", modelManager->getModels().size());
 				const auto& models = modelManager->getModels();
 				static int selectedModel = -1;
-
+				size_t vertexCount = 0;
 				for (size_t i = 0; i < models.size(); ++i) {
 					const auto& model = models[i];
 					ImGui::PushID(static_cast<int>(i));
@@ -2805,7 +2953,7 @@ int main()
 					// Right-click context menu
 					if (ImGui::BeginPopupContextItem()) {
 						if (ImGui::MenuItem("Create Instance")) {
-							modelManager->createInstance(i, camera.position + glm::vec3(0, 0, -5));
+							modelManager->createInstance(i, camera.position + glm::vec3(0, 0, 0));
 						}
 						if (ImGui::MenuItem("Create at Origin")) {
 							modelManager->createInstance(i, glm::vec3(0.0f));
@@ -2831,13 +2979,12 @@ int main()
 						ImGui::EndPopup();
 					}
 
+					
 					ImGui::SameLine();
 					ImGui::TextDisabled("(%zu verts, %zu tex)",
 						model->vertexCount, model->textures.size());
-
 					ImGui::PopID();
 				}
-
 				ImGui::Separator();
 
 				// Instances
@@ -2867,12 +3014,22 @@ int main()
 							}
 							modelManager->removeInstance(i);
 						}
+						if (ImGui::MenuItem("Copy")) {
+							if (gizmo.selectedInstance == static_cast<int>(i)) {
+								gizmo.deselect();
+							}
+							else if (gizmo.selectedInstance > static_cast<int>(i)) {
+								gizmo.selectedInstance--;
+							}
+							modelManager->createInstance(instances[i].modelIndex, instances[i].position, instances[i].rotation, instances[i].scale);
+						}
 						ImGui::EndPopup();
 					}
-
+					// vertexCount += modelManager->getModel(inst.modelIndex)->vertexCount;
 					ImGui::PopID();
 				}
-
+				// ImGui::TextDisabled("(Verts in scene %zu)",
+					vertexCount);
 				// Single unified inspector
 				ImGui::Separator();
 				if (gizmo.selectedInstance >= 0 &&

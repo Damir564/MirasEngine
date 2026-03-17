@@ -320,7 +320,7 @@ void ModelManager::unloadModel(size_t modelIndex) {
     m_models.erase(m_models.begin() + modelIndex);
 }
 
-size_t ModelManager::createInstance(size_t modelIndex, const glm::vec3& position) {
+size_t ModelManager::createInstance(size_t modelIndex, const glm::vec3& position, const glm::vec3& rotation, const glm::vec3& scale) {
     std::lock_guard<std::mutex> lock(m_mutex);
 
     if (modelIndex >= m_models.size()) {
@@ -330,6 +330,8 @@ size_t ModelManager::createInstance(size_t modelIndex, const glm::vec3& position
     ModelInstance inst;
     inst.modelIndex = modelIndex;
     inst.position = position;
+    inst.rotation = rotation;
+    inst.scale = scale;
     inst.name = m_models[modelIndex]->name + "_" + std::to_string(m_nextInstanceId++);
 
     m_instances.push_back(inst);
