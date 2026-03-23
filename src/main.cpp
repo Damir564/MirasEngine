@@ -1302,65 +1302,65 @@ size_t calculateTotalVertices(const fastgltf::Asset& asset) {
 // =============================================================
 // Main Load Function
 // =============================================================
-//void processFastGltfNodeTracked(
-//	fastgltf::Asset& asset,
-//	size_t nodeIndex,
-//	const glm::mat4& parentTransform,
-//	Mesh& result,
-//	std::unordered_map<std::string, int>& textureCache,
-//	const std::string& path,
-//	std::vector<size_t>& submeshNodeMap)
-//{
-//	const auto& node = asset.nodes[nodeIndex];
-//
-//	glm::mat4 localTransform(1.0f);
-//	if (auto* trs = std::get_if<fastgltf::TRS>(&node.transform)) {
-//		glm::vec3 t(trs->translation[0], trs->translation[1], trs->translation[2]);
-//		glm::quat r(trs->rotation[3], trs->rotation[0], trs->rotation[1], trs->rotation[2]);
-//		glm::vec3 s(trs->scale[0], trs->scale[1], trs->scale[2]);
-//		localTransform = glm::translate(glm::mat4(1.0f), t)
-//			* glm::mat4_cast(r)
-//			* glm::scale(glm::mat4(1.0f), s);
-//	}
-//	else if (auto* mat = std::get_if<fastgltf::math::fmat4x4>(&node.transform)) {
-//		std::memcpy(&localTransform, mat, sizeof(glm::mat4));
-//	}
-//
-//	glm::mat4 worldTransform = parentTransform * localTransform;
-//
-//	if (node.meshIndex.has_value()) {
-//		size_t before = result.submeshes.size();
-//
-//		processFastGltfNode(asset, *node.meshIndex, worldTransform, result, textureCache, path);
-//
-//		for (size_t s = before; s < result.submeshes.size(); ++s) {
-//			submeshNodeMap.push_back(nodeIndex);
-//		}
-//	}
-//
-//	for (size_t child : node.children) {
-//		processFastGltfNodeTracked(asset, child, worldTransform, result,
-//			textureCache, path, submeshNodeMap);
-//	}
-//}
-
 IfcInfo buildIfcLayers(const fastgltf::Asset& asset,
 	const std::vector<size_t>& submeshNodeMap) {
 	IfcInfo info;
 	info.isIfc = true;
 
-	// Group submeshes by IFC type
-	std::unordered_map<std::string, std::vector<int>> typeMap;
+	// Build parent map
+	std::unordered_map<size_t, size_t> parentMap;
+	for (size_t i = 0; i < asset.nodes.size(); ++i) {
+		for (size_t c : asset.nodes[i].children) {
+			parentMap[c] = i;
+		}
+	}
 
+	// For a node, try itself first, then walk up parents for a better type
+	auto findType = [&](size_t nodeIdx) -> std::string {
+		// Try the node itself
+		std::string name(asset.nodes[nodeIdx].name.begin(), asset.nodes[nodeIdx].name.end());
+		std::string type = extractIfcType(name);
+
+		// If we got a good IFC type (starts with "Ifc"), use it
+		if (type.size() >= 3 && type.substr(0, 3) == "Ifc")
+			return type;
+
+		// Otherwise walk up parents looking for an IFC type
+		size_t current = nodeIdx;
+		int depth = 0;
+		while (depth < 10) {
+			auto it = parentMap.find(current);
+			if (it == parentMap.end()) break;
+			current = it->second;
+			depth++;
+
+			std::string parentName(asset.nodes[current].name.begin(),
+				asset.nodes[current].name.end());
+			std::string parentType = extractIfcType(parentName);
+
+			// Prefer IFC types from parents
+			if (parentType.size() >= 3 && parentType.substr(0, 3) == "Ifc") {
+				// Skip container types, they're too broad
+				if (parentType != "IfcBuildingStorey" &&
+					parentType != "IfcBuilding" &&
+					parentType != "IfcSite" &&
+					parentType != "IfcProject") {
+					return parentType;
+				}
+			}
+		}
+
+		// No IFC type found in parents either, use what we extracted from the node
+		return type;
+		};
+
+	// Group submeshes by type
+	std::unordered_map<std::string, std::vector<int>> typeMap;
 	for (int si = 0; si < static_cast<int>(submeshNodeMap.size()); ++si) {
-		size_t nodeIdx = submeshNodeMap[si];
-		const auto& node = asset.nodes[nodeIdx];
-		std::string name(node.name.begin(), node.name.end());
-		std::string ifcType = extractIfcType(name);
+		std::string ifcType = findType(submeshNodeMap[si]);
 		typeMap[ifcType].push_back(si);
 	}
 
-	// Convert to sorted layer list
 	for (auto& [typeName, indices] : typeMap) {
 		IfcTypeLayer layer;
 		layer.typeName = typeName;
@@ -1369,17 +1369,15 @@ IfcInfo buildIfcLayers(const fastgltf::Asset& asset,
 		info.layers.push_back(std::move(layer));
 	}
 
-	// Sort alphabetically
 	std::sort(info.layers.begin(), info.layers.end(),
 		[](const IfcTypeLayer& a, const IfcTypeLayer& b) {
 			return a.typeName < b.typeName;
 		});
 
-	std::cout << "[IFC] " << info.layers.size() << " type layers found:\n";
+	std::cout << "[IFC] " << info.layers.size() << " layers:\n";
 	for (const auto& l : info.layers) {
 		std::cout << "  " << l.typeName << " (" << l.submeshIndices.size() << " meshes)\n";
 	}
-
 	return info;
 }
 

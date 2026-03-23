@@ -236,7 +236,9 @@ void ModelManager::loadModelAsync(const std::string& path, const std::string& na
     task.state = LoadingState::LoadingCPU;
 
     task.meshFuture = std::async(std::launch::async, [path]() {
-        return loadModelSmart(path);
+        LoadedResult result;
+        result.mesh = loadModelSmart(path, &result.ifcInfo);
+        return result;
         });
 
     m_loadingTasks.push_back(std::move(task));
@@ -246,9 +248,12 @@ size_t ModelManager::loadModelSync(const std::string& path, const std::string& n
     std::string modelName = name.empty() ? std::filesystem::path(path).stem().string() : name;
 
     std::cout << "[ModelManager] Loading model synchronously: " << path << "\n";
-
+    
+    IfcInfo ifcInfo;
     Mesh mesh = loadModelSmart(path);
-    return uploadModelToGPU(mesh, modelName, path);
+    size_t idx = uploadModelToGPU(mesh, modelName, path);
+    m_models[idx]->ifcInfo = std::move(ifcInfo);
+    return idx;
 }
 
 size_t ModelManager::uploadModelToGPU(Mesh& mesh, const std::string& name, const std::string& path) {
@@ -370,7 +375,9 @@ void ModelManager::update() {
             if (task.meshFuture.valid() &&
                 task.meshFuture.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
                 try {
-                    task.loadedMesh = task.meshFuture.get();
+                    auto result = task.meshFuture.get();
+                    task.loadedMesh = std::move(result.mesh);
+                    task.ifcInfo = std::move(result.ifcInfo);
                     task.state = LoadingState::UploadingGPU;
                 }
                 catch (const std::exception& e) {
@@ -384,7 +391,8 @@ void ModelManager::update() {
         if (task.state == LoadingState::UploadingGPU) {
             try {
                 m_mutex.unlock();
-                uploadModelToGPU(task.loadedMesh, task.name, task.path);
+                size_t idx = uploadModelToGPU(task.loadedMesh, task.name, task.path);
+                m_models[idx]->ifcInfo = std::move(task.ifcInfo);
                 m_mutex.lock();
                 task.state = LoadingState::Complete;
             }

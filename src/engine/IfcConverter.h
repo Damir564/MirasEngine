@@ -30,7 +30,7 @@ public:
 
         std::string cmd = s_path
             + " --use-world-coords"
-            // + " --weld-vertices"
+            + " --weld-vertices"
             + " --use-element-names"
             + " --y-up"
             // + " --exclude entities IfcOpeningElemen;IfcSpace"

@@ -64,14 +64,20 @@ enum class LoadingState {
     Failed
 };
 
+struct LoadedResult {
+    Mesh mesh;
+    IfcInfo ifcInfo;
+};
+
 struct LoadingTask {
     std::string path;
     std::string name;
     LoadingState state = LoadingState::Idle;
     std::string errorMessage;
     float progress = 0.0f;
-    std::future<Mesh> meshFuture;
+    std::future<LoadedResult> meshFuture;
     Mesh loadedMesh;
+    IfcInfo ifcInfo;
 };
 
 class ModelManager {
