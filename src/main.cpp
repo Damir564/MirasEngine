@@ -1381,61 +1381,116 @@ static bool containsInsensitive(const std::string& text, const std::string& sub)
 	return toLowerCopy(text).find(toLowerCopy(sub)) != std::string::npos;
 }
 
-static std::string classifyIfcSemanticGroup(const std::string& family, const std::string& type, const std::string& fullName) {
+static std::string classifyIfcSemanticGroup(const std::string& family,
+	const std::string& type,
+	const std::string& fullName) {
 	const std::string f = toLowerCopy(family);
 	const std::string t = toLowerCopy(type);
 	const std::string n = toLowerCopy(fullName);
 
-	// Spaces / rooms
+	// ----------------------------
+	// Spaces / room codes
+	// ----------------------------
+	auto looksLikeRoomCode = [](const std::string& s) {
+		// Examples: R301, R301-M, A101, B203
+		if (s.size() < 2) return false;
+		if (!std::isalpha((unsigned char)s[0])) return false;
+
+		size_t i = 1;
+		bool hasDigit = false;
+		while (i < s.size() && std::isdigit((unsigned char)s[i])) {
+			hasDigit = true;
+			++i;
+		}
+		if (!hasDigit) return false;
+
+		if (i == s.size()) return true;
+
+		if (s[i] == '-') {
+			++i;
+			if (i < s.size() && std::isalpha((unsigned char)s[i])) return true;
+		}
+
+		return false;
+		};
+
+	if (looksLikeRoomCode(family) || looksLikeRoomCode(type))
+		return "Spaces";
+
 	if (containsInsensitive(n, "space") || containsInsensitive(f, "space"))
 		return "Spaces";
 
-	// Structural / architectural
+	// ----------------------------
+	// Architecture / Structure
+	// ----------------------------
 	if (containsInsensitive(n, "wall") || containsInsensitive(n, "slab") ||
 		containsInsensitive(n, "roof") || containsInsensitive(n, "door") ||
 		containsInsensitive(n, "window") || containsInsensitive(n, "column") ||
 		containsInsensitive(n, "beam") || containsInsensitive(n, "stair") ||
-		containsInsensitive(n, "railing"))
+		containsInsensitive(n, "railing") || containsInsensitive(n, "floor") ||
+		containsInsensitive(n, "ceiling") || containsInsensitive(n, "foundation"))
 		return "Architecture / Structure";
 
+	// ----------------------------
+	// Electrical
+	// ----------------------------
+	if (containsInsensitive(f, "light") || containsInsensitive(n, "light") ||
+		containsInsensitive(f, "lamp") || containsInsensitive(f, "lighting") ||
+		containsInsensitive(f, "switch") || containsInsensitive(f, "receptacle") ||
+		containsInsensitive(f, "telephone") || containsInsensitive(f, "conduit") ||
+		containsInsensitive(f, "panelboard") || containsInsensitive(f, "panel") ||
+		containsInsensitive(f, "outlet") || containsInsensitive(f, "sconce") ||
+		containsInsensitive(f, "pendant"))
+		return "Electrical";
+
+	// ----------------------------
+	// Fire / Safety
+	// ----------------------------
+	if (containsInsensitive(f, "smoke detector") || containsInsensitive(f, "fire alarm") ||
+		containsInsensitive(f, "alarm") || containsInsensitive(f, "detector"))
+		return "Fire / Safety";
+
+	// ----------------------------
+	// HVAC
+	// ----------------------------
+	if (containsInsensitive(f, "duct") || containsInsensitive(n, "duct") ||
+		containsInsensitive(f, "fan") || containsInsensitive(f, "hvac") ||
+		containsInsensitive(f, "diffuser") || containsInsensitive(f, "air") ||
+		containsInsensitive(f, "thermostat"))
+		return "HVAC";
+
+	// ----------------------------
+	// Plumbing fixtures
+	// ----------------------------
+	if (containsInsensitive(f, "lavatory") || containsInsensitive(f, "water closet") ||
+		containsInsensitive(f, "bath tub") || containsInsensitive(f, "sink") ||
+		containsInsensitive(f, "shower") || containsInsensitive(f, "roof drain") ||
+		containsInsensitive(f, "drain"))
+		return "Plumbing Fixtures";
+
+	// ----------------------------
 	// Piping
+	// ----------------------------
 	if (containsInsensitive(f, "pipe") || containsInsensitive(n, "pipe") ||
 		containsInsensitive(f, "elbow") || containsInsensitive(f, "tee") ||
 		containsInsensitive(f, "transition") || containsInsensitive(f, "valve") ||
-		containsInsensitive(f, "backflow"))
+		containsInsensitive(f, "backflow") || containsInsensitive(f, "bend") ||
+		containsInsensitive(f, "pvc") || containsInsensitive(f, "dwv"))
 		return "Piping";
 
-	// HVAC / ducting
-	if (containsInsensitive(f, "duct") || containsInsensitive(n, "duct") ||
-		containsInsensitive(f, "fan") || containsInsensitive(f, "hvac") ||
-		containsInsensitive(f, "diffuser") || containsInsensitive(f, "air"))
-		return "HVAC";
-
-	// Electrical
-	if (containsInsensitive(f, "receptacle") || containsInsensitive(f, "switch") ||
-		containsInsensitive(f, "panel") || containsInsensitive(f, "lighting") ||
-		containsInsensitive(f, "telephone") || containsInsensitive(f, "conduit"))
-		return "Electrical";
-
-	// Fire / safety / low voltage
-	if (containsInsensitive(f, "smoke detector") || containsInsensitive(f, "fire alarm") ||
-		containsInsensitive(f, "alarm"))
-		return "Fire / Safety";
-
-	// Plumbing fixtures
-	if (containsInsensitive(f, "lavatory") || containsInsensitive(f, "water closet") ||
-		containsInsensitive(f, "bath tub") || containsInsensitive(f, "sink") ||
-		containsInsensitive(f, "shower") || containsInsensitive(f, "roof drain"))
-		return "Plumbing Fixtures";
-
-	// Equipment
+	// ----------------------------
+	// Equipment / appliances
+	// ----------------------------
 	if (containsInsensitive(f, "radiator") || containsInsensitive(f, "boiler") ||
 		containsInsensitive(f, "pump") || containsInsensitive(f, "refrigerator") ||
-		containsInsensitive(f, "microwave") || containsInsensitive(f, "range"))
+		containsInsensitive(f, "microwave") || containsInsensitive(f, "range") ||
+		containsInsensitive(f, "fan coil") || containsInsensitive(f, "heater"))
 		return "Equipment";
 
-	// Furniture / generic fixtures
-	if (containsInsensitive(f, "furniture") || containsInsensitive(f, "fixture"))
+	// ----------------------------
+	// Fixtures / furniture
+	// ----------------------------
+	if (containsInsensitive(f, "fixture") || containsInsensitive(f, "furniture"))
 		return "Fixtures";
 
 	return "Other";
