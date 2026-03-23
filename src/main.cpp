@@ -2779,6 +2779,23 @@ int main()
 							}
 						}
 
+						for (size_t fi = 0; fi < pendingScene.models.size(); ++fi) {
+							int managerIdx = fileToManager[fi];
+							if (managerIdx < 0) continue;
+
+							GPUModel* gpuModel = modelManager->getModel(static_cast<size_t>(managerIdx));
+							if (!gpuModel || !gpuModel->isValid()) continue;
+
+							for (const auto& savedLayer : pendingScene.models[fi].layers) {
+								for (auto& runtimeLayer : gpuModel->ifcInfo.layers) {
+									if (runtimeLayer.typeName == savedLayer.name) {
+										runtimeLayer.visible = savedLayer.visible;
+										break;
+									}
+								}
+							}
+						}
+
 						// Create all instances
 						for (const auto& inst : pendingScene.instances) {
 							if (inst.fileModelIndex >= fileToManager.size()) continue;
@@ -3473,6 +3490,22 @@ int main()
 									loadedModels[mi]->sourcePath == pendingScene.models[fi].path) {
 									fileToManager[fi] = static_cast<int>(mi);
 									break;
+								}
+							}
+						}
+						for (size_t fi = 0; fi < pendingScene.models.size(); ++fi) {
+							int managerIdx = fileToManager[fi];
+							if (managerIdx < 0) continue;
+
+							GPUModel* gpuModel = modelManager->getModel(static_cast<size_t>(managerIdx));
+							if (!gpuModel || !gpuModel->isValid()) continue;
+
+							for (const auto& savedLayer : pendingScene.models[fi].layers) {
+								for (auto& runtimeLayer : gpuModel->ifcInfo.layers) {
+									if (runtimeLayer.typeName == savedLayer.name) {
+										runtimeLayer.visible = savedLayer.visible;
+										break;
+									}
 								}
 							}
 						}

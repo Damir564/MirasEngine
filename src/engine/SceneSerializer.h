@@ -11,14 +11,20 @@
 
 struct SceneFileHeader {
     char magic[4] = { 'S', 'C', 'N', 'E' };
-    uint32_t version = 1;
+    uint32_t version = 2;
     uint32_t modelCount = 0;
     uint32_t instanceCount = 0;
+};
+
+struct SceneLayerEntry {
+    uint32_t nameLength = 0;
+    bool visible = true;
 };
 
 struct SceneModelEntry {
     uint32_t pathLength = 0;
     uint32_t nameLength = 0;
+    uint32_t layerCount = 0;
     // followed by: char path[pathLength], char name[nameLength]
 };
 
@@ -48,6 +54,7 @@ public:
         struct ModelEntry {
             std::string path;
             std::string name;
+            std::vector<IfcTypeLayer> layers;
         };
         std::vector<ModelEntry> uniqueModels;
         // Map from modelManager model index -> file model index
@@ -66,7 +73,7 @@ public:
             }
             if (!found) {
                 modelIndexMap[i] = static_cast<uint32_t>(uniqueModels.size());
-                uniqueModels.push_back({ models[i]->sourcePath, models[i]->name });
+                uniqueModels.push_back({ models[i]->sourcePath, models[i]->name, models[i]->ifcInfo.layers });
             }
         }
 
@@ -89,9 +96,18 @@ public:
             SceneModelEntry entry;
             entry.pathLength = static_cast<uint32_t>(model.path.size());
             entry.nameLength = static_cast<uint32_t>(model.name.size());
+            entry.layerCount = static_cast<uint32_t>(model.layers.size());
             file.write(reinterpret_cast<const char*>(&entry), sizeof(entry));
             file.write(model.path.data(), entry.pathLength);
             file.write(model.name.data(), entry.nameLength);
+
+            for (const auto& layer : model.layers) {
+                SceneLayerEntry le;
+                le.nameLength = static_cast<uint32_t>(layer.typeName.size());
+                le.visible = layer.visible;
+                file.write(reinterpret_cast<const char*>(&le), sizeof(le));
+                file.write(layer.typeName.data(), le.nameLength);
+            }
         }
 
         // Write instances
@@ -125,9 +141,15 @@ public:
     }
 
     struct LoadedScene {
+        struct LoadedLayer {
+            std::string name;
+            bool visible = true;
+        };
+
         struct LoadedModel {
             std::string path;
             std::string name;
+            std::vector<LoadedLayer> layers;
         };
         struct LoadedInstance {
             uint32_t fileModelIndex; // index into loadedModels
@@ -163,7 +185,7 @@ public:
             return scene;
         }
 
-        if (header.version != 1) {
+        if (header.version != 1 && header.version != 2) {
             std::cerr << "[SCENE] Unsupported scene version: " << header.version << "\n";
             return scene;
         }
@@ -179,6 +201,18 @@ public:
 
             scene.models[i].name.resize(entry.nameLength);
             file.read(scene.models[i].name.data(), entry.nameLength);
+
+            if (header.version >= 2) {
+                scene.models[i].layers.resize(entry.layerCount);
+                for (uint32_t l = 0; l < entry.layerCount; ++l) {
+                    SceneLayerEntry le{};
+                    file.read(reinterpret_cast<char*>(&le), sizeof(le));
+
+                    scene.models[i].layers[l].visible = le.visible;
+                    scene.models[i].layers[l].name.resize(le.nameLength);
+                    file.read(scene.models[i].layers[l].name.data(), le.nameLength);
+                }
+            }
         }
 
         // Read instances
