@@ -16,6 +16,7 @@ struct IfcTypeLayer {
 
 struct IfcTreeNode {
     std::string name;
+    std::string fullPath;
     int parent = -1;
     std::vector<int> children;
     std::vector<int> submeshIndices;

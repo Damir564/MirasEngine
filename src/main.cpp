@@ -1451,6 +1451,13 @@ IfcInfo buildIfcLayers(const fastgltf::Asset& asset,
 		node.parent = parent;
 		node.visible = true;
 
+		if (parent >= 0) {
+			node.fullPath = info.tree[parent].fullPath + "/" + name;
+		}
+		else {
+			node.fullPath = name;
+		}
+
 		int idx = static_cast<int>(info.tree.size());
 		info.tree.push_back(std::move(node));
 
@@ -2979,7 +2986,7 @@ int main()
 
 							for (const auto& savedNode : pendingScene.models[fi].hierarchyNodes) {
 								for (auto& runtimeNode : gpuModel->ifcInfo.tree) {
-									if (runtimeNode.name == savedNode.name) {
+									if (runtimeNode.fullPath == savedNode.fullPath) {
 										runtimeNode.visible = savedNode.visible;
 									}
 								}
@@ -3785,7 +3792,7 @@ int main()
 
 							for (const auto& savedNode : pendingScene.models[fi].hierarchyNodes) {
 								for (auto& runtimeNode : gpuModel->ifcInfo.tree) {
-									if (runtimeNode.name == savedNode.name) {
+									if (runtimeNode.fullPath == savedNode.fullPath) {
 										runtimeNode.visible = savedNode.visible;
 									}
 								}

@@ -128,10 +128,10 @@ public:
 
             for (const auto& node : model.hierarchy) {
                 SceneHierarchyEntry he;
-                he.nameLength = static_cast<uint32_t>(node.name.size());
+                he.nameLength = static_cast<uint32_t>(node.fullPath.size());
                 he.visible = node.visible;
                 file.write(reinterpret_cast<const char*>(&he), sizeof(he));
-                file.write(node.name.data(), he.nameLength);
+                file.write(node.fullPath.data(), he.nameLength);
             }
         }
 
@@ -172,7 +172,7 @@ public:
         };
 
         struct LoadedHierarchyNode {
-            std::string name;
+            std::string fullPath;
             bool visible = true;
         };
 
@@ -250,8 +250,8 @@ public:
                 SceneHierarchyEntry he{};
                 file.read(reinterpret_cast<char*>(&he), sizeof(he));
                 scene.models[i].hierarchyNodes[h].visible = he.visible;
-                scene.models[i].hierarchyNodes[h].name.resize(he.nameLength);
-                file.read(scene.models[i].hierarchyNodes[h].name.data(), he.nameLength);
+                scene.models[i].hierarchyNodes[h].fullPath.resize(he.nameLength);
+                file.read(scene.models[i].hierarchyNodes[h].fullPath.data(), he.nameLength);
             }
 
             
