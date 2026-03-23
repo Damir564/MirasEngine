@@ -1292,62 +1292,95 @@ size_t calculateTotalVertices(const fastgltf::Asset& asset) {
 	return totalVertices;
 }
 
+//IfcInfo buildIfcLayers(const fastgltf::Asset& asset,
+//	const std::vector<size_t>& submeshNodeMap) {
+//	IfcInfo info;
+//	info.isIfc = true;
+//
+//	// Build parent map
+//	std::unordered_map<size_t, size_t> parentMap;
+//	for (size_t i = 0; i < asset.nodes.size(); ++i) {
+//		for (size_t c : asset.nodes[i].children) {
+//			parentMap[c] = i;
+//		}
+//	}
+//
+//	// For a node, try itself first, then walk up parents for a better type
+//	auto findType = [&](size_t nodeIdx) -> std::string {
+//		// Try the node itself
+//		std::string name(asset.nodes[nodeIdx].name.begin(), asset.nodes[nodeIdx].name.end());
+//		std::string type = extractIfcType(name);
+//
+//		// If we got a good IFC type (starts with "Ifc"), use it
+//		if (type.size() >= 3 && type.substr(0, 3) == "Ifc")
+//			return type;
+//
+//		// Otherwise walk up parents looking for an IFC type
+//		size_t current = nodeIdx;
+//		int depth = 0;
+//		while (depth < 10) {
+//			auto it = parentMap.find(current);
+//			if (it == parentMap.end()) break;
+//			current = it->second;
+//			depth++;
+//
+//			std::string parentName(asset.nodes[current].name.begin(),
+//				asset.nodes[current].name.end());
+//			std::string parentType = extractIfcType(parentName);
+//
+//			// Prefer IFC types from parents
+//			if (parentType.size() >= 3 && parentType.substr(0, 3) == "Ifc") {
+//				// Skip container types, they're too broad
+//				if (parentType != "IfcBuildingStorey" &&
+//					parentType != "IfcBuilding" &&
+//					parentType != "IfcSite" &&
+//					parentType != "IfcProject") {
+//					return parentType;
+//				}
+//			}
+//		}
+//
+//		// No IFC type found in parents either, use what we extracted from the node
+//		return type;
+//		};
+//
+//	// Group submeshes by type
+//	std::unordered_map<std::string, std::vector<int>> typeMap;
+//	for (int si = 0; si < static_cast<int>(submeshNodeMap.size()); ++si) {
+//		std::string ifcType = findType(submeshNodeMap[si]);
+//		typeMap[ifcType].push_back(si);
+//	}
+//
+//	for (auto& [typeName, indices] : typeMap) {
+//		IfcTypeLayer layer;
+//		layer.typeName = typeName;
+//		layer.submeshIndices = std::move(indices);
+//		layer.visible = true;
+//		info.layers.push_back(std::move(layer));
+//	}
+//
+//	std::sort(info.layers.begin(), info.layers.end(),
+//		[](const IfcTypeLayer& a, const IfcTypeLayer& b) {
+//			return a.typeName < b.typeName;
+//		});
+//
+//	std::cout << "[IFC] " << info.layers.size() << " layers:\n";
+//	for (const auto& l : info.layers) {
+//		std::cout << "  " << l.typeName << " (" << l.submeshIndices.size() << " meshes)\n";
+//	}
+//	return info;
+//}
+
 IfcInfo buildIfcLayers(const fastgltf::Asset& asset,
 	const std::vector<size_t>& submeshNodeMap) {
 	IfcInfo info;
 	info.isIfc = true;
 
-	// Build parent map
-	std::unordered_map<size_t, size_t> parentMap;
-	for (size_t i = 0; i < asset.nodes.size(); ++i) {
-		for (size_t c : asset.nodes[i].children) {
-			parentMap[c] = i;
-		}
-	}
-
-	// For a node, try itself first, then walk up parents for a better type
-	auto findType = [&](size_t nodeIdx) -> std::string {
-		// Try the node itself
-		std::string name(asset.nodes[nodeIdx].name.begin(), asset.nodes[nodeIdx].name.end());
-		std::string type = extractIfcType(name);
-
-		// If we got a good IFC type (starts with "Ifc"), use it
-		if (type.size() >= 3 && type.substr(0, 3) == "Ifc")
-			return type;
-
-		// Otherwise walk up parents looking for an IFC type
-		size_t current = nodeIdx;
-		int depth = 0;
-		while (depth < 10) {
-			auto it = parentMap.find(current);
-			if (it == parentMap.end()) break;
-			current = it->second;
-			depth++;
-
-			std::string parentName(asset.nodes[current].name.begin(),
-				asset.nodes[current].name.end());
-			std::string parentType = extractIfcType(parentName);
-
-			// Prefer IFC types from parents
-			if (parentType.size() >= 3 && parentType.substr(0, 3) == "Ifc") {
-				// Skip container types, they're too broad
-				if (parentType != "IfcBuildingStorey" &&
-					parentType != "IfcBuilding" &&
-					parentType != "IfcSite" &&
-					parentType != "IfcProject") {
-					return parentType;
-				}
-			}
-		}
-
-		// No IFC type found in parents either, use what we extracted from the node
-		return type;
-		};
-
-	// Group submeshes by type
 	std::unordered_map<std::string, std::vector<int>> typeMap;
 	for (int si = 0; si < static_cast<int>(submeshNodeMap.size()); ++si) {
-		std::string ifcType = findType(submeshNodeMap[si]);
+		size_t nodeIdx = submeshNodeMap[si];
+		std::string name(asset.nodes[nodeIdx].name.begin(), asset.nodes[nodeIdx].name.end());
+		std::string ifcType = extractIfcType(name);
 		typeMap[ifcType].push_back(si);
 	}
 
@@ -1364,10 +1397,118 @@ IfcInfo buildIfcLayers(const fastgltf::Asset& asset,
 			return a.typeName < b.typeName;
 		});
 
-	std::cout << "[IFC] " << info.layers.size() << " layers:\n";
-	for (const auto& l : info.layers) {
-		std::cout << "  " << l.typeName << " (" << l.submeshIndices.size() << " meshes)\n";
+	std::unordered_map<std::string, int> familyNodeMap;
+	std::unordered_map<std::string, int> typeNodeMap;
+
+	info.submeshToNode.resize(submeshNodeMap.size(), -1);
+
+	auto createNode = [&](const std::string& name, int parent) -> int {
+		IfcTreeNode node;
+		node.name = name;
+		node.parent = parent;
+		node.visible = true;
+
+		int idx = static_cast<int>(info.tree.size());
+		info.tree.push_back(std::move(node));
+
+		if (parent >= 0) {
+			info.tree[parent].children.push_back(idx);
+		}
+		else {
+			info.rootIndices.push_back(idx);
+		}
+		return idx;
+		};
+
+	for (int si = 0; si < static_cast<int>(submeshNodeMap.size()); ++si) {
+		size_t nodeIdx = submeshNodeMap[si];
+		std::string fullName(asset.nodes[nodeIdx].name.begin(), asset.nodes[nodeIdx].name.end());
+
+		// Remove "M_" prefix
+		if (fullName.rfind("M_", 0) == 0) {
+			fullName = fullName.substr(2);
+		}
+
+		// Split by ':'
+		std::vector<std::string> parts;
+		{
+			std::string part;
+			for (char c : fullName) {
+				if (c == ':') {
+					if (!part.empty()) parts.push_back(part);
+					part.clear();
+				}
+				else {
+					part.push_back(c);
+				}
+			}
+			if (!part.empty()) parts.push_back(part);
+		}
+
+		if (!parts.empty()) {
+			bool allDigits = !parts.back().empty();
+			for (char c : parts.back()) {
+				if (!std::isdigit(static_cast<unsigned char>(c))) {
+					allDigits = false;
+					break;
+				}
+			}
+			if (allDigits) {
+				parts.pop_back();
+			}
+		}
+
+		std::string family = parts.size() > 0 ? parts[0] : "Other";
+		std::string type = parts.size() > 1 ? parts[1] : family;
+
+		auto cleanup = [](std::string s) {
+			auto trim = [](std::string& x) {
+				while (!x.empty() && std::isspace((unsigned char)x.front())) x.erase(x.begin());
+				while (!x.empty() && std::isspace((unsigned char)x.back())) x.pop_back();
+				};
+			trim(s);
+			return s;
+			};
+
+		family = cleanup(family);
+		type = cleanup(type);
+
+		int familyIdx;
+		auto fit = familyNodeMap.find(family);
+		if (fit == familyNodeMap.end()) {
+			familyIdx = createNode(family, -1);
+			familyNodeMap[family] = familyIdx;
+		}
+		else {
+			familyIdx = fit->second;
+		}
+
+		std::string typeKey = family + "::" + type;
+		int typeIdx;
+		auto tit = typeNodeMap.find(typeKey);
+		if (tit == typeNodeMap.end()) {
+			typeIdx = createNode(type, familyIdx);
+			typeNodeMap[typeKey] = typeIdx;
+		}
+		else {
+			typeIdx = tit->second;
+		}
+
+		info.tree[typeIdx].submeshIndices.push_back(si);
+		info.submeshToNode[si] = typeIdx;
 	}
+
+	std::sort(info.rootIndices.begin(), info.rootIndices.end(),
+		[&](int a, int b) { return info.tree[a].name < info.tree[b].name; });
+
+	for (auto& node : info.tree) {
+		std::sort(node.children.begin(), node.children.end(),
+			[&](int a, int b) { return info.tree[a].name < info.tree[b].name; });
+	}
+
+	std::cout << "[IFC] " << info.layers.size() << " flat layers, "
+		<< info.rootIndices.size() << " hierarchy roots\n";
+
 	return info;
 }
 
@@ -3193,26 +3334,100 @@ int main()
 					GPUModel* gpuModel = modelManager->getModel(
 						instances[gizmo.selectedInstance].modelIndex);
 
+					//if (gpuModel && gpuModel->ifcInfo.isIfc) {
+					//	ImGui::Separator();
+					//	ImGui::Text("IFC Layers");
+
+					//	if (ImGui::Button("Show All##ifc")) {
+					//		for (auto& l : gpuModel->ifcInfo.layers) l.visible = true;
+					//	}
+					//	ImGui::SameLine();
+					//	if (ImGui::Button("Hide All##ifc")) {
+					//		for (auto& l : gpuModel->ifcInfo.layers) l.visible = false;
+					//	}
+
+					//	for (size_t i = 0; i < gpuModel->ifcInfo.layers.size(); ++i) {
+					//		auto& layer = gpuModel->ifcInfo.layers[i];
+					//		ImGui::PushID(static_cast<int>(i));
+					//		ImGui::Checkbox("##lv", &layer.visible);
+					//		ImGui::SameLine();
+					//		ImGui::Text("%s (%zu)", layer.typeName.c_str(),
+					//			layer.submeshIndices.size());
+					//		ImGui::PopID();
+					//	}
+					//}
+
 					if (gpuModel && gpuModel->ifcInfo.isIfc) {
 						ImGui::Separator();
-						ImGui::Text("IFC Layers");
+						ImGui::Text("IFC");
 
-						if (ImGui::Button("Show All##ifc")) {
-							for (auto& l : gpuModel->ifcInfo.layers) l.visible = true;
-						}
+						static int ifcViewMode = 0; // 0 = hierarchy, 1 = flat
+						ImGui::RadioButton("Hierarchy", &ifcViewMode, 0);
 						ImGui::SameLine();
-						if (ImGui::Button("Hide All##ifc")) {
-							for (auto& l : gpuModel->ifcInfo.layers) l.visible = false;
-						}
+						ImGui::RadioButton("Flat", &ifcViewMode, 1);
 
-						for (size_t i = 0; i < gpuModel->ifcInfo.layers.size(); ++i) {
-							auto& layer = gpuModel->ifcInfo.layers[i];
-							ImGui::PushID(static_cast<int>(i));
-							ImGui::Checkbox("##lv", &layer.visible);
+						if (ifcViewMode == 0) {
+							if (ImGui::Button("Show All##ifc_tree")) {
+								for (auto& n : gpuModel->ifcInfo.tree) n.visible = true;
+							}
 							ImGui::SameLine();
-							ImGui::Text("%s (%zu)", layer.typeName.c_str(),
-								layer.submeshIndices.size());
-							ImGui::PopID();
+							if (ImGui::Button("Hide All##ifc_tree")) {
+								for (auto& n : gpuModel->ifcInfo.tree) n.visible = false;
+							}
+
+							std::function<void(int)> drawIfcNode = [&](int nodeIdx) {
+								auto& node = gpuModel->ifcInfo.tree[nodeIdx];
+								ImGui::PushID(nodeIdx + 70000);
+
+								ImGui::Checkbox("##nodevis", &node.visible);
+								if (ImGui::IsItemDeactivatedAfterEdit()) {
+									gpuModel->ifcInfo.setNodeVisibleRecursive(nodeIdx, node.visible);
+								}
+								ImGui::SameLine();
+
+								std::string label = node.name + " (" + std::to_string(node.submeshIndices.size()) + ")";
+								if (!node.children.empty()) {
+									bool open = ImGui::TreeNode(label.c_str());
+									if (open) {
+										for (int child : node.children) {
+											drawIfcNode(child);
+										}
+										ImGui::TreePop();
+									}
+								}
+								else {
+									ImGui::BulletText("%s", label.c_str());
+								}
+
+								ImGui::PopID();
+								};
+
+							ImGui::BeginChild("IfcHierarchy", ImVec2(0, 220), true);
+							for (int rootIdx : gpuModel->ifcInfo.rootIndices) {
+								drawIfcNode(rootIdx);
+							}
+							ImGui::EndChild();
+						}
+						else {
+							if (ImGui::Button("Show All##ifc_flat")) {
+								for (auto& l : gpuModel->ifcInfo.layers) l.visible = true;
+							}
+							ImGui::SameLine();
+							if (ImGui::Button("Hide All##ifc_flat")) {
+								for (auto& l : gpuModel->ifcInfo.layers) l.visible = false;
+							}
+
+							ImGui::BeginChild("IfcFlat", ImVec2(0, 220), true);
+							for (size_t i = 0; i < gpuModel->ifcInfo.layers.size(); ++i) {
+								auto& layer = gpuModel->ifcInfo.layers[i];
+								ImGui::PushID(static_cast<int>(i) + 50000);
+								ImGui::Checkbox("##lv", &layer.visible);
+								ImGui::SameLine();
+								ImGui::Text("%s (%zu)", layer.typeName.c_str(),
+									layer.submeshIndices.size());
+								ImGui::PopID();
+							}
+							ImGui::EndChild();
 						}
 					}
 
