@@ -1661,6 +1661,8 @@ IfcInfo buildIfcLayers(const fastgltf::Asset& asset,
 	std::cout << "[IFC] " << info.layers.size() << " flat layers, "
 		<< info.rootIndices.size() << " hierarchy roots\n";
 
+	info.rebuildParentVisibilityFromChildren();
+
 	return info;
 }
 
@@ -3902,6 +3904,8 @@ int main()
 									}
 								}
 							}
+
+							gpuModel->ifcInfo.rebuildParentVisibilityFromChildren();
 						}
 
 						// 3. Create instances

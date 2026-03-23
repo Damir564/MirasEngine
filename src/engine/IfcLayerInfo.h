@@ -154,4 +154,23 @@ struct IfcInfo {
             refreshParentVisibilityUpwards(nodeIdx);
         }
     }
+
+    void rebuildParentVisibilityFromChildren() {
+        if (tree.empty()) return;
+
+        for (int i = static_cast<int>(tree.size()) - 1; i >= 0; --i) {
+            if (tree[i].children.empty()) continue;
+
+            bool anyVisible = false;
+            for (int childIdx : tree[i].children) {
+                if (hasAnyVisibleInSubtree(childIdx)) {
+                    anyVisible = true;
+                    break;
+                }
+            }
+
+            tree[i].visible = anyVisible;
+        }
+    }
+
 };
