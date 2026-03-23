@@ -2,7 +2,6 @@ add_executable (engine
   vma.cpp
   main.cpp
   vk_globals.cpp 
-  external/portable-file-dialogs.h
   external/ImGuiFileDialog.h
   external/ImGuiFileDialogConfig.h
   external/ImGuiFileDialog.cpp

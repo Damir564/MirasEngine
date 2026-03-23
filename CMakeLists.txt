@@ -14,24 +14,22 @@ add_subdirectory(external)
 
 add_subdirectory(src)
 
+file(COPY ${CMAKE_SOURCE_DIR}/src/external/IfcConvert.exe
+     DESTINATION ${CMAKE_BINARY_DIR}/src/external)
+
+file(COPY ${CMAKE_SOURCE_DIR}/src/external/IfcConvert.config
+     DESTINATION ${CMAKE_BINARY_DIR}/src/external)
+
 file(COPY ${CMAKE_SOURCE_DIR}/src/shaders
      DESTINATION ${CMAKE_BINARY_DIR}/src)
 
-# ==========================================
-# Shader compilation CMake snippet
-# ==========================================
-
-# 1️⃣ Source and output directories
 set(SHADER_SRC_DIR ${CMAKE_SOURCE_DIR}/src/shaders)
 set(SHADER_OUT_DIR ${CMAKE_BINARY_DIR}/src/shaders)
 
-# Ensure output directory exists
 file(MAKE_DIRECTORY ${SHADER_OUT_DIR})
 
-# 2️⃣ Glob all GLSL shader files (vert, frag, etc.)
 file(GLOB SHADERS "${SHADER_SRC_DIR}/*.*")
 
-# List to hold SPIR-V output files
 set(SPIRV_FILES "")
 
 # 3️⃣ Loop through each shader and create a custom command
@@ -48,7 +46,6 @@ foreach(SHADER_FILE ${SHADERS})
     # Add to SPIR-V list
     list(APPEND SPIRV_FILES ${OUTPUT_FILE})
     
-    # Add custom command to compile shader
     add_custom_command(
         OUTPUT ${OUTPUT_FILE}
         COMMAND ${CMAKE_COMMAND} -E echo "Compiling ${SHADER_FILE} -> ${OUTPUT_FILE}"
@@ -59,10 +56,8 @@ foreach(SHADER_FILE ${SHADERS})
     )
 endforeach()
 
-# 4️⃣ Add a custom target to build all shaders
 add_custom_target(Shaders ALL DEPENDS ${SPIRV_FILES})
 
-# 5️⃣ Example: Link shaders to your executable target
 add_dependencies(engine Shaders)
 
 
