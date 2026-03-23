@@ -21,10 +21,17 @@ struct SceneLayerEntry {
     bool visible = true;
 };
 
+struct SceneHierarchyEntry {
+    uint32_t nameLength = 0;
+    bool visible = true;
+};
+
 struct SceneModelEntry {
     uint32_t pathLength = 0;
     uint32_t nameLength = 0;
     uint32_t layerCount = 0;
+    uint32_t hierarchyCount = 0;
+    uint32_t viewMode = 0;
     // followed by: char path[pathLength], char name[nameLength]
 };
 
@@ -55,6 +62,8 @@ public:
             std::string path;
             std::string name;
             std::vector<IfcTypeLayer> layers;
+            std::vector<IfcTreeNode> hierarchy;
+            uint32_t viewMode = 0;
         };
         std::vector<ModelEntry> uniqueModels;
         // Map from modelManager model index -> file model index
@@ -73,7 +82,13 @@ public:
             }
             if (!found) {
                 modelIndexMap[i] = static_cast<uint32_t>(uniqueModels.size());
-                uniqueModels.push_back({ models[i]->sourcePath, models[i]->name, models[i]->ifcInfo.layers });
+                ModelEntry modelEntry;
+                modelEntry.path = models[i]->sourcePath;
+                modelEntry.name = models[i]->name;
+                modelEntry.layers = models[i]->ifcInfo.layers;
+                modelEntry.hierarchy = models[i]->ifcInfo.tree;
+                modelEntry.viewMode = static_cast<uint32_t>(models[i]->ifcInfo.viewMode);
+                uniqueModels.push_back(std::move(modelEntry));
             }
         }
 
@@ -97,6 +112,8 @@ public:
             entry.pathLength = static_cast<uint32_t>(model.path.size());
             entry.nameLength = static_cast<uint32_t>(model.name.size());
             entry.layerCount = static_cast<uint32_t>(model.layers.size());
+            entry.hierarchyCount = static_cast<uint32_t>(model.hierarchy.size());
+            entry.viewMode = model.viewMode;
             file.write(reinterpret_cast<const char*>(&entry), sizeof(entry));
             file.write(model.path.data(), entry.pathLength);
             file.write(model.name.data(), entry.nameLength);
@@ -107,6 +124,14 @@ public:
                 le.visible = layer.visible;
                 file.write(reinterpret_cast<const char*>(&le), sizeof(le));
                 file.write(layer.typeName.data(), le.nameLength);
+            }
+
+            for (const auto& node : model.hierarchy) {
+                SceneHierarchyEntry he;
+                he.nameLength = static_cast<uint32_t>(node.name.size());
+                he.visible = node.visible;
+                file.write(reinterpret_cast<const char*>(&he), sizeof(he));
+                file.write(node.name.data(), he.nameLength);
             }
         }
 
@@ -146,10 +171,17 @@ public:
             bool visible = true;
         };
 
+        struct LoadedHierarchyNode {
+            std::string name;
+            bool visible = true;
+        };
+
         struct LoadedModel {
             std::string path;
             std::string name;
             std::vector<LoadedLayer> layers;
+            std::vector<LoadedHierarchyNode> hierarchyNodes;
+            uint32_t viewMode = 0;
         };
         struct LoadedInstance {
             uint32_t fileModelIndex; // index into loadedModels
@@ -202,17 +234,27 @@ public:
             scene.models[i].name.resize(entry.nameLength);
             file.read(scene.models[i].name.data(), entry.nameLength);
 
-            if (header.version >= 2) {
-                scene.models[i].layers.resize(entry.layerCount);
-                for (uint32_t l = 0; l < entry.layerCount; ++l) {
-                    SceneLayerEntry le{};
-                    file.read(reinterpret_cast<char*>(&le), sizeof(le));
+            scene.models[i].viewMode = entry.viewMode;
 
-                    scene.models[i].layers[l].visible = le.visible;
-                    scene.models[i].layers[l].name.resize(le.nameLength);
-                    file.read(scene.models[i].layers[l].name.data(), le.nameLength);
-                }
+            scene.models[i].layers.resize(entry.layerCount);
+            for (uint32_t l = 0; l < entry.layerCount; ++l) {
+                SceneLayerEntry le{};
+                file.read(reinterpret_cast<char*>(&le), sizeof(le));
+
+                scene.models[i].layers[l].visible = le.visible;
+                scene.models[i].layers[l].name.resize(le.nameLength);
+                file.read(scene.models[i].layers[l].name.data(), le.nameLength);
             }
+            scene.models[i].hierarchyNodes.resize(entry.hierarchyCount);
+            for (uint32_t h = 0; h < entry.hierarchyCount; ++h) {
+                SceneHierarchyEntry he{};
+                file.read(reinterpret_cast<char*>(&he), sizeof(he));
+                scene.models[i].hierarchyNodes[h].visible = he.visible;
+                scene.models[i].hierarchyNodes[h].name.resize(he.nameLength);
+                file.read(scene.models[i].hierarchyNodes[h].name.data(), he.nameLength);
+            }
+
+            
         }
 
         // Read instances

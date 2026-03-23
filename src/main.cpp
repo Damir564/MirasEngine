@@ -1371,11 +1371,50 @@ size_t calculateTotalVertices(const fastgltf::Asset& asset) {
 //	return info;
 //}
 
+static std::string trimCopy(std::string s) {
+	while (!s.empty() && std::isspace((unsigned char)s.front())) s.erase(s.begin());
+	while (!s.empty() && std::isspace((unsigned char)s.back())) s.pop_back();
+	return s;
+}
+
+static bool isDigitsOnly(const std::string& s) {
+	if (s.empty()) return false;
+	for (char c : s) {
+		if (!std::isdigit((unsigned char)c)) return false;
+	}
+	return true;
+}
+
+// Try to extract codes like A101, A101-M, B203 etc.
+static std::string extractGroupCode(const std::string& text) {
+	for (size_t i = 0; i < text.size(); ++i) {
+		if (std::isalpha((unsigned char)text[i])) {
+			size_t j = i + 1;
+			while (j < text.size() && std::isdigit((unsigned char)text[j])) j++;
+
+			if (j > i + 1) {
+				// optional suffix like -M
+				size_t k = j;
+				if (k + 1 < text.size() && text[k] == '-' && std::isalpha((unsigned char)text[k + 1])) {
+					++k;
+					while (k < text.size() && (std::isalnum((unsigned char)text[k]) || text[k] == '-')) k++;
+					return text.substr(i, k - i);
+				}
+				return text.substr(i, j - i);
+			}
+		}
+	}
+	return "General";
+}
+
 IfcInfo buildIfcLayers(const fastgltf::Asset& asset,
 	const std::vector<size_t>& submeshNodeMap) {
 	IfcInfo info;
 	info.isIfc = true;
 
+	// -----------------------------------
+	// Flat type layers
+	// -----------------------------------
 	std::unordered_map<std::string, std::vector<int>> typeMap;
 	for (int si = 0; si < static_cast<int>(submeshNodeMap.size()); ++si) {
 		size_t nodeIdx = submeshNodeMap[si];
@@ -1397,8 +1436,12 @@ IfcInfo buildIfcLayers(const fastgltf::Asset& asset,
 			return a.typeName < b.typeName;
 		});
 
-	std::unordered_map<std::string, int> familyNodeMap;
+	// -----------------------------------
+	// Hierarchy: Family -> Type -> GroupCode
+	// -----------------------------------
+	std::unordered_map<std::string, int> familyMap;
 	std::unordered_map<std::string, int> typeNodeMap;
+	std::unordered_map<std::string, int> groupNodeMap;
 
 	info.submeshToNode.resize(submeshNodeMap.size(), -1);
 
@@ -1424,60 +1467,46 @@ IfcInfo buildIfcLayers(const fastgltf::Asset& asset,
 		size_t nodeIdx = submeshNodeMap[si];
 		std::string fullName(asset.nodes[nodeIdx].name.begin(), asset.nodes[nodeIdx].name.end());
 
-		// Remove "M_" prefix
 		if (fullName.rfind("M_", 0) == 0) {
 			fullName = fullName.substr(2);
 		}
 
-		// Split by ':'
 		std::vector<std::string> parts;
 		{
 			std::string part;
 			for (char c : fullName) {
 				if (c == ':') {
-					if (!part.empty()) parts.push_back(part);
+					if (!part.empty()) parts.push_back(trimCopy(part));
 					part.clear();
 				}
 				else {
 					part.push_back(c);
 				}
 			}
-			if (!part.empty()) parts.push_back(part);
+			if (!part.empty()) parts.push_back(trimCopy(part));
 		}
 
-		if (!parts.empty()) {
-			bool allDigits = !parts.back().empty();
-			for (char c : parts.back()) {
-				if (!std::isdigit(static_cast<unsigned char>(c))) {
-					allDigits = false;
-					break;
-				}
-			}
-			if (allDigits) {
-				parts.pop_back();
-			}
+		if (!parts.empty() && isDigitsOnly(parts.back())) {
+			parts.pop_back();
 		}
 
 		std::string family = parts.size() > 0 ? parts[0] : "Other";
 		std::string type = parts.size() > 1 ? parts[1] : family;
 
-		auto cleanup = [](std::string s) {
-			auto trim = [](std::string& x) {
-				while (!x.empty() && std::isspace((unsigned char)x.front())) x.erase(x.begin());
-				while (!x.empty() && std::isspace((unsigned char)x.back())) x.pop_back();
-				};
-			trim(s);
-			return s;
-			};
-
-		family = cleanup(family);
-		type = cleanup(type);
+		std::string groupCode = "General";
+		for (const auto& p : parts) {
+			std::string code = extractGroupCode(p);
+			if (code != "General") {
+				groupCode = code;
+				break;
+			}
+		}
 
 		int familyIdx;
-		auto fit = familyNodeMap.find(family);
-		if (fit == familyNodeMap.end()) {
+		auto fit = familyMap.find(family);
+		if (fit == familyMap.end()) {
 			familyIdx = createNode(family, -1);
-			familyNodeMap[family] = familyIdx;
+			familyMap[family] = familyIdx;
 		}
 		else {
 			familyIdx = fit->second;
@@ -1494,8 +1523,19 @@ IfcInfo buildIfcLayers(const fastgltf::Asset& asset,
 			typeIdx = tit->second;
 		}
 
-		info.tree[typeIdx].submeshIndices.push_back(si);
-		info.submeshToNode[si] = typeIdx;
+		std::string groupKey = typeKey + "::" + groupCode;
+		int groupIdx;
+		auto git = groupNodeMap.find(groupKey);
+		if (git == groupNodeMap.end()) {
+			groupIdx = createNode(groupCode, typeIdx);
+			groupNodeMap[groupKey] = groupIdx;
+		}
+		else {
+			groupIdx = git->second;
+		}
+
+		info.tree[groupIdx].submeshIndices.push_back(si);
+		info.submeshToNode[si] = groupIdx;
 	}
 
 	std::sort(info.rootIndices.begin(), info.rootIndices.end(),
@@ -2902,14 +2942,11 @@ int main()
 					const auto& loadingTasks = modelManager->getLoadingTasks();
 					const auto& loadedModels = modelManager->getModels();
 
-					// Check if all models finished loading
 					bool allDone = loadingTasks.empty() && !loadedModels.empty();
-
-					// Also check if expected model count matches
 					if (allDone && loadedModels.size() >= pendingScene.models.size()) {
-						// Build map from file model index to manager model index by matching paths
 						std::vector<int> fileToManager(pendingScene.models.size(), -1);
 
+						// 1. Build file model index -> manager model index map
 						for (size_t fi = 0; fi < pendingScene.models.size(); ++fi) {
 							for (size_t mi = 0; mi < loadedModels.size(); ++mi) {
 								if (loadedModels[mi] && loadedModels[mi]->isValid() &&
@@ -2920,12 +2957,16 @@ int main()
 							}
 						}
 
+						// 2. Restore IFC view mode, flat layers, hierarchy node visibility
 						for (size_t fi = 0; fi < pendingScene.models.size(); ++fi) {
 							int managerIdx = fileToManager[fi];
 							if (managerIdx < 0) continue;
 
 							GPUModel* gpuModel = modelManager->getModel(static_cast<size_t>(managerIdx));
 							if (!gpuModel || !gpuModel->isValid()) continue;
+
+							gpuModel->ifcInfo.viewMode =
+								static_cast<IfcViewMode>(pendingScene.models[fi].viewMode);
 
 							for (const auto& savedLayer : pendingScene.models[fi].layers) {
 								for (auto& runtimeLayer : gpuModel->ifcInfo.layers) {
@@ -2935,9 +2976,17 @@ int main()
 									}
 								}
 							}
+
+							for (const auto& savedNode : pendingScene.models[fi].hierarchyNodes) {
+								for (auto& runtimeNode : gpuModel->ifcInfo.tree) {
+									if (runtimeNode.name == savedNode.name) {
+										runtimeNode.visible = savedNode.visible;
+									}
+								}
+							}
 						}
 
-						// Create all instances
+						// 3. Create instances
 						for (const auto& inst : pendingScene.instances) {
 							if (inst.fileModelIndex >= fileToManager.size()) continue;
 							int managerIdx = fileToManager[inst.fileModelIndex];
@@ -3361,12 +3410,13 @@ int main()
 						ImGui::Separator();
 						ImGui::Text("IFC");
 
-						static int ifcViewMode = 0; // 0 = hierarchy, 1 = flat
-						ImGui::RadioButton("Hierarchy", &ifcViewMode, 0);
+						int mode = static_cast<int>(gpuModel->ifcInfo.viewMode);
+						ImGui::RadioButton("Hierarchy", &mode, 0);
 						ImGui::SameLine();
-						ImGui::RadioButton("Flat", &ifcViewMode, 1);
+						ImGui::RadioButton("Flat", &mode, 1);
+						gpuModel->ifcInfo.viewMode = static_cast<IfcViewMode>(mode);
 
-						if (ifcViewMode == 0) {
+						if (gpuModel->ifcInfo.viewMode == IfcViewMode::Hierarchy) {
 							if (ImGui::Button("Show All##ifc_tree")) {
 								for (auto& n : gpuModel->ifcInfo.tree) n.visible = true;
 							}
@@ -3379,13 +3429,15 @@ int main()
 								auto& node = gpuModel->ifcInfo.tree[nodeIdx];
 								ImGui::PushID(nodeIdx + 70000);
 
-								ImGui::Checkbox("##nodevis", &node.visible);
-								if (ImGui::IsItemDeactivatedAfterEdit()) {
-									gpuModel->ifcInfo.setNodeVisibleRecursive(nodeIdx, node.visible);
+								bool vis = node.visible;
+								if (ImGui::Checkbox("##nodevis", &vis)) {
+									gpuModel->ifcInfo.setNodeVisibleRecursive(nodeIdx, vis);
 								}
 								ImGui::SameLine();
 
-								std::string label = node.name + " (" + std::to_string(node.submeshIndices.size()) + ")";
+								int subtreeCount = gpuModel->ifcInfo.getSubtreeSubmeshCount(nodeIdx);
+								std::string label = node.name + " (" + std::to_string(subtreeCount) + ")";
+
 								if (!node.children.empty()) {
 									bool open = ImGui::TreeNode(label.c_str());
 									if (open) {
@@ -3402,7 +3454,7 @@ int main()
 								ImGui::PopID();
 								};
 
-							ImGui::BeginChild("IfcHierarchy", ImVec2(0, 220), true);
+							ImGui::BeginChild("IfcHierarchy", ImVec2(0, 240), true);
 							for (int rootIdx : gpuModel->ifcInfo.rootIndices) {
 								drawIfcNode(rootIdx);
 							}
@@ -3417,7 +3469,7 @@ int main()
 								for (auto& l : gpuModel->ifcInfo.layers) l.visible = false;
 							}
 
-							ImGui::BeginChild("IfcFlat", ImVec2(0, 220), true);
+							ImGui::BeginChild("IfcFlat", ImVec2(0, 240), true);
 							for (size_t i = 0; i < gpuModel->ifcInfo.layers.size(); ++i) {
 								auto& layer = gpuModel->ifcInfo.layers[i];
 								ImGui::PushID(static_cast<int>(i) + 50000);
@@ -3699,6 +3751,8 @@ int main()
 					bool allDone = loadingTasks.empty() && !loadedModels.empty();
 					if (allDone && loadedModels.size() >= pendingScene.models.size()) {
 						std::vector<int> fileToManager(pendingScene.models.size(), -1);
+
+						// 1. Build file model index -> manager model index map
 						for (size_t fi = 0; fi < pendingScene.models.size(); ++fi) {
 							for (size_t mi = 0; mi < loadedModels.size(); ++mi) {
 								if (loadedModels[mi] && loadedModels[mi]->isValid() &&
@@ -3708,12 +3762,17 @@ int main()
 								}
 							}
 						}
+
+						// 2. Restore IFC view mode, flat layers, hierarchy node visibility
 						for (size_t fi = 0; fi < pendingScene.models.size(); ++fi) {
 							int managerIdx = fileToManager[fi];
 							if (managerIdx < 0) continue;
 
 							GPUModel* gpuModel = modelManager->getModel(static_cast<size_t>(managerIdx));
 							if (!gpuModel || !gpuModel->isValid()) continue;
+
+							gpuModel->ifcInfo.viewMode =
+								static_cast<IfcViewMode>(pendingScene.models[fi].viewMode);
 
 							for (const auto& savedLayer : pendingScene.models[fi].layers) {
 								for (auto& runtimeLayer : gpuModel->ifcInfo.layers) {
@@ -3723,19 +3782,32 @@ int main()
 									}
 								}
 							}
+
+							for (const auto& savedNode : pendingScene.models[fi].hierarchyNodes) {
+								for (auto& runtimeNode : gpuModel->ifcInfo.tree) {
+									if (runtimeNode.name == savedNode.name) {
+										runtimeNode.visible = savedNode.visible;
+									}
+								}
+							}
 						}
+
+						// 3. Create instances
 						for (const auto& inst : pendingScene.instances) {
 							if (inst.fileModelIndex >= fileToManager.size()) continue;
 							int managerIdx = fileToManager[inst.fileModelIndex];
 							if (managerIdx < 0) continue;
+
 							size_t newIdx = modelManager->createInstance(
 								static_cast<size_t>(managerIdx), inst.position);
+
 							auto& newInst = modelManager->getInstances()[newIdx];
 							newInst.name = inst.name;
 							newInst.rotation = inst.rotation;
 							newInst.scale = inst.scale;
 							newInst.visible = inst.visible;
 						}
+
 						pendingSceneLoad = false;
 						std::cout << "[SCENE] All instances created\n";
 					}
