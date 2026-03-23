@@ -37,6 +37,14 @@
 #include "engine/SceneSerializer.h"
 #include "engine/CameraAnimation.h"
 #include "engine/FileDialog.h"
+#include "engine/IfcConverter.h"
+#include "engine/IfcLayerInfo.h"
+#include "engine/IfcNodeParser.h"
+
+#define VULKAN_API_VERSION_MAJOR 1
+#define VULKAN_API_VERSION_MINOR 3
+#define VULKAN_API_VERSION_VK vk::ApiVersion13
+#define VULKAN_API_VERSION_CURRENT VK_API_VERSION_1_3
 
 struct FrameUBO {
 	glm::mat4 view;
@@ -1294,6 +1302,89 @@ size_t calculateTotalVertices(const fastgltf::Asset& asset) {
 // =============================================================
 // Main Load Function
 // =============================================================
+//void processFastGltfNodeTracked(
+//	fastgltf::Asset& asset,
+//	size_t nodeIndex,
+//	const glm::mat4& parentTransform,
+//	Mesh& result,
+//	std::unordered_map<std::string, int>& textureCache,
+//	const std::string& path,
+//	std::vector<size_t>& submeshNodeMap)
+//{
+//	const auto& node = asset.nodes[nodeIndex];
+//
+//	glm::mat4 localTransform(1.0f);
+//	if (auto* trs = std::get_if<fastgltf::TRS>(&node.transform)) {
+//		glm::vec3 t(trs->translation[0], trs->translation[1], trs->translation[2]);
+//		glm::quat r(trs->rotation[3], trs->rotation[0], trs->rotation[1], trs->rotation[2]);
+//		glm::vec3 s(trs->scale[0], trs->scale[1], trs->scale[2]);
+//		localTransform = glm::translate(glm::mat4(1.0f), t)
+//			* glm::mat4_cast(r)
+//			* glm::scale(glm::mat4(1.0f), s);
+//	}
+//	else if (auto* mat = std::get_if<fastgltf::math::fmat4x4>(&node.transform)) {
+//		std::memcpy(&localTransform, mat, sizeof(glm::mat4));
+//	}
+//
+//	glm::mat4 worldTransform = parentTransform * localTransform;
+//
+//	if (node.meshIndex.has_value()) {
+//		size_t before = result.submeshes.size();
+//
+//		processFastGltfNode(asset, *node.meshIndex, worldTransform, result, textureCache, path);
+//
+//		for (size_t s = before; s < result.submeshes.size(); ++s) {
+//			submeshNodeMap.push_back(nodeIndex);
+//		}
+//	}
+//
+//	for (size_t child : node.children) {
+//		processFastGltfNodeTracked(asset, child, worldTransform, result,
+//			textureCache, path, submeshNodeMap);
+//	}
+//}
+
+IfcInfo buildIfcLayers(const fastgltf::Asset& asset,
+	const std::vector<size_t>& submeshNodeMap) {
+	IfcInfo info;
+	info.isIfc = true;
+
+	// Group submeshes by IFC type
+	std::unordered_map<std::string, std::vector<int>> typeMap;
+
+	for (int si = 0; si < static_cast<int>(submeshNodeMap.size()); ++si) {
+		size_t nodeIdx = submeshNodeMap[si];
+		const auto& node = asset.nodes[nodeIdx];
+		std::string name(node.name.begin(), node.name.end());
+		std::string ifcType = extractIfcType(name);
+		typeMap[ifcType].push_back(si);
+	}
+
+	// Convert to sorted layer list
+	for (auto& [typeName, indices] : typeMap) {
+		IfcTypeLayer layer;
+		layer.typeName = typeName;
+		layer.submeshIndices = std::move(indices);
+		layer.visible = true;
+		info.layers.push_back(std::move(layer));
+	}
+
+	// Sort alphabetically
+	std::sort(info.layers.begin(), info.layers.end(),
+		[](const IfcTypeLayer& a, const IfcTypeLayer& b) {
+			return a.typeName < b.typeName;
+		});
+
+	std::cout << "[IFC] " << info.layers.size() << " type layers found:\n";
+	for (const auto& l : info.layers) {
+		std::cout << "  " << l.typeName << " (" << l.submeshIndices.size() << " meshes)\n";
+	}
+
+	return info;
+}
+
+
+
 Mesh loadWithFastGltf(const std::string& path) {
 	Mesh result;
 	fastgltf::Parser parser;
@@ -1347,6 +1438,54 @@ Mesh loadWithFastGltf(const std::string& path) {
 	return result;
 }
 
+Mesh loadIfcModel(const std::string& ifcPath, IfcInfo& outInfo) {
+	// 1. Convert IFC -> GLB
+	auto glbOpt = IfcConverter::toGlb(ifcPath);
+	if (!glbOpt) throw std::runtime_error("IFC conversion failed: " + ifcPath);
+	std::string glbPath = *glbOpt;
+
+	// 2. Load GLB with your existing FAST loader — no changes needed
+	Mesh result = loadWithFastGltf(glbPath);
+
+	// 3. Cheap second pass: read only node tree for layer info (no geometry)
+	fastgltf::Parser parser;
+	auto gltfFile = fastgltf::MappedGltfFile::FromPath(glbPath);
+	if (!gltfFile) {
+		outInfo = {};
+		return result;
+	}
+
+	auto assetRet = parser.loadGltf(gltfFile.get(),
+		std::filesystem::path(glbPath).parent_path(), fastgltf::Options::None);
+
+	if (assetRet.error() == fastgltf::Error::None) {
+		auto& asset = assetRet.get();
+		std::vector<size_t> nodeMap;
+
+		size_t scn = asset.defaultScene.value_or(0);
+		if (!asset.scenes.empty()) {
+			// Walk in same order as loadWithFastGltf to match submesh indices
+			std::function<void(size_t)> walk = [&](size_t ni) {
+				const auto& n = asset.nodes[ni];
+				if (n.meshIndex.has_value()) {
+					size_t primCount = asset.meshes[*n.meshIndex].primitives.size();
+					for (size_t p = 0; p < primCount; ++p) {
+						nodeMap.push_back(ni);
+					}
+				}
+				for (size_t c : n.children) walk(c);
+				};
+			for (size_t ni : asset.scenes[scn].nodeIndices) walk(ni);
+		}
+
+		outInfo = buildIfcLayers(asset, nodeMap);
+	}
+
+	std::cout << "[IFC] " << result.vertices.size() << " verts, "
+		<< outInfo.layers.size() << " layers\n";
+	return result;
+}
+
 struct RenderSubmesh {
 	size_t submeshIndex;
 	float distanceToCamera;
@@ -1389,10 +1528,23 @@ std::vector<RenderSubmesh> sortSubmeshesForRendering(
 	return renderList;
 }
 
-Mesh loadModelSmart(const std::string& path) {
+Mesh loadModelSmart(const std::string& path, IfcInfo* outIfcInfo = nullptr) {
 	std::string cachePath = path + ".cache";
 	Mesh result;
 	bool loadedFromCache = false;
+
+	namespace fs = std::filesystem;
+	std::string ext = fs::path(path).extension().string();
+	std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+	bool isIfc = (ext == ".ifc");
+
+	std::string loadPath = path;
+	if (isIfc) {
+		auto glbOpt = IfcConverter::toGlb(path); 
+		if (!glbOpt) throw std::runtime_error("IFC conversion failed");
+		loadPath = *glbOpt;
+		cachePath = loadPath + ".cache";
+	}
 
 	// 1. Try Cache
 	if (ModelSerializer::IsCacheValid(path, cachePath)) {
@@ -1410,33 +1562,49 @@ Mesh loadModelSmart(const std::string& path) {
 		}
 	}
 
-	// 2. Fallback to Parse
+	IfcInfo ifcInfo;
+
 	if (!loadedFromCache) {
-		std::cout << "[PARSE] Parsing source file: " << path << " ...\n";
-
-		std::filesystem::path p(path);
-		std::string ext = p.extension().string();
-		std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
-
-		if (ext == ".gltf" || ext == ".glb") {
-			// Prefer FastGLTF for GLTF/GLB (if implemented)
-			result = loadWithFastGltf(path); // Uncomment if FastGLTF functions are defined
-			// result = loadWithAssimp(path);    // Fallback to Assimp for now based on snippet availability
+		if (isIfc) {
+			result = loadIfcModel(path, ifcInfo);
+		}
+		else if (ext == ".gltf" || ext == ".glb") {
+			result = loadWithFastGltf(loadPath);
 		}
 		else {
-			result = loadWithAssimp(path);
+			result = loadWithAssimp(loadPath);
 		}
 
-		// 3. Save to Cache (Result has decoded textures now)
-		std::cout << "[CACHE] Saving cache to: " << cachePath << " ... ";
-		if (ModelSerializer::SaveToCache(cachePath, result)) {
-			std::cout << "Done.\n";
-		}
-		else {
-			std::cout << "Failed.\n";
+		ModelSerializer::SaveToCache(cachePath, result);
+	}
+
+	if (isIfc && loadedFromCache) {
+		fastgltf::Parser parser;
+		auto gltfFile = fastgltf::MappedGltfFile::FromPath(loadPath);
+		if (gltfFile) {
+			auto assetRet = parser.loadGltf(gltfFile.get(),
+				fs::path(loadPath).parent_path(), fastgltf::Options::None);
+			if (assetRet.error() == fastgltf::Error::None) {
+				auto& asset = assetRet.get();
+				std::vector<size_t> nodeMap;
+				size_t si = asset.defaultScene.value_or(0);
+				if (!asset.scenes.empty()) {
+					std::function<void(size_t)> walk = [&](size_t ni) {
+						const auto& n = asset.nodes[ni];
+						if (n.meshIndex.has_value()) {
+							for (size_t p = 0; p < asset.meshes[*n.meshIndex].primitives.size(); ++p)
+								nodeMap.push_back(ni);
+						}
+						for (size_t c : n.children) walk(c);
+						};
+					for (size_t ni : asset.scenes[si].nodeIndices) walk(ni);
+				}
+				ifcInfo = buildIfcLayers(asset, nodeMap);
+			}
 		}
 	}
 
+	if (outIfcInfo) *outIfcInfo = ifcInfo;
 	return result;
 }
 
@@ -1507,8 +1675,8 @@ int main()
 	vkb::InstanceBuilder builder;
 	auto instRet = builder
 		.set_app_name("SDL3 Vulkan App")
-		.require_api_version(1, 4, 0)
-		.set_minimum_instance_version(1, 4)
+		.require_api_version(VULKAN_API_VERSION_MAJOR, VULKAN_API_VERSION_MINOR, 0)
+		.set_minimum_instance_version(VULKAN_API_VERSION_MAJOR, VULKAN_API_VERSION_MINOR)
 		// .use_default_debug_messenger()
 		.enable_extensions(extensions)
 		// .enable_extension(VK_EXT_SHADER_OBJECT_EXTENSION_NAME)
@@ -1570,7 +1738,7 @@ int main()
 
 	vkb::PhysicalDeviceSelector selector{ vkbInstance };
 	auto physRet = selector
-		.set_minimum_version(1, 4)
+		.set_minimum_version(VULKAN_API_VERSION_MAJOR, VULKAN_API_VERSION_MINOR)
 		.add_required_extension(vk::EXTShaderObjectExtensionName)
 		.add_required_extension_features(shaderObjectFeatures)
 		.set_required_features(coreFeatures)
@@ -1630,7 +1798,7 @@ int main()
 	allocatorInfo.device = device;
 	allocatorInfo.instance = instance;
 	allocatorInfo.pVulkanFunctions = &vulkanFunctions;
-	allocatorInfo.vulkanApiVersion = vk::ApiVersion14;
+	allocatorInfo.vulkanApiVersion = VULKAN_API_VERSION_VK;
 
 	VmaAllocator allocator;
 	if (vmaCreateAllocator(&allocatorInfo, &allocator) != VK_SUCCESS) {
@@ -2283,7 +2451,7 @@ int main()
 
 		// Zero-initialize as required
 		ImGui_ImplVulkan_InitInfo initInfo = {};
-		initInfo.ApiVersion = VK_API_VERSION_1_4;  // Or VK_API_VERSION_1_3
+		initInfo.ApiVersion = VULKAN_API_VERSION_CURRENT;  // Or VK_API_VERSION_1_3
 		initInfo.Instance = vkInstance;
 		initInfo.PhysicalDevice = vkbPhys.physical_device;
 		initInfo.Device = vkDevice;
@@ -2308,7 +2476,7 @@ int main()
 			std::cerr << "ERROR: vkGetInstanceProcAddr returns null for vkCmdBeginRendering!\n";
 		}
 
-		ImGui_ImplVulkan_LoadFunctions(VK_API_VERSION_1_4, [](const char* function_name, void* user_data) {
+		ImGui_ImplVulkan_LoadFunctions(VULKAN_API_VERSION_CURRENT, [](const char* function_name, void* user_data) {
 			return vkGetInstanceProcAddr((VkInstance)user_data, function_name);
 			}, vkInstance);
 
@@ -2837,7 +3005,7 @@ int main()
 					ImGuiFileDialog::Instance()->OpenDialog(
 						"BrowseModelDlg",
 						"Select 3D Model",
-						"{.gltf,.glb,.obj}, .gltf,.glb,.obj",   // allowed model formats
+						"{.gltf,.glb,.obj,.ifc}, .gltf,.glb,.obj,.ifc",   // allowed model formats
 						config
 					);
 				}
@@ -3035,6 +3203,32 @@ int main()
 				ImGui::Separator();
 				if (gizmo.selectedInstance >= 0 &&
 					gizmo.selectedInstance < static_cast<int>(instances.size())) {
+
+					GPUModel* gpuModel = modelManager->getModel(
+						instances[gizmo.selectedInstance].modelIndex);
+
+					if (gpuModel && gpuModel->ifcInfo.isIfc) {
+						ImGui::Separator();
+						ImGui::Text("IFC Layers");
+
+						if (ImGui::Button("Show All##ifc")) {
+							for (auto& l : gpuModel->ifcInfo.layers) l.visible = true;
+						}
+						ImGui::SameLine();
+						if (ImGui::Button("Hide All##ifc")) {
+							for (auto& l : gpuModel->ifcInfo.layers) l.visible = false;
+						}
+
+						for (size_t i = 0; i < gpuModel->ifcInfo.layers.size(); ++i) {
+							auto& layer = gpuModel->ifcInfo.layers[i];
+							ImGui::PushID(static_cast<int>(i));
+							ImGui::Checkbox("##lv", &layer.visible);
+							ImGui::SameLine();
+							ImGui::Text("%s (%zu)", layer.typeName.c_str(),
+								layer.submeshIndices.size());
+							ImGui::PopID();
+						}
+					}
 
 					auto& sel = instances[gizmo.selectedInstance];
 					ImGui::Text("Selected: %s", sel.name.c_str());
@@ -3604,7 +3798,7 @@ int main()
 			cmd.setViewport(0, viewport);
 			cmd.setScissor(0, rect);
 			cmd.setRasterizerDiscardEnable(false);
-			cmd.setCullMode(vk::CullModeFlagBits::eBack);
+			cmd.setCullMode(vk::CullModeFlagBits::eNone);
 			cmd.setFrontFace(vk::FrontFace::eCounterClockwise);
 			cmd.setStencilTestEnable(false);
 			cmd.setDepthTestEnable(true);
@@ -3666,6 +3860,9 @@ int main()
 
 				for (const auto& renderSub : sortedSubmeshes) {
 					const auto& sub = gpuModel->submeshes[renderSub.submeshIndex];
+
+					if (!gpuModel->ifcInfo.isSubmeshVisible(renderSub.submeshIndex))
+						continue;
 
 					bool needsBlending = (sub.material.alphaMode == AlphaMode::BLEND);
 

@@ -10,6 +10,7 @@
 #include <glm/ext/matrix_transform.hpp>
 #include "ModelTypes.h"
 #include "Buffers.h"
+#include "IfcLayerInfo.h"
 
 class TextureImage;
 
@@ -31,6 +32,8 @@ struct GPUModel {
     float boundsRadius{ 1.0f };
     glm::vec3 boundsMin{ 0.0f };
     glm::vec3 boundsMax{ 0.0f };
+
+    IfcInfo ifcInfo;
 
     bool isValid() const { return vertexBuffer != nullptr && indexBuffer != nullptr; }
 };

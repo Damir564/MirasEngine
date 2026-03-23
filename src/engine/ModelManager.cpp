@@ -4,6 +4,7 @@
 #include <filesystem>
 #include "stb_image.h"
 #include "Shadow.h"
+#include "IfcLayerInfo.h"
 
 // TextureImage class - move from main.cpp or keep inline here
 class TextureImage {
@@ -137,7 +138,7 @@ private:
 };
 
 // External function declarations - these remain in main.cpp
-extern Mesh loadModelSmart(const std::string& path);
+extern Mesh loadModelSmart(const std::string& path, IfcInfo* outIfcInfo = nullptr);
 // extern SceneBounds calculateSceneBounds(const std::vector<Vertex>& vertices, const std::vector<InstanceData>& instances);
 
 void TextureData::free() {
