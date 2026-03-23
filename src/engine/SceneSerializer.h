@@ -70,7 +70,8 @@ public:
         std::vector<uint32_t> modelIndexMap(models.size(), 0);
 
         for (size_t i = 0; i < models.size(); ++i) {
-            if (!models[i] || !models[i]->isValid()) continue;
+            const auto& model = models[i];
+            if (!model || model->hiddenFromUI) continue;
 
             bool found = false;
             for (size_t j = 0; j < uniqueModels.size(); ++j) {

@@ -24,6 +24,7 @@
 #include <fastgltf/glm_element_traits.hpp>
 #include <fastgltf/tools.hpp>
 #include <future>
+#define IMGUI_DEFINE_MATH_OPERATORS
 #define IMGUI_IMPL_VULKAN_NO_PROTOTYPES
 #include "imgui.h"
 #include "backends/imgui_impl_sdl3.h"
@@ -40,6 +41,7 @@
 #include "engine/IfcConverter.h"
 #include "engine/IfcLayerInfo.h"
 #include "engine/IfcNodeParser.h"
+#include <imgui_internal.h>
 
 #define VULKAN_API_VERSION_MAJOR 1
 #define VULKAN_API_VERSION_MINOR 3
@@ -3289,7 +3291,7 @@ int main()
 
 					IGFD::FileDialogConfig config;
 					config.path = absRoot;
-					config.countSelectionMax = 1;
+					config.countSelectionMax = 32;
 					config.flags = ImGuiFileDialogFlags_Modal;
 
 					ImGuiFileDialog::Instance()->OpenDialog(
@@ -3360,19 +3362,27 @@ int main()
 					ImGuiWindowFlags_NoCollapse, dialogSize))
 				{
 					if (ImGuiFileDialog::Instance()->IsOk()) {
-						std::string selectedPath = ImGuiFileDialog::Instance()->GetFilePathName();
+						auto selection = ImGuiFileDialog::Instance()->GetSelection();
 
-						auto rel = makeRelativeIfInside(selectedPath, MODELS_ROOT);
-						if (rel.has_value()) {
-							strncpy(modelPath, rel.value().c_str(), sizeof(modelPath) - 1);
-							modelPath[sizeof(modelPath) - 1] = '\0';
-
-							namespace fs = std::filesystem;
-							std::string name = fs::path(modelPath).stem().string();
-							modelManager->loadModelAsync(modelPath, name);
+						std::vector<std::string> selectedPaths;
+						for (const auto& [fileName, fullPath] : selection) {
+							auto rel = makeRelativeIfInside(fullPath, MODELS_ROOT);
+							if (rel.has_value()) {
+								selectedPaths.push_back(rel.value());
+							}
 						}
-						else {
-							std::cerr << "[MODEL] File must be inside \"" << MODELS_ROOT << "/\"\n";
+
+						if (!selectedPaths.empty()) {
+							namespace fs = std::filesystem;
+
+							if (selectedPaths.size() == 1) {
+								std::string name = fs::path(selectedPaths[0]).stem().string();
+								modelManager->loadModelAsync(selectedPaths[0], name);
+							}
+							else {
+								std::string groupName = "IFC_Group_" + std::to_string(SDL_GetTicks());
+								modelManager->loadCompositeModelAsync(selectedPaths, groupName);
+							}
 						}
 					}
 					ImGuiFileDialog::Instance()->Close();
@@ -3396,12 +3406,18 @@ int main()
 				}
 
 				// Loaded Models
-				ImGui::Text("Loaded Models: %zu", modelManager->getModels().size());
 				const auto& models = modelManager->getModels();
+				size_t visibleModelCount = 0;
+				for (const auto& m : models) {
+					if (m && !m->hiddenFromUI) visibleModelCount++;
+				}
+				ImGui::Text("Loaded Models: %zu", visibleModelCount);
 				static int selectedModel = -1;
 				size_t vertexCount = 0;
 				for (size_t i = 0; i < models.size(); ++i) {
 					const auto& model = models[i];
+					if (!model || model->hiddenFromUI) continue;
+
 					ImGui::PushID(static_cast<int>(i));
 
 					bool isSelected = (selectedModel == static_cast<int>(i));
@@ -3440,8 +3456,21 @@ int main()
 
 					
 					ImGui::SameLine();
-					ImGui::TextDisabled("(%zu verts, %zu tex)",
-						model->vertexCount, model->textures.size());
+					if (model->isComposite) {
+						size_t totalVerts = 0;
+						size_t totalTex = 0;
+						for (size_t childIdx : model->childModelIndices) {
+							GPUModel* child = modelManager->getModel(childIdx);
+							if (!child) continue;
+							totalVerts += child->vertexCount;
+							totalTex += child->textures.size();
+						}
+						ImGui::TextDisabled("(composite: %zu verts, %zu tex)", totalVerts, totalTex);
+					}
+					else {
+						ImGui::TextDisabled("(%zu verts, %zu tex)",
+							model->vertexCount, model->textures.size());
+					}
 					ImGui::PopID();
 				}
 				ImGui::Separator();
@@ -3524,76 +3553,211 @@ int main()
 						ImGui::Separator();
 						ImGui::Text("IFC");
 
-						int mode = static_cast<int>(gpuModel->ifcInfo.viewMode);
-						ImGui::RadioButton("Hierarchy", &mode, 0);
-						ImGui::SameLine();
-						ImGui::RadioButton("Flat", &mode, 1);
-						gpuModel->ifcInfo.viewMode = static_cast<IfcViewMode>(mode);
-
-						if (gpuModel->ifcInfo.viewMode == IfcViewMode::Hierarchy) {
-							if (ImGui::Button("Show All##ifc_tree")) {
-								for (auto& n : gpuModel->ifcInfo.tree) n.visible = true;
-							}
+						if (gpuModel->isComposite && gpuModel->ifcInfo.isCompositeIfc) {
+							int mode = static_cast<int>(gpuModel->ifcInfo.viewMode);
+							ImGui::RadioButton("Hierarchy", &mode, 0);
 							ImGui::SameLine();
-							if (ImGui::Button("Hide All##ifc_tree")) {
-								for (auto& n : gpuModel->ifcInfo.tree) n.visible = false;
+							ImGui::RadioButton("Flat", &mode, 1);
+							gpuModel->ifcInfo.viewMode = static_cast<IfcViewMode>(mode);
+
+							// propagate selected mode to children
+							for (size_t childIdx : gpuModel->childModelIndices) {
+								GPUModel* childModel = modelManager->getModel(childIdx);
+								if (childModel && childModel->isValid()) {
+									childModel->ifcInfo.viewMode = gpuModel->ifcInfo.viewMode;
+								}
 							}
 
-							std::function<void(int)> drawIfcNode = [&](int nodeIdx) {
-								auto& node = gpuModel->ifcInfo.tree[nodeIdx];
-								ImGui::PushID(nodeIdx + 70000);
-
-								bool vis = node.visible;
-								if (ImGui::Checkbox("##nodevis", &vis)) {
-									gpuModel->ifcInfo.setNodeVisibility(nodeIdx, vis);
-								}
-								ImGui::SameLine();
-
-								int subtreeCount = gpuModel->ifcInfo.getSubtreeSubmeshCount(nodeIdx);
-								std::string label = node.name + " (" + std::to_string(subtreeCount) + ")";
-
-								if (!node.children.empty()) {
-									bool open = ImGui::TreeNode(label.c_str());
-									if (open) {
-										for (int child : node.children) {
-											drawIfcNode(child);
-										}
-										ImGui::TreePop();
+							if (gpuModel->ifcInfo.viewMode == IfcViewMode::Hierarchy) {
+								if (ImGui::Button("Show All##ifc_tree")) {
+									for (size_t childIdx : gpuModel->childModelIndices) {
+										GPUModel* childModel = modelManager->getModel(childIdx);
+										if (!childModel || !childModel->isValid()) continue;
+										for (auto& n : childModel->ifcInfo.tree) n.visible = true;
 									}
 								}
-								else {
-									ImGui::Text("%s", label.c_str());
+								ImGui::SameLine();
+								if (ImGui::Button("Hide All##ifc_tree")) {
+									for (size_t childIdx : gpuModel->childModelIndices) {
+										GPUModel* childModel = modelManager->getModel(childIdx);
+										if (!childModel || !childModel->isValid()) continue;
+										for (auto& n : childModel->ifcInfo.tree) n.visible = false;
+									}
 								}
 
-								ImGui::PopID();
-								};
+								ImGui::BeginChild("IfcHierarchyComposite", ImVec2(0, 260), true);
 
-							ImGui::BeginChild("IfcHierarchy", ImVec2(0, 240), true);
-							for (int rootIdx : gpuModel->ifcInfo.rootIndices) {
-								drawIfcNode(rootIdx);
+								for (size_t pi = 0; pi < gpuModel->childModelIndices.size(); ++pi) {
+									GPUModel* childModel = modelManager->getModel(gpuModel->childModelIndices[pi]);
+									if (!childModel || !childModel->isValid()) continue;
+
+									std::function<void(int)> drawIfcNode = [&](int nodeIdx) {
+										auto& node = childModel->ifcInfo.tree[nodeIdx];
+										ImGui::PushID(nodeIdx + static_cast<int>(pi) * 100000);
+
+										bool partial = childModel->ifcInfo.isNodePartiallyVisible(nodeIdx);
+										bool vis = node.visible || partial;
+
+										if (partial) {
+											ImGui::PushItemFlag(ImGuiItemFlags_MixedValue, true);
+										}
+
+										if (ImGui::Checkbox("##nodevis", &vis)) {
+											childModel->ifcInfo.setNodeVisibility(nodeIdx, vis);
+										}
+
+										if (partial) {
+											ImGui::PopItemFlag();
+										}
+
+										ImGui::SameLine();
+
+										int subtreeCount = childModel->ifcInfo.getSubtreeSubmeshCount(nodeIdx);
+										std::string label = node.name + " (" + std::to_string(subtreeCount) + ")";
+
+										if (!node.children.empty()) {
+											bool open = ImGui::TreeNode(label.c_str());
+											if (open) {
+												for (int child : node.children) {
+													drawIfcNode(child);
+												}
+												ImGui::TreePop();
+											}
+										}
+										else {
+											ImGui::Text("%s", label.c_str());
+										}
+
+										ImGui::PopID();
+										};
+
+									for (int rootIdx : childModel->ifcInfo.rootIndices) {
+										drawIfcNode(rootIdx);
+									}
+								}
+
+								ImGui::EndChild();
 							}
-							ImGui::EndChild();
+							else {
+								if (ImGui::Button("Show All##ifc_flat")) {
+									for (size_t childIdx : gpuModel->childModelIndices) {
+										GPUModel* childModel = modelManager->getModel(childIdx);
+										if (!childModel || !childModel->isValid()) continue;
+										for (auto& l : childModel->ifcInfo.layers) l.visible = true;
+									}
+								}
+								ImGui::SameLine();
+								if (ImGui::Button("Hide All##ifc_flat")) {
+									for (size_t childIdx : gpuModel->childModelIndices) {
+										GPUModel* childModel = modelManager->getModel(childIdx);
+										if (!childModel || !childModel->isValid()) continue;
+										for (auto& l : childModel->ifcInfo.layers) l.visible = false;
+									}
+								}
+
+								ImGui::BeginChild("IfcFlatComposite", ImVec2(0, 260), true);
+
+								for (size_t pi = 0; pi < gpuModel->childModelIndices.size(); ++pi) {
+									GPUModel* childModel = modelManager->getModel(gpuModel->childModelIndices[pi]);
+									if (!childModel || !childModel->isValid()) continue;
+
+									for (size_t i = 0; i < childModel->ifcInfo.layers.size(); ++i) {
+										auto& layer = childModel->ifcInfo.layers[i];
+										ImGui::PushID(static_cast<int>(i) + static_cast<int>(pi) * 100000 + 50000);
+										ImGui::Checkbox("##lv", &layer.visible);
+										ImGui::SameLine();
+										ImGui::Text("%s (%zu)", layer.typeName.c_str(),
+											layer.submeshIndices.size());
+										ImGui::PopID();
+									}
+								}
+
+								ImGui::EndChild();
+							}
 						}
 						else {
-							if (ImGui::Button("Show All##ifc_flat")) {
-								for (auto& l : gpuModel->ifcInfo.layers) l.visible = true;
-							}
+							int mode = static_cast<int>(gpuModel->ifcInfo.viewMode);
+							ImGui::RadioButton("Hierarchy", &mode, 0);
 							ImGui::SameLine();
-							if (ImGui::Button("Hide All##ifc_flat")) {
-								for (auto& l : gpuModel->ifcInfo.layers) l.visible = false;
-							}
+							ImGui::RadioButton("Flat", &mode, 1);
+							gpuModel->ifcInfo.viewMode = static_cast<IfcViewMode>(mode);
 
-							ImGui::BeginChild("IfcFlat", ImVec2(0, 240), true);
-							for (size_t i = 0; i < gpuModel->ifcInfo.layers.size(); ++i) {
-								auto& layer = gpuModel->ifcInfo.layers[i];
-								ImGui::PushID(static_cast<int>(i) + 50000);
-								ImGui::Checkbox("##lv", &layer.visible);
+							if (gpuModel->ifcInfo.viewMode == IfcViewMode::Hierarchy) {
+								if (ImGui::Button("Show All##ifc_tree")) {
+									for (auto& n : gpuModel->ifcInfo.tree) n.visible = true;
+								}
 								ImGui::SameLine();
-								ImGui::Text("%s (%zu)", layer.typeName.c_str(),
-									layer.submeshIndices.size());
-								ImGui::PopID();
+								if (ImGui::Button("Hide All##ifc_tree")) {
+									for (auto& n : gpuModel->ifcInfo.tree) n.visible = false;
+								}
+
+								std::function<void(int)> drawIfcNode = [&](int nodeIdx) {
+									auto& node = gpuModel->ifcInfo.tree[nodeIdx];
+									ImGui::PushID(nodeIdx + 70000);
+
+									bool partial = gpuModel->ifcInfo.isNodePartiallyVisible(nodeIdx);
+									bool vis = node.visible || partial;
+
+									if (partial) {
+										ImGui::PushItemFlag(ImGuiItemFlags_MixedValue, true);
+									}
+
+									if (ImGui::Checkbox("##nodevis", &vis)) {
+										gpuModel->ifcInfo.setNodeVisibility(nodeIdx, vis);
+									}
+
+									if (partial) {
+										ImGui::PopItemFlag();
+									}
+
+									ImGui::SameLine();
+
+									int subtreeCount = gpuModel->ifcInfo.getSubtreeSubmeshCount(nodeIdx);
+									std::string label = node.name + " (" + std::to_string(subtreeCount) + ")";
+
+									if (!node.children.empty()) {
+										bool open = ImGui::TreeNode(label.c_str());
+										if (open) {
+											for (int child : node.children) {
+												drawIfcNode(child);
+											}
+											ImGui::TreePop();
+										}
+									}
+									else {
+										ImGui::Text("%s", label.c_str());
+									}
+
+									ImGui::PopID();
+									};
+
+								ImGui::BeginChild("IfcHierarchy", ImVec2(0, 220), true);
+								for (int rootIdx : gpuModel->ifcInfo.rootIndices) {
+									drawIfcNode(rootIdx);
+								}
+								ImGui::EndChild();
 							}
-							ImGui::EndChild();
+							else {
+								if (ImGui::Button("Show All##ifc_flat")) {
+									for (auto& l : gpuModel->ifcInfo.layers) l.visible = true;
+								}
+								ImGui::SameLine();
+								if (ImGui::Button("Hide All##ifc_flat")) {
+									for (auto& l : gpuModel->ifcInfo.layers) l.visible = false;
+								}
+
+								ImGui::BeginChild("IfcFlat", ImVec2(0, 220), true);
+								for (size_t i = 0; i < gpuModel->ifcInfo.layers.size(); ++i) {
+									auto& layer = gpuModel->ifcInfo.layers[i];
+									ImGui::PushID(static_cast<int>(i) + 50000);
+									ImGui::Checkbox("##lv", &layer.visible);
+									ImGui::SameLine();
+									ImGui::Text("%s (%zu)", layer.typeName.c_str(),
+										layer.submeshIndices.size());
+									ImGui::PopID();
+								}
+								ImGui::EndChild();
+							}
 						}
 					}
 
@@ -4064,49 +4228,88 @@ int main()
 
 					glm::mat4 instanceTransform = inst.getTransformMatrix();
 
-					// Bind vertex/index buffers for this model
-					vk::Buffer modelBuffers[1] = { gpuModel->vertexBuffer->getBuffer() };
-					vk::DeviceSize modelOffsets[1] = { 0 };
-					vk::DeviceSize modelSizes[1] = { sizeof(Vertex) * gpuModel->vertexCount };
-					vk::DeviceSize modelStrides[1] = { sizeof(Vertex) };
+					auto drawShadowModel = [&](GPUModel* drawModel, const glm::mat4& transform) {
+						if (!drawModel || !drawModel->isValid() || drawModel->isComposite) return;
 
-					vk::VertexInputBindingDescription2EXT singleBinding = Vertex::getBindingDescription(0);
-					cmd.setVertexInputEXT(1, &singleBinding,
-						static_cast<uint32_t>(shadowAttribs.size()), shadowAttribs.data());
+						// Bind vertex/index buffers for this model
+						vk::Buffer modelBuffers[1] = { drawModel->vertexBuffer->getBuffer() };
+						vk::DeviceSize modelOffsets[1] = { 0 };
+						vk::DeviceSize modelSizes[1] = { sizeof(Vertex) * drawModel->vertexCount };
+						vk::DeviceSize modelStrides[1] = { sizeof(Vertex) };
 
-					cmd.bindVertexBuffers2(0, 1, modelBuffers, modelOffsets, modelSizes, modelStrides);
-					cmd.bindIndexBuffer(gpuModel->indexBuffer->getBuffer(), 0, vk::IndexType::eUint32);
+						vk::VertexInputBindingDescription2EXT singleBinding = Vertex::getBindingDescription(0);
+						cmd.setVertexInputEXT(1, &singleBinding,
+							static_cast<uint32_t>(shadowAttribs.size()), shadowAttribs.data());
 
-					// Draw all non-blend submeshes for shadow
-					for (const auto& sub : gpuModel->submeshes) {
-						if (sub.material.alphaMode == AlphaMode::BLEND)
-							continue;
+						cmd.bindVertexBuffers2(0, 1, modelBuffers, modelOffsets, modelSizes, modelStrides);
+						cmd.bindIndexBuffer(drawModel->indexBuffer->getBuffer(), 0, vk::IndexType::eUint32);
 
-						ShadowPushConstants shadowPc{};
-						shadowPc.modelMatrix = instanceTransform;
-						shadowPc.alphaCutoff = sub.material.alphaCutoff;
-						shadowPc.alphaMode = static_cast<int>(sub.material.alphaMode);
+						// Draw all non-blend submeshes for shadow
+						for (size_t subIdx = 0; subIdx < drawModel->submeshes.size(); ++subIdx) {
+							const auto& sub = drawModel->submeshes[subIdx];
 
-						cmd.pushConstants(
-							shadowPipelineLayout,
-							vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment,
-							0,
-							sizeof(ShadowPushConstants),
-							&shadowPc
-						);
+							if (!drawModel->ifcInfo.isSubmeshVisible(static_cast<int>(subIdx)))
+								continue;
 
-						// Bind base color texture for alpha testing
-						if (sub.material.alphaMode == AlphaMode::MASK && sub.material.baseColorTextureIndex >= 0 &&
-							sub.material.baseColorTextureIndex < static_cast<int>(gpuModel->textureDescriptorSets.size())) {
-							vk::DescriptorSet baseColorSet = gpuModel->textureDescriptorSets[sub.material.baseColorTextureIndex];
-							cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, shadowPipelineLayout, 1, 1, &baseColorSet, 0, nullptr);
+							if (sub.material.alphaMode == AlphaMode::BLEND)
+								continue;
+
+							ShadowPushConstants shadowPc{};
+							shadowPc.modelMatrix = transform;
+							shadowPc.alphaCutoff = sub.material.alphaCutoff;
+							shadowPc.alphaMode = static_cast<int>(sub.material.alphaMode);
+
+							cmd.pushConstants(
+								shadowPipelineLayout,
+								vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment,
+								0,
+								sizeof(ShadowPushConstants),
+								&shadowPc
+							);
+
+							// Bind base color texture for alpha testing
+							if (sub.material.alphaMode == AlphaMode::MASK &&
+								sub.material.baseColorTextureIndex >= 0 &&
+								sub.material.baseColorTextureIndex < static_cast<int>(drawModel->textureDescriptorSets.size())) {
+								vk::DescriptorSet baseColorSet =
+									drawModel->textureDescriptorSets[sub.material.baseColorTextureIndex];
+								cmd.bindDescriptorSets(
+									vk::PipelineBindPoint::eGraphics,
+									shadowPipelineLayout,
+									1, 1,
+									&baseColorSet,
+									0, nullptr
+								);
+							}
+							else {
+								vk::DescriptorSet defaultSet = modelManager->getDefaultBaseColorSet();
+								cmd.bindDescriptorSets(
+									vk::PipelineBindPoint::eGraphics,
+									shadowPipelineLayout,
+									1, 1,
+									&defaultSet,
+									0, nullptr
+								);
+							}
+
+							cmd.drawIndexed(sub.indexCount, 1, sub.indexOffset, sub.vertexOffset, 0);
 						}
-						else {
-							vk::DescriptorSet defaultSet = modelManager->getDefaultBaseColorSet();
-							cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, shadowPipelineLayout, 1, 1, &defaultSet, 0, nullptr);
-						}
+						};
 
-						cmd.drawIndexed(sub.indexCount, 1, sub.indexOffset, sub.vertexOffset, 0);
+					if (gpuModel->isComposite) {
+						/*std::cout << "[RENDER] Drawing composite " << gpuModel->name
+							<< " children=" << gpuModel->childModelIndices.size() << "\n";*/
+						for (size_t childIdx : gpuModel->childModelIndices) {
+							GPUModel* childModel = modelManager->getModel(childIdx);
+							//std::cout << "  child idx=" << childIdx
+							//	<< " ptr=" << childModel
+							//	<< (childModel ? " valid=" + std::to_string(childModel->isValid()) : "")
+							//	<< "\n";
+							drawShadowModel(childModel, instanceTransform);
+						}
+					}
+					else {
+						drawShadowModel(gpuModel, instanceTransform);
 					}
 				}
 
@@ -4236,105 +4439,124 @@ int main()
 				if (!inst.visible) continue;
 
 				GPUModel* gpuModel = modelManager->getModel(inst.modelIndex);
-				if (!gpuModel || !gpuModel->isValid()) continue;
+				if (!gpuModel) {
+					std::cout << "[RENDER] null model for instance " << inst.name << "\n";
+					continue;
+				}
+				if (!gpuModel->isValid()) {
+					std::cout << "[RENDER] invalid model for instance " << inst.name
+						<< " name=" << gpuModel->name
+						<< " isComposite=" << gpuModel->isComposite
+						<< "\n";
+					continue;
+				}
 
 				glm::mat4 instanceTransform = inst.getTransformMatrix();
 
-				// Bind vertex/index buffers for this model
-				vk::Buffer modelBuffers[1] = { gpuModel->vertexBuffer->getBuffer() };
-				vk::DeviceSize modelOffsets[1] = { 0 };
-				vk::DeviceSize modelSizes[1] = { sizeof(Vertex) * gpuModel->vertexCount };
-				vk::DeviceSize modelStrides[1] = { sizeof(Vertex) };
+				auto drawSingleGpuModel = [&](GPUModel* drawModel, const glm::mat4& transform) {
+					if (!drawModel || !drawModel->isValid() || drawModel->isComposite) return;
+					if (!drawModel->vertexBuffer || !drawModel->indexBuffer) return;
 
-				// Update vertex input for single buffer (no instancing for now)
-				vk::VertexInputBindingDescription2EXT singleBinding = Vertex::getBindingDescription(0);
-				cmd.setVertexInputEXT(1, &singleBinding,
-					static_cast<uint32_t>(mainAttribs.size()), mainAttribs.data());
+					vk::Buffer modelBuffers[1] = { drawModel->vertexBuffer->getBuffer() };
+					vk::DeviceSize modelOffsets[1] = { 0 };
+					vk::DeviceSize modelSizes[1] = { sizeof(Vertex) * drawModel->vertexCount };
+					vk::DeviceSize modelStrides[1] = { sizeof(Vertex) };
 
-				cmd.bindVertexBuffers2(0, 1, modelBuffers, modelOffsets, modelSizes, modelStrides);
-				cmd.bindIndexBuffer(gpuModel->indexBuffer->getBuffer(), 0, vk::IndexType::eUint32);
+					vk::VertexInputBindingDescription2EXT singleBinding = Vertex::getBindingDescription(0);
+					cmd.setVertexInputEXT(1, &singleBinding,
+						static_cast<uint32_t>(mainAttribs.size()), mainAttribs.data());
 
-				// Sort submeshes
-				auto sortedSubmeshes = sortSubmeshesForRendering(
-					gpuModel->submeshes,
-					std::vector<Vertex>(), 
-					camera.position
-				);
+					cmd.bindVertexBuffers2(0, 1, modelBuffers, modelOffsets, modelSizes, modelStrides);
+					cmd.bindIndexBuffer(drawModel->indexBuffer->getBuffer(), 0, vk::IndexType::eUint32);
 
-				bool currentlyBlending = false;
-
-				for (const auto& renderSub : sortedSubmeshes) {
-					const auto& sub = gpuModel->submeshes[renderSub.submeshIndex];
-
-					if (!gpuModel->ifcInfo.isSubmeshVisible(renderSub.submeshIndex))
-						continue;
-
-					bool needsBlending = (sub.material.alphaMode == AlphaMode::BLEND);
-
-					if (needsBlending != currentlyBlending) {
-						currentlyBlending = needsBlending;
-
-						if (needsBlending) {
-							cmd.setColorBlendEnableEXT(0, VK_TRUE);
-							vk::ColorBlendEquationEXT blendEquation{};
-							blendEquation.srcColorBlendFactor = vk::BlendFactor::eSrcAlpha;
-							blendEquation.dstColorBlendFactor = vk::BlendFactor::eOneMinusSrcAlpha;
-							blendEquation.colorBlendOp = vk::BlendOp::eAdd;
-							blendEquation.srcAlphaBlendFactor = vk::BlendFactor::eOne;
-							blendEquation.dstAlphaBlendFactor = vk::BlendFactor::eOneMinusSrcAlpha;
-							blendEquation.alphaBlendOp = vk::BlendOp::eAdd;
-							cmd.setColorBlendEquationEXT(0, 1, &blendEquation);
-							cmd.setDepthWriteEnable(VK_FALSE);
-						}
-						else {
-							cmd.setColorBlendEnableEXT(0, VK_FALSE);
-							cmd.setDepthWriteEnable(VK_TRUE);
-						}
-					}
-
-					// Push constants
-					MeshPushConstants pc{};
-					pc.modelMatrix = instanceTransform;
-					pc.baseColor = sub.material.baseColorFactor;
-					pc.metallic = sub.material.metallicFactor;
-					pc.roughness = sub.material.roughnessFactor;
-					pc.alphaCutoff = sub.material.alphaCutoff;
-					pc.alphaMode = static_cast<int>(sub.material.alphaMode);
-
-					cmd.pushConstants(
-						pipelineLayout,
-						vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment,
-						0, sizeof(MeshPushConstants), &pc
+					auto sortedSubmeshes = sortSubmeshesForRendering(
+						drawModel->submeshes,
+						std::vector<Vertex>(),
+						camera.position
 					);
 
-					// Bind textures
-					vk::DescriptorSet baseColorSet = (sub.material.baseColorTextureIndex >= 0 &&
-						sub.material.baseColorTextureIndex < static_cast<int>(gpuModel->textureDescriptorSets.size()))
-						? gpuModel->textureDescriptorSets[sub.material.baseColorTextureIndex]
-						: modelManager->getDefaultBaseColorSet();
-					cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipelineLayout, 1, 1, &baseColorSet, 0, nullptr);
+					bool currentlyBlending = false;
 
-					vk::DescriptorSet normalSet = (sub.material.normalTextureIndex >= 0 &&
-						sub.material.normalTextureIndex < static_cast<int>(gpuModel->textureDescriptorSets.size()))
-						? gpuModel->textureDescriptorSets[sub.material.normalTextureIndex]
-						: modelManager->getDefaultNormalSet();
-					cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipelineLayout, 2, 1, &normalSet, 0, nullptr);
+					for (const auto& renderSub : sortedSubmeshes) {
+						const auto& sub = drawModel->submeshes[renderSub.submeshIndex];
 
-					vk::DescriptorSet mrSet = (sub.material.metallicRoughnessTextureIndex >= 0 &&
-						sub.material.metallicRoughnessTextureIndex < static_cast<int>(gpuModel->textureDescriptorSets.size()))
-						? gpuModel->textureDescriptorSets[sub.material.metallicRoughnessTextureIndex]
-						: modelManager->getDefaultMRSet();
-					cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipelineLayout, 3, 1, &mrSet, 0, nullptr);
+						if (!drawModel->ifcInfo.isSubmeshVisible(static_cast<int>(renderSub.submeshIndex)))
+							continue;
 
-					cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipelineLayout, 4, 1, &shadowMapDescriptorSet, 0, nullptr);
+						bool needsBlending = (sub.material.alphaMode == AlphaMode::BLEND);
 
-					// Draw
-					cmd.drawIndexed(sub.indexCount, 1, sub.indexOffset, sub.vertexOffset, 0);
+						if (needsBlending != currentlyBlending) {
+							currentlyBlending = needsBlending;
+
+							if (needsBlending) {
+								cmd.setColorBlendEnableEXT(0, VK_TRUE);
+								vk::ColorBlendEquationEXT blendEquation{};
+								blendEquation.srcColorBlendFactor = vk::BlendFactor::eSrcAlpha;
+								blendEquation.dstColorBlendFactor = vk::BlendFactor::eOneMinusSrcAlpha;
+								blendEquation.colorBlendOp = vk::BlendOp::eAdd;
+								blendEquation.srcAlphaBlendFactor = vk::BlendFactor::eOne;
+								blendEquation.dstAlphaBlendFactor = vk::BlendFactor::eOneMinusSrcAlpha;
+								blendEquation.alphaBlendOp = vk::BlendOp::eAdd;
+								cmd.setColorBlendEquationEXT(0, 1, &blendEquation);
+								cmd.setDepthWriteEnable(VK_FALSE);
+							}
+							else {
+								cmd.setColorBlendEnableEXT(0, VK_FALSE);
+								cmd.setDepthWriteEnable(VK_TRUE);
+							}
+						}
+
+						MeshPushConstants pc{};
+						pc.modelMatrix = transform;
+						pc.baseColor = sub.material.baseColorFactor;
+						pc.metallic = sub.material.metallicFactor;
+						pc.roughness = sub.material.roughnessFactor;
+						pc.alphaCutoff = sub.material.alphaCutoff;
+						pc.alphaMode = static_cast<int>(sub.material.alphaMode);
+
+						cmd.pushConstants(
+							pipelineLayout,
+							vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment,
+							0, sizeof(MeshPushConstants), &pc
+						);
+
+						vk::DescriptorSet baseColorSet = (sub.material.baseColorTextureIndex >= 0 &&
+							sub.material.baseColorTextureIndex < static_cast<int>(drawModel->textureDescriptorSets.size()))
+							? drawModel->textureDescriptorSets[sub.material.baseColorTextureIndex]
+							: modelManager->getDefaultBaseColorSet();
+						cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipelineLayout, 1, 1, &baseColorSet, 0, nullptr);
+
+						vk::DescriptorSet normalSet = (sub.material.normalTextureIndex >= 0 &&
+							sub.material.normalTextureIndex < static_cast<int>(drawModel->textureDescriptorSets.size()))
+							? drawModel->textureDescriptorSets[sub.material.normalTextureIndex]
+							: modelManager->getDefaultNormalSet();
+						cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipelineLayout, 2, 1, &normalSet, 0, nullptr);
+
+						vk::DescriptorSet mrSet = (sub.material.metallicRoughnessTextureIndex >= 0 &&
+							sub.material.metallicRoughnessTextureIndex < static_cast<int>(drawModel->textureDescriptorSets.size()))
+							? drawModel->textureDescriptorSets[sub.material.metallicRoughnessTextureIndex]
+							: modelManager->getDefaultMRSet();
+						cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipelineLayout, 3, 1, &mrSet, 0, nullptr);
+
+						cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipelineLayout, 4, 1, &shadowMapDescriptorSet, 0, nullptr);
+
+						cmd.drawIndexed(sub.indexCount, 1, sub.indexOffset, sub.vertexOffset, 0);
+					}
+
+					if (currentlyBlending) {
+						cmd.setColorBlendEnableEXT(0, VK_FALSE);
+						cmd.setDepthWriteEnable(VK_TRUE);
+					}
+					};
+
+				if (gpuModel->isComposite) {
+					for (size_t childIdx : gpuModel->childModelIndices) {
+						GPUModel* childModel = modelManager->getModel(childIdx);
+						drawSingleGpuModel(childModel, instanceTransform);
+					}
 				}
-
-				if (currentlyBlending) {
-					cmd.setColorBlendEnableEXT(0, VK_FALSE);
-					cmd.setDepthWriteEnable(VK_TRUE);
+				else {
+					drawSingleGpuModel(gpuModel, instanceTransform);
 				}
 			}
 

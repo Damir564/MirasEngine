@@ -23,6 +23,8 @@ struct IfcTreeNode {
     bool visible = true;
 };
 
+struct IfcCompositePart;
+
 struct IfcInfo {
     bool isIfc = false;
 
@@ -33,6 +35,9 @@ struct IfcInfo {
     std::vector<int> submeshToNode;
 
     IfcViewMode viewMode = IfcViewMode::Hierarchy;
+
+    bool isCompositeIfc = false;
+    std::vector<IfcCompositePart> parts;
 
     bool isSubmeshVisibleFlat(int submeshIdx) const {
         if (!isIfc) return true;
@@ -116,6 +121,29 @@ struct IfcInfo {
         return false;
     }
 
+    bool isNodePartiallyVisible(int nodeIdx) const {
+        if (nodeIdx < 0 || nodeIdx >= static_cast<int>(tree.size()))
+            return false;
+
+        if (tree[nodeIdx].children.empty())
+            return false;
+
+        bool anyVisible = false;
+        bool anyHidden = false;
+
+        for (int childIdx : tree[nodeIdx].children) {
+            if (hasAnyVisibleInSubtree(childIdx))
+                anyVisible = true;
+            else
+                anyHidden = true;
+
+            if (anyVisible && anyHidden)
+                return true;
+        }
+
+        return false;
+    }
+
     void refreshParentVisibilityUpwards(int nodeIdx) {
         if (nodeIdx < 0 || nodeIdx >= static_cast<int>(tree.size())) return;
 
@@ -173,4 +201,9 @@ struct IfcInfo {
         }
     }
 
+};
+
+struct IfcCompositePart {
+    std::string name;
+    IfcInfo info;
 };

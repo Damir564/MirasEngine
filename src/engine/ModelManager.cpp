@@ -227,6 +227,39 @@ vk::DescriptorSet ModelManager::allocateTextureDescriptorSet(vk::ImageView view)
     return set;
 }
 
+void ModelManager::loadCompositeModelAsync(const std::vector<std::string>& paths, const std::string& name) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+
+    LoadingTask task;
+    task.name = name;
+    task.state = LoadingState::LoadingCPU;
+    task.isComposite = true;
+    task.compositePaths = paths;
+
+    task.compositeNames.reserve(paths.size());
+    for (const auto& p : paths) {
+        task.compositeNames.push_back(std::filesystem::path(p).stem().string());
+    }
+
+    task.compositeFuture = std::async(std::launch::async, [paths]() {
+        LoadedCompositeResult result;
+        result.paths = paths;
+        result.names.reserve(paths.size());
+        result.parts.reserve(paths.size());
+
+        for (const auto& p : paths) {
+            LoadedResult part;
+            part.mesh = loadModelSmart(p, &part.ifcInfo);
+            result.parts.push_back(std::move(part));
+            result.names.push_back(std::filesystem::path(p).stem().string());
+        }
+
+        return result;
+        });
+
+    m_loadingTasks.push_back(std::move(task));
+}
+
 void ModelManager::loadModelAsync(const std::string& path, const std::string& name) {
     std::lock_guard<std::mutex> lock(m_mutex);
 
@@ -372,28 +405,126 @@ void ModelManager::update() {
         LoadingTask& task = *it;
 
         if (task.state == LoadingState::LoadingCPU) {
-            if (task.meshFuture.valid() &&
-                task.meshFuture.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
-                try {
-                    auto result = task.meshFuture.get();
-                    task.loadedMesh = std::move(result.mesh);
-                    task.ifcInfo = std::move(result.ifcInfo);
-                    task.state = LoadingState::UploadingGPU;
+            if (task.isComposite) {
+                if (task.compositeFuture.valid() &&
+                    task.compositeFuture.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
+                    try {
+                        auto result = task.compositeFuture.get();
+                        task.compositeParts = std::move(result.parts);
+                        task.compositePaths = std::move(result.paths);
+                        task.compositeNames = std::move(result.names);
+                        task.state = LoadingState::UploadingGPU;
+                    }
+                    catch (const std::exception& e) {
+                        task.state = LoadingState::Failed;
+                        task.errorMessage = e.what();
+                        std::cerr << "[ModelManager] Composite load failed: " << e.what() << "\n";
+                    }
                 }
-                catch (const std::exception& e) {
-                    task.state = LoadingState::Failed;
-                    task.errorMessage = e.what();
-                    std::cerr << "[ModelManager] Failed: " << e.what() << "\n";
+            }
+            else {
+                if (task.meshFuture.valid() &&
+                    task.meshFuture.wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
+                    try {
+                        auto result = task.meshFuture.get();
+                        task.loadedMesh = std::move(result.mesh);
+                        task.ifcInfo = std::move(result.ifcInfo);
+                        task.state = LoadingState::UploadingGPU;
+                    }
+                    catch (const std::exception& e) {
+                        task.state = LoadingState::Failed;
+                        task.errorMessage = e.what();
+                        std::cerr << "[ModelManager] Failed: " << e.what() << "\n";
+                    }
                 }
             }
         }
 
         if (task.state == LoadingState::UploadingGPU) {
             try {
-                m_mutex.unlock();
-                size_t idx = uploadModelToGPU(task.loadedMesh, task.name, task.path);
-                m_models[idx]->ifcInfo = std::move(task.ifcInfo);
-                m_mutex.lock();
+                auto uploadStart = std::chrono::high_resolution_clock::now();
+
+                if (task.isComposite) {
+                    std::vector<size_t> childIndices;
+                    childIndices.reserve(task.compositeParts.size());
+
+                    glm::vec3 bmin(FLT_MAX);
+                    glm::vec3 bmax(-FLT_MAX);
+                    bool hasBounds = false;
+
+                    for (size_t i = 0; i < task.compositeParts.size(); ++i) {
+                        size_t idx = uploadModelToGPU(task.compositeParts[i].mesh, task.compositeNames[i], task.compositePaths[i]);
+                        m_models[idx]->ifcInfo = std::move(task.compositeParts[i].ifcInfo);
+                        m_models[idx]->hiddenFromUI = true;
+                        childIndices.push_back(idx);
+
+                        GPUModel* child = m_models[idx].get();
+                        if (child && child->isValid()) {
+                            if (!hasBounds) {
+                                bmin = child->boundsMin;
+                                bmax = child->boundsMax;
+                                hasBounds = true;
+                            }
+                            else {
+                                bmin = glm::min(bmin, child->boundsMin);
+                                bmax = glm::max(bmax, child->boundsMax);
+                            }
+                        }
+                    }
+
+                    auto composite = std::make_unique<GPUModel>();
+                    composite->name = task.name;
+                    composite->sourcePath = "[composite]";
+                    composite->isComposite = true;
+                    composite->childModelIndices = std::move(childIndices);
+
+                    composite->ifcInfo.isIfc = true;
+                    composite->ifcInfo.isCompositeIfc = true;
+                    composite->ifcInfo.viewMode = IfcViewMode::Hierarchy;
+
+                    for (size_t i = 0; i < task.compositeParts.size(); ++i) {
+                        IfcCompositePart part;
+                        part.name = task.compositeNames[i];
+                        part.info = m_models[composite->childModelIndices[i]]->ifcInfo;
+                        composite->ifcInfo.parts.push_back(std::move(part));
+                    }
+
+                    if (hasBounds) {
+                        composite->boundsMin = bmin;
+                        composite->boundsMax = bmax;
+                        composite->boundsCenter = (bmin + bmax) * 0.5f;
+                        composite->boundsRadius = glm::length(bmax - bmin) * 0.5f;
+                    }
+
+                    m_models.push_back(std::move(composite));
+
+                    GPUModel* comp = m_models.back().get();
+                    std::cout << "[COMPOSITE] Created group '" << comp->name << "' with children: ";
+                    for (size_t childIdx : comp->childModelIndices) {
+                        std::cout << childIdx << " ";
+                    }
+                    std::cout << "\n";
+
+                    for (size_t childIdx : comp->childModelIndices) {
+                        GPUModel* child = m_models[childIdx].get();
+                        if (child) {
+                            std::cout << "  child[" << childIdx << "] name=" << child->name
+                                << " valid=" << child->isValid()
+                                << " verts=" << child->vertexCount
+                                << " hiddenFromUI=" << child->hiddenFromUI
+                                << "\n";
+                        }
+                    }
+                }
+                else {
+                    size_t idx = uploadModelToGPU(task.loadedMesh, task.name, task.path);
+                    m_models[idx]->ifcInfo = std::move(task.ifcInfo);
+                }
+
+                auto uploadEnd = std::chrono::high_resolution_clock::now();
+                float uploadMs = std::chrono::duration<float, std::milli>(uploadEnd - uploadStart).count();
+                std::cout << "[ModelManager] GPU upload: " << uploadMs << " ms\n";
+
                 task.state = LoadingState::Complete;
             }
             catch (const std::exception& e) {

@@ -15,6 +15,10 @@
 class TextureImage;
 
 struct GPUModel {
+
+    bool isComposite = false;
+    bool hiddenFromUI = false;
+    std::vector<size_t> childModelIndices;
     std::string name;
     std::string sourcePath;
 
@@ -35,7 +39,11 @@ struct GPUModel {
 
     IfcInfo ifcInfo;
 
-    bool isValid() const { return vertexBuffer != nullptr && indexBuffer != nullptr; }
+    bool isValid() const {
+        if (isComposite)
+            return !childModelIndices.empty();
+        return vertexBuffer && indexBuffer && vertexCount > 0 && indexCount > 0;
+    }
 };
 
 struct ModelInstance {
@@ -69,6 +77,12 @@ struct LoadedResult {
     IfcInfo ifcInfo;
 };
 
+struct LoadedCompositeResult {
+    std::vector<LoadedResult> parts;
+    std::vector<std::string> paths;
+    std::vector<std::string> names;
+};
+
 struct LoadingTask {
     std::string path;
     std::string name;
@@ -78,6 +92,13 @@ struct LoadingTask {
     std::future<LoadedResult> meshFuture;
     Mesh loadedMesh;
     IfcInfo ifcInfo;
+
+    bool isComposite = false;
+    std::vector<std::string> compositePaths;
+    std::vector<std::string> compositeNames;
+
+    std::future<LoadedCompositeResult> compositeFuture;
+    std::vector<LoadedResult> compositeParts;
 };
 
 class ModelManager {
@@ -89,6 +110,8 @@ public:
 
     ModelManager(const ModelManager&) = delete;
     ModelManager& operator=(const ModelManager&) = delete;
+
+    void loadCompositeModelAsync(const std::vector<std::string>& paths, const std::string& name);
 
     void loadModelAsync(const std::string& path, const std::string& name = "");
     size_t loadModelSync(const std::string& path, const std::string& name = "");
