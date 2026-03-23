@@ -1164,18 +1164,12 @@ void processFastGltfNode(fastgltf::Asset& asset, size_t nodeIndex, const glm::ma
 						tangents[i] = glm::vec4(v.x(), v.y(), v.z(), v.w());
 					});
 			}
-
-			// === TRANSFORM AND PUSH ===
 			for (size_t i = 0; i < vCount; ++i) {
 				Vertex v{};
 				v.position = glm::vec3(globalTransform * glm::vec4(positions[i], 1.0f));
-
-				// Apply Normal Matrix
 				v.normal = glm::normalize(normalMatrix * normals[i]);
 
-				// Handle Tangents safely
 				glm::vec3 tXYZ = glm::vec3(tangents[i]);
-				// Only normalize if length is valid to prevent NaN
 				if (glm::length(tXYZ) > 0.0001f) {
 					glm::vec3 transformedTangent = glm::normalize(normalMatrix * tXYZ);
 					v.tangent = glm::vec4(transformedTangent, tangents[i].w);
@@ -1192,7 +1186,6 @@ void processFastGltfNode(fastgltf::Asset& asset, size_t nodeIndex, const glm::ma
 				result.indices.push_back(idx);
 			}
 
-			// === MATERIALS (Existing logic) ===
 			if (primitive.materialIndex.has_value()) {
 				const auto& material = asset.materials[primitive.materialIndex.value()];
 				auto& pbr = material.pbrData;
@@ -1299,9 +1292,6 @@ size_t calculateTotalVertices(const fastgltf::Asset& asset) {
 	return totalVertices;
 }
 
-// =============================================================
-// Main Load Function
-// =============================================================
 IfcInfo buildIfcLayers(const fastgltf::Asset& asset,
 	const std::vector<size_t>& submeshNodeMap) {
 	IfcInfo info;
@@ -1411,8 +1401,6 @@ Mesh loadWithFastGltf(const std::string& path) {
 		processFastGltfNode(asset, nodeIndex, rootTransform, result, textureCache, path);
 	}
 
-	// 3. Parallel Texture Loading
-	// Now that result.textureData is fully populated and stable, we process it in parallel.
 	if (!result.textureData.empty()) {
 		std::cout << "Decoding " << result.textureData.size() << " textures in parallel...\n";
 
@@ -1420,13 +1408,11 @@ Mesh loadWithFastGltf(const std::string& path) {
 		futures.reserve(result.textureData.size());
 
 		for (auto& tex : result.textureData) {
-			// Launch async job for each texture
 			futures.push_back(std::async(std::launch::async, [&tex]() {
 				decodeTextureParallel(tex);
 				}));
 		}
 
-		// Wait for all threads to finish
 		for (auto& f : futures) {
 			f.wait();
 		}
@@ -1436,51 +1422,36 @@ Mesh loadWithFastGltf(const std::string& path) {
 	return result;
 }
 
-Mesh loadIfcModel(const std::string& ifcPath, IfcInfo& outInfo) {
-	// 1. Convert IFC -> GLB
-	auto glbOpt = IfcConverter::toGlb(ifcPath);
-	if (!glbOpt) throw std::runtime_error("IFC conversion failed: " + ifcPath);
-	std::string glbPath = *glbOpt;
-
-	// 2. Load GLB with your existing FAST loader — no changes needed
+Mesh loadIfcModel(const std::string& ifcPath, const std::string& glbPath, IfcInfo& outInfo) {
 	Mesh result = loadWithFastGltf(glbPath);
-
-	// 3. Cheap second pass: read only node tree for layer info (no geometry)
 	fastgltf::Parser parser;
 	auto gltfFile = fastgltf::MappedGltfFile::FromPath(glbPath);
-	if (!gltfFile) {
-		outInfo = {};
-		return result;
-	}
+	if (gltfFile) {
+		auto assetRet = parser.loadGltf(gltfFile.get(),
+			std::filesystem::path(glbPath).parent_path(), fastgltf::Options::None);
 
-	auto assetRet = parser.loadGltf(gltfFile.get(),
-		std::filesystem::path(glbPath).parent_path(), fastgltf::Options::None);
+		if (assetRet.error() == fastgltf::Error::None) {
+			auto& asset = assetRet.get();
+			std::vector<size_t> nodeMap;
 
-	if (assetRet.error() == fastgltf::Error::None) {
-		auto& asset = assetRet.get();
-		std::vector<size_t> nodeMap;
-
-		size_t scn = asset.defaultScene.value_or(0);
-		if (!asset.scenes.empty()) {
-			// Walk in same order as loadWithFastGltf to match submesh indices
-			std::function<void(size_t)> walk = [&](size_t ni) {
-				const auto& n = asset.nodes[ni];
-				if (n.meshIndex.has_value()) {
-					size_t primCount = asset.meshes[*n.meshIndex].primitives.size();
-					for (size_t p = 0; p < primCount; ++p) {
-						nodeMap.push_back(ni);
+			size_t scn = asset.defaultScene.value_or(0);
+			if (!asset.scenes.empty()) {
+				std::function<void(size_t)> walk = [&](size_t ni) {
+					const auto& n = asset.nodes[ni];
+					if (n.meshIndex.has_value()) {
+						size_t primCount = asset.meshes[*n.meshIndex].primitives.size();
+						for (size_t p = 0; p < primCount; ++p)
+							nodeMap.push_back(ni);
 					}
-				}
-				for (size_t c : n.children) walk(c);
-				};
-			for (size_t ni : asset.scenes[scn].nodeIndices) walk(ni);
-		}
+					for (size_t c : n.children) walk(c);
+					};
+				for (size_t ni : asset.scenes[scn].nodeIndices) walk(ni);
+			}
 
-		outInfo = buildIfcLayers(asset, nodeMap);
+			outInfo = buildIfcLayers(asset, nodeMap);
+		}
 	}
 
-	std::cout << "[IFC] " << result.vertices.size() << " verts, "
-		<< outInfo.layers.size() << " layers\n";
 	return result;
 }
 
@@ -1564,7 +1535,7 @@ Mesh loadModelSmart(const std::string& path, IfcInfo* outIfcInfo = nullptr) {
 
 	if (!loadedFromCache) {
 		if (isIfc) {
-			result = loadIfcModel(path, ifcInfo);
+			result = loadIfcModel(path, loadPath, ifcInfo);
 		}
 		else if (ext == ".gltf" || ext == ".glb") {
 			result = loadWithFastGltf(loadPath);
