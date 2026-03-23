@@ -50,11 +50,10 @@ struct IfcInfo {
             return true;
 
         int nodeIdx = submeshToNode[submeshIdx];
-        while (nodeIdx >= 0) {
-            if (!tree[nodeIdx].visible) return false;
-            nodeIdx = tree[nodeIdx].parent;
-        }
-        return true;
+        if (nodeIdx < 0 || nodeIdx >= static_cast<int>(tree.size()))
+            return true;
+
+        return tree[nodeIdx].visible;
     }
 
     bool isSubmeshVisible(int submeshIdx) const {
@@ -74,6 +73,27 @@ struct IfcInfo {
         }
     }
 
+    void setNodeVisibleWithParents(int nodeIdx, bool v) {
+        if (nodeIdx < 0 || nodeIdx >= static_cast<int>(tree.size())) return;
+
+        tree[nodeIdx].visible = v;
+
+        if (v) {
+            int p = tree[nodeIdx].parent;
+            while (p >= 0) {
+                tree[p].visible = true;
+                p = tree[p].parent;
+            }
+        }
+        else {
+            for (int child : tree[nodeIdx].children) {
+                setNodeVisibleRecursive(child, false);
+            }
+        }
+
+        
+    }
+
     int getSubtreeSubmeshCount(int nodeIdx) const {
         if (nodeIdx < 0 || nodeIdx >= static_cast<int>(tree.size())) return 0;
         int count = static_cast<int>(tree[nodeIdx].submeshIndices.size());
@@ -81,5 +101,57 @@ struct IfcInfo {
             count += getSubtreeSubmeshCount(child);
         }
         return count;
+    }
+
+    bool hasAnyVisibleInSubtree(int nodeIdx) const {
+        if (nodeIdx < 0 || nodeIdx >= static_cast<int>(tree.size())) return false;
+
+        if (tree[nodeIdx].visible)
+            return true;
+
+        for (int child : tree[nodeIdx].children) {
+            if (hasAnyVisibleInSubtree(child))
+                return true;
+        }
+        return false;
+    }
+
+    void refreshParentVisibilityUpwards(int nodeIdx) {
+        if (nodeIdx < 0 || nodeIdx >= static_cast<int>(tree.size())) return;
+
+        int parentIdx = tree[nodeIdx].parent;
+        while (parentIdx >= 0) {
+            bool anyVisible = false;
+
+            for (int childIdx : tree[parentIdx].children) {
+                if (hasAnyVisibleInSubtree(childIdx)) {
+                    anyVisible = true;
+                    break;
+                }
+            }
+
+            tree[parentIdx].visible = anyVisible;
+            parentIdx = tree[parentIdx].parent;
+        }
+    }
+
+    void setNodeVisibility(int nodeIdx, bool v) {
+        if (nodeIdx < 0 || nodeIdx >= static_cast<int>(tree.size())) return;
+
+        // If parent clicked: affect full subtree
+        setNodeVisibleRecursive(nodeIdx, v);
+
+        if (v) {
+            // turn on all parents too
+            int parentIdx = tree[nodeIdx].parent;
+            while (parentIdx >= 0) {
+                tree[parentIdx].visible = true;
+                parentIdx = tree[parentIdx].parent;
+            }
+        }
+        else {
+            // if disabled, parents may need to turn off too
+            refreshParentVisibilityUpwards(nodeIdx);
+        }
     }
 };

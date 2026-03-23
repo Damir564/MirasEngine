@@ -1371,6 +1371,76 @@ size_t calculateTotalVertices(const fastgltf::Asset& asset) {
 //	return info;
 //}
 
+static std::string toLowerCopy(std::string s) {
+	std::transform(s.begin(), s.end(), s.begin(),
+		[](unsigned char c) { return (char)std::tolower(c); });
+	return s;
+}
+
+static bool containsInsensitive(const std::string& text, const std::string& sub) {
+	return toLowerCopy(text).find(toLowerCopy(sub)) != std::string::npos;
+}
+
+static std::string classifyIfcSemanticGroup(const std::string& family, const std::string& type, const std::string& fullName) {
+	const std::string f = toLowerCopy(family);
+	const std::string t = toLowerCopy(type);
+	const std::string n = toLowerCopy(fullName);
+
+	// Spaces / rooms
+	if (containsInsensitive(n, "space") || containsInsensitive(f, "space"))
+		return "Spaces";
+
+	// Structural / architectural
+	if (containsInsensitive(n, "wall") || containsInsensitive(n, "slab") ||
+		containsInsensitive(n, "roof") || containsInsensitive(n, "door") ||
+		containsInsensitive(n, "window") || containsInsensitive(n, "column") ||
+		containsInsensitive(n, "beam") || containsInsensitive(n, "stair") ||
+		containsInsensitive(n, "railing"))
+		return "Architecture / Structure";
+
+	// Piping
+	if (containsInsensitive(f, "pipe") || containsInsensitive(n, "pipe") ||
+		containsInsensitive(f, "elbow") || containsInsensitive(f, "tee") ||
+		containsInsensitive(f, "transition") || containsInsensitive(f, "valve") ||
+		containsInsensitive(f, "backflow"))
+		return "Piping";
+
+	// HVAC / ducting
+	if (containsInsensitive(f, "duct") || containsInsensitive(n, "duct") ||
+		containsInsensitive(f, "fan") || containsInsensitive(f, "hvac") ||
+		containsInsensitive(f, "diffuser") || containsInsensitive(f, "air"))
+		return "HVAC";
+
+	// Electrical
+	if (containsInsensitive(f, "receptacle") || containsInsensitive(f, "switch") ||
+		containsInsensitive(f, "panel") || containsInsensitive(f, "lighting") ||
+		containsInsensitive(f, "telephone") || containsInsensitive(f, "conduit"))
+		return "Electrical";
+
+	// Fire / safety / low voltage
+	if (containsInsensitive(f, "smoke detector") || containsInsensitive(f, "fire alarm") ||
+		containsInsensitive(f, "alarm"))
+		return "Fire / Safety";
+
+	// Plumbing fixtures
+	if (containsInsensitive(f, "lavatory") || containsInsensitive(f, "water closet") ||
+		containsInsensitive(f, "bath tub") || containsInsensitive(f, "sink") ||
+		containsInsensitive(f, "shower") || containsInsensitive(f, "roof drain"))
+		return "Plumbing Fixtures";
+
+	// Equipment
+	if (containsInsensitive(f, "radiator") || containsInsensitive(f, "boiler") ||
+		containsInsensitive(f, "pump") || containsInsensitive(f, "refrigerator") ||
+		containsInsensitive(f, "microwave") || containsInsensitive(f, "range"))
+		return "Equipment";
+
+	// Furniture / generic fixtures
+	if (containsInsensitive(f, "furniture") || containsInsensitive(f, "fixture"))
+		return "Fixtures";
+
+	return "Other";
+}
+
 static std::string trimCopy(std::string s) {
 	while (!s.empty() && std::isspace((unsigned char)s.front())) s.erase(s.begin());
 	while (!s.empty() && std::isspace((unsigned char)s.back())) s.pop_back();
@@ -1385,26 +1455,14 @@ static bool isDigitsOnly(const std::string& s) {
 	return true;
 }
 
-// Try to extract codes like A101, A101-M, B203 etc.
-static std::string extractGroupCode(const std::string& text) {
-	for (size_t i = 0; i < text.size(); ++i) {
-		if (std::isalpha((unsigned char)text[i])) {
-			size_t j = i + 1;
-			while (j < text.size() && std::isdigit((unsigned char)text[j])) j++;
+static std::string makeCompactChildLabel(const std::string& family, const std::string& type) {
+	if (type.empty() || type == family)
+		return family;
 
-			if (j > i + 1) {
-				// optional suffix like -M
-				size_t k = j;
-				if (k + 1 < text.size() && text[k] == '-' && std::isalpha((unsigned char)text[k + 1])) {
-					++k;
-					while (k < text.size() && (std::isalnum((unsigned char)text[k]) || text[k] == '-')) k++;
-					return text.substr(i, k - i);
-				}
-				return text.substr(i, j - i);
-			}
-		}
-	}
-	return "General";
+	if (family.find(type) != std::string::npos)
+		return family;
+
+	return family + " / " + type;
 }
 
 IfcInfo buildIfcLayers(const fastgltf::Asset& asset,
@@ -1439,9 +1497,8 @@ IfcInfo buildIfcLayers(const fastgltf::Asset& asset,
 	// -----------------------------------
 	// Hierarchy: Family -> Type -> GroupCode
 	// -----------------------------------
-	std::unordered_map<std::string, int> familyMap;
-	std::unordered_map<std::string, int> typeNodeMap;
-	std::unordered_map<std::string, int> groupNodeMap;
+	std::unordered_map<std::string, int> categoryMap;
+	std::unordered_map<std::string, int> childMap;
 
 	info.submeshToNode.resize(submeshNodeMap.size(), -1);
 
@@ -1500,49 +1557,42 @@ IfcInfo buildIfcLayers(const fastgltf::Asset& asset,
 		std::string family = parts.size() > 0 ? parts[0] : "Other";
 		std::string type = parts.size() > 1 ? parts[1] : family;
 
-		std::string groupCode = "General";
-		for (const auto& p : parts) {
-			std::string code = extractGroupCode(p);
-			if (code != "General") {
-				groupCode = code;
-				break;
-			}
-		}
+		std::string category = classifyIfcSemanticGroup(family, type, fullName);
 
-		int familyIdx;
-		auto fit = familyMap.find(family);
-		if (fit == familyMap.end()) {
-			familyIdx = createNode(family, -1);
-			familyMap[family] = familyIdx;
+		int categoryIdx;
+		auto catIt = categoryMap.find(category);
+		if (catIt == categoryMap.end()) {
+			categoryIdx = createNode(category, -1);
+			categoryMap[category] = categoryIdx;
 		}
 		else {
-			familyIdx = fit->second;
+			categoryIdx = catIt->second;
 		}
 
-		std::string typeKey = family + "::" + type;
-		int typeIdx;
-		auto tit = typeNodeMap.find(typeKey);
-		if (tit == typeNodeMap.end()) {
-			typeIdx = createNode(type, familyIdx);
-			typeNodeMap[typeKey] = typeIdx;
+		std::string childLabel = makeCompactChildLabel(family, type);
+
+		std::string childKey = category + "::" + childLabel;
+		int childIdx;
+		auto childIt = childMap.find(childKey);
+		if (childIt == childMap.end()) {
+			childIdx = createNode(childLabel, categoryIdx);
+			childMap[childKey] = childIdx;
 		}
 		else {
-			typeIdx = tit->second;
+			childIdx = childIt->second;
 		}
 
-		std::string groupKey = typeKey + "::" + groupCode;
-		int groupIdx;
-		auto git = groupNodeMap.find(groupKey);
-		if (git == groupNodeMap.end()) {
-			groupIdx = createNode(groupCode, typeIdx);
-			groupNodeMap[groupKey] = groupIdx;
-		}
-		else {
-			groupIdx = git->second;
-		}
+		info.tree[childIdx].submeshIndices.push_back(si);
+		info.submeshToNode[si] = childIdx;
+	}
 
-		info.tree[groupIdx].submeshIndices.push_back(si);
-		info.submeshToNode[si] = groupIdx;
+	// sort root nodes and children
+	std::sort(info.rootIndices.begin(), info.rootIndices.end(),
+		[&](int a, int b) { return info.tree[a].name < info.tree[b].name; });
+
+	for (auto& node : info.tree) {
+		std::sort(node.children.begin(), node.children.end(),
+			[&](int a, int b) { return info.tree[a].name < info.tree[b].name; });
 	}
 
 	std::sort(info.rootIndices.begin(), info.rootIndices.end(),
@@ -3438,7 +3488,7 @@ int main()
 
 								bool vis = node.visible;
 								if (ImGui::Checkbox("##nodevis", &vis)) {
-									gpuModel->ifcInfo.setNodeVisibleRecursive(nodeIdx, vis);
+									gpuModel->ifcInfo.setNodeVisibility(nodeIdx, vis);
 								}
 								ImGui::SameLine();
 
@@ -3455,7 +3505,7 @@ int main()
 									}
 								}
 								else {
-									ImGui::BulletText("%s", label.c_str());
+									ImGui::Text("%s", label.c_str());
 								}
 
 								ImGui::PopID();
