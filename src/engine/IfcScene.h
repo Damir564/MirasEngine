@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <limits>
 #include <iostream>
+#include <algorithm>
 
 struct IfcTypeInfo {
     std::string guid;
@@ -56,11 +57,14 @@ struct IfcScene {
     std::unordered_map<std::size_t, std::string> submeshToGuid;
 
     bool isSubmeshVisible(std::size_t submeshIdx) const {
-        // if (!isIfc) return true;
         auto it = submeshToGuid.find(submeshIdx);
-        if (it == submeshToGuid.end()) return true;
+        if (it == submeshToGuid.end())
+            return false;
+
         auto eit = elements.find(it->second);
-        if (eit == elements.end()) return true;
+        if (eit == elements.end())
+            return false;
+
         return eit->second.visible;
     }
 

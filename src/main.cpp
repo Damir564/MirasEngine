@@ -1390,8 +1390,6 @@ void buildIfcScene(
 	const fastgltf::Asset& asset,
 	const std::vector<size_t>& submeshNodeMap)
 {
-	// scene.isIfc = true;
-
 	for (std::size_t si = 0; si < submeshNodeMap.size(); ++si) {
 		std::size_t nodeIdx = submeshNodeMap[si];
 		const auto& node = asset.nodes[nodeIdx];
@@ -1405,23 +1403,28 @@ void buildIfcScene(
 		}
 	}
 
-	std::size_t matched = 0;
+	std::vector<std::string> toRemove;
 	for (auto& [guid, elem] : scene.elements) {
-		if (elem.submeshIndex != std::numeric_limits<std::size_t>::max())
-			++matched;
+		if (elem.submeshIndex == std::numeric_limits<std::size_t>::max())
+			toRemove.push_back(guid);
 	}
 
-	std::cout << "[IFC] " << scene.elements.size() << " elements in JSON, "
-		<< submeshNodeMap.size() << " submeshes in GLB, "
-		<< matched << " matched\n";
+	for (auto& guid : toRemove) {
+		scene.elements.erase(guid);
 
-	for (auto& rootGuid : scene.roots) {
-		auto it = scene.spatial.find(rootGuid);
-		if (it != scene.spatial.end()) {
-			std::cout << "[IFC] Root: " << it->second.type
-				<< " \"" << it->second.name << "\"\n";
+		for (auto& [sg, sn] : scene.spatial) {
+			auto& ev = sn.elementGuids;
+			ev.erase(
+				std::remove(ev.begin(), ev.end(), guid),
+				ev.end());
 		}
 	}
+
+	std::size_t matched = scene.submeshToGuid.size();
+
+	std::cout << "[IFC] " << scene.elements.size() << " elements with geometry, "
+		<< toRemove.size() << " without geometry removed, "
+		<< matched << " submeshes matched\n";
 }
 
 
@@ -3238,6 +3241,22 @@ int main()
 								if (it == scene.spatial.end()) return;
 
 								IfcSpatialNode& node = it->second;
+
+								bool hasElements = !node.elementGuids.empty();
+								bool hasChildren = false;
+								for (const auto& childGuid : node.childSpatialGuids) {
+									auto cit = scene.spatial.find(childGuid);
+									if (cit != scene.spatial.end()) {
+										if (!cit->second.elementGuids.empty() ||
+											!cit->second.childSpatialGuids.empty()) {
+											hasChildren = true;
+											break;
+										}
+									}
+								}
+
+								if (!hasElements && !hasChildren)
+									return;
 
 								ImGui::PushID(node.guid.c_str());
 

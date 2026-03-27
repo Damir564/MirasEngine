@@ -134,7 +134,7 @@ def collect_elements(model, spatial):
 
     candidates = []
     candidates.extend(safe_by_type(model, "IfcElement"))
-    candidates.extend(safe_by_type(model, "IfcSpace"))  # ADD THIS
+    # candidates.extend(safe_by_type(model, "IfcSpace"))  # ADD THIS
 
     seen = set()
 
