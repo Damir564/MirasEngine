@@ -4,7 +4,10 @@
 #include <glm/gtc/quaternion.hpp>
 #include <string>
 #include <vector>
+#include <optional>
+#include "IfcScene.h"
 
+// class IfcScene;
 
 enum class AlphaMode : int {
     OPAQUE = 0,
@@ -49,4 +52,6 @@ struct Mesh {
     std::vector<uint32_t> indices;
     std::vector<SubmeshInfo> submeshes;
     std::vector<TextureData> textureData;
+
+    std::optional<IfcScene> ifcScene;
 };

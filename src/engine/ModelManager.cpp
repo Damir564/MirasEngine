@@ -5,6 +5,7 @@
 #include "stb_image.h"
 #include "Shadow.h"
 #include "IfcLayerInfo.h"
+#include "IfcScene.h"
 
 // TextureImage class - move from main.cpp or keep inline here
 class TextureImage {
@@ -138,7 +139,7 @@ private:
 };
 
 // External function declarations - these remain in main.cpp
-extern Mesh loadModelSmart(const std::string& path, IfcInfo* outIfcInfo = nullptr);
+extern Mesh loadModelSmart(const std::string& path);
 // extern SceneBounds calculateSceneBounds(const std::vector<Vertex>& vertices, const std::vector<InstanceData>& instances);
 
 void TextureData::free() {
@@ -258,6 +259,7 @@ size_t ModelManager::uploadModelToGPU(Mesh& mesh, const std::string& name, const
     gpuModel->submeshes = mesh.submeshes;
     gpuModel->vertexCount = mesh.vertices.size();
     gpuModel->indexCount = mesh.indices.size();
+    gpuModel->ifcScene = mesh.ifcScene;
 
     // Create buffers
     gpuModel->vertexBuffer = std::make_unique<VertexBuffer>(m_allocator, m_device, mesh.vertices);

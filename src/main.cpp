@@ -41,6 +41,7 @@
 #include "engine/IfcLayerInfo.h"
 #include "engine/IfcNodeParser.h"
 #include "engine/IfcScene.h"
+#include "engine/IfcSceneLoader.h"
 
 #define VULKAN_API_VERSION_MAJOR 1
 #define VULKAN_API_VERSION_MINOR 3
@@ -1477,7 +1478,8 @@ Mesh loadWithFastGltf(const std::string& path) {
 	return result;
 }
 
-Mesh loadIfcModel(const std::string& ifcPath, IfcInfo& outInfo) {
+Mesh loadIfcModel(const std::string& ifcPath) {
+	IfcScene ifcScene = {};
 	auto glbOpt = IfcConverter::toGlb(ifcPath);
 	if (!glbOpt) throw std::runtime_error("IFC conversion failed to GLB: " + ifcPath);
 	std::string glbPath = *glbOpt;
@@ -1488,40 +1490,46 @@ Mesh loadIfcModel(const std::string& ifcPath, IfcInfo& outInfo) {
 
 	Mesh result = loadWithFastGltf(glbPath);
 
+	if (!loadIfcScene(jsonPath, ifcScene)) {
+		std::cerr << "[IFC] Warning: failed to load metadata from " << jsonPath << "\n";
+	}
+
 	fastgltf::Parser parser;
 	auto gltfFile = fastgltf::MappedGltfFile::FromPath(glbPath);
-	if (!gltfFile) {
-		outInfo = {};
+	if (!gltfFile) 
 		return result;
-	}
 
 	auto assetRet = parser.loadGltf(gltfFile.get(),
 		std::filesystem::path(glbPath).parent_path(), fastgltf::Options::None);
 
 	if (assetRet.error() == fastgltf::Error::None) {
 		auto& asset = assetRet.get();
-		std::vector<size_t> nodeMap;
+		std::vector<size_t> submeshNodeMap;
 
-		size_t scn = asset.defaultScene.value_or(0);
+		std::size_t scn = asset.defaultScene.value_or(0);
 		if (!asset.scenes.empty()) {
 			std::function<void(size_t)> walk = [&](size_t ni) {
 				const auto& n = asset.nodes[ni];
 				if (n.meshIndex.has_value()) {
-					size_t primCount = asset.meshes[*n.meshIndex].primitives.size();
-					for (size_t p = 0; p < primCount; ++p) {
-						nodeMap.push_back(ni);
+					std::size_t primCount = asset.meshes[*n.meshIndex].primitives.size();
+					for (std::size_t p = 0; p < primCount; ++p) {
+						submeshNodeMap.push_back(ni);
 					}
 				}
 				for (size_t c : n.children) walk(c);
 				};
-			for (size_t ni : asset.scenes[scn].nodeIndices) walk(ni);
+			for (size_t ni : asset.scenes[scn].nodeIndices)
+				walk(ni);
 		}
 
-		outInfo = buildIfcLayers(asset, nodeMap);
+		buildIfcScene(ifcScene, asset, submeshNodeMap);
 	}
 
 	std::cout << "[IFC] " << result.vertices.size() << " verts, "
-		<< outInfo.layers.size() << " layers\n";
+		<< ifcScene.elements.size() << " elements, "
+		<< ifcScene.spatial.size() << " spatial nodes\n";
+
+	result.ifcScene = ifcScene;
 	return result;
 }
 
@@ -1567,7 +1575,7 @@ std::vector<RenderSubmesh> sortSubmeshesForRendering(
 	return renderList;
 }
 
-Mesh loadModelSmart(const std::string& path, IfcInfo* outIfcInfo = nullptr) {
+Mesh loadModelSmart(const std::string& path) {
 	std::string cachePath = path + ".cache";
 	Mesh result;
 	bool loadedFromCache = false;
@@ -1578,12 +1586,6 @@ Mesh loadModelSmart(const std::string& path, IfcInfo* outIfcInfo = nullptr) {
 	bool isIfc = (ext == ".ifc");
 
 	std::string loadPath = path;
-	//if (isIfc) {
-	//	auto glbOpt = IfcConverter::toGlb(path); 
-	//	if (!glbOpt) throw std::runtime_error("IFC conversion failed");
-	//	loadPath = *glbOpt;
-	//	cachePath = loadPath + ".cache";
-	//}
 
 	// 1. Try Cache
 	if (ModelSerializer::IsCacheValid(path, cachePath)) {
@@ -1601,11 +1603,9 @@ Mesh loadModelSmart(const std::string& path, IfcInfo* outIfcInfo = nullptr) {
 		}
 	}
 
-	IfcInfo ifcInfo;
-
 	if (!loadedFromCache) {
 		if (isIfc) {
-			result = loadIfcModel(path, ifcInfo);
+			result = loadIfcModel(path);
 		}
 		else if (ext == ".gltf" || ext == ".glb") {
 			result = loadWithFastGltf(path);
@@ -1617,33 +1617,6 @@ Mesh loadModelSmart(const std::string& path, IfcInfo* outIfcInfo = nullptr) {
 		ModelSerializer::SaveToCache(cachePath, result);
 	}
 
-	if (isIfc && loadedFromCache) {
-		fastgltf::Parser parser;
-		auto gltfFile = fastgltf::MappedGltfFile::FromPath(loadPath);
-		if (gltfFile) {
-			auto assetRet = parser.loadGltf(gltfFile.get(),
-				fs::path(loadPath).parent_path(), fastgltf::Options::None);
-			if (assetRet.error() == fastgltf::Error::None) {
-				auto& asset = assetRet.get();
-				std::vector<size_t> nodeMap;
-				size_t si = asset.defaultScene.value_or(0);
-				if (!asset.scenes.empty()) {
-					std::function<void(size_t)> walk = [&](size_t ni) {
-						const auto& n = asset.nodes[ni];
-						if (n.meshIndex.has_value()) {
-							for (size_t p = 0; p < asset.meshes[*n.meshIndex].primitives.size(); ++p)
-								nodeMap.push_back(ni);
-						}
-						for (size_t c : n.children) walk(c);
-						};
-					for (size_t ni : asset.scenes[si].nodeIndices) walk(ni);
-				}
-				ifcInfo = buildIfcLayers(asset, nodeMap);
-			}
-		}
-	}
-
-	if (outIfcInfo) *outIfcInfo = ifcInfo;
 	return result;
 }
 
@@ -3246,27 +3219,27 @@ int main()
 					GPUModel* gpuModel = modelManager->getModel(
 						instances[gizmo.selectedInstance].modelIndex);
 
-					if (gpuModel && gpuModel->ifcInfo.isIfc) {
+					if (gpuModel && gpuModel->ifcScene) {
 						ImGui::Separator();
 						ImGui::Text("IFC Layers");
+						IfcScene::printIfcScene(gpuModel->ifcScene.value());
+						//if (ImGui::Button("Show All##ifc")) {
+						//	for (auto& l : gpuModel->ifcInfo.layers) l.visible = true;
+						//}
+						//ImGui::SameLine();
+						//if (ImGui::Button("Hide All##ifc")) {
+						//	for (auto& l : gpuModel->ifcInfo.layers) l.visible = false;
+						//}
 
-						if (ImGui::Button("Show All##ifc")) {
-							for (auto& l : gpuModel->ifcInfo.layers) l.visible = true;
-						}
-						ImGui::SameLine();
-						if (ImGui::Button("Hide All##ifc")) {
-							for (auto& l : gpuModel->ifcInfo.layers) l.visible = false;
-						}
-
-						for (size_t i = 0; i < gpuModel->ifcInfo.layers.size(); ++i) {
-							auto& layer = gpuModel->ifcInfo.layers[i];
-							ImGui::PushID(static_cast<int>(i));
-							ImGui::Checkbox("##lv", &layer.visible);
-							ImGui::SameLine();
-							ImGui::Text("%s (%zu)", layer.typeName.c_str(),
-								layer.submeshIndices.size());
-							ImGui::PopID();
-						}
+						//for (size_t i = 0; i < gpuModel->ifcInfo.layers.size(); ++i) {
+						//	auto& layer = gpuModel->ifcInfo.layers[i];
+						//	ImGui::PushID(static_cast<int>(i));
+						//	ImGui::Checkbox("##lv", &layer.visible);
+						//	ImGui::SameLine();
+						//	ImGui::Text("%s (%zu)", layer.typeName.c_str(),
+						//		layer.submeshIndices.size());
+						//	ImGui::PopID();
+						//}
 					}
 
 					auto& sel = instances[gizmo.selectedInstance];
