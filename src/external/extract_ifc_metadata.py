@@ -132,19 +132,26 @@ def collect_spatial(model):
 def collect_elements(model, spatial):
     elements = {}
 
-    for elem in safe_by_type(model, "IfcElement"):
-        gid = attr(elem, "GlobalId")
-        if not gid:
+    candidates = []
+    candidates.extend(safe_by_type(model, "IfcElement"))
+    candidates.extend(safe_by_type(model, "IfcSpace"))  # ADD THIS
+
+    seen = set()
+
+    for elem in candidates:
+        guid = attr(elem, "GlobalId", None)
+        if not guid or guid in seen:
             continue
+        seen.add(guid)
 
         container_guid = get_direct_container_guid(elem)
 
-        elements[gid] = {
-            "guid": gid,
+        elements[guid] = {
+            "guid": guid,
             "type": elem.is_a(),
-            "name": attr(elem, "Name"),
-            "objectType": attr(elem, "ObjectType"),
-            "tag": attr(elem, "Tag"),
+            "name": attr(elem, "Name", None),
+            "objectType": attr(elem, "ObjectType", None),
+            "tag": attr(elem, "Tag", None),
             "storey": get_storey_name(elem),
             "parentSpatialGuid": container_guid,
             "typeInfo": get_type_info(elem),
@@ -152,7 +159,7 @@ def collect_elements(model, spatial):
         }
 
         if container_guid and container_guid in spatial:
-            spatial[container_guid]["elements"].append(gid)
+            spatial[container_guid]["elements"].append(guid)
 
     return elements
 
