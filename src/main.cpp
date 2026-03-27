@@ -3220,26 +3220,193 @@ int main()
 						instances[gizmo.selectedInstance].modelIndex);
 
 					if (gpuModel && gpuModel->ifcScene) {
-						ImGui::Separator();
-						ImGui::Text("IFC Layers");
-						IfcScene::printIfcScene(gpuModel->ifcScene.value());
-						//if (ImGui::Button("Show All##ifc")) {
-						//	for (auto& l : gpuModel->ifcInfo.layers) l.visible = true;
-						//}
-						//ImGui::SameLine();
-						//if (ImGui::Button("Hide All##ifc")) {
-						//	for (auto& l : gpuModel->ifcInfo.layers) l.visible = false;
-						//}
+						IfcScene& scene = gpuModel->ifcScene.value();
 
-						//for (size_t i = 0; i < gpuModel->ifcInfo.layers.size(); ++i) {
-						//	auto& layer = gpuModel->ifcInfo.layers[i];
-						//	ImGui::PushID(static_cast<int>(i));
-						//	ImGui::Checkbox("##lv", &layer.visible);
-						//	ImGui::SameLine();
-						//	ImGui::Text("%s (%zu)", layer.typeName.c_str(),
-						//		layer.submeshIndices.size());
-						//	ImGui::PopID();
-						//}
+						ImGui::Separator();
+						ImGui::Text("IFC Hierarchy (%zu elements, %zu spatial)",
+							scene.elements.size(), scene.spatial.size());
+
+						// show all / hide all
+						if (ImGui::Button("Show All##ifc")) {
+							for (auto& [guid, elem] : scene.elements)
+								elem.visible = true;
+							for (auto& [guid, node] : scene.spatial)
+								node.visible = true;
+						}
+						ImGui::SameLine();
+						if (ImGui::Button("Hide All##ifc")) {
+							for (auto& [guid, elem] : scene.elements)
+								elem.visible = false;
+							for (auto& [guid, node] : scene.spatial)
+								node.visible = false;
+						}
+
+						ImGui::Separator();
+
+						// recursive spatial tree drawing
+						std::function<void(const std::string&)> drawSpatialNode =
+							[&](const std::string& spatialGuid)
+							{
+								auto it = scene.spatial.find(spatialGuid);
+								if (it == scene.spatial.end()) return;
+
+								IfcSpatialNode& node = it->second;
+
+								ImGui::PushID(node.guid.c_str());
+
+								// checkbox for whole branch visibility
+								bool branchVis = node.visible;
+								if (ImGui::Checkbox("##sv", &branchVis)) {
+									scene.setVisibilityRecursive(node.guid, branchVis);
+								}
+								ImGui::SameLine();
+
+								// count elements under this branch
+								std::size_t elemCount = node.elementGuids.size();
+
+								// tree node for spatial
+								std::string label = node.type + ": " + node.name
+									+ " (" + std::to_string(elemCount) + ")";
+
+								ImGuiTreeNodeFlags flags =
+									ImGuiTreeNodeFlags_OpenOnArrow |
+									ImGuiTreeNodeFlags_OpenOnDoubleClick;
+
+								if (node.childSpatialGuids.empty() && node.elementGuids.empty())
+									flags |= ImGuiTreeNodeFlags_Leaf;
+
+								bool open = ImGui::TreeNodeEx(label.c_str(), flags);
+
+								// tooltip with details
+								if (ImGui::IsItemHovered()) {
+									ImGui::BeginTooltip();
+									ImGui::Text("GUID: %s", node.guid.c_str());
+									ImGui::Text("Type: %s", node.type.c_str());
+									ImGui::Text("Children: %zu", node.childSpatialGuids.size());
+									ImGui::Text("Elements: %zu", node.elementGuids.size());
+									ImGui::EndTooltip();
+								}
+
+								if (open) {
+									// draw child spatial nodes
+									for (const auto& childGuid : node.childSpatialGuids) {
+										drawSpatialNode(childGuid);
+									}
+
+									// draw contained elements
+									for (const auto& elemGuid : node.elementGuids) {
+										auto eit = scene.elements.find(elemGuid);
+										if (eit == scene.elements.end()) continue;
+
+										IfcElement& elem = eit->second;
+
+										ImGui::PushID(elem.guid.c_str());
+
+										// element visibility checkbox
+										ImGui::Checkbox("##ev", &elem.visible);
+										ImGui::SameLine();
+
+										// short display name
+										std::string elemLabel = elem.type;
+										if (!elem.name.empty())
+											elemLabel += ": " + elem.name;
+										else if (!elem.tag.empty())
+											elemLabel += ": #" + elem.tag;
+
+										// leaf node
+										ImGuiTreeNodeFlags elemFlags =
+											ImGuiTreeNodeFlags_Leaf |
+											ImGuiTreeNodeFlags_NoTreePushOnOpen;
+
+										if (elem.selected)
+											elemFlags |= ImGuiTreeNodeFlags_Selected;
+
+										ImGui::TreeNodeEx(elemLabel.c_str(), elemFlags);
+
+										// click to select
+										if (ImGui::IsItemClicked()) {
+											// deselect previous
+											for (auto& [g, e] : scene.elements)
+												e.selected = false;
+											elem.selected = true;
+										}
+
+										// tooltip with full details
+										if (ImGui::IsItemHovered()) {
+											ImGui::BeginTooltip();
+											ImGui::Text("GUID: %s", elem.guid.c_str());
+											ImGui::Text("Type: %s", elem.type.c_str());
+											ImGui::Text("Name: %s", elem.name.c_str());
+											ImGui::Text("Tag: %s", elem.tag.c_str());
+											ImGui::Text("Storey: %s", elem.storey.c_str());
+
+											if (!elem.objectType.empty())
+												ImGui::Text("ObjectType: %s", elem.objectType.c_str());
+
+											if (elem.typeInfo) {
+												ImGui::Separator();
+												ImGui::Text("TypeInfo:");
+												ImGui::Text("  Type: %s", elem.typeInfo->type.c_str());
+												ImGui::Text("  Name: %s", elem.typeInfo->name.c_str());
+											}
+
+											if (!elem.data.empty()) {
+												ImGui::Separator();
+												ImGui::Text("Properties:");
+												for (auto& [k, v] : elem.data) {
+													ImGui::Text("  %s = %s", k.c_str(), v.c_str());
+												}
+											}
+
+											ImGui::EndTooltip();
+										}
+
+										ImGui::PopID();
+									}
+
+									ImGui::TreePop();
+								}
+
+								ImGui::PopID();
+							};
+
+						// draw from roots
+						for (const auto& rootGuid : scene.roots) {
+							drawSpatialNode(rootGuid);
+						}
+
+						// orphan elements (not in any spatial node)
+						bool hasOrphans = false;
+						for (auto& [guid, elem] : scene.elements) {
+							if (elem.parentSpatialGuid.empty() ||
+								scene.spatial.find(elem.parentSpatialGuid) == scene.spatial.end()) {
+								hasOrphans = true;
+								break;
+							}
+						}
+
+						if (hasOrphans) {
+							ImGui::Separator();
+							if (ImGui::TreeNode("Unassigned Elements")) {
+								for (auto& [guid, elem] : scene.elements) {
+									if (!elem.parentSpatialGuid.empty() &&
+										scene.spatial.find(elem.parentSpatialGuid) != scene.spatial.end())
+										continue;
+
+									ImGui::PushID(elem.guid.c_str());
+									ImGui::Checkbox("##ev", &elem.visible);
+									ImGui::SameLine();
+
+									std::string label = elem.type + ": " + elem.name;
+									ImGui::TreeNodeEx(label.c_str(),
+										ImGuiTreeNodeFlags_Leaf |
+										ImGuiTreeNodeFlags_NoTreePushOnOpen);
+
+									ImGui::PopID();
+								}
+								ImGui::TreePop();
+							}
+						}
 					}
 
 					auto& sel = instances[gizmo.selectedInstance];
