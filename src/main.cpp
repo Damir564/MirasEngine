@@ -2981,19 +2981,6 @@ int main()
 
 				ImGui::Separator();
 
-				//ImGui::Text("Quick Load:");
-				//if (ImGui::Button("Load Sponza")) {
-				//	modelManager->loadModelAsync("models/main_sponza/NewSponza_Main_glTF_003.gltf", "Sponza");
-				//}
-				//ImGui::SameLine();
-				//if (ImGui::Button("Load School")) {
-				//	modelManager->loadModelAsync("models/tomsk_school1/tomsk_school1.obj", "School");
-				//}
-				//ImGui::SameLine();
-				//if (ImGui::Button("Load Bus Stop")) {
-				//	modelManager->loadModelAsync("models/bus_stop/Untitled.glb", "BusStop");
-				//}
-
 				static char modelPath[512] = "models/";
 				ImGui::InputText("Model Path", modelPath, sizeof(modelPath));
 
@@ -3852,8 +3839,12 @@ int main()
 					cmd.bindIndexBuffer(gpuModel->indexBuffer->getBuffer(), 0, vk::IndexType::eUint32);
 
 					// Draw all non-blend submeshes for shadow
-					for (const auto& sub : gpuModel->submeshes) {
+					for (std::size_t si = 0; si < gpuModel->submeshes.size(); ++si) {
+						const auto& sub = gpuModel->submeshes[si];
 						if (sub.material.alphaMode == AlphaMode::BLEND)
+							continue;
+
+						if (gpuModel->ifcScene && !gpuModel->ifcScene->isSubmeshVisible(si))
 							continue;
 
 						ShadowPushConstants shadowPc{};
@@ -3957,21 +3948,12 @@ int main()
 				vk::ShaderStageFlagBits::eVertex,
 				vk::ShaderStageFlagBits::eFragment
 			};
-
 			vk::ShaderEXT shaders[] = {
 				vertShader,
 				fragShader
 			};
-			// Bind shaders and draw
 			cmd.bindShadersEXT(2, stages, shaders);
-			// Begin rendering
 			cmd.setPrimitiveTopology(vk::PrimitiveTopology::eTriangleList);
-
-			// cmd.bindVertexBuffers(0, 1, &vertexBuffer->getBuffer(), &offset);
-			
-			
-
-
 			const vk::Viewport viewport{ 0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, 0.f, 1.f };
 			const vk::Rect2D rect{ {0,0},{(int)SCREEN_WIDTH, (int)SCREEN_HEIGHT} };
 			cmd.setViewport(0, viewport);
@@ -4040,9 +4022,8 @@ int main()
 				for (const auto& renderSub : sortedSubmeshes) {
 					const auto& sub = gpuModel->submeshes[renderSub.submeshIndex];
 
-					/*if (!gpuModel->ifcInfo.isSubmeshVisible(renderSub.submeshIndex))
-						continue;*/
-
+					if (gpuModel->ifcScene && !gpuModel->ifcScene->isSubmeshVisible(renderSub.submeshIndex))
+						continue;
 					bool needsBlending = (sub.material.alphaMode == AlphaMode::BLEND);
 
 					if (needsBlending != currentlyBlending) {
