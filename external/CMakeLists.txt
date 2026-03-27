@@ -5,9 +5,6 @@ include(FetchContent)
 set(FETCHCONTENT_QUIET OFF)
 set(FETCHCONTENT_UPDATES_DISCONNECTED ON)
 
-# ============================
-# Vulkan Memory Allocator (VMA)
-# ============================
 FetchContent_Declare(
   VulkanHpp
   GIT_REPOSITORY https://github.com/KhronosGroup/Vulkan-Hpp.git
@@ -15,9 +12,6 @@ FetchContent_Declare(
   GIT_SHALLOW TRUE
 )
 
-# ============================
-# Volk (small static library)
-# ============================
 FetchContent_Declare(
   volk
   GIT_REPOSITORY https://github.com/zeux/volk.git
@@ -28,9 +22,6 @@ FetchContent_Declare(
 set(VOLK_HEADERS_ONLY OFF CACHE BOOL "" FORCE)
 set(VOLK_INSTALL OFF CACHE BOOL "" FORCE)
 
-# ============================
-# Vulkan Memory Allocator (VMA)
-# ============================
 FetchContent_Declare(
   VMA
   GIT_REPOSITORY https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator.git
@@ -41,9 +32,6 @@ set(VMA_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
 set(VMA_BUILD_SAMPLE OFF CACHE BOOL "" FORCE)
 set(VMA_BUILD_DOCUMENTATION OFF CACHE BOOL "" FORCE)
 
-# ============================
-# vk-bootstrap (header-only)
-# ============================
 FetchContent_Declare(
   vk_bootstrap
   GIT_REPOSITORY https://github.com/charles-lunarg/vk-bootstrap.git
@@ -54,9 +42,6 @@ FetchContent_Declare(
 set(VK_BOOTSTRAP_TEST OFF CACHE BOOL "" FORCE)
 set(VK_BOOTSTRAP_INSTALL OFF CACHE BOOL "" FORCE)
 
-# ---------------------------------
-# Fetch SDL3 from GitHub
-# ---------------------------------
 FetchContent_Declare(
   SDL3
   GIT_REPOSITORY https://github.com/libsdl-org/SDL.git
@@ -64,9 +49,6 @@ FetchContent_Declare(
   GIT_SHALLOW TRUE
 )
 
-# ---------------------------------
-# Fetch glm from GitHub
-# ---------------------------------
 FetchContent_Declare(
   glm
   GIT_REPOSITORY https://github.com/g-truc/glm.git
@@ -74,9 +56,6 @@ FetchContent_Declare(
   GIT_SHALLOW TRUE
 )
 
-# ============================
-# Fetch Assimp from GitHub
-# ============================
 FetchContent_Declare(
   assimp
   GIT_REPOSITORY https://github.com/assimp/assimp.git
@@ -87,16 +66,12 @@ FetchContent_Declare(
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 set(ASSIMP_BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 
-# Disable building unnecessary things
 set(ASSIMP_BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 set(ASSIMP_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(ASSIMP_BUILD_SAMPLES OFF CACHE BOOL "" FORCE)
 set(ASSIMP_BUILD_DOCS OFF CACHE BOOL "" FORCE)
 set(ASSIMP_BUILD_ASSIMP_TOOLS OFF CACHE BOOL "" FORCE)
 
-# ============================
-# Fetch stb_image from GitHub
-# ============================
 FetchContent_Declare(
     stb
     GIT_REPOSITORY https://github.com/nothings/stb.git
@@ -118,13 +93,19 @@ FetchContent_Declare(
     GIT_SHALLOW TRUE
 )
 
+FetchContent_Declare(
+    nlohmann_json
+    GIT_REPOSITORY https://github.com/nlohmann/json.git
+    GIT_TAG v3.11.3
+    GIT_SHALLOW TRUE
+)
+
 set(FASTGLTF_COMPILE_AS_CPP20 ON CACHE BOOL "" FORCE)
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 
 add_compile_definitions(IMGUI_IMPL_VULKAN_NO_PROTOTYPES)
-# ============================
-# Make everything available
-# ============================
+
+
 FetchContent_MakeAvailable(
   VulkanHpp
   volk
@@ -136,6 +117,7 @@ FetchContent_MakeAvailable(
   stb
   fastgltf
   imgui
+  nlohmann_json
 )
 
 add_library(imgui STATIC
@@ -144,14 +126,13 @@ add_library(imgui STATIC
     ${imgui_SOURCE_DIR}/imgui_draw.cpp
     ${imgui_SOURCE_DIR}/imgui_tables.cpp
     ${imgui_SOURCE_DIR}/imgui_widgets.cpp
-    # Add the specific backends for your stack
     ${imgui_SOURCE_DIR}/backends/imgui_impl_sdl3.cpp
     ${imgui_SOURCE_DIR}/backends/imgui_impl_vulkan.cpp
 )
 
 target_include_directories(imgui PUBLIC
-    ${imgui_SOURCE_DIR}           # For "imgui.h"
-    ${imgui_SOURCE_DIR}/backends  # For "imgui_impl_sdl3.h" etc
+    ${imgui_SOURCE_DIR} 
+    ${imgui_SOURCE_DIR}/backends
 )
 
 add_library(stb_image STATIC

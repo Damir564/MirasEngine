@@ -40,6 +40,7 @@
 #include "engine/IfcConverter.h"
 #include "engine/IfcLayerInfo.h"
 #include "engine/IfcNodeParser.h"
+#include "engine/IfcScene.h"
 
 #define VULKAN_API_VERSION_MAJOR 1
 #define VULKAN_API_VERSION_MINOR 3
@@ -1383,6 +1384,44 @@ IfcInfo buildIfcLayers(const fastgltf::Asset& asset,
 	return info;
 }
 
+void buildIfcScene(
+	IfcScene& scene,
+	const fastgltf::Asset& asset,
+	const std::vector<size_t>& submeshNodeMap)
+{
+	// scene.isIfc = true;
+
+	for (std::size_t si = 0; si < submeshNodeMap.size(); ++si) {
+		std::size_t nodeIdx = submeshNodeMap[si];
+		const auto& node = asset.nodes[nodeIdx];
+
+		std::string guid(node.name.begin(), node.name.end());
+
+		auto it = scene.elements.find(guid);
+		if (it != scene.elements.end()) {
+			it->second.submeshIndex = si;
+			scene.submeshToGuid[si] = guid;
+		}
+	}
+
+	std::size_t matched = 0;
+	for (auto& [guid, elem] : scene.elements) {
+		if (elem.submeshIndex != std::numeric_limits<std::size_t>::max())
+			++matched;
+	}
+
+	std::cout << "[IFC] " << scene.elements.size() << " elements in JSON, "
+		<< submeshNodeMap.size() << " submeshes in GLB, "
+		<< matched << " matched\n";
+
+	for (auto& rootGuid : scene.roots) {
+		auto it = scene.spatial.find(rootGuid);
+		if (it != scene.spatial.end()) {
+			std::cout << "[IFC] Root: " << it->second.type
+				<< " \"" << it->second.name << "\"\n";
+		}
+	}
+}
 
 
 Mesh loadWithFastGltf(const std::string& path) {
@@ -1439,15 +1478,16 @@ Mesh loadWithFastGltf(const std::string& path) {
 }
 
 Mesh loadIfcModel(const std::string& ifcPath, IfcInfo& outInfo) {
-	// 1. Convert IFC -> GLB
 	auto glbOpt = IfcConverter::toGlb(ifcPath);
-	if (!glbOpt) throw std::runtime_error("IFC conversion failed: " + ifcPath);
+	if (!glbOpt) throw std::runtime_error("IFC conversion failed to GLB: " + ifcPath);
 	std::string glbPath = *glbOpt;
 
-	// 2. Load GLB with your existing FAST loader — no changes needed
+	auto jsonOpt = IfcConverter::toJson(ifcPath);
+	if (!glbOpt) throw std::runtime_error("IFC conversion failed to JSON: " + ifcPath);
+	std::string jsonPath = *jsonOpt;
+
 	Mesh result = loadWithFastGltf(glbPath);
 
-	// 3. Cheap second pass: read only node tree for layer info (no geometry)
 	fastgltf::Parser parser;
 	auto gltfFile = fastgltf::MappedGltfFile::FromPath(glbPath);
 	if (!gltfFile) {
@@ -1464,7 +1504,6 @@ Mesh loadIfcModel(const std::string& ifcPath, IfcInfo& outInfo) {
 
 		size_t scn = asset.defaultScene.value_or(0);
 		if (!asset.scenes.empty()) {
-			// Walk in same order as loadWithFastGltf to match submesh indices
 			std::function<void(size_t)> walk = [&](size_t ni) {
 				const auto& n = asset.nodes[ni];
 				if (n.meshIndex.has_value()) {
@@ -1539,12 +1578,12 @@ Mesh loadModelSmart(const std::string& path, IfcInfo* outIfcInfo = nullptr) {
 	bool isIfc = (ext == ".ifc");
 
 	std::string loadPath = path;
-	if (isIfc) {
-		auto glbOpt = IfcConverter::toGlb(path); 
-		if (!glbOpt) throw std::runtime_error("IFC conversion failed");
-		loadPath = *glbOpt;
-		cachePath = loadPath + ".cache";
-	}
+	//if (isIfc) {
+	//	auto glbOpt = IfcConverter::toGlb(path); 
+	//	if (!glbOpt) throw std::runtime_error("IFC conversion failed");
+	//	loadPath = *glbOpt;
+	//	cachePath = loadPath + ".cache";
+	//}
 
 	// 1. Try Cache
 	if (ModelSerializer::IsCacheValid(path, cachePath)) {
@@ -1569,10 +1608,10 @@ Mesh loadModelSmart(const std::string& path, IfcInfo* outIfcInfo = nullptr) {
 			result = loadIfcModel(path, ifcInfo);
 		}
 		else if (ext == ".gltf" || ext == ".glb") {
-			result = loadWithFastGltf(loadPath);
+			result = loadWithFastGltf(path);
 		}
 		else {
-			result = loadWithAssimp(loadPath);
+			result = loadWithAssimp(path);
 		}
 
 		ModelSerializer::SaveToCache(cachePath, result);
@@ -3861,8 +3900,8 @@ int main()
 				for (const auto& renderSub : sortedSubmeshes) {
 					const auto& sub = gpuModel->submeshes[renderSub.submeshIndex];
 
-					if (!gpuModel->ifcInfo.isSubmeshVisible(renderSub.submeshIndex))
-						continue;
+					/*if (!gpuModel->ifcInfo.isSubmeshVisible(renderSub.submeshIndex))
+						continue;*/
 
 					bool needsBlending = (sub.material.alphaMode == AlphaMode::BLEND);
 

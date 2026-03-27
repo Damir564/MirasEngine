@@ -19,7 +19,7 @@ add_executable (engine
   engine/SceneSerializer.h 
   engine/CameraAnimation.h 
   engine/CameraAnimation.cpp 
-  engine/FileDialog.h "engine/IfcConverter.h" "engine/IfcLayerInfo.h" "engine/IfcNodeParser.h")
+  engine/FileDialog.h "engine/IfcConverter.h" "engine/IfcLayerInfo.h" "engine/IfcNodeParser.h" "engine/IfcScene.h" "engine/IfcSceneLoader.h" "engine/IfcSceneLoader.cpp")
 
 if (CMAKE_VERSION VERSION_GREATER 3.12)
   set_property(TARGET engine PROPERTY CXX_STANDARD 20)
@@ -44,6 +44,7 @@ target_link_libraries(engine PRIVATE
     stb_image
     fastgltf::fastgltf
     imgui
+    nlohmann_json::nlohmann_json
 )
 
 

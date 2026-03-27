@@ -14,6 +14,15 @@ add_subdirectory(external)
 
 add_subdirectory(src)
 
+file(COPY ${CMAKE_SOURCE_DIR}/src/external/IfcConvert.exe
+     DESTINATION ${CMAKE_BINARY_DIR}/src/external)
+
+file(COPY ${CMAKE_SOURCE_DIR}/src/external/IfcConvert.config
+     DESTINATION ${CMAKE_BINARY_DIR}/src/external)
+
+     file(COPY ${CMAKE_SOURCE_DIR}/src/external/extract_ifc_metadata.py
+     DESTINATION ${CMAKE_BINARY_DIR}/src/external)
+
 file(COPY ${CMAKE_SOURCE_DIR}/src/shaders
      DESTINATION ${CMAKE_BINARY_DIR}/src)
 

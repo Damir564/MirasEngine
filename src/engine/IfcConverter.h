@@ -4,12 +4,26 @@
 #include <filesystem>
 #include <iostream>
 
+#define IFC_CONVERT_PARAMS " --weld-vertices --use-element-names --y-up" /*  --weld-vertices --use-element-types*/
+
+
 class IfcConverter {
 public:
-    static void setExecutablePath(const std::string& path) { s_path = path; }
 
-    static bool isAvailable() {
-        return std::system((s_path + " --version > /dev/null 2>&1").c_str()) == 0;
+    static std::string loadIfcParams() {
+        std::string params = IFC_CONVERT_PARAMS;  // defaults
+
+        std::ifstream file(s_Pathconfig);
+        if (file.is_open()) {
+            std::string line;
+            std::getline(file, line);
+            if (!line.empty()) {
+                params = " " + line;
+                std::cout << "[IFC] Config params: " << params << "\n";
+            }
+        }
+
+        return params;
     }
 
     static std::optional<std::string> toGlb(const std::string& ifcPath) {
@@ -22,20 +36,21 @@ public:
         fs::create_directories(outputDir);
         std::string glbPath = (outputDir / input.stem()).string() + ".glb";
 
-        // Skip if cached GLB is newer than IFC
         if (fs::exists(glbPath) && fs::last_write_time(glbPath) >= fs::last_write_time(ifcPath)) {
             std::cout << "[IFC] Using cached: " << glbPath << "\n";
             return glbPath;
         }
 
-        std::string cmd = s_path
-            + " --use-world-coords"
-            // + " --weld-vertices"
-            + " --use-element-names"
-            + " --y-up"
-            // + " --exclude entities IfcOpeningElemen;IfcSpace"
-            + " " + ifcPath
-            + " " + glbPath;
+        unsigned int threads = std::thread::hardware_concurrency();
+        if (threads == 0) threads = 4;
+
+        std::string ifcParams = loadIfcParams();
+
+        const std::string cmd = s_pathExe
+            + " -j " + std::to_string(threads)
+            + " " + " \"" + ifcPath + "\""
+            + " " + " \"" + glbPath + "\""
+            + ifcParams;
 
         std::cout << "[IFC] Converting: " << cmd << "\n";
         int ret = std::system(cmd.c_str());
@@ -49,6 +64,40 @@ public:
         return glbPath;
     }
 
+    static std::optional<std::string> toJson(const std::string& ifcPath) {
+        namespace fs = std::filesystem;
+
+        if (!fs::exists(ifcPath)) return std::nullopt;
+
+        fs::path input(ifcPath);
+        fs::path outputDir = input.parent_path() / "converted";
+        fs::create_directories(outputDir);
+        std::string jsonPath = (outputDir / input.stem()).string() + ".json";
+
+        if (fs::exists(jsonPath) && fs::last_write_time(jsonPath) >= fs::last_write_time(ifcPath)) {
+            std::cout << "[IFC] Using cached metadata: " << jsonPath << "\n";
+            return jsonPath;
+        }
+
+        const std::string cmd =
+            "py \"" + s_PathExeJson + "\""
+            + " \"" + ifcPath + "\""
+            + " \"" + jsonPath + "\"";
+
+        std::cout << "[IFC] Extracting metadata: " << cmd << "\n";
+        int ret = std::system(cmd.c_str());
+
+        if (ret != 0 || !fs::exists(jsonPath)) {
+            std::cerr << "[IFC] Metadata extraction failed\n";
+            return std::nullopt;
+        }
+
+        std::cout << "[IFC] Metadata extracted to: " << jsonPath << "\n";
+        return jsonPath;
+    }
+
 private:
-    static inline std::string s_path = "IfcConvert";
+    static inline std::string s_pathExe = (std::filesystem::path("external") / "IfcConvert.exe").string();
+    static inline std::string s_Pathconfig = (std::filesystem::path("external") / "IfcConvert.config").string();
+    static inline std::string s_PathExeJson = (std::filesystem::path("external") / "extract_ifc_metadata.py").string();
 };
