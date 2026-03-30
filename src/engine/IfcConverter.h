@@ -3,6 +3,8 @@
 #include <optional>
 #include <filesystem>
 #include <iostream>
+#include <thread>
+#include <fstream>
 
 #define IFC_CONVERT_PARAMS " --weld-vertices --use-element-names --y-up" /*  --weld-vertices --use-element-types*/
 

@@ -200,6 +200,8 @@ struct ModelCacheHeader {
 	uint64_t indexCount;
 	uint64_t submeshCount;
 	uint64_t textureCount;
+	//uint8_t isIfc = 0;
+	//uint8_t  reserved[7] = {};
 };
 
 class ModelSerializer {
@@ -220,6 +222,8 @@ public:
 		header.indexCount = model.indices.size();
 		header.submeshCount = model.submeshes.size();
 		header.textureCount = model.textureData.size();
+	/*	if (model.ifcScene)
+			header.isIfc = 1;*/
 
 		file.write(reinterpret_cast<const char*>(&header), sizeof(header));
 
@@ -295,6 +299,9 @@ public:
 
 			// We don't restore 'path' or 'encodedData' because we have the raw pixels now
 		}
+
+		//if (header.isIfc > 0)
+		//	outModel.ifcScene = {};
 
 		return true;
 	}
@@ -1481,58 +1488,67 @@ Mesh loadWithFastGltf(const std::string& path) {
 	return result;
 }
 
-Mesh loadIfcModel(const std::string& ifcPath) {
+IfcScene beginLoadIfcScene(const std::string& ifcPath, const std::string& glbPath, const std::string jsonPath) {
 	IfcScene ifcScene = {};
-	auto glbOpt = IfcConverter::toGlb(ifcPath);
-	if (!glbOpt) throw std::runtime_error("IFC conversion failed to GLB: " + ifcPath);
-	std::string glbPath = *glbOpt;
 
-	auto jsonOpt = IfcConverter::toJson(ifcPath);
-	if (!glbOpt) throw std::runtime_error("IFC conversion failed to JSON: " + ifcPath);
-	std::string jsonPath = *jsonOpt;
-
-	Mesh result = loadWithFastGltf(glbPath);
-
+	
 	if (!loadIfcScene(jsonPath, ifcScene)) {
 		std::cerr << "[IFC] Warning: failed to load metadata from " << jsonPath << "\n";
 	}
 
 	fastgltf::Parser parser;
 	auto gltfFile = fastgltf::MappedGltfFile::FromPath(glbPath);
-	if (!gltfFile) 
-		return result;
+	if (!gltfFile)
+		return ifcScene;
 
 	auto assetRet = parser.loadGltf(gltfFile.get(),
 		std::filesystem::path(glbPath).parent_path(), fastgltf::Options::None);
 
-	if (assetRet.error() == fastgltf::Error::None) {
-		auto& asset = assetRet.get();
-		std::vector<size_t> submeshNodeMap;
+	if (assetRet.error() != fastgltf::Error::None)
+		return ifcScene;
 
-		std::size_t scn = asset.defaultScene.value_or(0);
-		if (!asset.scenes.empty()) {
-			std::function<void(size_t)> walk = [&](size_t ni) {
-				const auto& n = asset.nodes[ni];
-				if (n.meshIndex.has_value()) {
-					std::size_t primCount = asset.meshes[*n.meshIndex].primitives.size();
-					for (std::size_t p = 0; p < primCount; ++p) {
-						submeshNodeMap.push_back(ni);
-					}
+	auto& asset = assetRet.get();
+	std::vector<size_t> submeshNodeMap;
+
+	std::size_t scn = asset.defaultScene.value_or(0);
+	if (!asset.scenes.empty()) {
+		std::function<void(size_t)> walk = [&](size_t ni) {
+			const auto& n = asset.nodes[ni];
+			if (n.meshIndex.has_value()) {
+				std::size_t primCount = asset.meshes[*n.meshIndex].primitives.size();
+				for (std::size_t p = 0; p < primCount; ++p) {
+					submeshNodeMap.push_back(ni);
 				}
-				for (size_t c : n.children) walk(c);
-				};
-			for (size_t ni : asset.scenes[scn].nodeIndices)
-				walk(ni);
-		}
-
-		buildIfcScene(ifcScene, asset, submeshNodeMap);
+			}
+			for (size_t c : n.children) walk(c);
+			};
+		for (size_t ni : asset.scenes[scn].nodeIndices)
+			walk(ni);
 	}
 
-	std::cout << "[IFC] " << result.vertices.size() << " verts, "
-		<< ifcScene.elements.size() << " elements, "
-		<< ifcScene.spatial.size() << " spatial nodes\n";
+	buildIfcScene(ifcScene, asset, submeshNodeMap);
+	
 
-	result.ifcScene = ifcScene;
+	return ifcScene;
+}
+
+Mesh loadIfcModel(const std::string& ifcPath) {
+	auto glbOpt = IfcConverter::toGlb(ifcPath);
+	if (!glbOpt) throw std::runtime_error("IFC conversion failed to GLB: " + ifcPath);
+	std::string glbPath = *glbOpt;
+
+	Mesh result = loadWithFastGltf(glbPath);
+
+	auto jsonOpt = IfcConverter::toJson(ifcPath);
+	if (!jsonOpt) throw std::runtime_error("IFC conversion failed to JSON: " + ifcPath);
+	std::string jsonPath = *jsonOpt;
+	result.ifcScene = beginLoadIfcScene(ifcPath, glbPath, jsonPath);
+
+
+	std::cout << "[IFC] " << result.vertices.size() << " verts, "
+		<< result.ifcScene->elements.size() << " elements, "
+		<< result.ifcScene->spatial.size() << " spatial nodes\n";
+
 	return result;
 }
 
@@ -1584,11 +1600,10 @@ Mesh loadModelSmart(const std::string& path) {
 	bool loadedFromCache = false;
 
 	namespace fs = std::filesystem;
-	std::string ext = fs::path(path).extension().string();
+	fs::path fsPath = fs::path(path);
+	std::string ext = fsPath.extension().string();
 	std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
 	bool isIfc = (ext == ".ifc");
-
-	std::string loadPath = path;
 
 	// 1. Try Cache
 	if (ModelSerializer::IsCacheValid(path, cachePath)) {
@@ -1596,6 +1611,12 @@ Mesh loadModelSmart(const std::string& path) {
 		auto start = std::chrono::high_resolution_clock::now();
 
 		if (ModelSerializer::LoadFromCache(cachePath, result)) {
+			if (isIfc) {
+				fs::path fileStem = fsPath.stem();
+				std::string jsonPath = (fsPath.parent_path() / "converted" / fileStem).string() + ".json";
+				std::string glbPath = (fsPath.parent_path() / "converted" / fileStem).string() + ".glb";
+				result.ifcScene = beginLoadIfcScene(path, glbPath, jsonPath);
+			}
 			auto end = std::chrono::high_resolution_clock::now();
 			std::chrono::duration<float, std::milli> duration = end - start;
 			std::cout << "Done (" << duration.count() << "ms)\n";
