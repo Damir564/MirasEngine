@@ -139,9 +139,11 @@ def collect_spatial(model):
                 "guid": gid,
                 "type": obj.is_a(),
                 "name": attr(obj, "Name"),
+                "longName": attr(obj, "LongName"), 
                 "parentGuid": pgid,
                 "children": [],
-                "elements": []
+                "elements": [],
+                "data": get_psets_flat(obj),
             }
 
             # ── add storey info to spaces (and anything below a storey) ──

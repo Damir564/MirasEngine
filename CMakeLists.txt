@@ -20,8 +20,13 @@ file(COPY ${CMAKE_SOURCE_DIR}/src/external/IfcConvert.exe
 file(COPY ${CMAKE_SOURCE_DIR}/src/external/IfcConvert.config
      DESTINATION ${CMAKE_BINARY_DIR}/src/external)
 
-     file(COPY ${CMAKE_SOURCE_DIR}/src/external/extract_ifc_metadata.py
-     DESTINATION ${CMAKE_BINARY_DIR}/src/external)
+# if .py changed, execute in external
+# .venv/scripts/activate
+# pyinstaller --onefile --clean --collect-all ifcopenshell .\extract_ifc_metadata.py
+# and then regenerate CMake
+
+file(COPY ${CMAKE_SOURCE_DIR}/src/external/dist/extract_ifc_metadata.exe
+    DESTINATION ${CMAKE_BINARY_DIR}/src/external)
 
 file(COPY ${CMAKE_SOURCE_DIR}/src/shaders
      DESTINATION ${CMAKE_BINARY_DIR}/src)

@@ -38,13 +38,17 @@ struct IfcSpatialNode {
     std::string guid;
     std::string type;
     std::string name;
+    std::string longName;
     std::string parentGuid;
+
+    std::unordered_map<std::string, std::string> data;
 
     std::vector<std::string> childSpatialGuids;
     std::vector<std::string> elementGuids;
 
     bool visible = true;
     bool expanded = true;
+    bool selected = false;
 };
 
 struct IfcScene {

@@ -55,6 +55,7 @@ bool loadIfcScene(const std::string& jsonPath, IfcScene& scene)
             node.guid = guid;
             node.type = jstr(sj, "type");
             node.name = jstr(sj, "name");
+            node.longName = jstr(sj, "longName");
             node.parentGuid = jstr(sj, "parentGuid");
 
             if (sj.contains("children") && sj["children"].is_array())
@@ -72,6 +73,23 @@ bool loadIfcScene(const std::string& jsonPath, IfcScene& scene)
                 {
                     if (e.is_string())
                         node.elementGuids.push_back(e.get<std::string>());
+                }
+            }
+
+            if (sj.contains("data") && sj["data"].is_object())
+            {
+                for (auto& [k, v] : sj["data"].items())
+                {
+                    if (v.is_string())
+                        node.data[k] = v.get<std::string>();
+                    else if (v.is_number_integer())
+                        node.data[k] = std::to_string(v.get<int64_t>());
+                    else if (v.is_number_float())
+                        node.data[k] = std::to_string(v.get<double>());
+                    else if (v.is_boolean())
+                        node.data[k] = v.get<bool>() ? "true" : "false";
+                    else if (!v.is_null())
+                        node.data[k] = v.dump();
                 }
             }
 

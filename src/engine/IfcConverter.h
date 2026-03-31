@@ -81,8 +81,7 @@ public:
             return jsonPath;
         }
 
-        const std::string cmd =
-            "py \"" + s_PathExeJson + "\""
+        const std::string cmd = s_PathExeJson
             + " \"" + ifcPath + "\""
             + " \"" + jsonPath + "\"";
 
@@ -101,5 +100,5 @@ public:
 private:
     static inline std::string s_pathExe = (std::filesystem::path("external") / "IfcConvert.exe").string();
     static inline std::string s_Pathconfig = (std::filesystem::path("external") / "IfcConvert.config").string();
-    static inline std::string s_PathExeJson = (std::filesystem::path("external") / "extract_ifc_metadata.py").string();
+    static inline std::string s_PathExeJson = (std::filesystem::path("external") / "extract_ifc_metadata.exe").string();
 };
