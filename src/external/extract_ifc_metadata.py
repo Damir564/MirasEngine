@@ -60,9 +60,10 @@ def get_type_info(elem):
         return None
 
 
-# ── spatial parent (IfcRelAggregates / Decomposes) ──────────────
+# ── two ways to find a parent ───────────────────────────────────
+
 def get_spatial_parent(obj):
-    """Parent of a spatial-structure element (Project→Site→Building→Storey→Space)."""
+    """Parent via IfcRelAggregates (spatial hierarchy: Space→Storey→Building…)."""
     try:
         for rel in getattr(obj, "Decomposes", ()):
             if rel.is_a("IfcRelAggregates"):
@@ -72,38 +73,48 @@ def get_spatial_parent(obj):
     return None
 
 
-# ── element container (IfcRelContainedInSpatialStructure) ───────
 def get_container(elem):
+    """Parent via IfcRelContainedInSpatialStructure (element→spatial)."""
     try:
         return ifcopenshell.util.element.get_container(elem)
     except Exception:
         return None
 
 
-def get_storey_name(elem):
-    cur = elem
+# ── walk up both chains to find the storey ──────────────────────
+
+def find_storey(obj):
+    """Walk up containment + aggregation until we hit an IfcBuildingStorey."""
+    cur = obj
     visited = set()
-    while True:
-        c = get_container(cur)
-        if not c:
-            return None
-        gid = attr(c, "GlobalId")
-        if gid in visited:
+    while cur:
+        if cur.is_a("IfcBuildingStorey"):
+            return cur
+        gid = attr(cur, "GlobalId")
+        if not gid or gid in visited:
             return None
         visited.add(gid)
-        if c.is_a() == "IfcBuildingStorey":
-            return attr(c, "Name")
-        cur = c
+        cur = get_container(cur) or get_spatial_parent(cur)
+    return None
+
+
+def get_storey_name(obj):
+    s = find_storey(obj)
+    return attr(s, "Name") if s else None
+
+
+def get_storey_guid(obj):
+    s = find_storey(obj)
+    return attr(s, "GlobalId") if s else None
 
 
 def get_direct_container_guid(elem):
     c = get_container(elem)
-    if c:
-        return attr(c, "GlobalId")
-    return None
+    return attr(c, "GlobalId") if c else None
 
 
 # ── spatial tree ────────────────────────────────────────────────
+
 def collect_spatial(model):
     spatial = {}
     roots = []
@@ -124,7 +135,7 @@ def collect_spatial(model):
             parent = get_spatial_parent(obj)
             pgid = attr(parent, "GlobalId") if parent else None
 
-            spatial[gid] = {
+            node = {
                 "guid": gid,
                 "type": obj.is_a(),
                 "name": attr(obj, "Name"),
@@ -132,6 +143,16 @@ def collect_spatial(model):
                 "children": [],
                 "elements": []
             }
+
+            # ── add storey info to spaces (and anything below a storey) ──
+            if obj.is_a("IfcBuildingStorey"):
+                node["storey"] = attr(obj, "Name")
+                node["storeyGuid"] = gid
+            else:
+                node["storey"] = get_storey_name(obj)
+                node["storeyGuid"] = get_storey_guid(obj)
+
+            spatial[gid] = node
 
     for gid, node in spatial.items():
         pg = node["parentGuid"]
@@ -144,6 +165,7 @@ def collect_spatial(model):
 
 
 # ── elements ────────────────────────────────────────────────────
+
 def collect_elements(model, spatial):
     elements = {}
     seen = set()
@@ -163,6 +185,7 @@ def collect_elements(model, spatial):
             "objectType": attr(elem, "ObjectType", None),
             "tag": attr(elem, "Tag", None),
             "storey": get_storey_name(elem),
+            "storeyGuid": get_storey_guid(elem),
             "parentSpatialGuid": container_guid,
             "typeInfo": get_type_info(elem),
             "data": get_psets_flat(elem)
