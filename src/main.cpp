@@ -3318,7 +3318,8 @@ int main()
 
 								bool open = ImGui::TreeNodeEx(label.c_str(), flags);
 
-								if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
+								if (ImGui::IsItemClicked(ImGuiMouseButton_Left) ||
+									(ImGui::IsItemFocused() && ImGui::IsKeyPressed(ImGuiKey_Enter))) {
 									// deselect previous
 									for (auto& [g, e] : scene.elements)
 										e.selected = false;
@@ -3326,6 +3327,7 @@ int main()
 										s.selected = false;
 									node.selected = true;
 									selectedIfcGuid = node.guid;
+									selectedIfcKind = IfcSelectionKind::kSpatial;
 									selectedInstanceForProperties = gizmo.selectedInstance;
 								}
 
@@ -3388,7 +3390,8 @@ int main()
 										ImGui::TreeNodeEx(elemLabel.c_str(), elemFlags);
 
 										// click to select
-										if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
+										if (ImGui::IsItemClicked(ImGuiMouseButton_Left) ||
+											(ImGui::IsItemFocused() && ImGui::IsKeyPressed(ImGuiKey_Enter))) {
 											// deselect previous
 											for (auto& [g, e] : scene.elements)
 												e.selected = false;
@@ -3396,6 +3399,7 @@ int main()
 												s.selected = false;
 											elem.selected = true;
 											selectedIfcGuid = elem.guid;
+											selectedIfcKind = IfcSelectionKind::kElement;
 											selectedInstanceForProperties = gizmo.selectedInstance;
 										}
 
@@ -4146,7 +4150,7 @@ int main()
 						if (sub.material.alphaMode == AlphaMode::BLEND)
 							continue;
 
-						if (!inst.ifcScene->isSubmeshVisible(si))
+						if (inst.ifcScene && !inst.ifcScene->isSubmeshVisible(si))
 							continue;
 
 						ShadowPushConstants shadowPc{};
@@ -4324,7 +4328,7 @@ int main()
 				for (const auto& renderSub : sortedSubmeshes) {
 					const auto& sub = gpuModel->submeshes[renderSub.submeshIndex];
 
-					if (!inst.ifcScene->isSubmeshVisible(renderSub.submeshIndex))
+					if (inst.ifcScene && !inst.ifcScene->isSubmeshVisible(renderSub.submeshIndex))
 						continue;
 					bool needsBlending = (sub.material.alphaMode == AlphaMode::BLEND);
 
