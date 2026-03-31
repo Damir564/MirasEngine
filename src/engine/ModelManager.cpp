@@ -336,6 +336,7 @@ size_t ModelManager::createInstance(size_t modelIndex, const glm::vec3& position
     inst.rotation = rotation;
     inst.scale = scale;
     inst.name = m_models[modelIndex]->name + "_" + std::to_string(m_nextInstanceId++);
+    inst.ifcScene = m_models[modelIndex]->ifcScene;
 
     m_instances.push_back(inst);
     return m_instances.size() - 1;

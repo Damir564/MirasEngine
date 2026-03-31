@@ -3227,11 +3227,11 @@ int main()
 				if (gizmo.selectedInstance >= 0 &&
 					gizmo.selectedInstance < static_cast<int>(instances.size())) {
 
-					GPUModel* gpuModel = modelManager->getModel(
-						instances[gizmo.selectedInstance].modelIndex);
+					/*GPUModel* gpuModel = modelManager->getModel(
+						instances[gizmo.selectedInstance].modelIndex);*/
 
-					if (gpuModel && gpuModel->ifcScene) {
-						IfcScene& scene = gpuModel->ifcScene.value();
+					if (instances[gizmo.selectedInstance].ifcScene) {
+						IfcScene& scene = instances[gizmo.selectedInstance].ifcScene.value();
 
 						ImGui::Separator();
 						ImGui::Text("IFC Hierarchy (%zu elements, %zu spatial)",
@@ -3884,7 +3884,7 @@ int main()
 						if (sub.material.alphaMode == AlphaMode::BLEND)
 							continue;
 
-						if (gpuModel->ifcScene && !gpuModel->ifcScene->isSubmeshVisible(si))
+						if (!inst.ifcScene->isSubmeshVisible(si))
 							continue;
 
 						ShadowPushConstants shadowPc{};
@@ -4062,7 +4062,7 @@ int main()
 				for (const auto& renderSub : sortedSubmeshes) {
 					const auto& sub = gpuModel->submeshes[renderSub.submeshIndex];
 
-					if (gpuModel->ifcScene && !gpuModel->ifcScene->isSubmeshVisible(renderSub.submeshIndex))
+					if (!inst.ifcScene->isSubmeshVisible(renderSub.submeshIndex))
 						continue;
 					bool needsBlending = (sub.material.alphaMode == AlphaMode::BLEND);
 

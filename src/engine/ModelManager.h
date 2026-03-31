@@ -45,6 +45,7 @@ struct ModelInstance {
     glm::vec3 position{ 0.0f };
     glm::vec3 rotation{ 0.0f };
     glm::vec3 scale{ 1.0f };
+    std::optional<IfcScene> ifcScene;
     bool visible = true;
 
     glm::mat4 getTransformMatrix() const {
