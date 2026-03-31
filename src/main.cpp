@@ -2540,6 +2540,10 @@ int main()
 		static float time = 0.0f;
 		// Push constant data
 		uint32_t lastTime = SDL_GetTicks();
+
+		bool showPropertiesWindow = false;
+		std::string selectedElementGuid;
+		int selectedInstanceForProperties = -1;
 		while (running) {
 			uint32_t currentTime = SDL_GetTicks();
 			float dt = (currentTime - lastTime) / 1000.0f; // convert ms to seconds
@@ -3289,11 +3293,12 @@ int main()
 								ImGui::SameLine();
 
 								// count elements under this branch
-								std::size_t elemCount = node.elementGuids.size();
+								std::size_t elemAndSpatialCount = node.elementGuids.size() 
+									+ node.childSpatialGuids.size();
 
 								// tree node for spatial
 								std::string label = node.type + ": " + node.name
-									+ " (" + std::to_string(elemCount) + ")";
+									+ " (" + std::to_string(elemAndSpatialCount) + ")";
 
 								ImGuiTreeNodeFlags flags =
 									ImGuiTreeNodeFlags_OpenOnArrow |
@@ -3351,21 +3356,32 @@ int main()
 										ImGui::TreeNodeEx(elemLabel.c_str(), elemFlags);
 
 										// click to select
-										if (ImGui::IsItemClicked()) {
+										if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
 											// deselect previous
 											for (auto& [g, e] : scene.elements)
 												e.selected = false;
 											elem.selected = true;
 										}
 
+										if (ImGui::BeginPopupContextItem("ElementContextMenu")) {
+											if (ImGui::MenuItem("Properties")) {
+												selectedElementGuid = elem.guid;
+												selectedInstanceForProperties = gizmo.selectedInstance;
+												showPropertiesWindow = true;
+											}
+
+											ImGui::EndPopup();
+										}
+
 										// tooltip with full details
-										if (ImGui::IsItemHovered()) {
+										if (ImGui::IsItemHovered() && !ImGui::IsPopupOpen("ElementContextMenu")) {
 											ImGui::BeginTooltip();
 											ImGui::Text("GUID: %s", elem.guid.c_str());
 											ImGui::Text("Type: %s", elem.type.c_str());
 											ImGui::Text("Name: %s", elem.name.c_str());
 											ImGui::Text("Tag: %s", elem.tag.c_str());
 											ImGui::Text("Storey: %s", elem.storey.c_str());
+											ImGui::Text("Parent spatial GUID: %s", elem.parentSpatialGuid.c_str());
 
 											if (!elem.objectType.empty())
 												ImGui::Text("ObjectType: %s", elem.objectType.c_str());
@@ -3377,13 +3393,13 @@ int main()
 												ImGui::Text("  Name: %s", elem.typeInfo->name.c_str());
 											}
 
-											if (!elem.data.empty()) {
+											/*if (!elem.data.empty()) {
 												ImGui::Separator();
 												ImGui::Text("Properties:");
 												for (auto& [k, v] : elem.data) {
 													ImGui::Text("  %s = %s", k.c_str(), v.c_str());
 												}
-											}
+											}*/
 
 											ImGui::EndTooltip();
 										}
@@ -3463,6 +3479,126 @@ int main()
 					ImGui::Text("Click on model to select (in viewport)");
 					ImGui::Text("Or click instance in list above");
 					ImGui::Text("Keys 1/2/3 for Translate/Rotate/Scale");
+				}
+
+				if (showPropertiesWindow &&
+					selectedInstanceForProperties >= 0 &&
+					selectedInstanceForProperties < static_cast<int>(instances.size()) &&
+					instances[selectedInstanceForProperties].ifcScene) {
+
+					IfcScene& scene = instances[selectedInstanceForProperties].ifcScene.value();
+					auto it = scene.elements.find(selectedElementGuid);
+
+					if (it != scene.elements.end()) {
+						IfcElement& elem = it->second;
+
+						ImGui::SetNextWindowSize(ImVec2(450, 550), ImGuiCond_FirstUseEver);
+
+						std::string windowTitle = "Properties: " + elem.type;
+						if (!elem.name.empty()) windowTitle += " - " + elem.name;
+						windowTitle += "###PropertiesWindow";
+
+						if (ImGui::Begin(windowTitle.c_str(), &showPropertiesWindow)) {
+
+							// Basic Info Section
+							if (ImGui::CollapsingHeader("Basic Information", ImGuiTreeNodeFlags_DefaultOpen)) {
+								ImGui::Text("GUID:"); ImGui::SameLine(120);
+								ImGui::TextColored(ImVec4(0.8f, 0.8f, 0.2f, 1.0f), "%s", elem.guid.c_str());
+
+								ImGui::Text("Type:"); ImGui::SameLine(120);
+								ImGui::Text("%s", elem.type.c_str());
+
+								ImGui::Text("Name:"); ImGui::SameLine(120);
+								ImGui::Text("%s", elem.name.c_str());
+
+								ImGui::Text("Tag:"); ImGui::SameLine(120);
+								ImGui::Text("%s", elem.tag.c_str());
+
+								ImGui::Text("Storey:"); ImGui::SameLine(120);
+								ImGui::Text("%s", elem.storey.c_str());
+
+								ImGui::Text("Parent GUID:"); ImGui::SameLine(120);
+								ImGui::TextWrapped("%s", elem.parentSpatialGuid.c_str());
+
+								if (!elem.objectType.empty()) {
+									ImGui::Text("ObjectType:"); ImGui::SameLine(120);
+									ImGui::Text("%s", elem.objectType.c_str());
+								}
+							}
+
+							// Type Info Section
+							if (elem.typeInfo && ImGui::CollapsingHeader("Type Information", ImGuiTreeNodeFlags_DefaultOpen)) {
+								ImGui::Text("Type:"); ImGui::SameLine(120);
+								ImGui::Text("%s", elem.typeInfo->type.c_str());
+
+								ImGui::Text("Name:"); ImGui::SameLine(120);
+								ImGui::Text("%s", elem.typeInfo->name.c_str());
+							}
+
+							// Properties Section (elem.data)
+							if (!elem.data.empty() && ImGui::CollapsingHeader("Properties", ImGuiTreeNodeFlags_DefaultOpen)) {
+
+								// Optional: Add search filter
+								static char filterBuf[128] = "";
+								ImGui::InputTextWithHint("##filter", "Filter properties...", filterBuf, sizeof(filterBuf));
+
+								ImGui::BeginChild("PropertiesList", ImVec2(0, 300), true);
+
+								if (ImGui::BeginTable("PropsTable", 2,
+									ImGuiTableFlags_Borders |
+									ImGuiTableFlags_RowBg |
+									ImGuiTableFlags_Resizable |
+									ImGuiTableFlags_ScrollY)) {
+
+									ImGui::TableSetupColumn("Property", ImGuiTableColumnFlags_WidthStretch, 0.4f);
+									ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch, 0.6f);
+									ImGui::TableHeadersRow();
+
+									std::string filter(filterBuf);
+									std::transform(filter.begin(), filter.end(), filter.begin(), ::tolower);
+
+									for (const auto& [k, v] : elem.data) {
+										// Filter check
+										if (!filter.empty()) {
+											std::string keyLower = k;
+											std::string valLower = v;
+											std::transform(keyLower.begin(), keyLower.end(), keyLower.begin(), ::tolower);
+											std::transform(valLower.begin(), valLower.end(), valLower.begin(), ::tolower);
+
+											if (keyLower.find(filter) == std::string::npos &&
+												valLower.find(filter) == std::string::npos) {
+												continue;
+											}
+										}
+
+										ImGui::TableNextRow();
+										ImGui::TableNextColumn();
+										ImGui::TextWrapped("%s", k.c_str());
+										ImGui::TableNextColumn();
+										ImGui::TextWrapped("%s", v.c_str());
+									}
+
+									ImGui::EndTable();
+								}
+
+								ImGui::EndChild();
+
+								ImGui::Text("Total: %zu properties", elem.data.size());
+							}
+
+							ImGui::Separator();
+
+							ImGui::SameLine();
+							if (ImGui::Button("Close")) {
+								showPropertiesWindow = false;
+							}
+						}
+						ImGui::End();
+					}
+					else {
+						// Element no longer exists
+						showPropertiesWindow = false;
+					}
 				}
 
 
