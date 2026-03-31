@@ -60,6 +60,19 @@ def get_type_info(elem):
         return None
 
 
+# ── spatial parent (IfcRelAggregates / Decomposes) ──────────────
+def get_spatial_parent(obj):
+    """Parent of a spatial-structure element (Project→Site→Building→Storey→Space)."""
+    try:
+        for rel in getattr(obj, "Decomposes", ()):
+            if rel.is_a("IfcRelAggregates"):
+                return rel.RelatingObject
+    except Exception:
+        pass
+    return None
+
+
+# ── element container (IfcRelContainedInSpatialStructure) ───────
 def get_container(elem):
     try:
         return ifcopenshell.util.element.get_container(elem)
@@ -90,6 +103,7 @@ def get_direct_container_guid(elem):
     return None
 
 
+# ── spatial tree ────────────────────────────────────────────────
 def collect_spatial(model):
     spatial = {}
     roots = []
@@ -107,7 +121,7 @@ def collect_spatial(model):
                 continue
             seen.add(gid)
 
-            parent = get_container(obj)
+            parent = get_spatial_parent(obj)
             pgid = attr(parent, "GlobalId") if parent else None
 
             spatial[gid] = {
@@ -129,16 +143,12 @@ def collect_spatial(model):
     return spatial, roots
 
 
+# ── elements ────────────────────────────────────────────────────
 def collect_elements(model, spatial):
     elements = {}
-
-    candidates = []
-    candidates.extend(safe_by_type(model, "IfcElement"))
-    # candidates.extend(safe_by_type(model, "IfcSpace"))  # ADD THIS
-
     seen = set()
 
-    for elem in candidates:
+    for elem in safe_by_type(model, "IfcElement"):
         guid = attr(elem, "GlobalId", None)
         if not guid or guid in seen:
             continue
