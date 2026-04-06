@@ -4156,8 +4156,8 @@ int main()
 				cmd.setAlphaToCoverageEnableEXT(VK_FALSE);
 				cmd.setPrimitiveRestartEnable(VK_FALSE);
 
-				auto shadowAttribs = Vertex::getVertexOnlyAttributes(0);
-				vk::VertexInputBindingDescription2EXT shadowBinding = Vertex::getBindingDescription(0);
+				static auto shadowAttribs = Vertex::getVertexOnlyAttributes(0);
+				static vk::VertexInputBindingDescription2EXT shadowBinding = Vertex::getBindingDescription(0);
 				cmd.setVertexInputEXT(1, &shadowBinding,
 					static_cast<uint32_t>(shadowAttribs.size()), shadowAttribs.data());
 
@@ -4185,10 +4185,6 @@ int main()
 					vk::DeviceSize modelOffsets[1] = { 0 };
 					vk::DeviceSize modelSizes[1] = { sizeof(Vertex) * gpuModel->vertexCount };
 					vk::DeviceSize modelStrides[1] = { sizeof(Vertex) };
-
-					vk::VertexInputBindingDescription2EXT singleBinding = Vertex::getBindingDescription(0);
-					//cmd.setVertexInputEXT(1, &singleBinding,
-					//	static_cast<uint32_t>(shadowAttribs.size()), shadowAttribs.data());
 
 					cmd.bindVertexBuffers2(0, 1, modelBuffers, modelOffsets, modelSizes, modelStrides);
 					cmd.bindIndexBuffer(gpuModel->indexBuffer->getBuffer(), 0, vk::IndexType::eUint32);
@@ -4353,8 +4349,8 @@ int main()
 			cmd.setScissorWithCount(1, &rect);
 			cmd.setPrimitiveRestartEnable(VK_FALSE);
 
-			auto mainAttribs = Vertex::getVertexOnlyAttributes(0);
-			vk::VertexInputBindingDescription2EXT mainBinding = Vertex::getBindingDescription(0);
+			static auto mainAttribs = Vertex::getVertexOnlyAttributes(0);
+			static vk::VertexInputBindingDescription2EXT mainBinding = Vertex::getBindingDescription(0);
 			cmd.setVertexInputEXT(1, &mainBinding,
 				static_cast<uint32_t>(mainAttribs.size()), mainAttribs.data());
 
