@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include <string>
 #include <vector>
@@ -60,17 +60,35 @@ struct IfcScene {
 
     std::unordered_map<std::size_t, std::string> submeshToGuid;
 
+    std::vector<bool> submeshVisibilityCache;
+
     bool isSubmeshVisible(std::size_t submeshIdx) const {
-        auto it = submeshToGuid.find(submeshIdx);
-        if (it == submeshToGuid.end())
-            return false;
-
-        auto eit = elements.find(it->second);
-        if (eit == elements.end())
-            return false;
-
-        return eit->second.visible;
+        if (submeshIdx < submeshVisibilityCache.size()) {
+            return submeshVisibilityCache[submeshIdx];
+        }
+        return false;
     }
+
+    void syncVisibilityCache() {
+        for (const auto& [guid, elem] : elements) {
+            if (elem.submeshIndex != std::numeric_limits<std::size_t>::max() &&
+                elem.submeshIndex < submeshVisibilityCache.size()) {
+                submeshVisibilityCache[elem.submeshIndex] = elem.visible;
+            }
+        }
+    }
+
+    //bool isSubmeshVisible(std::size_t submeshIdx) const {
+    //    auto it = submeshToGuid.find(submeshIdx);
+    //    if (it == submeshToGuid.end())
+    //        return false;
+
+    //    auto eit = elements.find(it->second);
+    //    if (eit == elements.end())
+    //        return false;
+
+    //    return eit->second.visible;
+    //}
 
     void setVisibilityRecursive(const std::string& spatialGuid, bool vis) {
         auto it = spatial.find(spatialGuid);

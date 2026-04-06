@@ -1395,6 +1395,8 @@ void buildIfcScene(
 	const fastgltf::Asset& asset,
 	const std::vector<size_t>& submeshNodeMap)
 {
+	scene.submeshVisibilityCache.assign(submeshNodeMap.size(), true);
+
 	for (std::size_t si = 0; si < submeshNodeMap.size(); ++si) {
 		std::size_t nodeIdx = submeshNodeMap[si];
 		const auto& node = asset.nodes[nodeIdx];
@@ -1405,6 +1407,8 @@ void buildIfcScene(
 		if (it != scene.elements.end()) {
 			it->second.submeshIndex = si;
 			scene.submeshToGuid[si] = guid;
+
+			scene.submeshVisibilityCache[si] = it->second.visible;
 		}
 	}
 
@@ -1559,12 +1563,16 @@ struct RenderSubmesh {
 std::vector<RenderSubmesh> sortSubmeshesForRendering(
 	const std::vector<SubmeshInfo>& submeshes,
 	const std::vector<Vertex>& vertices,
-	const glm::vec3& cameraPos)
+	const glm::vec3& cameraPos,
+	const IfcScene* ifcScene = nullptr)
 {
 	std::vector<RenderSubmesh> renderList;
 	renderList.reserve(submeshes.size());
 
 	for (size_t i = 0; i < submeshes.size(); ++i) {
+		if (ifcScene && !ifcScene->isSubmeshVisible(i)) 
+			continue;
+
 		const auto& sub = submeshes[i];
 
 		RenderSubmesh rs;
@@ -4061,7 +4069,11 @@ int main()
 				std::cerr << "Failed to acquireNextImageKHR\n";
 				return -1;
 			}
-
+			for (auto& inst : modelManager->getInstances()) {
+				if (inst.visible && inst.ifcScene) {
+					inst.ifcScene->syncVisibilityCache();
+				}
+			}
 			// ============================================
 			// CAMERA ANIMATION UPDATE
 			// ============================================
@@ -4178,7 +4190,15 @@ int main()
 
 					GPUModel* gpuModel = modelManager->getModel(inst.modelIndex);
 					if (!gpuModel || !gpuModel->isValid()) continue;
-
+					/*if (inst.ifcScene) {
+						const auto& scene = inst.ifcScene.value();
+						if (!scene.roots.empty()) {
+							auto it = scene.spatial.find(scene.roots.front());
+							if (it != scene.spatial.end() && !it->second.visible) {
+								continue;
+							}
+						}
+					}*/
 
 					// Bind vertex/index buffers for this model
 					vk::Buffer modelBuffers[1] = { gpuModel->vertexBuffer->getBuffer() };
@@ -4190,6 +4210,11 @@ int main()
 					cmd.bindIndexBuffer(gpuModel->indexBuffer->getBuffer(), 0, vk::IndexType::eUint32);
 
 					glm::mat4 instanceTransform = inst.getTransformMatrix();
+
+					glm::mat4 MVP = lightSpaceMatrix * instanceTransform;
+					if (!isAABBVisible(gpuModel->boundsMin, gpuModel->boundsMax, MVP)) {
+						continue; // Skip this entire model, it's not on screen!
+					}
 
 					bool instanceMatrixChanged = true;
 
@@ -4370,8 +4395,22 @@ int main()
 
 				GPUModel* gpuModel = modelManager->getModel(inst.modelIndex);
 				if (!gpuModel || !gpuModel->isValid()) continue;
+				/*if (inst.ifcScene) {
+					const auto& scene = inst.ifcScene.value();
+					if (!scene.roots.empty()) {
+						auto it = scene.spatial.find(scene.roots.front());
+						if (it != scene.spatial.end() && !it->second.visible) {
+							continue;
+						}
+					}
+				}*/
 
 				glm::mat4 instanceTransform = inst.getTransformMatrix();
+
+				glm::mat4 MVP = frameData.proj * frameData.view * instanceTransform;
+				if (!isAABBVisible(gpuModel->boundsMin, gpuModel->boundsMax, MVP)) {
+					continue;
+				}
 
 				// Bind vertex/index buffers for this model
 				vk::Buffer modelBuffers[1] = { gpuModel->vertexBuffer->getBuffer() };
@@ -4381,12 +4420,13 @@ int main()
 
 				cmd.bindVertexBuffers2(0, 1, modelBuffers, modelOffsets, modelSizes, modelStrides);
 				cmd.bindIndexBuffer(gpuModel->indexBuffer->getBuffer(), 0, vk::IndexType::eUint32);
-
+				static const std::vector<Vertex> emptyVertices;
 				// Sort submeshes
 				auto sortedSubmeshes = sortSubmeshesForRendering(
 					gpuModel->submeshes,
 					std::vector<Vertex>(), 
-					camera.position
+					camera.position,
+					(inst.ifcScene.has_value() ? &inst.ifcScene.value() : nullptr)
 				);
 
 				bool currentlyBlending = false;
