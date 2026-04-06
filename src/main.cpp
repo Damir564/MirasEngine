@@ -3376,88 +3376,94 @@ int main()
 									}
 
 									// draw contained elements
-									for (const auto& elemGuid : node.elementGuids) {
-										auto eit = scene.elements.find(elemGuid);
-										if (eit == scene.elements.end()) continue;
+									ImGuiListClipper clipper;
+									clipper.Begin(static_cast<int>(node.elementGuids.size()));
+									while (clipper.Step()) {
+										for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; ++i) {
+											const auto& elemGuid = node.elementGuids[i];
 
-										IfcElement& elem = eit->second;
+											auto eit = scene.elements.find(elemGuid);
+											if (eit == scene.elements.end()) continue;
 
-										ImGui::PushID(elem.guid.c_str());
+											IfcElement& elem = eit->second;
 
-										// element visibility checkbox
-										if (ImGui::Checkbox("##ev", &elem.visible)) {
-											scene.syncVisibilityCache();
-										}
-										ImGui::SameLine();
+											ImGui::PushID(elem.guid.c_str());
 
-										// leaf node
-										ImGuiTreeNodeFlags elemFlags =
-											ImGuiTreeNodeFlags_Leaf |
-											ImGuiTreeNodeFlags_NoTreePushOnOpen;
+											// element visibility checkbox
+											if (ImGui::Checkbox("##ev", &elem.visible)) {
+												scene.syncVisibilityCache();
+											}
+											ImGui::SameLine();
 
-										if (elem.selected)
-											elemFlags |= ImGuiTreeNodeFlags_Selected;
+											// leaf node
+											ImGuiTreeNodeFlags elemFlags =
+												ImGuiTreeNodeFlags_Leaf |
+												ImGuiTreeNodeFlags_NoTreePushOnOpen;
 
-										const char* displayName = elem.name.empty() ? elem.type.c_str() : elem.name.c_str();
-										ImGui::TreeNodeEx(elem.guid.c_str(), elemFlags, "%s", displayName);
+											if (elem.selected)
+												elemFlags |= ImGuiTreeNodeFlags_Selected;
 
-										// click to select
-										if (ImGui::IsItemClicked(ImGuiMouseButton_Left) ||
-											(ImGui::IsItemFocused() && ImGui::IsKeyPressed(ImGuiKey_Enter))) {
-											// deselect previous
-											for (auto& [g, e] : scene.elements)
-												e.selected = false;
-											for (auto& [g, s] : scene.spatial)
-												s.selected = false;
-											elem.selected = true;
-											selectedIfcGuid = elem.guid;
-											selectedIfcKind = IfcSelectionKind::kElement;
-											selectedInstanceForProperties = gizmo.selectedInstance;
-										}
+											const char* displayName = elem.name.empty() ? elem.type.c_str() : elem.name.c_str();
+											ImGui::TreeNodeEx(elem.guid.c_str(), elemFlags, "%s", displayName);
 
-										if (ImGui::BeginPopupContextItem("ElementContextMenu")) {
-											if (ImGui::MenuItem("Properties")) {
+											// click to select
+											if (ImGui::IsItemClicked(ImGuiMouseButton_Left) ||
+												(ImGui::IsItemFocused() && ImGui::IsKeyPressed(ImGuiKey_Enter))) {
+												// deselect previous
+												for (auto& [g, e] : scene.elements)
+													e.selected = false;
+												for (auto& [g, s] : scene.spatial)
+													s.selected = false;
+												elem.selected = true;
 												selectedIfcGuid = elem.guid;
 												selectedIfcKind = IfcSelectionKind::kElement;
 												selectedInstanceForProperties = gizmo.selectedInstance;
-												showPropertiesWindow = true;
 											}
 
-											ImGui::EndPopup();
-										}
-
-										// tooltip with full details
-										if (ImGui::IsItemHovered() && !ImGui::IsPopupOpen("ElementContextMenu")) {
-											ImGui::BeginTooltip();
-											ImGui::Text("GUID: %s", elem.guid.c_str());
-											ImGui::Text("Type: %s", elem.type.c_str());
-											ImGui::Text("Name: %s", elem.name.c_str());
-											ImGui::Text("Tag: %s", elem.tag.c_str());
-											ImGui::Text("Storey: %s", elem.storey.c_str());
-											ImGui::Text("Parent spatial GUID: %s", elem.parentSpatialGuid.c_str());
-
-											if (!elem.objectType.empty())
-												ImGui::Text("ObjectType: %s", elem.objectType.c_str());
-
-											if (elem.typeInfo) {
-												ImGui::Separator();
-												ImGui::Text("TypeInfo:");
-												ImGui::Text("  Type: %s", elem.typeInfo->type.c_str());
-												ImGui::Text("  Name: %s", elem.typeInfo->name.c_str());
-											}
-
-											/*if (!elem.data.empty()) {
-												ImGui::Separator();
-												ImGui::Text("Properties:");
-												for (auto& [k, v] : elem.data) {
-													ImGui::Text("  %s = %s", k.c_str(), v.c_str());
+											if (ImGui::BeginPopupContextItem("ElementContextMenu")) {
+												if (ImGui::MenuItem("Properties")) {
+													selectedIfcGuid = elem.guid;
+													selectedIfcKind = IfcSelectionKind::kElement;
+													selectedInstanceForProperties = gizmo.selectedInstance;
+													showPropertiesWindow = true;
 												}
-											}*/
 
-											ImGui::EndTooltip();
+												ImGui::EndPopup();
+											}
+
+											// tooltip with full details
+											if (ImGui::IsItemHovered() && !ImGui::IsPopupOpen("ElementContextMenu")) {
+												ImGui::BeginTooltip();
+												ImGui::Text("GUID: %s", elem.guid.c_str());
+												ImGui::Text("Type: %s", elem.type.c_str());
+												ImGui::Text("Name: %s", elem.name.c_str());
+												ImGui::Text("Tag: %s", elem.tag.c_str());
+												ImGui::Text("Storey: %s", elem.storey.c_str());
+												ImGui::Text("Parent spatial GUID: %s", elem.parentSpatialGuid.c_str());
+
+												if (!elem.objectType.empty())
+													ImGui::Text("ObjectType: %s", elem.objectType.c_str());
+
+												if (elem.typeInfo) {
+													ImGui::Separator();
+													ImGui::Text("TypeInfo:");
+													ImGui::Text("  Type: %s", elem.typeInfo->type.c_str());
+													ImGui::Text("  Name: %s", elem.typeInfo->name.c_str());
+												}
+
+												/*if (!elem.data.empty()) {
+													ImGui::Separator();
+													ImGui::Text("Properties:");
+													for (auto& [k, v] : elem.data) {
+														ImGui::Text("  %s = %s", k.c_str(), v.c_str());
+													}
+												}*/
+
+												ImGui::EndTooltip();
+											}
+
+											ImGui::PopID();
 										}
-
-										ImGui::PopID();
 									}
 
 									ImGui::TreePop();
