@@ -7,6 +7,9 @@ if (POLICY CMP0141)
 endif()
 
 project ("MirasEngine")
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
 
 find_package(Vulkan REQUIRED)
 

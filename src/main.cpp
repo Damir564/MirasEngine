@@ -1495,7 +1495,6 @@ IfcScene beginLoadIfcScene(const std::string& ifcPath, const std::string& glbPat
 	if (!loadIfcScene(jsonPath, ifcScene)) {
 		std::cerr << "[IFC] Warning: failed to load metadata from " << jsonPath << "\n";
 	}
-
 	fastgltf::Parser parser;
 	auto gltfFile = fastgltf::MappedGltfFile::FromPath(glbPath);
 	if (!gltfFile)
@@ -2467,6 +2466,12 @@ int main()
 		IMGUI_CHECKVERSION();
 		ImGui::CreateContext();
 		ImGuiIO& io = ImGui::GetIO();
+		io.Fonts->AddFontFromFileTTF(
+			"C:/Windows/Fonts/arial.ttf",
+			18.0f,
+			nullptr,
+			io.Fonts->GetGlyphRangesCyrillic()
+		);
 		io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
 		io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
 
