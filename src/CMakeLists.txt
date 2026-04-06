@@ -1,4 +1,4 @@
-add_executable (engine 
+﻿add_executable (engine 
   vma.cpp
   main.cpp
   vk_globals.cpp 
@@ -31,6 +31,8 @@ target_compile_definitions(engine PRIVATE
     VK_NO_PROTOTYPES    
     VULKAN_HPP_NO_EXCEPTIONS
     VULKAN_HPP_DISPATCH_LOADER_DYNAMIC
+    IMGUI_IMPL_VULKAN_NO_PROTOTYPES
+    USE_STD_FILESYSTEM
 )
 
 target_link_libraries(engine PRIVATE

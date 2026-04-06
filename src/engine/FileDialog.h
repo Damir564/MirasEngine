@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 //#include "../external/portable-file-dialogs.h"
 //#ifdef OPAQUE

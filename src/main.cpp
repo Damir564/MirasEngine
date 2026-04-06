@@ -19,12 +19,10 @@
 #include <assimp/scene.h>
 #include <assimp/postprocess.h>
 #include "stb_image.h"
-#define FASTGLTF_USE_STD_MODULE 0
 #include <fastgltf/core.hpp>
 #include <fastgltf/glm_element_traits.hpp>
 #include <fastgltf/tools.hpp>
 #include <future>
-#define IMGUI_IMPL_VULKAN_NO_PROTOTYPES
 #include "imgui.h"
 #include "backends/imgui_impl_sdl3.h"
 #include "backends/imgui_impl_vulkan.h"
@@ -1600,7 +1598,7 @@ Mesh loadModelSmart(const std::string& path) {
 
 	namespace fs = std::filesystem;
 	fs::path fsPath = fs::path(path);
-	std::string ext = fsPath.extension().string();
+	std::string ext = pathToUtf8(fsPath.extension());
 	std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
 	bool isIfc = (ext == ".ifc");
 
@@ -1612,8 +1610,8 @@ Mesh loadModelSmart(const std::string& path) {
 		if (ModelSerializer::LoadFromCache(cachePath, result)) {
 			if (isIfc) {
 				fs::path fileStem = fsPath.stem();
-				std::string jsonPath = (fsPath.parent_path() / "converted" / fileStem).string() + ".json";
-				std::string glbPath = (fsPath.parent_path() / "converted" / fileStem).string() + ".glb";
+				std::string jsonPath = pathToUtf8((fsPath.parent_path() / "converted" / fileStem)) + ".json";
+				std::string glbPath = pathToUtf8((fsPath.parent_path() / "converted" / fileStem)) + ".glb";
 				result.ifcScene = beginLoadIfcScene(path, glbPath, jsonPath);
 			}
 			auto end = std::chrono::high_resolution_clock::now();
@@ -3377,10 +3375,11 @@ int main()
 										ImGui::SameLine();
 
 										// short display name
-										std::string elemLabel = elem.type;
+										// std::string elemLabel = elem.type;
+										std::string elemLabel = "";
 
-										//if (!elem.name.empty())
-										//	elemLabel += ": " + elem.name;
+										if (!elem.name.empty())
+											elemLabel += ": " + elem.name;
 										//else if (!elem.tag.empty())
 										//	elemLabel += ": #" + elem.tag;
 
@@ -3738,6 +3737,96 @@ int main()
 
 
 				ImGui::End();
+				// ============================================
+				// COUNT ELEMENTS UI
+				// ============================================
+				static std::string lastSelectedGuid = "";
+				static int lastSelectedInstance = -1;
+				static std::string cachedElementType = "";
+				static size_t cachedCountInModel = 0;
+				static size_t cachedCountInScene = 0;
+
+				if (selectedIfcKind != IfcSelectionKind::kNone && selectedInstanceForProperties != -1) {
+
+					// 2. Only recalculate if the user clicked on a DIFFERENT element
+					if (selectedIfcGuid != lastSelectedGuid || selectedInstanceForProperties != lastSelectedInstance) {
+
+						// Update the trackers
+						lastSelectedGuid = selectedIfcGuid;
+						lastSelectedInstance = selectedInstanceForProperties;
+
+						// Reset counts
+						cachedCountInModel = 0;
+						cachedCountInScene = 0;
+						cachedElementType = "";
+
+						IfcScene& scene = instances[selectedInstanceForProperties].ifcScene.value();
+
+						if (selectedIfcKind == IfcSelectionKind::kElement) {
+							auto it = scene.elements.find(selectedIfcGuid);
+							if (it != scene.elements.end()) {
+								cachedElementType = it->second.name;
+							}
+
+							if (!cachedElementType.empty()) {
+								for (int sceneIterator = 0; sceneIterator != instances.size(); ++sceneIterator) {
+									if (!instances[sceneIterator].ifcScene) continue;
+
+									const auto& instScene = instances[sceneIterator].ifcScene.value();
+
+									// 3. CRITICAL: Use const auto& to prevent copying the map pair every loop!
+									for (const auto& el : instScene.elements) {
+										if (el.second.name == cachedElementType) {
+											++cachedCountInScene;
+											if (sceneIterator == selectedInstanceForProperties) {
+												++cachedCountInModel;
+											}
+										}
+									}
+								}
+							}
+						}
+						else if (selectedIfcKind == IfcSelectionKind::kSpatial) {
+							auto it = scene.spatial.find(selectedIfcGuid); // Fixed this from scene.elements
+							if (it != scene.spatial.end()) {
+								cachedElementType = it->second.name;
+							}
+
+							if (!cachedElementType.empty()) {
+								for (int sceneIterator = 0; sceneIterator != instances.size(); ++sceneIterator) {
+									if (!instances[sceneIterator].ifcScene) continue;
+
+									const auto& instScene = instances[sceneIterator].ifcScene.value();
+
+									// 3. CRITICAL: Use const auto& here as well
+									for (const auto& el : instScene.spatial) {
+										if (el.second.name == cachedElementType) {
+											++cachedCountInScene;
+											if (sceneIterator == selectedInstanceForProperties) {
+												++cachedCountInModel;
+											}
+										}
+									}
+								}
+							}
+						}
+					}
+
+					// 4. Draw ImGui instantly using the cached data (Zero performance hit)
+					ImGui::Begin("Element Counter");
+					ImGui::Text("Type: %s", cachedElementType.c_str());
+					ImGui::Separator();
+					ImGui::Text("Count:");
+					ImGui::Text("In model: %zu", cachedCountInModel);
+					ImGui::Text("In scene: %zu", cachedCountInScene);
+					ImGui::End();
+
+				}
+				else {
+					// Reset cache trigger if nothing is selected
+					lastSelectedGuid = "";
+					lastSelectedInstance = -1;
+				}
 
 				// ============================================
 				// CAMERA ANIMATION UI
