@@ -4475,185 +4475,109 @@ int main()
 				}
 			}
 
-			if (!mouseEnabled &&
+			bool drawGizmo = (!mouseEnabled &&
 				gizmo.selectedInstance >= 0 &&
 				gizmo.selectedInstance < static_cast<int>(modelManager->getInstances().size()) &&
 				gizmo.mode != GizmoMode::None &&
-				modelManager->getInstances()[gizmo.selectedInstance].visible) {
+				modelManager->getInstances()[gizmo.selectedInstance].visible);
 
-				auto& gizmoInst = modelManager->getInstances()[gizmo.selectedInstance];
+			bool drawPath = (!mouseEnabled &&
+				showAnimationPath &&
+				pathVisualizationBuffer != VK_NULL_HANDLE &&
+				pathVisualizationVertexCount > 0);
 
-				// Bind gizmo shaders
-				vk::ShaderStageFlagBits gizmoStages[] = {
-					vk::ShaderStageFlagBits::eVertex,
-					vk::ShaderStageFlagBits::eFragment
-				};
-				vk::ShaderEXT gizmoShaders[] = { gizmoVertShader, gizmoFragShader };
-				cmd.bindShadersEXT(2, gizmoStages, gizmoShaders);
+			// ============================================
+			// GIZMO & PATH VISUALIZATION (SHARED SETUP)
+			// ============================================
+			if (drawGizmo || drawPath) {
+				// OPTIMIZATION 1: Bind shared shaders and state ONCE
+				vk::ShaderStageFlagBits lineStages[] = { vk::ShaderStageFlagBits::eVertex, vk::ShaderStageFlagBits::eFragment };
+				vk::ShaderEXT lineShaders[] = { gizmoVertShader, gizmoFragShader };
+				cmd.bindShadersEXT(2, lineStages, lineShaders);
 
-				// Set state for line rendering
 				cmd.setPrimitiveTopology(vk::PrimitiveTopology::eLineList);
-				cmd.setLineWidth(3.0f);
 				cmd.setCullMode(vk::CullModeFlagBits::eNone);
-				cmd.setDepthTestEnable(false);  // Draw on top of everything
-				cmd.setDepthWriteEnable(false);
 				cmd.setColorBlendEnableEXT(0, VK_FALSE);
 
-				// Set vertex input for GizmoVertex
-				vk::VertexInputBindingDescription2EXT gizmoBinding{};
-				gizmoBinding.binding = 0;
-				gizmoBinding.stride = sizeof(GizmoVertex);
-				gizmoBinding.inputRate = vk::VertexInputRate::eVertex;
-				gizmoBinding.divisor = 1;
+				// OPTIMIZATION 2: Use static variables to prevent rebuilding the Vertex Layout every frame
+				static const vk::VertexInputBindingDescription2EXT gizmoBinding{
+					0, sizeof(GizmoVertex), vk::VertexInputRate::eVertex, 1
+				};
 
-				std::array<vk::VertexInputAttributeDescription2EXT, 2> gizmoAttribs{};
-				gizmoAttribs[0].location = 0;
-				gizmoAttribs[0].binding = 0;
-				gizmoAttribs[0].format = vk::Format::eR32G32B32Sfloat;
-				gizmoAttribs[0].offset = offsetof(GizmoVertex, position);
+				static const std::array<vk::VertexInputAttributeDescription2EXT, 2> gizmoAttribs = { {
+					{ 0, 0, vk::Format::eR32G32B32Sfloat, static_cast<uint32_t>(offsetof(GizmoVertex, position)) },
+					{ 1, 0, vk::Format::eR32G32B32Sfloat, static_cast<uint32_t>(offsetof(GizmoVertex, color)) }
+				} };
 
-				gizmoAttribs[1].location = 1;
-				gizmoAttribs[1].binding = 0;
-				gizmoAttribs[1].format = vk::Format::eR32G32B32Sfloat;
-				gizmoAttribs[1].offset = offsetof(GizmoVertex, color);
+				cmd.setVertexInputEXT(1, &gizmoBinding, static_cast<uint32_t>(gizmoAttribs.size()), gizmoAttribs.data());
 
-				cmd.setVertexInputEXT(1, &gizmoBinding,
-					static_cast<uint32_t>(gizmoAttribs.size()), gizmoAttribs.data());
-
-				// Bind UBO
+				// Bind shared UBO
 				cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, gizmoPipelineLayout, 0, 1,
 					&uboDescriptorSets[currentFrame], 0, nullptr);
 
-				// Push gizmo transform (position only, no rotation for gizmo itself)
-				float gizmoScale = getGizmoScale(gizmoInst.position, camera.position,
-					0.15f, frameData.proj);
-				glm::mat4 gizmoTransform = glm::translate(glm::mat4(1.0f), gizmoInst.position)
-					* glm::scale(glm::mat4(1.0f), glm::vec3(gizmoScale));
-				cmd.pushConstants(gizmoPipelineLayout, vk::ShaderStageFlagBits::eVertex,
-					0, sizeof(glm::mat4), &gizmoTransform);
+				// --- DRAW GIZMO ---
+				if (drawGizmo) {
+					auto& gizmoInst = modelManager->getInstances()[gizmo.selectedInstance];
 
-				// Select which gizmo buffer to draw
-				vk::Buffer gizmoVB;
-				uint32_t gizmoVertexCount;
+					cmd.setLineWidth(3.0f);
+					cmd.setDepthTestEnable(false);  // Draw on top of everything
+					cmd.setDepthWriteEnable(false);
 
-				switch (gizmo.mode) {
-				case GizmoMode::Translate:
-					gizmoVB = translateBuffer;
-					gizmoVertexCount = static_cast<uint32_t>(translateLines.size());
-					break;
-				case GizmoMode::Rotate:
-					gizmoVB = rotateBuffer;
-					gizmoVertexCount = static_cast<uint32_t>(rotateLines.size());
-					break;
-				case GizmoMode::Scale:
-					gizmoVB = scaleBuffer;
-					gizmoVertexCount = static_cast<uint32_t>(scaleLines.size());
-					break;
-				default:
-					gizmoVB = translateBuffer;
-					gizmoVertexCount = 0;
-					break;
+					float gizmoScale = getGizmoScale(gizmoInst.position, camera.position, 0.15f, frameData.proj);
+					glm::mat4 gizmoTransform = glm::translate(glm::mat4(1.0f), gizmoInst.position) * glm::scale(glm::mat4(1.0f), glm::vec3(gizmoScale));
+
+					cmd.pushConstants(gizmoPipelineLayout, vk::ShaderStageFlagBits::eVertex, 0, sizeof(glm::mat4), &gizmoTransform);
+
+					vk::Buffer gizmoVB;
+					uint32_t gizmoVertexCount = 0;
+
+					switch (gizmo.mode) {
+					case GizmoMode::Translate: gizmoVB = translateBuffer; gizmoVertexCount = static_cast<uint32_t>(translateLines.size()); break;
+					case GizmoMode::Rotate:    gizmoVB = rotateBuffer;    gizmoVertexCount = static_cast<uint32_t>(rotateLines.size()); break;
+					case GizmoMode::Scale:     gizmoVB = scaleBuffer;     gizmoVertexCount = static_cast<uint32_t>(scaleLines.size()); break;
+					default: break;
+					}
+
+					if (gizmoVertexCount > 0) {
+						vk::DeviceSize offset = 0, size = sizeof(GizmoVertex) * gizmoVertexCount, stride = sizeof(GizmoVertex);
+						cmd.bindVertexBuffers2(0, 1, &gizmoVB, &offset, &size, &stride);
+						cmd.draw(gizmoVertexCount, 1, 0, 0);
+					}
 				}
 
-				if (gizmoVertexCount > 0) {
-					vk::DeviceSize offset = 0;
-					vk::DeviceSize size = sizeof(GizmoVertex) * gizmoVertexCount;
-					vk::DeviceSize stride = sizeof(GizmoVertex);
-					cmd.bindVertexBuffers2(0, 1, &gizmoVB, &offset, &size, &stride);
-					cmd.draw(gizmoVertexCount, 1, 0, 0);
+				// --- DRAW CAMERA PATH ---
+				if (drawPath) {
+					cmd.setLineWidth(2.0f);
+					cmd.setDepthTestEnable(true);   // Path goes behind objects
+					cmd.setDepthWriteEnable(false);
+
+					glm::mat4 identity(1.0f);
+					cmd.pushConstants(gizmoPipelineLayout, vk::ShaderStageFlagBits::eVertex, 0, sizeof(glm::mat4), &identity);
+
+					vk::Buffer pathVB = vk::Buffer(pathVisualizationBuffer);
+					vk::DeviceSize pathOffset = 0, pathSize = sizeof(GizmoVertex) * pathVisualizationVertexCount, pathStride = sizeof(GizmoVertex);
+
+					cmd.bindVertexBuffers2(0, 1, &pathVB, &pathOffset, &pathSize, &pathStride);
+					cmd.draw(pathVisualizationVertexCount, 1, 0, 0);
 				}
 
-				// Restore state for subsequent rendering
+				// Restore state for ImGui / Next Frame
 				cmd.setDepthTestEnable(true);
 				cmd.setDepthWriteEnable(true);
 				cmd.setPrimitiveTopology(vk::PrimitiveTopology::eTriangleList);
 			}
 
 			// ============================================
-// CAMERA PATH VISUALIZATION
-// ============================================
-			if (!mouseEnabled && showAnimationPath && pathVisualizationBuffer != VK_NULL_HANDLE && pathVisualizationVertexCount > 0) {
-				// Bind gizmo shaders (reuse them for line rendering)
-				vk::ShaderStageFlagBits pathStages[] = {
-					vk::ShaderStageFlagBits::eVertex,
-					vk::ShaderStageFlagBits::eFragment
-				};
-				vk::ShaderEXT pathShaders[] = { gizmoVertShader, gizmoFragShader };
-				cmd.bindShadersEXT(2, pathStages, pathShaders);
-
-				// Set state for line rendering
-				cmd.setPrimitiveTopology(vk::PrimitiveTopology::eLineList);
-				cmd.setLineWidth(2.0f);
-				cmd.setCullMode(vk::CullModeFlagBits::eNone);
-				cmd.setDepthTestEnable(true);   // Depth test ON so path goes behind objects
-				cmd.setDepthWriteEnable(false);
-				cmd.setColorBlendEnableEXT(0, VK_FALSE);
-
-				// Set vertex input (same as gizmo)
-				vk::VertexInputBindingDescription2EXT pathBinding{};
-				pathBinding.binding = 0;
-				pathBinding.stride = sizeof(GizmoVertex);
-				pathBinding.inputRate = vk::VertexInputRate::eVertex;
-				pathBinding.divisor = 1;
-
-				std::array<vk::VertexInputAttributeDescription2EXT, 2> pathAttribs{};
-				pathAttribs[0].location = 0;
-				pathAttribs[0].binding = 0;
-				pathAttribs[0].format = vk::Format::eR32G32B32Sfloat;
-				pathAttribs[0].offset = offsetof(GizmoVertex, position);
-				pathAttribs[1].location = 1;
-				pathAttribs[1].binding = 0;
-				pathAttribs[1].format = vk::Format::eR32G32B32Sfloat;
-				pathAttribs[1].offset = offsetof(GizmoVertex, color);
-
-				cmd.setVertexInputEXT(1, &pathBinding,
-					static_cast<uint32_t>(pathAttribs.size()), pathAttribs.data());
-
-				// Bind UBO
-				cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, gizmoPipelineLayout, 0, 1,
-					&uboDescriptorSets[currentFrame], 0, nullptr);
-
-				// Identity transform (path is in world space)
-				glm::mat4 identity(1.0f);
-				cmd.pushConstants(gizmoPipelineLayout, vk::ShaderStageFlagBits::eVertex,
-					0, sizeof(glm::mat4), &identity);
-
-				// Bind and draw
-				vk::Buffer pathVB = vk::Buffer(pathVisualizationBuffer);
-				vk::DeviceSize pathOffset = 0;
-				vk::DeviceSize pathSize = sizeof(GizmoVertex) * pathVisualizationVertexCount;
-				vk::DeviceSize pathStride = sizeof(GizmoVertex);
-				cmd.bindVertexBuffers2(0, 1, &pathVB, &pathOffset, &pathSize, &pathStride);
-				cmd.draw(pathVisualizationVertexCount, 1, 0, 0);
-
-				// Restore state
-				cmd.setDepthTestEnable(true);
-				cmd.setDepthWriteEnable(true);
-				cmd.setPrimitiveTopology(vk::PrimitiveTopology::eTriangleList);
-			}
-
-			cmd.endRendering();
-
+			// IMGUI OVERLAY
+			// ============================================
 			if (drawData && drawData->TotalVtxCount > 0) {
-				// Begin new rendering pass for ImGui overlay
-				vk::RenderingAttachmentInfo imguiColorAttachment{};
-				imguiColorAttachment.setImageView(swapchainImageViews[imageIndex])
-					.setImageLayout(vk::ImageLayout::eColorAttachmentOptimal)
-					.setLoadOp(vk::AttachmentLoadOp::eLoad)   // LOAD to preserve scene!
-					.setStoreOp(vk::AttachmentStoreOp::eStore);
-
-				vk::RenderingInfo imguiRenderInfo{};
-				imguiRenderInfo.setRenderArea({ {0, 0}, {(int)SCREEN_WIDTH, (int)SCREEN_HEIGHT} })
-					.setLayerCount(1)
-					.setColorAttachments(imguiColorAttachment);
-
-				cmd.beginRendering(imguiRenderInfo);
-
-				// Record ImGui draw commands
+				// OPTIMIZATION 3: We DO NOT begin a new render pass!
+				// ImGui natively supports being injected at the end of an active Render Pass.
 				ImGui_ImplVulkan_RenderDrawData(drawData, cmd);
-
-				cmd.endRendering();
 			}
+
+			// FINALLY end the render pass once everything (Models, Gizmos, UI) is drawn
+			cmd.endRendering();
 
 			// Transition from COLOR_ATTACHMENT_OPTIMAL to PRESENT_SRC_KHR
 			layoutBarrier.setSrcStageMask(vk::PipelineStageFlagBits2::eColorAttachmentOutput)
