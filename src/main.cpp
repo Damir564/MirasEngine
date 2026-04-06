@@ -3477,7 +3477,7 @@ int main()
 							drawSpatialNode(rootGuid);
 						}
 
-						static int cachedOrphanInstance = -1;
+						/*static int cachedOrphanInstance = -1;
 						static std::vector<std::string> cachedOrphanGuids;
 
 						if (gizmo.selectedInstance != cachedOrphanInstance) {
@@ -3513,7 +3513,7 @@ int main()
 								}
 								ImGui::TreePop();
 							}
-						}
+						}*/
 					}
 
 					auto& sel = instances[gizmo.selectedInstance];
