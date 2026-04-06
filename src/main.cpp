@@ -1395,7 +1395,7 @@ void buildIfcScene(
 	const fastgltf::Asset& asset,
 	const std::vector<size_t>& submeshNodeMap)
 {
-	scene.submeshVisibilityCache.assign(submeshNodeMap.size(), true);
+	scene.submeshVisibilityCache.assign(submeshNodeMap.size(), false);
 
 	for (std::size_t si = 0; si < submeshNodeMap.size(); ++si) {
 		std::size_t nodeIdx = submeshNodeMap[si];

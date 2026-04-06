@@ -70,10 +70,12 @@ struct IfcScene {
     }
 
     void syncVisibilityCache() {
-        for (const auto& [guid, elem] : elements) {
-            if (elem.submeshIndex != std::numeric_limits<std::size_t>::max() &&
-                elem.submeshIndex < submeshVisibilityCache.size()) {
-                submeshVisibilityCache[elem.submeshIndex] = elem.visible;
+        for (const auto& [submeshIdx, guid] : submeshToGuid) {
+            auto eit = elements.find(guid);
+            if (eit != elements.end()) {
+                if (submeshIdx < submeshVisibilityCache.size()) {
+                    submeshVisibilityCache[submeshIdx] = eit->second.visible;
+                }
             }
         }
     }
@@ -96,10 +98,16 @@ struct IfcScene {
 
         it->second.visible = vis;
 
-        for (auto& eg : it->second.elementGuids) {
+        for (const auto& eg : it->second.elementGuids) {
             auto eit = elements.find(eg);
-            if (eit != elements.end())
+            if (eit != elements.end()) {
                 eit->second.visible = vis;
+
+                if (eit->second.submeshIndex != std::numeric_limits<std::size_t>::max() &&
+                    eit->second.submeshIndex < submeshVisibilityCache.size()) {
+                    submeshVisibilityCache[eit->second.submeshIndex] = vis;
+                }
+            }
         }
 
         for (auto& cg : it->second.childSpatialGuids)
