@@ -3377,7 +3377,7 @@ int main()
 										// short display name
 										// std::string elemLabel = elem.type;
 										std::string elemLabel = "";
-
+										// elemLabel += ": "
 										if (!elem.name.empty())
 											elemLabel += ": " + elem.name;
 										//else if (!elem.tag.empty())
