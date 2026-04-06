@@ -3379,7 +3379,7 @@ int main()
 										std::string elemLabel = "";
 										// elemLabel += ": "
 										if (!elem.name.empty())
-											elemLabel += ": " + elem.name;
+											elemLabel += elem.name;
 										//else if (!elem.tag.empty())
 										//	elemLabel += ": #" + elem.tag;
 
