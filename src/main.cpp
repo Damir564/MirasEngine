@@ -1567,25 +1567,24 @@ std::vector<RenderSubmesh> sortSubmeshesForRendering(
 	for (size_t i = 0; i < submeshes.size(); ++i) {
 		const auto& sub = submeshes[i];
 
-		// Use submesh index as approximate distance (or compute from bounds later)
 		RenderSubmesh rs;
 		rs.submeshIndex = i;
-		rs.distanceToCamera = 0.0f;  // Simplified - opaque/transparent sorting still works
+
+		rs.distanceToCamera = 0.0;
+
 		rs.isTransparent = (static_cast<int>(sub.material.alphaMode) == 2);
 
 		renderList.push_back(rs);
 	}
 
-	// Sort: opaque first, then transparent
-	std::sort(renderList.begin(), renderList.end(),
+	auto transparentStart = std::partition(renderList.begin(), renderList.end(),
+		[](const RenderSubmesh& rs) {
+			return !rs.isTransparent;
+		});
+
+	std::sort(transparentStart, renderList.end(),
 		[](const RenderSubmesh& a, const RenderSubmesh& b) {
-			if (a.isTransparent != b.isTransparent) {
-				return !a.isTransparent;
-			}
-			if (a.isTransparent) {
-				return a.distanceToCamera > b.distanceToCamera;
-			}
-			return a.distanceToCamera < b.distanceToCamera;
+			return a.distanceToCamera > b.distanceToCamera;
 		});
 
 	return renderList;
@@ -3267,6 +3266,17 @@ int main()
 
 						ImGui::Separator();
 
+						auto clearPreviousSelection = [&]() {
+							if (selectedIfcKind == IfcSelectionKind::kElement) {
+								auto it = scene.elements.find(selectedIfcGuid);
+								if (it != scene.elements.end()) it->second.selected = false;
+							}
+							else if (selectedIfcKind == IfcSelectionKind::kSpatial) {
+								auto it = scene.spatial.find(selectedIfcGuid);
+								if (it != scene.spatial.end()) it->second.selected = false;
+							}
+						};
+
 						// recursive spatial tree drawing
 						std::function<void(const std::string&)> drawSpatialNode =
 							[&](const std::string& spatialGuid)
@@ -3305,21 +3315,12 @@ int main()
 								std::size_t elemAndSpatialCount = node.elementGuids.size() 
 									+ node.childSpatialGuids.size();
 
-								// tree node for spatial
-								std::string label = node.type + ": " + node.name
-									+ " (" + std::to_string(elemAndSpatialCount) + ")";
+								ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_OpenOnDoubleClick;
+								if (node.childSpatialGuids.empty() && node.elementGuids.empty()) flags |= ImGuiTreeNodeFlags_Leaf;
+								if (node.selected) flags |= ImGuiTreeNodeFlags_Selected;
 
-								ImGuiTreeNodeFlags flags =
-									ImGuiTreeNodeFlags_OpenOnArrow |
-									ImGuiTreeNodeFlags_OpenOnDoubleClick;
-
-								if (node.childSpatialGuids.empty() && node.elementGuids.empty())
-									flags |= ImGuiTreeNodeFlags_Leaf;
-
-								if (node.selected)
-									flags |= ImGuiTreeNodeFlags_Selected;
-
-								bool open = ImGui::TreeNodeEx(label.c_str(), flags);
+								bool open = ImGui::TreeNodeEx(node.guid.c_str(), flags, "%s: %s (%zu)",
+									node.type.c_str(), node.name.c_str(), elemAndSpatialCount);
 
 								if (ImGui::IsItemClicked(ImGuiMouseButton_Left) ||
 									(ImGui::IsItemFocused() && ImGui::IsKeyPressed(ImGuiKey_Enter))) {
@@ -3374,15 +3375,6 @@ int main()
 										ImGui::Checkbox("##ev", &elem.visible);
 										ImGui::SameLine();
 
-										// short display name
-										// std::string elemLabel = elem.type;
-										std::string elemLabel = "";
-										// elemLabel += ": "
-										if (!elem.name.empty())
-											elemLabel += elem.name;
-										//else if (!elem.tag.empty())
-										//	elemLabel += ": #" + elem.tag;
-
 										// leaf node
 										ImGuiTreeNodeFlags elemFlags =
 											ImGuiTreeNodeFlags_Leaf |
@@ -3391,7 +3383,8 @@ int main()
 										if (elem.selected)
 											elemFlags |= ImGuiTreeNodeFlags_Selected;
 
-										ImGui::TreeNodeEx(elemLabel.c_str(), elemFlags);
+										const char* displayName = elem.name.empty() ? elem.type.c_str() : elem.name.c_str();
+										ImGui::TreeNodeEx(elem.guid.c_str(), elemFlags, "%s", displayName);
 
 										// click to select
 										if (ImGui::IsItemClicked(ImGuiMouseButton_Left) ||
@@ -3463,32 +3456,35 @@ int main()
 							drawSpatialNode(rootGuid);
 						}
 
-						// orphan elements (not in any spatial node)
-						bool hasOrphans = false;
-						for (auto& [guid, elem] : scene.elements) {
-							if (elem.parentSpatialGuid.empty() ||
-								scene.spatial.find(elem.parentSpatialGuid) == scene.spatial.end()) {
-								hasOrphans = true;
-								break;
+						static int cachedOrphanInstance = -1;
+						static std::vector<std::string> cachedOrphanGuids;
+
+						if (gizmo.selectedInstance != cachedOrphanInstance) {
+							cachedOrphanInstance = gizmo.selectedInstance;
+							cachedOrphanGuids.clear();
+							for (const auto& [guid, elem] : scene.elements) {
+								if (elem.parentSpatialGuid.empty() ||
+									scene.spatial.find(elem.parentSpatialGuid) == scene.spatial.end()) {
+									cachedOrphanGuids.push_back(guid);
+								}
 							}
 						}
 
-						if (hasOrphans) {
+						if (!cachedOrphanGuids.empty()) {
 							ImGui::Separator();
 							if (ImGui::TreeNode("Unassigned Elements")) {
-								for (auto& [guid, elem] : scene.elements) {
-									if (!elem.parentSpatialGuid.empty() &&
-										scene.spatial.find(elem.parentSpatialGuid) != scene.spatial.end())
-										continue;
+								for (const auto& guid : cachedOrphanGuids) {
+									auto eit = scene.elements.find(guid);
+									if (eit == scene.elements.end()) continue;
+
+									IfcElement& elem = eit->second;
 
 									ImGui::PushID(elem.guid.c_str());
 									ImGui::Checkbox("##ev", &elem.visible);
 									ImGui::SameLine();
 
-									std::string label = elem.type + ": " + elem.name;
-									ImGui::TreeNodeEx(label.c_str(),
-										ImGuiTreeNodeFlags_Leaf |
-										ImGuiTreeNodeFlags_NoTreePushOnOpen);
+									ImGui::TreeNodeEx(elem.guid.c_str(), ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen,
+										"%s: %s", elem.type.c_str(), elem.name.c_str());
 
 									ImGui::PopID();
 								}
@@ -3533,17 +3529,15 @@ int main()
 					selectedIfcKind != IfcSelectionKind::kNone) {
 			
 					IfcScene& scene = instances[selectedInstanceForProperties].ifcScene.value();
-					
+
+					ImGui::SetNextWindowSize(ImVec2(450, 550), ImGuiCond_FirstUseEver);
+					static ImGuiTextFilter propertyFilter;
 					if (selectedIfcKind == IfcSelectionKind::kElement) {
 						auto it = scene.elements.find(selectedIfcGuid);
 						if (it != scene.elements.end()) {
 							IfcElement& elem = it->second;
 
-							ImGui::SetNextWindowSize(ImVec2(450, 550), ImGuiCond_FirstUseEver);
-
-							std::string windowTitle = "Properties: " + elem.type;
-							if (!elem.name.empty()) windowTitle += " - " + elem.name;
-							windowTitle += "###PropertiesWindow";
+							std::string windowTitle = "Properties: " + elem.type + "###PropertiesWindow";
 
 							if (ImGui::Begin(windowTitle.c_str(), &showPropertiesWindow)) {
 
@@ -3585,62 +3579,29 @@ int main()
 								// Properties Section (elem.data)
 								if (!elem.data.empty() && ImGui::CollapsingHeader("Properties", ImGuiTreeNodeFlags_DefaultOpen)) {
 
-									// Optional: Add search filter
-									static char filterBuf[128] = "";
-									ImGui::InputTextWithHint("##filter", "Filter properties...", filterBuf, sizeof(filterBuf));
+									propertyFilter.Draw("Filter properties...");
 
 									ImGui::BeginChild("PropertiesList", ImVec2(0, 300), true);
-
-									if (ImGui::BeginTable("PropsTable", 2,
-										ImGuiTableFlags_Borders |
-										ImGuiTableFlags_RowBg |
-										ImGuiTableFlags_Resizable |
-										ImGuiTableFlags_ScrollY)) {
-
+									if (ImGui::BeginTable("PropsTable", 2, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable | ImGuiTableFlags_ScrollY)) {
 										ImGui::TableSetupColumn("Property", ImGuiTableColumnFlags_WidthStretch, 0.4f);
 										ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch, 0.6f);
 										ImGui::TableHeadersRow();
 
-										std::string filter(filterBuf);
-										std::transform(filter.begin(), filter.end(), filter.begin(), ::tolower);
-
 										for (const auto& [k, v] : elem.data) {
-											// Filter check
-											if (!filter.empty()) {
-												std::string keyLower = k;
-												std::string valLower = v;
-												std::transform(keyLower.begin(), keyLower.end(), keyLower.begin(), ::tolower);
-												std::transform(valLower.begin(), valLower.end(), valLower.begin(), ::tolower);
-
-												if (keyLower.find(filter) == std::string::npos &&
-													valLower.find(filter) == std::string::npos) {
-													continue;
-												}
+											if (propertyFilter.PassFilter(k.c_str()) || propertyFilter.PassFilter(v.c_str())) {
+												ImGui::TableNextRow();
+												ImGui::TableNextColumn(); ImGui::TextWrapped("%s", k.c_str());
+												ImGui::TableNextColumn(); ImGui::TextWrapped("%s", v.c_str());
 											}
-
-											ImGui::TableNextRow();
-											ImGui::TableNextColumn();
-											ImGui::TextWrapped("%s", k.c_str());
-											ImGui::TableNextColumn();
-											ImGui::TextWrapped("%s", v.c_str());
 										}
-
 										ImGui::EndTable();
 									}
 
 									ImGui::EndChild();
-
-									ImGui::Text("Total: %zu properties", elem.data.size());
 								}
 
 								ImGui::Separator();
-
-								ImGui::SameLine();
-								if (ImGui::Button("Close")) {
-									// selectedIfcGuid = "";
-									// selectedIfcKind = IfcSelectionKind::kNone;
-									showPropertiesWindow = false;
-								}
+								if (ImGui::Button("Close")) showPropertiesWindow = false;
 							}
 							ImGui::End();
 						}
@@ -3681,8 +3642,9 @@ int main()
 								}
 
 								if (!node.data.empty() && ImGui::CollapsingHeader("Properties", ImGuiTreeNodeFlags_DefaultOpen)) {
-									static char filterBufSpatial[128] = "";
-									ImGui::InputTextWithHint("##filter_spatial", "Filter properties...", filterBufSpatial, sizeof(filterBufSpatial));
+
+									// We re-use the exact same filter from the Element block
+									propertyFilter.Draw("Filter properties...");
 
 									ImGui::BeginChild("SpatialPropertiesList", ImVec2(0, 300), true);
 
@@ -3696,27 +3658,15 @@ int main()
 										ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch, 0.6f);
 										ImGui::TableHeadersRow();
 
-										std::string filter(filterBufSpatial);
-										std::transform(filter.begin(), filter.end(), filter.begin(), ::tolower);
-
 										for (const auto& [k, v] : node.data) {
-											if (!filter.empty()) {
-												std::string keyLower = k;
-												std::string valLower = v;
-												std::transform(keyLower.begin(), keyLower.end(), keyLower.begin(), ::tolower);
-												std::transform(valLower.begin(), valLower.end(), valLower.begin(), ::tolower);
-
-												if (keyLower.find(filter) == std::string::npos &&
-													valLower.find(filter) == std::string::npos) {
-													continue;
-												}
+											// Replaced std::transform loops with lightning-fast PassFilter
+											if (propertyFilter.PassFilter(k.c_str()) || propertyFilter.PassFilter(v.c_str())) {
+												ImGui::TableNextRow();
+												ImGui::TableNextColumn();
+												ImGui::TextWrapped("%s", k.c_str());
+												ImGui::TableNextColumn();
+												ImGui::TextWrapped("%s", v.c_str());
 											}
-
-											ImGui::TableNextRow();
-											ImGui::TableNextColumn();
-											ImGui::TextWrapped("%s", k.c_str());
-											ImGui::TableNextColumn();
-											ImGui::TextWrapped("%s", v.c_str());
 										}
 
 										ImGui::EndTable();
