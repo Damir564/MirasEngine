@@ -3263,6 +3263,8 @@ int main()
 								elem.visible = true;
 							for (auto& [guid, node] : scene.spatial)
 								node.visible = true;
+
+							scene.syncVisibilityCache();
 						}
 						ImGui::SameLine();
 						if (ImGui::Button("Hide All##ifc")) {
@@ -3270,6 +3272,8 @@ int main()
 								elem.visible = false;
 							for (auto& [guid, node] : scene.spatial)
 								node.visible = false;
+
+							scene.syncVisibilityCache();
 						}
 
 						ImGui::Separator();
@@ -3316,6 +3320,7 @@ int main()
 								bool branchVis = node.visible;
 								if (ImGui::Checkbox("##sv", &branchVis)) {
 									scene.setVisibilityRecursive(node.guid, branchVis);
+									scene.syncVisibilityCache();
 								}
 								ImGui::SameLine();
 
@@ -3380,7 +3385,9 @@ int main()
 										ImGui::PushID(elem.guid.c_str());
 
 										// element visibility checkbox
-										ImGui::Checkbox("##ev", &elem.visible);
+										if (ImGui::Checkbox("##ev", &elem.visible)) {
+											scene.syncVisibilityCache();
+										}
 										ImGui::SameLine();
 
 										// leaf node
@@ -3488,7 +3495,9 @@ int main()
 									IfcElement& elem = eit->second;
 
 									ImGui::PushID(elem.guid.c_str());
-									ImGui::Checkbox("##ev", &elem.visible);
+									if (ImGui::Checkbox("##ev", &elem.visible)) {
+										scene.syncVisibilityCache();
+									}
 									ImGui::SameLine();
 
 									ImGui::TreeNodeEx(elem.guid.c_str(), ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen,
@@ -4068,11 +4077,6 @@ int main()
 			if (result != vk::Result::eSuccess && result != vk::Result::eSuboptimalKHR) {
 				std::cerr << "Failed to acquireNextImageKHR\n";
 				return -1;
-			}
-			for (auto& inst : modelManager->getInstances()) {
-				if (inst.visible && inst.ifcScene) {
-					inst.ifcScene->syncVisibilityCache();
-				}
 			}
 			// ============================================
 			// CAMERA ANIMATION UPDATE
