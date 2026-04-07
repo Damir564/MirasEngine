@@ -40,6 +40,8 @@
 #include "engine/IfcNodeParser.h"
 #include "engine/IfcScene.h"
 #include "engine/IfcSceneLoader.h"
+#include <execution>
+#include <numeric>
 
 #define VULKAN_API_VERSION_MAJOR 1
 #define VULKAN_API_VERSION_MINOR 3
@@ -4131,41 +4133,70 @@ int main()
 			static glm::mat4 lightSpaceMatrix = frameData.lightSpaceMatrix;
 			float maxShadowDistance = 150.0f;
 
-			for (const auto& inst : modelManager->getInstances()) {
-				if (!inst.visible) continue;
+			// --- MULTITHREADED CULLING START ---
+			struct CullResult {
+				bool visibleMain = false;
+				bool visibleShadow = false;
+				glm::mat4 transform = glm::mat4(1.0f);
+				const ModelInstance* instance = nullptr;
+				size_t modelIndex = 0;
+				GPUModel* gpuModel = nullptr;
+			};
+
+			const auto& instances = modelManager->getInstances();
+			std::vector<CullResult> cullResults(instances.size());
+
+			// Create indices array [0, 1, 2, ... N]
+			std::vector<size_t> indices(instances.size());
+			std::iota(indices.begin(), indices.end(), 0);
+
+			// 1. Parallel Math Phase (No locks, threads write to their own index)
+			std::for_each(std::execution::par, indices.begin(), indices.end(), [&](size_t i) {
+				const auto& inst = instances[i];
+				auto& res = cullResults[i];
+
+				res.instance = &inst;
+				res.modelIndex = inst.modelIndex;
+
+				if (!inst.visible) return;
 
 				GPUModel* gpuModel = modelManager->getModel(inst.modelIndex);
-				if (!gpuModel || !gpuModel->isValid()) continue;
+				if (!gpuModel || !gpuModel->isValid()) return;
 
-				glm::mat4 transform = inst.getTransformMatrix();
+				res.gpuModel = gpuModel;
+				res.transform = inst.getTransformMatrix();
 
-				glm::mat4 MVP_main = frameData.proj * frameData.view * transform;
-				bool inMainView = isAABBVisible(gpuModel->boundsMin, gpuModel->boundsMax, MVP_main);
+				// Main view culling
+				glm::mat4 MVP_main = frameData.proj * frameData.view * res.transform;
+				res.visibleMain = isAABBVisible(gpuModel->boundsMin, gpuModel->boundsMax, MVP_main);
 
-				if (inMainView) {
-					if (mainBatches.find(inst.modelIndex) == mainBatches.end()) {
-						mainBatches[inst.modelIndex] = { gpuModel, {} };
-					}
-					mainBatches[inst.modelIndex].instances.push_back({ &inst, transform });
-				}
-
-				// ----------------------------------------------------
-				// SHADOW PASS CULLING (Distance-based)
-				// ----------------------------------------------------
-
-				glm::vec3 worldCenter = glm::vec3(transform * glm::vec4(gpuModel->boundsCenter, 1.0f));
+				// Shadow culling
+				glm::vec3 worldCenter = glm::vec3(res.transform * glm::vec4(gpuModel->boundsCenter, 1.0f));
 				float maxScale = std::max({ inst.scale.x, inst.scale.y, inst.scale.z });
 				float distToCamera = glm::distance(worldCenter, camera.position) - (gpuModel->boundsRadius * maxScale);
 
-				// ONLY process the shadow if the model is close enough to the camera!
 				if (distToCamera < maxShadowDistance) {
-					glm::mat4 MVP_shadow = lightSpaceMatrix * transform;
-					if (isAABBVisible(gpuModel->boundsMin, gpuModel->boundsMax, MVP_shadow)) {
-						if (shadowBatches.find(inst.modelIndex) == shadowBatches.end()) {
-							shadowBatches[inst.modelIndex] = { gpuModel, {} };
-						}
-						shadowBatches[inst.modelIndex].instances.push_back({ &inst, transform });
+					glm::mat4 MVP_shadow = lightSpaceMatrix * res.transform;
+					res.visibleShadow = isAABBVisible(gpuModel->boundsMin, gpuModel->boundsMax, MVP_shadow);
+				}
+				});
+
+			// 2. Sequential Aggregation Phase (Fast, safely modifies unordered_maps)
+			for (const auto& res : cullResults) {
+				if (!res.gpuModel) continue; // Skip invalid or invisible base objects
+
+				if (res.visibleMain) {
+					if (mainBatches.find(res.modelIndex) == mainBatches.end()) {
+						mainBatches[res.modelIndex] = { res.gpuModel, {} };
 					}
+					mainBatches[res.modelIndex].instances.push_back({ res.instance, res.transform });
+				}
+
+				if (res.visibleShadow) {
+					if (shadowBatches.find(res.modelIndex) == shadowBatches.end()) {
+						shadowBatches[res.modelIndex] = { res.gpuModel, {} };
+					}
+					shadowBatches[res.modelIndex].instances.push_back({ res.instance, res.transform });
 				}
 			}
 			auto startShadowPass = std::chrono::high_resolution_clock::now();
