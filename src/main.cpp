@@ -4128,7 +4128,8 @@ int main()
 			std::unordered_map<size_t, RenderBatch> shadowBatches;
 			std::unordered_map<size_t, RenderBatch> mainBatches;
 
-			glm::mat4 lightSpaceMatrix = calculateLightSpaceMatrix(sunLight, sceneBounds.center, sceneBounds.radius);
+			static glm::mat4 lightSpaceMatrix = frameData.lightSpaceMatrix;
+			float maxShadowDistance = 150.0f;
 
 			for (const auto& inst : modelManager->getInstances()) {
 				if (!inst.visible) continue;
@@ -4138,23 +4139,35 @@ int main()
 
 				glm::mat4 transform = inst.getTransformMatrix();
 
-				glm::mat4 MVP_shadow = lightSpaceMatrix * transform;
-				if (isAABBVisible(gpuModel->boundsMin, gpuModel->boundsMax, MVP_shadow)) {
-					if (shadowBatches.find(inst.modelIndex) == shadowBatches.end()) {
-						shadowBatches[inst.modelIndex] = { gpuModel, {} };
-					}
-					shadowBatches[inst.modelIndex].instances.push_back({ &inst, transform });
-				}
-
 				glm::mat4 MVP_main = frameData.proj * frameData.view * transform;
-				if (isAABBVisible(gpuModel->boundsMin, gpuModel->boundsMax, MVP_main)) {
+				bool inMainView = isAABBVisible(gpuModel->boundsMin, gpuModel->boundsMax, MVP_main);
+
+				if (inMainView) {
 					if (mainBatches.find(inst.modelIndex) == mainBatches.end()) {
 						mainBatches[inst.modelIndex] = { gpuModel, {} };
 					}
 					mainBatches[inst.modelIndex].instances.push_back({ &inst, transform });
 				}
-			}
 
+				// ----------------------------------------------------
+				// SHADOW PASS CULLING (Distance-based)
+				// ----------------------------------------------------
+
+				glm::vec3 worldCenter = glm::vec3(transform * glm::vec4(gpuModel->boundsCenter, 1.0f));
+				float maxScale = std::max({ inst.scale.x, inst.scale.y, inst.scale.z });
+				float distToCamera = glm::distance(worldCenter, camera.position) - (gpuModel->boundsRadius * maxScale);
+
+				// ONLY process the shadow if the model is close enough to the camera!
+				if (distToCamera < maxShadowDistance) {
+					glm::mat4 MVP_shadow = lightSpaceMatrix * transform;
+					if (isAABBVisible(gpuModel->boundsMin, gpuModel->boundsMax, MVP_shadow)) {
+						if (shadowBatches.find(inst.modelIndex) == shadowBatches.end()) {
+							shadowBatches[inst.modelIndex] = { gpuModel, {} };
+						}
+						shadowBatches[inst.modelIndex].instances.push_back({ &inst, transform });
+					}
+				}
+			}
 			auto startShadowPass = std::chrono::high_resolution_clock::now();
 			// Record command buffer to clear blue
 			vk::CommandBuffer cmd = commandBuffers[currentFrame].get();
