@@ -2651,41 +2651,41 @@ int main()
 						// First: try clicking on gizmo axis
 						if (gizmo.selectedInstance >= 0 && gizmo.mode != GizmoMode::None && gizmo.selectedInstance < static_cast<int>(modelManager->getInstances().size())) {
 
-    auto& inst = modelManager->getInstances()[gizmo.selectedInstance];
-    float gizmoScaleVal = getGizmoScale(inst.position, camera.position,
-        0.15f, projMat);
+							auto& inst = modelManager->getInstances()[gizmo.selectedInstance];
+							float gizmoScaleVal = getGizmoScale(inst.position, camera.position,
+								0.15f, projMat);
 
-    GizmoAxis hitAxis = GizmoAxis::None;
+							GizmoAxis hitAxis = GizmoAxis::None;
 
-    if (gizmo.mode == GizmoMode::Rotate) {
-        hitAxis = pickRotateGizmoAxis(
-            glm::vec2(mx, my),
-            inst.position,
-            gizmoScaleVal,
-            15.0f,
-            viewMat, projMat,
-			SCREEN_WIDTH, SCREEN_HEIGHT);
-    }
-    else {
-        hitAxis = pickGizmoAxis(
-            glm::vec2(mx, my),
-            inst.position,
-            gizmoScaleVal,
-            20.0f,
-            viewMat, projMat,
-			SCREEN_WIDTH, SCREEN_HEIGHT);
-    }
+							if (gizmo.mode == GizmoMode::Rotate) {
+								hitAxis = pickRotateGizmoAxis(
+									glm::vec2(mx, my),
+									inst.position,
+									gizmoScaleVal,
+									15.0f,
+									viewMat, projMat,
+									SCREEN_WIDTH, SCREEN_HEIGHT);
+							}
+							else {
+								hitAxis = pickGizmoAxis(
+									glm::vec2(mx, my),
+									inst.position,
+									gizmoScaleVal,
+									20.0f,
+									viewMat, projMat,
+									SCREEN_WIDTH, SCREEN_HEIGHT);
+							}
 
-    if (hitAxis != GizmoAxis::None) {
-        gizmo.activeAxis = hitAxis;
-        gizmo.isDragging = true;
-        gizmo.dragStart = glm::vec2(mx, my);
-        gizmo.originalPosition = inst.position;
-        gizmo.originalRotation = inst.rotation;
-        gizmo.originalScale = inst.scale;
-        clickedOnGizmo = true;
-    }
-}
+							if (hitAxis != GizmoAxis::None) {
+								gizmo.activeAxis = hitAxis;
+								gizmo.isDragging = true;
+								gizmo.dragStart = glm::vec2(mx, my);
+								gizmo.originalPosition = inst.position;
+								gizmo.originalRotation = inst.rotation;
+								gizmo.originalScale = inst.scale;
+								clickedOnGizmo = true;
+							}
+						}
 
 						// Second: if not clicking gizmo, try picking a model
 						if (!clickedOnGizmo) {
@@ -2839,6 +2839,7 @@ int main()
 			// ImGUI
 			ImDrawData* drawData = nullptr;
 			if (!mouseEnabled) {
+				auto startGUI = std::chrono::high_resolution_clock::now();
 				ImGui_ImplVulkan_NewFrame();
 				ImGui_ImplSDL3_NewFrame();
 				ImGui::NewFrame();
@@ -4025,8 +4026,12 @@ int main()
 				// Finalize ImGui frame (must call before RenderDrawData)
 				ImGui::Render();
 				drawData = ImGui::GetDrawData();
+				auto endGUI = std::chrono::high_resolution_clock::now();
+				std::chrono::duration<double, std::milli> cpuTime = endGUI - startGUI;
+				// std::cout << "GUI Frame Time: " << cpuTime.count() << " ms\n";
 			}
 			else {
+				auto startModelsUpdate = std::chrono::high_resolution_clock::now();
 				modelManager->update();
 
 				// Handle pending scene load even when GUI is hidden
@@ -4064,6 +4069,9 @@ int main()
 				}
 
 				drawData = nullptr;
+				auto endModelsUpdate = std::chrono::high_resolution_clock::now();
+				std::chrono::duration<double, std::milli> cpuTime = endModelsUpdate - startModelsUpdate;
+				// std::cout << "Models Update Frame Time: " << cpuTime.count() << " ms\n";
 			}
 			vk::SwapchainKHR swapchainHPP(vkbSwapchain.swapchain);
 
@@ -4104,9 +4112,9 @@ int main()
 			frameData.lightDir = glm::vec4(sunLight.direction, 0.0f);
 			frameData.time = time;
 			frameData.shadowBias = 0.005f;
-
 			memcpy(frameUBOs[currentFrame].mapped, &frameData, sizeof(FrameUBO));
 
+			auto startShadowPass = std::chrono::high_resolution_clock::now();
 			// Record command buffer to clear blue
 			vk::CommandBuffer cmd = commandBuffers[currentFrame].get();
 			(void)cmd.reset();
@@ -4194,7 +4202,7 @@ int main()
 
 				vk::DescriptorSet boundShadowSet = nullptr;
 
-
+				auto startShadowPassLoop = std::chrono::high_resolution_clock::now();
 				for (const auto& inst : shadowInstances) {
 					if (!inst.visible) continue;
 
@@ -4281,8 +4289,9 @@ int main()
 						cmd.drawIndexed(sub.indexCount, 1, sub.indexOffset, sub.vertexOffset, 0);
 					}
 				}
-
+				
 				cmd.endRendering();
+
 
 				// Transition shadow map for shader reading
 				shadowBarrier.setSrcStageMask(vk::PipelineStageFlagBits2::eLateFragmentTests)
@@ -4294,8 +4303,15 @@ int main()
 
 				shadowDepInfo.setImageMemoryBarriers(shadowBarrier);
 				cmd.pipelineBarrier2(shadowDepInfo);
+				auto endShadowPass = std::chrono::high_resolution_clock::now();
+				std::chrono::duration<double, std::milli> timeShadowPass = endShadowPass - startShadowPass;
+				std::cout << "Shadow Pass Time: " << timeShadowPass.count() << " ms\n";
+				auto endShadowPassLoop = std::chrono::high_resolution_clock::now();
+				std::chrono::duration<double, std::milli> timeShadowPassLoop = endShadowPassLoop - startShadowPassLoop;
+				std::cout << "\t Shadow Pass Loop Time: " << timeShadowPassLoop.count() << " ms\n";
 			}
 
+			auto startMainPass = std::chrono::high_resolution_clock::now();
 			// Transition the swapchain image from UNDEFINED to COLOR_ATTACHMENT_OPTIMAL
 			vk::ImageMemoryBarrier2 layoutBarrier;
 			layoutBarrier.setSrcStageMask(vk::PipelineStageFlagBits2::eColorAttachmentOutput)
@@ -4400,6 +4416,7 @@ int main()
 
 			static const std::vector<Vertex> emptyVertices;
 
+			auto startMainPassLoop = std::chrono::high_resolution_clock::now();		
 			for (const auto& inst : modelInstances) {
 				if (!inst.visible) continue;
 
@@ -4521,6 +4538,13 @@ int main()
 				}
 			}
 
+			auto endMainPass = std::chrono::high_resolution_clock::now();
+			std::chrono::duration<double, std::milli> timeMainPass = endMainPass - startMainPass;
+			std::cout << "Main Pass Time: " << timeMainPass.count() << " ms\n";
+			auto endMainPassLoop = std::chrono::high_resolution_clock::now();
+			std::chrono::duration<double, std::milli> timeMainPassLoop = endMainPassLoop - startMainPassLoop;
+			std::cout << "\t Main Pass Loop Time: " << timeMainPassLoop.count() << " ms\n";
+			auto startGuiPass = std::chrono::high_resolution_clock::now();
 			bool drawGizmo = (!mouseEnabled &&
 				gizmo.selectedInstance >= 0 &&
 				gizmo.selectedInstance < static_cast<int>(modelManager->getInstances().size()) &&
@@ -4636,7 +4660,9 @@ int main()
 			cmd.pipelineBarrier2(depInfo);
 
 			(void)cmd.end();
-
+			auto endGuiPass = std::chrono::high_resolution_clock::now();
+			std::chrono::duration<double, std::milli> timeGuiPass = endGuiPass - startGuiPass;
+			std::cout << "GUI Pass Time: " << timeGuiPass.count() << " ms\n\n";
 			// Submit
 			vk::CommandBufferSubmitInfo cmdInfo{};
 			cmdInfo.setCommandBuffer(cmd);
