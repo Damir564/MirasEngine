@@ -4114,6 +4114,47 @@ int main()
 			frameData.shadowBias = 0.005f;
 			memcpy(frameUBOs[currentFrame].mapped, &frameData, sizeof(FrameUBO));
 
+			// PRE-PASS. CULLING AND BATCHING
+			struct InstanceRenderData {
+				const ModelInstance* instance;
+				glm::mat4 transform;
+			};
+
+			struct RenderBatch {
+				GPUModel* model;
+				std::vector<InstanceRenderData> instances;
+			};
+
+			std::unordered_map<size_t, RenderBatch> shadowBatches;
+			std::unordered_map<size_t, RenderBatch> mainBatches;
+
+			glm::mat4 lightSpaceMatrix = calculateLightSpaceMatrix(sunLight, sceneBounds.center, sceneBounds.radius);
+
+			for (const auto& inst : modelManager->getInstances()) {
+				if (!inst.visible) continue;
+
+				GPUModel* gpuModel = modelManager->getModel(inst.modelIndex);
+				if (!gpuModel || !gpuModel->isValid()) continue;
+
+				glm::mat4 transform = inst.getTransformMatrix();
+
+				glm::mat4 MVP_shadow = lightSpaceMatrix * transform;
+				if (isAABBVisible(gpuModel->boundsMin, gpuModel->boundsMax, MVP_shadow)) {
+					if (shadowBatches.find(inst.modelIndex) == shadowBatches.end()) {
+						shadowBatches[inst.modelIndex] = { gpuModel, {} };
+					}
+					shadowBatches[inst.modelIndex].instances.push_back({ &inst, transform });
+				}
+
+				glm::mat4 MVP_main = frameData.proj * frameData.view * transform;
+				if (isAABBVisible(gpuModel->boundsMin, gpuModel->boundsMax, MVP_main)) {
+					if (mainBatches.find(inst.modelIndex) == mainBatches.end()) {
+						mainBatches[inst.modelIndex] = { gpuModel, {} };
+					}
+					mainBatches[inst.modelIndex].instances.push_back({ &inst, transform });
+				}
+			}
+
 			auto startShadowPass = std::chrono::high_resolution_clock::now();
 			// Record command buffer to clear blue
 			vk::CommandBuffer cmd = commandBuffers[currentFrame].get();
@@ -4203,22 +4244,9 @@ int main()
 				vk::DescriptorSet boundShadowSet = nullptr;
 
 				auto startShadowPassLoop = std::chrono::high_resolution_clock::now();
-				for (const auto& inst : shadowInstances) {
-					if (!inst.visible) continue;
+				for (const auto& [modelIdx, batch] : shadowBatches) {
+					GPUModel* gpuModel = batch.model;
 
-					GPUModel* gpuModel = modelManager->getModel(inst.modelIndex);
-					if (!gpuModel || !gpuModel->isValid()) continue;
-					/*if (inst.ifcScene) {
-						const auto& scene = inst.ifcScene.value();
-						if (!scene.roots.empty()) {
-							auto it = scene.spatial.find(scene.roots.front());
-							if (it != scene.spatial.end() && !it->second.visible) {
-								continue;
-							}
-						}
-					}*/
-
-					// Bind vertex/index buffers for this model
 					vk::Buffer modelBuffers[1] = { gpuModel->vertexBuffer->getBuffer() };
 					vk::DeviceSize modelOffsets[1] = { 0 };
 					vk::DeviceSize modelSizes[1] = { sizeof(Vertex) * gpuModel->vertexCount };
@@ -4227,66 +4255,43 @@ int main()
 					cmd.bindVertexBuffers2(0, 1, modelBuffers, modelOffsets, modelSizes, modelStrides);
 					cmd.bindIndexBuffer(gpuModel->indexBuffer->getBuffer(), 0, vk::IndexType::eUint32);
 
-					glm::mat4 instanceTransform = inst.getTransformMatrix();
-
-					glm::mat4 MVP = lightSpaceMatrix * instanceTransform;
-					if (!isAABBVisible(gpuModel->boundsMin, gpuModel->boundsMax, MVP)) {
-						continue; // Skip this entire model, it's not on screen!
-					}
-
-					bool instanceMatrixChanged = true;
-
-					// Draw all non-blend submeshes for shadow
 					for (std::size_t si = 0; si < gpuModel->submeshes.size(); ++si) {
 						const auto& sub = gpuModel->submeshes[si];
-						if (inst.ifcScene && !inst.ifcScene->isSubmeshVisible(si))
-							continue;
 
-						if (sub.material.alphaMode == AlphaMode::BLEND)
-							continue;
+						if (sub.material.alphaMode == AlphaMode::BLEND) continue;
 
 						bool alphaChanged = (static_cast<int>(sub.material.alphaMode) != lastAlphaMode) ||
 							(sub.material.alphaCutoff != lastAlphaCutoff);
 
-						ShadowPushConstants shadowPc{};
-						shadowPc.modelMatrix = instanceTransform;
-						shadowPc.alphaCutoff = sub.material.alphaCutoff;
-						shadowPc.alphaMode = static_cast<int>(sub.material.alphaMode);
+						if (sub.material.alphaMode == AlphaMode::MASK) {
+							vk::DescriptorSet targetSet = (sub.material.baseColorTextureIndex >= 0 &&
+								sub.material.baseColorTextureIndex < static_cast<int>(gpuModel->textureDescriptorSets.size()))
+								? gpuModel->textureDescriptorSets[sub.material.baseColorTextureIndex]
+								: modelManager->getDefaultBaseColorSet();
 
-						if (instanceMatrixChanged || alphaChanged) {
+							if (targetSet != boundShadowSet) {
+								cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, shadowPipelineLayout, 1, 1, &targetSet, 0, nullptr);
+								boundShadowSet = targetSet;
+							}
+						}
+
+						for (const auto& renderData : batch.instances) {
+							if (renderData.instance->ifcScene && !renderData.instance->ifcScene->isSubmeshVisible(si))
+								continue;
+
+							ShadowPushConstants shadowPc{};
+							shadowPc.modelMatrix = renderData.transform;
 							shadowPc.alphaCutoff = sub.material.alphaCutoff;
 							shadowPc.alphaMode = static_cast<int>(sub.material.alphaMode);
 
 							cmd.pushConstants(
 								shadowPipelineLayout,
 								vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment,
-								0,
-								sizeof(ShadowPushConstants),
-								&shadowPc
+								0, sizeof(ShadowPushConstants), &shadowPc
 							);
 
-							lastAlphaMode = shadowPc.alphaMode;
-							lastAlphaCutoff = shadowPc.alphaCutoff;
-							instanceMatrixChanged = false;
+							cmd.drawIndexed(sub.indexCount, 1, sub.indexOffset, sub.vertexOffset, 0);
 						}
-
-						vk::DescriptorSet targetSet = nullptr;
-
-						if (sub.material.alphaMode == AlphaMode::MASK && sub.material.baseColorTextureIndex >= 0 &&
-							sub.material.baseColorTextureIndex < static_cast<int>(gpuModel->textureDescriptorSets.size())) {
-							targetSet = gpuModel->textureDescriptorSets[sub.material.baseColorTextureIndex];
-						}
-						else {
-							targetSet = modelManager->getDefaultBaseColorSet();
-						}
-
-						if (targetSet != boundShadowSet) {
-							cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, shadowPipelineLayout, 1, 1, &targetSet, 0, nullptr);
-							boundShadowSet = targetSet; // Update our tracker
-						}
-
-						// Draw
-						cmd.drawIndexed(sub.indexCount, 1, sub.indexOffset, sub.vertexOffset, 0);
 					}
 				}
 				
@@ -4417,29 +4422,14 @@ int main()
 			static const std::vector<Vertex> emptyVertices;
 
 			auto startMainPassLoop = std::chrono::high_resolution_clock::now();		
-			for (const auto& inst : modelInstances) {
-				if (!inst.visible) continue;
 
-				GPUModel* gpuModel = modelManager->getModel(inst.modelIndex);
-				if (!gpuModel || !gpuModel->isValid()) continue;
-				/*if (inst.ifcScene) {
-					const auto& scene = inst.ifcScene.value();
-					if (!scene.roots.empty()) {
-						auto it = scene.spatial.find(scene.roots.front());
-						if (it != scene.spatial.end() && !it->second.visible) {
-							continue;
-						}
-					}
-				}*/
+			bool currentlyBlending = false;
+			vk::DescriptorSet boundMaterialSets[3] = { nullptr, nullptr, nullptr };
 
-				glm::mat4 instanceTransform = inst.getTransformMatrix();
+			for (const auto& [modelIdx, batch] : mainBatches) {
+				GPUModel* gpuModel = batch.model;
 
-				glm::mat4 MVP = frameData.proj * frameData.view * instanceTransform;
-				if (!isAABBVisible(gpuModel->boundsMin, gpuModel->boundsMax, MVP)) {
-					continue;
-				}
-
-				// Bind vertex/index buffers for this model
+				// Bind Buffers ONCE per model
 				vk::Buffer modelBuffers[1] = { gpuModel->vertexBuffer->getBuffer() };
 				vk::DeviceSize modelOffsets[1] = { 0 };
 				vk::DeviceSize modelSizes[1] = { sizeof(Vertex) * gpuModel->vertexCount };
@@ -4447,95 +4437,114 @@ int main()
 
 				cmd.bindVertexBuffers2(0, 1, modelBuffers, modelOffsets, modelSizes, modelStrides);
 				cmd.bindIndexBuffer(gpuModel->indexBuffer->getBuffer(), 0, vk::IndexType::eUint32);
-				static const std::vector<Vertex> emptyVertices;
-				// Sort submeshes
-				auto sortedSubmeshes = sortSubmeshesForRendering(
-					gpuModel->submeshes,
-					std::vector<Vertex>(), 
-					camera.position,
-					(inst.ifcScene.has_value() ? &inst.ifcScene.value() : nullptr)
-				);
 
-				bool currentlyBlending = false;
-				vk::DescriptorSet boundMaterialSets[3] = { nullptr, nullptr, nullptr };
-				for (const auto& renderSub : sortedSubmeshes) {
-					const auto& sub = gpuModel->submeshes[renderSub.submeshIndex];
+				for (std::size_t si = 0; si < gpuModel->submeshes.size(); ++si) {
+					const auto& sub = gpuModel->submeshes[si];
 
-					if (inst.ifcScene && !inst.ifcScene->isSubmeshVisible(renderSub.submeshIndex))
-						continue;
-					bool needsBlending = (sub.material.alphaMode == AlphaMode::BLEND);
+					if (sub.material.alphaMode == AlphaMode::BLEND) continue;
 
-					if (needsBlending != currentlyBlending) {
-						currentlyBlending = needsBlending;
-
-						if (needsBlending) {
-							cmd.setColorBlendEnableEXT(0, VK_TRUE);
-							vk::ColorBlendEquationEXT blendEquation{};
-							blendEquation.srcColorBlendFactor = vk::BlendFactor::eSrcAlpha;
-							blendEquation.dstColorBlendFactor = vk::BlendFactor::eOneMinusSrcAlpha;
-							blendEquation.colorBlendOp = vk::BlendOp::eAdd;
-							blendEquation.srcAlphaBlendFactor = vk::BlendFactor::eOne;
-							blendEquation.dstAlphaBlendFactor = vk::BlendFactor::eOneMinusSrcAlpha;
-							blendEquation.alphaBlendOp = vk::BlendOp::eAdd;
-							cmd.setColorBlendEquationEXT(0, 1, &blendEquation);
-							cmd.setDepthWriteEnable(VK_FALSE);
-						}
-						else {
-							cmd.setColorBlendEnableEXT(0, VK_FALSE);
-							cmd.setDepthWriteEnable(VK_TRUE);
-						}
+					if (currentlyBlending) {
+						cmd.setColorBlendEnableEXT(0, VK_FALSE);
+						cmd.setDepthWriteEnable(VK_TRUE);
+						currentlyBlending = false;
 					}
 
-					// Push constants
-					MeshPushConstants pc{};
-					pc.modelMatrix = instanceTransform;
-					pc.baseColor = sub.material.baseColorFactor;
-					pc.metallic = sub.material.metallicFactor;
-					pc.roughness = sub.material.roughnessFactor;
-					pc.alphaCutoff = sub.material.alphaCutoff;
-					pc.alphaMode = static_cast<int>(sub.material.alphaMode);
-
-					cmd.pushConstants(
-						pipelineLayout,
-						vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment,
-						0, sizeof(MeshPushConstants), &pc
-					);
-
-					// Bind textures
-					vk::DescriptorSet baseColorSet = (sub.material.baseColorTextureIndex >= 0 &&
-						sub.material.baseColorTextureIndex < static_cast<int>(gpuModel->textureDescriptorSets.size()))
-						? gpuModel->textureDescriptorSets[sub.material.baseColorTextureIndex]
-						: modelManager->getDefaultBaseColorSet();
-					// cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipelineLayout, 1, 1, &baseColorSet, 0, nullptr);
-
-					vk::DescriptorSet normalSet = (sub.material.normalTextureIndex >= 0 &&
-						sub.material.normalTextureIndex < static_cast<int>(gpuModel->textureDescriptorSets.size()))
-						? gpuModel->textureDescriptorSets[sub.material.normalTextureIndex]
-						: modelManager->getDefaultNormalSet();
-					// cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipelineLayout, 2, 1, &normalSet, 0, nullptr);
-
-					vk::DescriptorSet mrSet = (sub.material.metallicRoughnessTextureIndex >= 0 &&
-						sub.material.metallicRoughnessTextureIndex < static_cast<int>(gpuModel->textureDescriptorSets.size()))
-						? gpuModel->textureDescriptorSets[sub.material.metallicRoughnessTextureIndex]
-						: modelManager->getDefaultMRSet();
-					// cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipelineLayout, 3, 1, &mrSet, 0, nullptr);
+					vk::DescriptorSet baseColorSet = (sub.material.baseColorTextureIndex >= 0 && sub.material.baseColorTextureIndex < static_cast<int>(gpuModel->textureDescriptorSets.size())) ? gpuModel->textureDescriptorSets[sub.material.baseColorTextureIndex] : modelManager->getDefaultBaseColorSet();
+					vk::DescriptorSet normalSet = (sub.material.normalTextureIndex >= 0 && sub.material.normalTextureIndex < static_cast<int>(gpuModel->textureDescriptorSets.size())) ? gpuModel->textureDescriptorSets[sub.material.normalTextureIndex] : modelManager->getDefaultNormalSet();
+					vk::DescriptorSet mrSet = (sub.material.metallicRoughnessTextureIndex >= 0 && sub.material.metallicRoughnessTextureIndex < static_cast<int>(gpuModel->textureDescriptorSets.size())) ? gpuModel->textureDescriptorSets[sub.material.metallicRoughnessTextureIndex] : modelManager->getDefaultMRSet();
 
 					if (baseColorSet != boundMaterialSets[0] || normalSet != boundMaterialSets[1] || mrSet != boundMaterialSets[2]) {
-						boundMaterialSets[0] = baseColorSet;
-						boundMaterialSets[1] = normalSet;
-						boundMaterialSets[2] = mrSet;
-
+						boundMaterialSets[0] = baseColorSet; boundMaterialSets[1] = normalSet; boundMaterialSets[2] = mrSet;
 						cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipelineLayout, 1, 3, boundMaterialSets, 0, nullptr);
 					}
 
-					// Draw
-					cmd.drawIndexed(sub.indexCount, 1, sub.indexOffset, sub.vertexOffset, 0);
-				}
+					for (const auto& renderData : batch.instances) {
+						if (renderData.instance->ifcScene && !renderData.instance->ifcScene->isSubmeshVisible(si)) continue;
 
-				if (currentlyBlending) {
-					cmd.setColorBlendEnableEXT(0, VK_FALSE);
-					cmd.setDepthWriteEnable(VK_TRUE);
+						MeshPushConstants pc{};
+						pc.modelMatrix = renderData.transform;
+						pc.baseColor = sub.material.baseColorFactor;
+						pc.metallic = sub.material.metallicFactor;
+						pc.roughness = sub.material.roughnessFactor;
+						pc.alphaCutoff = sub.material.alphaCutoff;
+						pc.alphaMode = static_cast<int>(sub.material.alphaMode);
+
+						cmd.pushConstants(pipelineLayout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0, sizeof(MeshPushConstants), &pc);
+						cmd.drawIndexed(sub.indexCount, 1, sub.indexOffset, sub.vertexOffset, 0);
+					}
 				}
+			}
+
+			for (const auto& [modelIdx, batch] : mainBatches) {
+				GPUModel* gpuModel = batch.model;
+				bool buffersBound = false;
+
+				for (std::size_t si = 0; si < gpuModel->submeshes.size(); ++si) {
+					const auto& sub = gpuModel->submeshes[si];
+
+					// Skip Opaque/Mask in Pass B
+					if (sub.material.alphaMode != AlphaMode::BLEND) continue;
+
+					if (!buffersBound) {
+						vk::Buffer modelBuffers[1] = { gpuModel->vertexBuffer->getBuffer() };
+						vk::DeviceSize modelOffsets[1] = { 0 };
+						vk::DeviceSize modelSizes[1] = { sizeof(Vertex) * gpuModel->vertexCount };
+						vk::DeviceSize modelStrides[1] = { sizeof(Vertex) };
+						cmd.bindVertexBuffers2(0, 1, modelBuffers, modelOffsets, modelSizes, modelStrides);
+						cmd.bindIndexBuffer(gpuModel->indexBuffer->getBuffer(), 0, vk::IndexType::eUint32);
+						buffersBound = true;
+					}
+
+					if (!currentlyBlending) {
+						cmd.setColorBlendEnableEXT(0, VK_TRUE);
+						vk::ColorBlendEquationEXT blendEquation{};
+						blendEquation.srcColorBlendFactor = vk::BlendFactor::eSrcAlpha;
+						blendEquation.dstColorBlendFactor = vk::BlendFactor::eOneMinusSrcAlpha;
+						blendEquation.colorBlendOp = vk::BlendOp::eAdd;
+						blendEquation.srcAlphaBlendFactor = vk::BlendFactor::eOne;
+						blendEquation.dstAlphaBlendFactor = vk::BlendFactor::eOneMinusSrcAlpha;
+						blendEquation.alphaBlendOp = vk::BlendOp::eAdd;
+						cmd.setColorBlendEquationEXT(0, 1, &blendEquation);
+						cmd.setDepthWriteEnable(VK_FALSE);
+						currentlyBlending = true;
+					}
+
+					vk::DescriptorSet baseColorSet = (sub.material.baseColorTextureIndex >= 0 && sub.material.baseColorTextureIndex < static_cast<int>(gpuModel->textureDescriptorSets.size())) ? gpuModel->textureDescriptorSets[sub.material.baseColorTextureIndex] : modelManager->getDefaultBaseColorSet();
+					vk::DescriptorSet normalSet = (sub.material.normalTextureIndex >= 0 && sub.material.normalTextureIndex < static_cast<int>(gpuModel->textureDescriptorSets.size())) ? gpuModel->textureDescriptorSets[sub.material.normalTextureIndex] : modelManager->getDefaultNormalSet();
+					vk::DescriptorSet mrSet = (sub.material.metallicRoughnessTextureIndex >= 0 && sub.material.metallicRoughnessTextureIndex < static_cast<int>(gpuModel->textureDescriptorSets.size())) ? gpuModel->textureDescriptorSets[sub.material.metallicRoughnessTextureIndex] : modelManager->getDefaultMRSet();
+
+					if (baseColorSet != boundMaterialSets[0] || normalSet != boundMaterialSets[1] || mrSet != boundMaterialSets[2]) {
+						boundMaterialSets[0] = baseColorSet; boundMaterialSets[1] = normalSet; boundMaterialSets[2] = mrSet;
+						cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipelineLayout, 1, 3, boundMaterialSets, 0, nullptr);
+					}
+
+					std::vector<InstanceRenderData> sortedInstances = batch.instances;
+					std::sort(sortedInstances.begin(), sortedInstances.end(), [&](const InstanceRenderData& a, const InstanceRenderData& b) {
+						float distA = glm::distance(camera.position, a.instance->position);
+						float distB = glm::distance(camera.position, b.instance->position);
+						return distA > distB;
+						});
+
+					for (const auto& renderData : sortedInstances) {
+						if (renderData.instance->ifcScene && !renderData.instance->ifcScene->isSubmeshVisible(si)) continue;
+
+						MeshPushConstants pc{};
+						pc.modelMatrix = renderData.transform;
+						pc.baseColor = sub.material.baseColorFactor;
+						pc.metallic = sub.material.metallicFactor;
+						pc.roughness = sub.material.roughnessFactor;
+						pc.alphaCutoff = sub.material.alphaCutoff;
+						pc.alphaMode = static_cast<int>(sub.material.alphaMode);
+
+						cmd.pushConstants(pipelineLayout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0, sizeof(MeshPushConstants), &pc);
+						cmd.drawIndexed(sub.indexCount, 1, sub.indexOffset, sub.vertexOffset, 0);
+					}
+				}
+			}
+
+			if (currentlyBlending) {
+				cmd.setColorBlendEnableEXT(0, VK_FALSE);
+				cmd.setDepthWriteEnable(VK_TRUE);
 			}
 
 			auto endMainPass = std::chrono::high_resolution_clock::now();
