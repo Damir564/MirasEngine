@@ -3153,53 +3153,56 @@ int main()
 				}
 
 				// Loaded Models
-				ImGui::Text("Loaded Models: %zu", modelManager->getModels().size());
-				const auto& models = modelManager->getModels();
-				static int selectedModel = -1;
-				size_t vertexCount = 0;
-				for (size_t i = 0; i < models.size(); ++i) {
-					const auto& model = models[i];
-					ImGui::PushID(static_cast<int>(i));
+				if (ImGui::CollapsingHeader("Loaded Models", ImGuiTreeNodeFlags_DefaultOpen))
+				{
+					ImGui::Text("Model Count: %zu", modelManager->getModels().size());
+					const auto& models = modelManager->getModels();
+					static int selectedModel = -1;
+					size_t vertexCount = 0;
+					for (size_t i = 0; i < models.size(); ++i) {
+						const auto& model = models[i];
+						ImGui::PushID(static_cast<int>(i));
 
-					bool isSelected = (selectedModel == static_cast<int>(i));
-					if (ImGui::Selectable(model->name.c_str(), isSelected)) {
-						selectedModel = static_cast<int>(i);
-					}
+						bool isSelected = (selectedModel == static_cast<int>(i));
+						if (ImGui::Selectable(model->name.c_str(), isSelected)) {
+							selectedModel = static_cast<int>(i);
+						}
 
-					// Right-click context menu
-					if (ImGui::BeginPopupContextItem()) {
-						if (ImGui::MenuItem("Create Instance")) {
-							modelManager->createInstance(i, camera.position + glm::vec3(0, 0, 0));
-						}
-						if (ImGui::MenuItem("Create at Origin")) {
-							modelManager->createInstance(i, glm::vec3(0.0f));
-						}
-						ImGui::Separator();
-						if (ImGui::MenuItem("Unload")) {
-							if (gizmo.selectedInstance >= 0) {
-								const auto& insts = modelManager->getInstances();
-								if (gizmo.selectedInstance >= static_cast<int>(insts.size())) {
-									gizmo.deselect();
-								}
-								else {
-									GPUModel* model = modelManager->getModel(insts[gizmo.selectedInstance].modelIndex);
-									if (!model || !model->isValid()) {
-										gizmo.deselect();  // <-- THIS might be firing!
+						// Right-click context menu
+						if (ImGui::BeginPopupContextItem()) {
+							if (ImGui::MenuItem("Create Instance")) {
+								modelManager->createInstance(i, camera.position + glm::vec3(0, 0, 0));
+							}
+							if (ImGui::MenuItem("Create at Origin")) {
+								modelManager->createInstance(i, glm::vec3(0.0f));
+							}
+							ImGui::Separator();
+							if (ImGui::MenuItem("Unload")) {
+								if (gizmo.selectedInstance >= 0) {
+									const auto& insts = modelManager->getInstances();
+									if (gizmo.selectedInstance >= static_cast<int>(insts.size())) {
+										gizmo.deselect();
+									}
+									else {
+										GPUModel* model = modelManager->getModel(insts[gizmo.selectedInstance].modelIndex);
+										if (!model || !model->isValid()) {
+											gizmo.deselect();  // <-- THIS might be firing!
+										}
 									}
 								}
+								modelManager->unloadModel(i);
+								selectedModel = -1;
+								gizmo.deselect();
 							}
-							modelManager->unloadModel(i);
-							selectedModel = -1;
-							gizmo.deselect();
+							ImGui::EndPopup();
 						}
-						ImGui::EndPopup();
-					}
 
-					
-					ImGui::SameLine();
-					ImGui::TextDisabled("(%zu verts, %zu tex)",
-						model->vertexCount, model->textures.size());
-					ImGui::PopID();
+
+						ImGui::SameLine();
+						ImGui::TextDisabled("(%zu verts, %zu tex)",
+							model->vertexCount, model->textures.size());
+						ImGui::PopID();
+					}
 				}
 				ImGui::Separator();
 
