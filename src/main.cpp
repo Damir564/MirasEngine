@@ -1460,6 +1460,7 @@ Mesh loadWithFastGltf(const std::string& path) {
 	size_t sceneIndex = asset.defaultScene.value_or(0);
 	if (asset.scenes.empty()) return result;
 
+
 	const auto& scene = asset.scenes[sceneIndex];
 	glm::mat4 rootTransform(1.0f);
 
@@ -1625,7 +1626,7 @@ Mesh loadModelSmart(const std::string& path) {
 			}
 			auto end = std::chrono::high_resolution_clock::now();
 			std::chrono::duration<float, std::milli> duration = end - start;
-			std::cout << "Done (" << duration.count() << "ms)\n";
+			// std::cout << "Done (" << duration.count() << "ms)\n";
 			loadedFromCache = true;
 		}
 		else {
@@ -4354,10 +4355,10 @@ int main()
 				cmd.pipelineBarrier2(shadowDepInfo);
 				auto endShadowPass = std::chrono::high_resolution_clock::now();
 				std::chrono::duration<double, std::milli> timeShadowPass = endShadowPass - startShadowPass;
-				std::cout << "Shadow Pass Time: " << timeShadowPass.count() << " ms\n";
+				// std::cout << "Shadow Pass Time: " << timeShadowPass.count() << " ms\n";
 				auto endShadowPassLoop = std::chrono::high_resolution_clock::now();
 				std::chrono::duration<double, std::milli> timeShadowPassLoop = endShadowPassLoop - startShadowPassLoop;
-				std::cout << "\t Shadow Pass Loop Time: " << timeShadowPassLoop.count() << " ms\n";
+				// std::cout << "\t Shadow Pass Loop Time: " << timeShadowPassLoop.count() << " ms\n";
 			}
 
 			auto startMainPass = std::chrono::high_resolution_clock::now();
@@ -4593,10 +4594,10 @@ int main()
 
 			auto endMainPass = std::chrono::high_resolution_clock::now();
 			std::chrono::duration<double, std::milli> timeMainPass = endMainPass - startMainPass;
-			std::cout << "Main Pass Time: " << timeMainPass.count() << " ms\n";
+			// std::cout << "Main Pass Time: " << timeMainPass.count() << " ms\n";
 			auto endMainPassLoop = std::chrono::high_resolution_clock::now();
 			std::chrono::duration<double, std::milli> timeMainPassLoop = endMainPassLoop - startMainPassLoop;
-			std::cout << "\t Main Pass Loop Time: " << timeMainPassLoop.count() << " ms\n";
+			// std::cout << "\t Main Pass Loop Time: " << timeMainPassLoop.count() << " ms\n";
 			auto startGuiPass = std::chrono::high_resolution_clock::now();
 			bool drawGizmo = (!mouseEnabled &&
 				gizmo.selectedInstance >= 0 &&
@@ -4715,7 +4716,7 @@ int main()
 			(void)cmd.end();
 			auto endGuiPass = std::chrono::high_resolution_clock::now();
 			std::chrono::duration<double, std::milli> timeGuiPass = endGuiPass - startGuiPass;
-			std::cout << "GUI Pass Time: " << timeGuiPass.count() << " ms\n\n";
+			// std::cout << "GUI Pass Time: " << timeGuiPass.count() << " ms\n\n";
 			// Submit
 			vk::CommandBufferSubmitInfo cmdInfo{};
 			cmdInfo.setCommandBuffer(cmd);
