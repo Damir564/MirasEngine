@@ -195,13 +195,11 @@ std::vector<uint32_t> loadSpirv(const std::filesystem::path& path)
 
 struct ModelCacheHeader {
 	uint32_t magic = 0x564B4D44; // "VKMD"
-	uint32_t version = 2;        // Version 2 (includes textures)
+	uint32_t version = 3;        // Version 2 (bounds added)
 	uint64_t vertexCount;
 	uint64_t indexCount;
 	uint64_t submeshCount;
 	uint64_t textureCount;
-	//uint8_t isIfc = 0;
-	//uint8_t  reserved[7] = {};
 };
 
 class ModelSerializer {
@@ -267,7 +265,7 @@ public:
 		ModelCacheHeader header{};
 		file.read(reinterpret_cast<char*>(&header), sizeof(header));
 
-		if (header.magic != 0x564B4D44 || header.version != 2) return false;
+		if (header.magic != 0x564B4D44 || header.version != 3) return false;
 
 		outModel.vertices.resize(header.vertexCount);
 		outModel.indices.resize(header.indexCount);
@@ -1308,6 +1306,27 @@ size_t calculateTotalVertices(const fastgltf::Asset& asset) {
 	return totalVertices;
 }
 
+inline void computeAllSubmeshBounds(Mesh& mesh)
+{
+	for (auto& sub : mesh.submeshes) {
+		sub.boundsMin = glm::vec3(std::numeric_limits<float>::max());
+		sub.boundsMax = glm::vec3(std::numeric_limits<float>::lowest());
+
+		const uint32_t end = sub.indexOffset + sub.indexCount;
+		for (uint32_t i = sub.indexOffset; i < end; ++i) {
+			const uint32_t absIdx = mesh.indices[i] + sub.vertexOffset;
+			const glm::vec3& pos = mesh.vertices[absIdx].position;
+			sub.boundsMin = glm::min(sub.boundsMin, pos);
+			sub.boundsMax = glm::max(sub.boundsMax, pos);
+		}
+
+		if (sub.indexCount == 0) {
+			sub.boundsMin = glm::vec3(0.0f);
+			sub.boundsMax = glm::vec3(0.0f);
+		}
+	}
+}
+
 // =============================================================
 // Main Load Function
 // =============================================================
@@ -1644,6 +1663,8 @@ Mesh loadModelSmart(const std::string& path) {
 		else {
 			result = loadWithAssimp(path);
 		}
+
+		computeAllSubmeshBounds(result);
 
 		ModelSerializer::SaveToCache(cachePath, result);
 	}
@@ -2690,33 +2711,55 @@ int main()
 							}
 						}
 
-						// Second: if not clicking gizmo, try picking a model
 						if (!clickedOnGizmo) {
-							float bestT = 1e30f;
-							int bestInstance = -1;
-							const auto& instances = modelManager->getInstances();
+							SubmeshHitResult hit = pickSubmesh(
+								ray,
+								modelManager->getInstances(),
+								[&](size_t idx) { return modelManager->getModel(idx); }
+							);
 
-							for (size_t i = 0; i < instances.size(); ++i) {
-								if (!instances[i].visible) continue;
-								GPUModel* model = modelManager->getModel(instances[i].modelIndex);
-								if (!model) continue;
+							if (hit.hit()) {
+								gizmo.select(hit.instanceIndex);
 
-								glm::mat4 instanceTransform = instances[i].getTransformMatrix();
+								auto& hitInst = modelManager->getInstances()[hit.instanceIndex];
 
-								float t;
-								if (rayIntersectsTransformedAABB(ray,
-									model->boundsMin, model->boundsMax,
-									instanceTransform, t))
-								{
-									if (t < bestT) {
-										bestT = t;
-										bestInstance = static_cast<int>(i);
+								if (hitInst.ifcScene.has_value()) {
+									IfcScene& scene = hitInst.ifcScene.value();
+
+									for (auto& [g, e] : scene.elements) e.selected = false;
+									for (auto& [g, s] : scene.spatial)  s.selected = false;
+
+									if (!hit.ifcGuid.empty()) {
+										auto eit = scene.elements.find(hit.ifcGuid);
+										if (eit != scene.elements.end()) {
+											eit->second.selected = true;
+											selectedIfcGuid = hit.ifcGuid;
+											selectedIfcKind = IfcSelectionKind::kElement;
+											selectedInstanceForProperties = hit.instanceIndex;
+
+											std::cout
+												<< "[PICK] IFC Hit"
+												<< " | Type: " << eit->second.type
+												<< " | Name: " << eit->second.name
+												<< " | GUID: " << hit.ifcGuid
+												<< " | Submesh: " << hit.submeshIndex
+												<< " | t: " << hit.t
+												<< "\n";
+										}
+									}
+									else {
+										std::cout
+											<< "[PICK] IFC model hit but no GUID for submesh "
+											<< hit.submeshIndex << "\n";
 									}
 								}
-							}
-
-							if (bestInstance >= 0) {
-								gizmo.select(bestInstance);
+								else {
+									std::cout
+										<< "[PICK] Instance " << hit.instanceIndex
+										<< " | Submesh " << hit.submeshIndex
+										<< " | t: " << hit.t
+										<< "\n";
+								}
 							}
 							else {
 								gizmo.deselect();

@@ -153,6 +153,76 @@ inline bool rayIntersectsTransformedAABB(const Ray& ray,
     return rayIntersectsAABB(localRay, localMin, localMax, tOut);
 }
 
+struct SubmeshHitResult {
+    int   instanceIndex = -1;
+    size_t submeshIndex = std::numeric_limits<size_t>::max();
+    float t = std::numeric_limits<float>::max();
+    std::string ifcGuid;                  
+
+    bool hit() const { return instanceIndex >= 0; }
+};
+
+template<typename GetModelFn>
+inline SubmeshHitResult pickSubmesh(
+    const Ray& ray,
+    const std::vector<ModelInstance>& instances,
+    GetModelFn&& getModel)
+{
+    SubmeshHitResult best;
+
+    for (size_t i = 0; i < instances.size(); ++i) {
+        const ModelInstance& inst = instances[i];
+        if (!inst.visible) continue;
+
+        GPUModel* model = getModel(inst.modelIndex);
+        if (!model || !model->isValid()) continue;
+
+        glm::mat4 transform = inst.getTransformMatrix();
+        float modelT;
+        if (!rayIntersectsTransformedAABB(
+            ray, model->boundsMin, model->boundsMax, transform, modelT))
+            continue;
+
+        if (modelT >= best.t) continue;
+
+        glm::mat4 invTransform = glm::inverse(transform);
+
+        Ray localRay;
+        localRay.origin = glm::vec3(invTransform * glm::vec4(ray.origin, 1.0f));
+        localRay.direction = glm::normalize(
+            glm::vec3(invTransform * glm::vec4(ray.direction, 0.0f)));
+
+        const bool hasIfc = inst.ifcScene.has_value();
+
+        for (size_t si = 0; si < model->submeshes.size(); ++si) {
+
+            if (hasIfc && !inst.ifcScene->isSubmeshVisible(si))
+                continue;
+
+            const SubmeshInfo& sub = model->submeshes[si];
+
+            float subT;
+            if (!rayIntersectsAABB(localRay, sub.boundsMin, sub.boundsMax, subT))
+                continue;
+
+            if (subT < best.t) {
+                best.t = subT;
+                best.instanceIndex = static_cast<int>(i);
+                best.submeshIndex = si;
+
+                best.ifcGuid.clear();
+                if (hasIfc) {
+                    auto it = inst.ifcScene->submeshToGuid.find(si);
+                    if (it != inst.ifcScene->submeshToGuid.end())
+                        best.ifcGuid = it->second;
+                }
+            }
+        }
+    }
+
+    return best;
+}
+
 inline float pointToSegment2D(const glm::vec2& point,
     const glm::vec2& segA, const glm::vec2& segB,
     float& segT)

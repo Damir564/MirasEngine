@@ -31,6 +31,9 @@ struct SubmeshInfo {
     uint32_t indexCount;
     uint32_t vertexOffset;
     Material material;
+
+    glm::vec3 boundsMin{ std::numeric_limits<float>::max() };
+    glm::vec3 boundsMax{ std::numeric_limits<float>::lowest() };
 };
 
 struct TextureData {
