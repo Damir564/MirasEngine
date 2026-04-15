@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <cmath>
 #include <vector>
+#include <string>
+#include "ModelManager.h"
 
 enum class GizmoMode {
     None = 0,
@@ -28,6 +30,8 @@ struct Gizmo {
     glm::vec3 originalPosition{ 0.0f };
     glm::vec3 originalRotation{ 0.0f };
     glm::vec3 originalScale{ 1.0f };
+    int outlineInstanceIndex = -1;
+    size_t outlineSubmeshIndex = std::numeric_limits<size_t>::max();
 
     void select(int instanceIndex) {
         selectedInstance = instanceIndex;
@@ -41,6 +45,8 @@ struct Gizmo {
         mode = GizmoMode::None;
         activeAxis = GizmoAxis::None;
         isDragging = false;
+        outlineInstanceIndex = -1;
+        outlineSubmeshIndex = std::numeric_limits<size_t>::max();
     }
 };
 

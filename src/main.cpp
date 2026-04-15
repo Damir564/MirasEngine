@@ -59,6 +59,15 @@ struct FrameUBO {
 	float padding[2];  // Pad to 16-byte alignment
 };
 
+struct OutlinePushConstants {
+	glm::mat4 modelMatrix;
+	float outlineWidth;
+	float _pad0;
+	float _pad1;
+	float _pad2;
+	glm::vec4 outlineColor;
+};
+
 struct MeshPushConstants {
 	glm::mat4 modelMatrix{ 1.0f };					// 64 bytes
 	glm::vec4 baseColor{ 1.0f, 1.0f, 1.0f, 1.0f };  // 16 bytes
@@ -1914,7 +1923,7 @@ int main()
 	// ------------------------
 	// 11a. Create Depth Image & View
 	// ------------------------
-	vk::Format depthFormat = vk::Format::eD32Sfloat;
+	vk::Format depthFormat = vk::Format::eD32SfloatS8Uint;
 
 	// Image
 	vk::ImageCreateInfo depthImageInfo{};
@@ -1944,7 +1953,7 @@ int main()
 	depthViewInfo.image = depthImage;
 	depthViewInfo.viewType = vk::ImageViewType::e2D;
 	depthViewInfo.format = depthFormat;
-	depthViewInfo.subresourceRange.aspectMask = vk::ImageAspectFlagBits::eDepth;
+	depthViewInfo.subresourceRange.aspectMask = vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil;
 	depthViewInfo.subresourceRange.baseMipLevel = 0;
 	depthViewInfo.subresourceRange.levelCount = 1;
 	depthViewInfo.subresourceRange.baseArrayLayer = 0;
@@ -2395,6 +2404,60 @@ int main()
 
 		std::cout << "Gizmo system initialized\n";
 
+		// Load outline shaders
+		std::vector<uint32_t> outlineVertCode = loadSpirv("shaders/outline.vert.spv");
+		std::vector<uint32_t> outlineFragCode = loadSpirv("shaders/outline.frag.spv");
+
+		// Outline push constant range
+		vk::PushConstantRange outlinePcRange{};
+		outlinePcRange.stageFlags = vk::ShaderStageFlagBits::eVertex
+			| vk::ShaderStageFlagBits::eFragment;
+		outlinePcRange.offset = 0;
+		outlinePcRange.size = sizeof(OutlinePushConstants);
+
+		// Outline only needs the UBO (set 0) — no textures
+		vk::DescriptorSetLayout outlineLayouts[] = { uboDescriptorSetLayout.get() };
+
+		vk::ShaderCreateInfoEXT outlineVertInfo{};
+		outlineVertInfo.setStage(vk::ShaderStageFlagBits::eVertex)
+			.setNextStage(vk::ShaderStageFlagBits::eFragment)
+			.setFlags(vk::ShaderCreateFlagBitsEXT::eLinkStage)
+			.setCodeType(vk::ShaderCodeTypeEXT::eSpirv)
+			.setCodeSize(outlineVertCode.size() * sizeof(uint32_t))
+			.setPCode(outlineVertCode.data())
+			.setPName("main")
+			.setPushConstantRangeCount(1)
+			.setPPushConstantRanges(&outlinePcRange)
+			.setSetLayoutCount(1)
+			.setPSetLayouts(outlineLayouts);
+
+		vk::ShaderCreateInfoEXT outlineFragInfo{};
+		outlineFragInfo.setStage(vk::ShaderStageFlagBits::eFragment)
+			.setFlags(vk::ShaderCreateFlagBitsEXT::eLinkStage)
+			.setCodeType(vk::ShaderCodeTypeEXT::eSpirv)
+			.setCodeSize(outlineFragCode.size() * sizeof(uint32_t))
+			.setPCode(outlineFragCode.data())
+			.setPName("main")
+			.setPushConstantRangeCount(1)
+			.setPPushConstantRanges(&outlinePcRange)
+			.setSetLayoutCount(1)
+			.setPSetLayouts(outlineLayouts);
+
+		vk::ShaderEXT outlineVertShader = device.createShaderEXT(outlineVertInfo).value;
+		vk::ShaderEXT outlineFragShader = device.createShaderEXT(outlineFragInfo).value;
+
+		vk::PipelineLayoutCreateInfo outlineLayoutInfo{};
+		outlineLayoutInfo.setPushConstantRangeCount(1);
+		outlineLayoutInfo.setPPushConstantRanges(&outlinePcRange);
+		outlineLayoutInfo.setSetLayoutCount(1);
+		outlineLayoutInfo.setPSetLayouts(outlineLayouts);
+
+		vk::PipelineLayout outlinePipelineLayout =
+			device.createPipelineLayout(outlineLayoutInfo).value;
+
+		std::cout << "Outline shaders created\n";
+
+
 		// ========================
 // CAMERA ANIMATION SETUP
 // ========================
@@ -2737,6 +2800,8 @@ int main()
 											selectedIfcKind = IfcSelectionKind::kElement;
 											selectedInstanceForProperties = hit.instanceIndex;
 
+											gizmo.outlineInstanceIndex = hit.instanceIndex;
+											gizmo.outlineSubmeshIndex = hit.submeshIndex;
 											std::cout
 												<< "[PICK] IFC Hit"
 												<< " | Type: " << eit->second.type
@@ -4430,9 +4495,9 @@ int main()
 				.setDstStageMask(vk::PipelineStageFlagBits2::eEarlyFragmentTests)
 				.setDstAccessMask(vk::AccessFlagBits2::eDepthStencilAttachmentWrite)
 				.setOldLayout(vk::ImageLayout::eUndefined)
-				.setNewLayout(vk::ImageLayout::eDepthAttachmentOptimal)
+				.setNewLayout(vk::ImageLayout::eDepthStencilAttachmentOptimal)
 				.setImage(depthImage)
-				.setSubresourceRange({ vk::ImageAspectFlagBits::eDepth, 0, 1, 0, 1 });
+				.setSubresourceRange({ vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil, 0, 1, 0, 1 });
 
 			vk::DependencyInfo depInfoDepth{};
 			depInfoDepth.setImageMemoryBarriers(depthBarrier);
@@ -4451,17 +4516,24 @@ int main()
 			vk::RenderingAttachmentInfo depthAttachment{};
 
 			depthAttachment.setImageView(depthImageView)
-				.setImageLayout(vk::ImageLayout::eDepthAttachmentOptimal)
+				.setImageLayout(vk::ImageLayout::eDepthStencilAttachmentOptimal)
 				.setLoadOp(vk::AttachmentLoadOp::eClear)
 				.setStoreOp(vk::AttachmentStoreOp::eDontCare)
 				.setClearValue(clearDepth);
 
+			vk::RenderingAttachmentInfo stencilAttachment{};
+			stencilAttachment.setImageView(depthImageView)
+				.setImageLayout(vk::ImageLayout::eDepthStencilAttachmentOptimal)
+				.setLoadOp(vk::AttachmentLoadOp::eClear)
+				.setStoreOp(vk::AttachmentStoreOp::eDontCare)
+				.setClearValue(vk::ClearValue(vk::ClearDepthStencilValue{ 1.0f, 0 }));
 
 			vk::RenderingInfo renderInfo{};
 			renderInfo.setRenderArea({ {0,0},{(int)SCREEN_WIDTH, (int)SCREEN_HEIGHT} })
 				.setLayerCount(1)
 				.setColorAttachments(colorAttachment)
-				.setPDepthAttachment(&depthAttachment);
+				.setPDepthAttachment(&depthAttachment)
+				.setPStencilAttachment(&stencilAttachment);
 			cmd.beginRendering(renderInfo);
 			vk::ShaderStageFlagBits stages[] = {
 				vk::ShaderStageFlagBits::eVertex,
@@ -4643,6 +4715,181 @@ int main()
 			// std::cout << "Main Pass Time: " << timeMainPass.count() << " ms\n";
 			auto endMainPassLoop = std::chrono::high_resolution_clock::now();
 			std::chrono::duration<double, std::milli> timeMainPassLoop = endMainPassLoop - startMainPassLoop;
+
+			// ============================================
+// OUTLINE RENDERING (Stencil-based, two passes)
+// ============================================
+			bool drawOutline = (gizmo.outlineInstanceIndex >= 0
+				&& gizmo.outlineInstanceIndex < static_cast<int>(modelManager->getInstances().size())
+				&& gizmo.outlineSubmeshIndex != std::numeric_limits<size_t>::max());
+
+			if (drawOutline) {
+				const auto& outlineInst = modelManager->getInstances()[gizmo.outlineInstanceIndex];
+				GPUModel* outlineModel = modelManager->getModel(outlineInst.modelIndex);
+
+				if (outlineModel && outlineModel->isValid()
+					&& gizmo.outlineSubmeshIndex < outlineModel->submeshes.size()
+					&& outlineInst.visible)
+				{
+					const SubmeshInfo& outlineSub = outlineModel->submeshes[gizmo.outlineSubmeshIndex];
+					glm::mat4 outlineTransform = outlineInst.getTransformMatrix();
+
+					// ── Pass A: Write stencil with the selected submesh (normal size) ──
+					{
+						// Bind main shaders (need proper vertex transformation)
+						cmd.bindShadersEXT(2, stages, shaders);
+
+						// Vertex input (same as main pass)
+						cmd.setVertexInputEXT(1, &mainBinding,
+							static_cast<uint32_t>(mainAttribs.size()), mainAttribs.data());
+
+						// Bind model buffers
+						vk::Buffer modelBuffers[1] = { outlineModel->vertexBuffer->getBuffer() };
+						vk::DeviceSize modelOffsets[1] = { 0 };
+						vk::DeviceSize modelSizes[1] = { sizeof(Vertex) * outlineModel->vertexCount };
+						vk::DeviceSize modelStrides[1] = { sizeof(Vertex) };
+						cmd.bindVertexBuffers2(0, 1, modelBuffers, modelOffsets,
+							modelSizes, modelStrides);
+						cmd.bindIndexBuffer(outlineModel->indexBuffer->getBuffer(),
+							0, vk::IndexType::eUint32);
+
+						// Stencil: always write 1, depth test enabled
+						cmd.setStencilTestEnable(true);
+						cmd.setStencilOp(
+							vk::StencilFaceFlagBits::eFrontAndBack,
+							vk::StencilOp::eKeep,       // stencilFailOp
+							vk::StencilOp::eReplace,    // depthPassOp  → write ref value
+							vk::StencilOp::eKeep,       // depthFailOp
+							vk::CompareOp::eAlways      // compareOp    → always pass stencil
+						);
+						cmd.setStencilReference(vk::StencilFaceFlagBits::eFrontAndBack, 1);
+						cmd.setStencilWriteMask(vk::StencilFaceFlagBits::eFrontAndBack, 0xFF);
+						cmd.setStencilCompareMask(vk::StencilFaceFlagBits::eFrontAndBack, 0xFF);
+
+						// Depth: test but don't write (we just want the stencil)
+						cmd.setDepthTestEnable(true);
+						cmd.setDepthWriteEnable(false);
+						cmd.setDepthCompareOp(vk::CompareOp::eLessOrEqual);
+
+						// No color output for stencil pass
+						cmd.setColorWriteMaskEXT(0, vk::ColorComponentFlags(0));
+
+						cmd.setCullMode(vk::CullModeFlagBits::eBack);
+						cmd.setFrontFace(vk::FrontFace::eCounterClockwise);
+						cmd.setPrimitiveTopology(vk::PrimitiveTopology::eTriangleList);
+						cmd.setPolygonModeEXT(vk::PolygonMode::eFill);
+						cmd.setRasterizationSamplesEXT(vk::SampleCountFlagBits::e1);
+						vk::SampleMask outlineMask = ~0u;
+						cmd.setSampleMaskEXT(vk::SampleCountFlagBits::e1, &outlineMask);
+						cmd.setAlphaToCoverageEnableEXT(VK_FALSE);
+						cmd.setRasterizerDiscardEnable(VK_FALSE);
+						cmd.setColorBlendEnableEXT(0, VK_FALSE);
+						cmd.setPrimitiveRestartEnable(VK_FALSE);
+						cmd.setDepthBiasEnable(VK_FALSE);
+
+						// Bind UBO
+						cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics,
+							pipelineLayout, 0, 1,
+							&uboDescriptorSets[currentFrame], 0, nullptr);
+
+						// Bind dummy textures for the main shader
+						vk::DescriptorSet dummySets[3] = {
+							modelManager->getDefaultBaseColorSet(),
+							modelManager->getDefaultNormalSet(),
+							modelManager->getDefaultMRSet()
+						};
+						cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics,
+							pipelineLayout, 1, 3, dummySets, 0, nullptr);
+						cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics,
+							pipelineLayout, 4, 1,
+							&shadowMapDescriptorSet, 0, nullptr);
+
+						MeshPushConstants stencilPc{};
+						stencilPc.modelMatrix = outlineTransform;
+						stencilPc.baseColor = outlineSub.material.baseColorFactor;
+						stencilPc.metallic = outlineSub.material.metallicFactor;
+						stencilPc.roughness = outlineSub.material.roughnessFactor;
+						stencilPc.alphaCutoff = 0.0f;
+						stencilPc.alphaMode = 0;
+
+						cmd.pushConstants(pipelineLayout,
+							vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment,
+							0, sizeof(MeshPushConstants), &stencilPc);
+
+						cmd.drawIndexed(outlineSub.indexCount, 1,
+							outlineSub.indexOffset, outlineSub.vertexOffset, 0);
+					}
+
+					// ── Pass B: Draw scaled-up mesh where stencil != 1 (the outline) ──
+					{
+						// Switch to outline shaders
+						vk::ShaderStageFlagBits outlineStages[] = {
+							vk::ShaderStageFlagBits::eVertex,
+							vk::ShaderStageFlagBits::eFragment
+						};
+						vk::ShaderEXT outlineShaders[] = { outlineVertShader, outlineFragShader };
+						cmd.bindShadersEXT(2, outlineStages, outlineShaders);
+
+						// Same vertex input (outline shader reads position + normal)
+						cmd.setVertexInputEXT(1, &mainBinding,
+							static_cast<uint32_t>(mainAttribs.size()), mainAttribs.data());
+
+						// Bind UBO for outline shader
+						cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics,
+							outlinePipelineLayout, 0, 1,
+							&uboDescriptorSets[currentFrame], 0, nullptr);
+
+						// Stencil: only draw where stencil != 1
+						cmd.setStencilTestEnable(true);
+						cmd.setStencilOp(
+							vk::StencilFaceFlagBits::eFrontAndBack,
+							vk::StencilOp::eKeep,       // stencilFailOp → keep (don't touch)
+							vk::StencilOp::eKeep,       // depthPassOp
+							vk::StencilOp::eKeep,       // depthFailOp
+							vk::CompareOp::eNotEqual    // compareOp → pass only where != ref
+						);
+						cmd.setStencilReference(vk::StencilFaceFlagBits::eFrontAndBack, 1);
+						cmd.setStencilWriteMask(vk::StencilFaceFlagBits::eFrontAndBack, 0x00);
+						cmd.setStencilCompareMask(vk::StencilFaceFlagBits::eFrontAndBack, 0xFF);
+
+						// Depth: disable (outline renders on top)
+						cmd.setDepthTestEnable(false);
+						cmd.setDepthWriteEnable(false);
+
+						// Color: enable output
+						cmd.setColorWriteMaskEXT(0, vk::ColorComponentFlags(0xF));
+						cmd.setColorBlendEnableEXT(0, VK_FALSE);
+
+						// Cull FRONT faces (inverted hull technique)
+						cmd.setCullMode(vk::CullModeFlagBits::eFront);
+						cmd.setFrontFace(vk::FrontFace::eCounterClockwise);
+
+						// Calculate outline width based on distance to camera
+						float distToCamera = glm::distance(camera.position, outlineInst.position);
+						float outlineWidth = glm::clamp(distToCamera * 0.003f, 0.01f, 0.15f);
+
+						OutlinePushConstants outlinePc{};
+						outlinePc.modelMatrix = outlineTransform;
+						outlinePc.outlineWidth = outlineWidth;
+						outlinePc.outlineColor = glm::vec4(1.0f, 0.5f, 0.0f, 1.0f); // Orange
+
+						cmd.pushConstants(outlinePipelineLayout,
+							vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment,
+							0, sizeof(OutlinePushConstants), &outlinePc);
+
+						cmd.drawIndexed(outlineSub.indexCount, 1,
+							outlineSub.indexOffset, outlineSub.vertexOffset, 0);
+					}
+
+					// ── Restore state for subsequent draws (gizmo, ImGui) ──
+					cmd.setStencilTestEnable(false);
+					cmd.setDepthTestEnable(true);
+					cmd.setDepthWriteEnable(true);
+					cmd.setDepthCompareOp(vk::CompareOp::eLess);
+					cmd.setCullMode(vk::CullModeFlagBits::eNone);
+					cmd.setColorWriteMaskEXT(0, vk::ColorComponentFlags(0xF));
+				}
+			}
 			// std::cout << "\t Main Pass Loop Time: " << timeMainPassLoop.count() << " ms\n";
 			auto startGuiPass = std::chrono::high_resolution_clock::now();
 			bool drawGizmo = (!mouseEnabled &&
@@ -4828,6 +5075,9 @@ int main()
 		device.destroyShaderEXT(gizmoVertShader);
 		device.destroyShaderEXT(gizmoFragShader);
 		device.destroyPipelineLayout(gizmoPipelineLayout);
+		device.destroyShaderEXT(outlineVertShader);
+		device.destroyShaderEXT(outlineFragShader);
+		device.destroyPipelineLayout(outlinePipelineLayout);
 		vmaDestroyBuffer(allocator, VkBuffer(translateBuffer), translateAlloc);
 		vmaDestroyBuffer(allocator, VkBuffer(rotateBuffer), rotateAlloc);
 		vmaDestroyBuffer(allocator, VkBuffer(scaleBuffer), scaleAlloc);
