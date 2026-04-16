@@ -59,6 +59,7 @@ struct IfcScene {
     std::vector<std::string> roots;
 
     std::unordered_map<std::size_t, std::string> submeshToGuid;
+    std::unordered_map<std::string, std::size_t> guidToSubmesh;
 
     std::vector<bool> submeshVisibilityCache;
 
@@ -78,6 +79,14 @@ struct IfcScene {
                 }
             }
         }
+    }
+
+    static int findSubmeshByGuid(const IfcScene& scene, const std::string& guid) {
+        auto it = scene.guidToSubmesh.find(guid);
+        if (it != scene.guidToSubmesh.end()) {
+            return static_cast<int>(it->second);
+        }
+        return -1;
     }
 
     //bool isSubmeshVisible(std::size_t submeshIdx) const {

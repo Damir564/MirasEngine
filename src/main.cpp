@@ -1437,6 +1437,7 @@ void buildIfcScene(
 		if (it != scene.elements.end()) {
 			it->second.submeshIndex = si;
 			scene.submeshToGuid[si] = guid;
+			scene.guidToSubmesh[guid] = si;
 
 			scene.submeshVisibilityCache[si] = it->second.visible;
 		}
@@ -2647,6 +2648,9 @@ int main()
 		IfcSelectionKind selectedIfcKind = IfcSelectionKind::kNone;
 		std::string selectedIfcGuid;
 		int selectedInstanceForProperties = -1;
+		bool selectionChangedFromViewport = false;
+		std::string lastKnownSelectedGuid = "";
+		std::unordered_set<std::string> openSpatialGuids;
 		while (running) {
 			uint32_t currentTime = SDL_GetTicks();
 			float dt = (currentTime - lastTime) / 1000.0f; // convert ms to seconds
@@ -2799,6 +2803,7 @@ int main()
 											selectedIfcGuid = hit.ifcGuid;
 											selectedIfcKind = IfcSelectionKind::kElement;
 											selectedInstanceForProperties = hit.instanceIndex;
+											selectionChangedFromViewport = true;
 
 											gizmo.outlineInstanceIndex = hit.instanceIndex;
 											gizmo.outlineSubmeshIndex = hit.submeshIndex;
@@ -3368,6 +3373,42 @@ int main()
 					if (instances[gizmo.selectedInstance].ifcScene) {
 						IfcScene& scene = instances[gizmo.selectedInstance].ifcScene.value();
 
+						if (selectionChangedFromViewport && !selectedIfcGuid.empty())
+						{
+							openSpatialGuids.clear();
+
+							if (selectedIfcKind == IfcSelectionKind::kElement)
+							{
+								auto eit = scene.elements.find(selectedIfcGuid);
+								if (eit != scene.elements.end())
+								{
+									// Walk up the spatial hierarchy from the element's parent
+									std::string parentGuid = eit->second.parentSpatialGuid;
+									while (!parentGuid.empty())
+									{
+										openSpatialGuids.insert(parentGuid);
+										auto sit = scene.spatial.find(parentGuid);
+										if (sit == scene.spatial.end()) break;
+										parentGuid = sit->second.parentGuid;
+									}
+								}
+							}
+							else if (selectedIfcKind == IfcSelectionKind::kSpatial)
+							{
+								// Open the node itself and all its ancestors
+								std::string guid = selectedIfcGuid;
+								while (!guid.empty())
+								{
+									openSpatialGuids.insert(guid);
+									auto sit = scene.spatial.find(guid);
+									if (sit == scene.spatial.end()) break;
+									guid = sit->second.parentGuid;
+								}
+							}
+
+							selectionChangedFromViewport = false; // consumed
+						}
+
 						ImGui::Separator();
 						ImGui::Text("IFC Hierarchy (%zu elements, %zu spatial)",
 							scene.elements.size(), scene.spatial.size());
@@ -3447,8 +3488,19 @@ int main()
 								if (node.childSpatialGuids.empty() && node.elementGuids.empty()) flags |= ImGuiTreeNodeFlags_Leaf;
 								if (node.selected) flags |= ImGuiTreeNodeFlags_Selected;
 
+								bool mustBeOpen = openSpatialGuids.count(node.guid) > 0;
+								if (mustBeOpen)
+									ImGui::SetNextItemOpen(true, ImGuiCond_Always);
+
 								bool open = ImGui::TreeNodeEx(node.guid.c_str(), flags, "%s: %s (%zu)",
 									node.type.c_str(), node.name.c_str(), elemAndSpatialCount);
+
+								if (selectedIfcKind == IfcSelectionKind::kSpatial &&
+									node.guid == selectedIfcGuid &&
+									openSpatialGuids.count(node.guid))
+								{
+									ImGui::SetScrollHereY(0.5f);
+								}
 
 								if (ImGui::IsItemClicked(ImGuiMouseButton_Left) ||
 									(ImGui::IsItemFocused() && ImGui::IsKeyPressed(ImGuiKey_Enter))) {
@@ -3461,6 +3513,17 @@ int main()
 									selectedIfcGuid = node.guid;
 									selectedIfcKind = IfcSelectionKind::kSpatial;
 									selectedInstanceForProperties = gizmo.selectedInstance;
+
+									gizmo.outlineInstanceIndex = -1;
+									gizmo.outlineSubmeshIndex = std::numeric_limits<size_t>::max();
+									for (const auto& elemGuid : node.elementGuids) {
+										int submeshIdx = IfcScene::findSubmeshByGuid(scene, elemGuid);
+										if (submeshIdx >= 0) {
+											gizmo.outlineInstanceIndex = gizmo.selectedInstance;
+											gizmo.outlineSubmeshIndex = static_cast<size_t>(submeshIdx);
+											break; // outline first found element
+										}
+									}
 								}
 
 								if (ImGui::BeginPopupContextItem("SpatialContextMenu")) {
@@ -3521,6 +3584,14 @@ int main()
 											const char* displayName = elem.name.empty() ? elem.type.c_str() : elem.name.c_str();
 											ImGui::TreeNodeEx(elem.guid.c_str(), elemFlags, "%s", displayName);
 
+											if (selectedIfcKind == IfcSelectionKind::kElement &&
+												elem.guid == selectedIfcGuid &&
+												!openSpatialGuids.empty()) 
+											{                              
+												ImGui::SetScrollHereY(0.5f);
+												openSpatialGuids.clear(); 
+											}
+
 											// click to select
 											if (ImGui::IsItemClicked(ImGuiMouseButton_Left) ||
 												(ImGui::IsItemFocused() && ImGui::IsKeyPressed(ImGuiKey_Enter))) {
@@ -3533,6 +3604,16 @@ int main()
 												selectedIfcGuid = elem.guid;
 												selectedIfcKind = IfcSelectionKind::kElement;
 												selectedInstanceForProperties = gizmo.selectedInstance;
+
+												int submeshIdx = IfcScene::findSubmeshByGuid(scene, elem.guid);
+												if (submeshIdx >= 0) {
+													gizmo.outlineInstanceIndex = gizmo.selectedInstance;
+													gizmo.outlineSubmeshIndex = static_cast<size_t>(submeshIdx);
+												}
+												else {
+													gizmo.outlineInstanceIndex = -1;
+													gizmo.outlineSubmeshIndex = std::numeric_limits<size_t>::max();
+												}
 											}
 
 											if (ImGui::BeginPopupContextItem("ElementContextMenu")) {
