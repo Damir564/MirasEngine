@@ -2677,6 +2677,7 @@ int main()
 		static char annotationText[256] = "";
 		std::string annotationTargetGuid = "";
 		int annotationTargetInstance = -1;
+		bool showAnnotations = true;
 		while (running) {
 			uint32_t currentTime = SDL_GetTicks();
 			float dt = (currentTime - lastTime) / 1000.0f; // convert ms to seconds
@@ -3947,7 +3948,7 @@ int main()
 				ImGui::End();
 				if (showAnnotationPopup) {
 					ImGui::OpenPopup("Add Annotation");
-					showAnnotationPopup = false; // only open once
+					showAnnotationPopup = false; 
 				}
 
 				if (ImGui::BeginPopupModal("Add Annotation", nullptr,
@@ -3955,7 +3956,6 @@ int main()
 				{
 					ImGui::Text("Add annotation to element:");
 
-					// Show which element we're annotating
 					if (annotationTargetInstance >= 0 &&
 						annotationTargetInstance < static_cast<int>(instances.size()) &&
 						instances[annotationTargetInstance].ifcScene)
@@ -3971,7 +3971,6 @@ int main()
 
 					ImGui::Separator();
 
-					// Auto-focus the text input
 					if (ImGui::IsWindowAppearing())
 						ImGui::SetKeyboardFocusHere();
 
@@ -3988,7 +3987,6 @@ int main()
 							ann.ifcGuid = annotationTargetGuid;
 							ann.instanceIndex = annotationTargetInstance;
 
-							// Compute world position for the annotation
 							const auto& inst = instances[annotationTargetInstance];
 							GPUModel* model = modelManager->getModel(inst.modelIndex);
 							if (model && inst.ifcScene) {
@@ -4021,10 +4019,7 @@ int main()
 					ImGui::EndPopup();
 				}
 
-				// ============================================
-				// RENDER ANNOTATIONS AS VIEWPORT OVERLAYS
-				// ============================================
-				if (!annotations.empty()) {
+				if (showAnnotations  && !annotations.empty()) {
 					glm::mat4 viewMat = getView(camera);
 					glm::mat4 projMat = getProjection(SCREEN_WIDTH, SCREEN_HEIGHT);
 					glm::mat4 vp = projMat * viewMat;
@@ -4034,7 +4029,6 @@ int main()
 					for (size_t ai = 0; ai < annotations.size(); ++ai) {
 						const auto& ann = annotations[ai];
 
-						// Skip annotations for deleted/invalid instances
 						if (ann.instanceIndex < 0 ||
 							ann.instanceIndex >= static_cast<int>(instances.size()))
 							continue;
@@ -4042,15 +4036,12 @@ int main()
 						const auto& inst = instances[ann.instanceIndex];
 						if (!inst.visible) continue;
 
-						// Project world position to screen
 						glm::vec4 clipPos = vp * glm::vec4(ann.worldPosition, 1.0f);
 
-						// Behind camera check
 						if (clipPos.w <= 0.0f) continue;
 
 						glm::vec3 ndc = glm::vec3(clipPos) / clipPos.w;
 
-						// Off-screen check
 						if (ndc.x < -1.0f || ndc.x > 1.0f ||
 							ndc.y < -1.0f || ndc.y > 1.0f)
 							continue;
@@ -4058,11 +4049,9 @@ int main()
 						float screenX = (ndc.x * 0.5f + 0.5f) * SCREEN_WIDTH;
 						float screenY = (ndc.y * 0.5f + 0.5f) * SCREEN_HEIGHT;
 
-						// Distance fade
 						float dist = glm::distance(camera.position, ann.worldPosition);
 						float alpha = glm::clamp(1.0f - (dist - 50.0f) / 100.0f, 0.1f, 1.0f);
 
-						// Background box
 						ImVec2 textSize = ImGui::CalcTextSize(ann.text.c_str());
 						float padding = 6.0f;
 						ImVec2 boxMin(screenX - padding, screenY - padding);
@@ -4074,8 +4063,6 @@ int main()
 
 						drawList->AddRectFilled(boxMin, boxMax, bgColor, 4.0f);
 						drawList->AddRect(boxMin, boxMax, borderColor, 4.0f, 0, 1.5f);
-
-						// Connector line from annotation to point
 						drawList->AddLine(
 							ImVec2(screenX + textSize.x * 0.5f, boxMax.y),
 							ImVec2(screenX + textSize.x * 0.5f, boxMax.y + 10.0f),
@@ -4084,16 +4071,23 @@ int main()
 							ImVec2(screenX + textSize.x * 0.5f, boxMax.y + 10.0f),
 							3.0f, borderColor);
 
-						// Text
 						drawList->AddText(ImVec2(screenX, screenY), textColor, ann.text.c_str());
 					}
 				}
 
-				// ============================================
-				// ANNOTATIONS LIST WINDOW
-				// ============================================
 				if (!annotations.empty()) {
 					ImGui::Begin("Annotations");
+
+					if (showAnnotations) {
+						if (ImGui::Button("Hide Annotations")) {
+							showAnnotations = false;
+						}
+					}
+					else {
+						if (ImGui::Button("Show Annotations")) {
+							showAnnotations = true;
+						}
+					}
 
 					for (size_t ai = 0; ai < annotations.size();) {
 						ImGui::PushID(static_cast<int>(ai));
@@ -4102,7 +4096,6 @@ int main()
 							annotations[ai].instanceIndex >= 0 &&
 							annotations[ai].instanceIndex < static_cast<int>(instances.size()));
 
-						// Show element info
 						if (isValid && instances[annotations[ai].instanceIndex].ifcScene) {
 							IfcScene& scene = instances[annotations[ai].instanceIndex].ifcScene.value();
 							auto eit = scene.elements.find(annotations[ai].ifcGuid);
@@ -4116,12 +4109,10 @@ int main()
 
 						ImGui::SameLine();
 
-						// Click to select the annotated element
 						if (ImGui::SmallButton("Select")) {
 							if (isValid && instances[annotations[ai].instanceIndex].ifcScene) {
 								IfcScene& scene = instances[annotations[ai].instanceIndex].ifcScene.value();
 
-								// Clear previous selection
 								for (auto& [g, e] : scene.elements) e.selected = false;
 								for (auto& [g, s] : scene.spatial)  s.selected = false;
 
@@ -4133,17 +4124,13 @@ int main()
 									selectedInstanceForProperties = annotations[ai].instanceIndex;
 									gizmo.select(annotations[ai].instanceIndex);
 
-									// Set outline
 									int submeshIdx = IfcScene::findSubmeshByGuid(scene, annotations[ai].ifcGuid);
 									if (submeshIdx >= 0) {
 										gizmo.outlineInstanceIndex = annotations[ai].instanceIndex;
 										gizmo.outlineSubmeshIndex = static_cast<size_t>(submeshIdx);
 									}
 
-									// Scroll tree to element
 									selectionChangedFromViewport = true;
-									//scrollTargetGuid = annotations[ai].ifcGuid;
-									//scrollToFrameCounter = 2;
 								}
 							}
 						}
@@ -4154,7 +4141,7 @@ int main()
 						if (ImGui::SmallButton("X")) {
 							annotations.erase(annotations.begin() + ai);
 							ImGui::PopID();
-							continue; // don't increment
+							continue;
 						}
 
 						ImGui::PopID();
@@ -4168,9 +4155,7 @@ int main()
 
 					ImGui::End();
 				}
-				// ============================================
-				// COUNT ELEMENTS UI
-				// ============================================
+
 				static std::string lastSelectedGuid = "";
 				static int lastSelectedInstance = -1;
 				static std::string cachedElementType = "";
