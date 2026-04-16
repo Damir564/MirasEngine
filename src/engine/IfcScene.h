@@ -8,6 +8,14 @@
 #include <limits>
 #include <iostream>
 #include <algorithm>
+#include <glm/ext/vector_float3.hpp>
+
+struct Annotation {
+    std::string text;
+    std::string ifcGuid;
+    int instanceIndex;
+    glm::vec3 worldPosition; // where to render the label
+};
 
 struct IfcTypeInfo {
     std::string guid;
@@ -123,7 +131,11 @@ struct IfcScene {
             setVisibilityRecursive(cg, vis);
     }
 
+    
+
     static void printSpatialTree(const IfcScene& scene, const std::string& spatialGuid, int depth = 0);
     static void printIfcScene(const IfcScene& scene);
 };
+
+
 
