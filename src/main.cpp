@@ -3048,7 +3048,7 @@ int main()
 				// ============================================
 				ImGui::Begin("Model Manager");
 
-				ImGui::Text("FPS: %.1f", ImGui::GetIO().Framerate);
+				// ImGui::Text("FPS: %.1f", ImGui::GetIO().Framerate);
 				ImGui::Text("Camera: (%.2f, %.2f, %.2f)",
 					camera.position.x, camera.position.y, camera.position.z);
 				ImGui::Separator();
@@ -3540,6 +3540,7 @@ int main()
 									openSpatialGuids.count(node.guid))
 								{
 									ImGui::SetScrollHereY(0.5f);
+									openSpatialGuids.clear();
 								}
 
 								if (ImGui::IsItemClicked(ImGuiMouseButton_Left) ||
