@@ -24,6 +24,7 @@
 #include <fastgltf/tools.hpp>
 #include <future>
 #include "imgui.h"
+#include "imgui_internal.h"
 #include "backends/imgui_impl_sdl3.h"
 #include "backends/imgui_impl_vulkan.h"
 #include "engine/Buffers.h"
@@ -40,8 +41,12 @@
 #include "engine/IfcNodeParser.h"
 #include "engine/IfcScene.h"
 #include "engine/IfcSceneLoader.h"
+#include "engine/EditorStyle.h"
 #include <execution>
 #include <numeric>
+#include <map>
+#include <algorithm>
+#include <unordered_set>
 
 #define VULKAN_API_VERSION_MAJOR 1
 #define VULKAN_API_VERSION_MINOR 3
@@ -2608,16 +2613,12 @@ int main()
 		IMGUI_CHECKVERSION();
 		ImGui::CreateContext();
 		ImGuiIO& io = ImGui::GetIO();
-		io.Fonts->AddFontFromFileTTF(
-			"C:/Windows/Fonts/arial.ttf",
-			18.0f,
-			nullptr,
-			io.Fonts->GetGlyphRangesCyrillic()
-		);
+		EditorStyle::loadFonts(io);
 		io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
 		io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
+		io.ConfigWindowsMoveFromTitleBarOnly = true;
 
-		ImGui::StyleColorsDark();
+		EditorStyle::apply();
 
 		// Setup Platform/Renderer backends
 		ImGui_ImplSDL3_InitForVulkan(window);
@@ -2677,8 +2678,8 @@ int main()
 		bool rightMouseHeld = false;
 		SDL_SetWindowRelativeMouseMode(window, mouseEnabled);
 		bool running = true;
-		static char sceneSavePath[512] = "tomsk_school1.scn";
-		static char sceneLoadPath[512] = "tomsk_school1.scn";
+		// Current scene file; empty means "Untitled" (Save then asks for a location).
+		static char sceneSavePath[512] = "";
 		bool pendingSceneLoad = false;
 		SceneSerializer::LoadedScene pendingScene;
 		SDL_Event event;
@@ -2689,7 +2690,6 @@ int main()
 		// Push constant data
 		uint32_t lastTime = SDL_GetTicks();
 
-		bool showPropertiesWindow = false;
 		enum class IfcSelectionKind {
 			kNone,
 			kElement,
@@ -2708,6 +2708,47 @@ int main()
 		std::string annotationTargetGuid = "";
 		int annotationTargetInstance = -1;
 		bool showAnnotations = true;
+
+		// ---- Editor UI state ----
+		// Scene viewport = central dock area in window coordinates. The 3D scene renders only here,
+		// and mouse picking / gizmo / annotation math is relative to it.
+		float sceneViewX = 0.0f, sceneViewY = 0.0f;
+		float sceneViewW = static_cast<float>(SCREEN_WIDTH), sceneViewH = static_cast<float>(SCREEN_HEIGHT);
+		bool showOutliner = true, showInspector = true, showAnimationPanel = true;
+		bool showAnnotationsPanel = true, showStatisticsPanel = true;
+		bool resetEditorLayout = false;
+		bool focusInspectorNextFrame = false;
+		std::string statusMessage = "Ready";
+		bool statusIsError = false;
+		double statusMessageTime = 0.0;
+		auto setStatus = [&](const std::string& message, bool isError = false) {
+			statusMessage = message;
+			statusIsError = isError;
+			statusMessageTime = ImGui::GetTime();
+			(isError ? std::cerr : std::cout) << "[EDITOR] " << message << "\n";
+		};
+		// Drops the current IFC element/spatial selection (flag, inspector target and outline).
+		auto clearIfcSelection = [&]() {
+			auto& insts = modelManager->getInstances();
+			if (selectedInstanceForProperties >= 0 && selectedInstanceForProperties < static_cast<int>(insts.size()) &&
+				insts[selectedInstanceForProperties].ifcScene) {
+				IfcScene& scene = *insts[selectedInstanceForProperties].ifcScene;
+				if (selectedIfcKind == IfcSelectionKind::kElement) {
+					auto it = scene.elements.find(selectedIfcGuid);
+					if (it != scene.elements.end()) it->second.selected = false;
+				}
+				else if (selectedIfcKind == IfcSelectionKind::kSpatial) {
+					auto it = scene.spatial.find(selectedIfcGuid);
+					if (it != scene.spatial.end()) it->second.selected = false;
+				}
+			}
+			selectedIfcKind = IfcSelectionKind::kNone;
+			selectedIfcGuid.clear();
+			selectedInstanceForProperties = -1;
+			gizmo.outlineInstanceIndex = -1;
+			gizmo.outlineSubmeshIndex = std::numeric_limits<size_t>::max();
+		};
+
 		// Rebuilds the swapchain and depth buffer for the current window size. Returns false when
 		// there is nothing to render into (window minimized / zero-sized) or recreation failed.
 		bool swapchainDirty = false;
@@ -2764,6 +2805,11 @@ int main()
 			SDL_GetWindowSize(window, &winWidthInt, &winHeightInt);
 			const float winWidth = static_cast<float>(std::max(winWidthInt, 1));
 			const float winHeight = static_cast<float>(std::max(winHeightInt, 1));
+			if (mouseEnabled) {
+				// Fly mode hides the editor UI, so the scene uses the whole window.
+				sceneViewX = 0.0f; sceneViewY = 0.0f;
+				sceneViewW = winWidth; sceneViewH = winHeight;
+			}
 			uint32_t currentTime = SDL_GetTicks();
 			float dt = (currentTime - lastTime) / 1000.0f; // convert ms to seconds
 			lastTime = currentTime;
@@ -2789,8 +2835,11 @@ int main()
 				// Only handle keyboard if ImGui doesn't want it
 				if (mouseEnabled || !imguiIO.WantCaptureKeyboard) {
 					if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat) {
-						if (event.key.scancode == SDL_SCANCODE_ESCAPE)
-							running = false;
+						// Escape leaves fly mode / clears the selection; quitting is File > Exit or closing the window.
+						if (event.key.scancode == SDL_SCANCODE_ESCAPE && mouseEnabled) {
+							mouseEnabled = false;
+							SDL_SetWindowRelativeMouseMode(window, false);
+						}
 
 						if (shiftHeld) {
 							cameraAmpilfier = 4.0f;
@@ -2813,22 +2862,6 @@ int main()
 							}
 						}
 						// ========== GIZMO MODE KEYS ==========
-						if (!mouseEnabled && gizmo.selectedInstance >= 0) {
-							if (event.key.scancode == SDL_SCANCODE_1) {
-								gizmo.mode = GizmoMode::Translate;
-							}
-							if (event.key.scancode == SDL_SCANCODE_2) {
-								gizmo.mode = GizmoMode::Rotate;
-							}
-							if (event.key.scancode == SDL_SCANCODE_3) {
-								gizmo.mode = GizmoMode::Scale;
-							}
-							if (event.key.scancode == SDL_SCANCODE_DELETE) {
-								int toDelete = gizmo.selectedInstance;
-								gizmo.deselect();
-								modelManager->removeInstance(gizmo.selectedInstance);
-							}
-						}
 						if (!mouseEnabled && event.key.scancode == SDL_SCANCODE_M) {
 							// Check if an IFC element is selected
 							if (selectedIfcKind == IfcSelectionKind::kElement &&
@@ -2842,13 +2875,6 @@ int main()
 								showAnnotationPopup = true;
 							}
 						}
-						// Deselect with Escape (when GUI visible)
-						if (!mouseEnabled && event.key.scancode == SDL_SCANCODE_ESCAPE) {
-							if (gizmo.selectedInstance >= 0) {
-								gizmo.deselect();
-								running = true; // Override the quit from escape
-							}
-						}		
 					}
 					if (event.type == SDL_EVENT_KEY_UP && !event.key.repeat) {
 						if (!shiftHeld)
@@ -2856,14 +2882,18 @@ int main()
 					}
 				}
 				if (!mouseEnabled) {
-					if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN && event.button.button == SDL_BUTTON_LEFT 
-						&& !ImGui::GetIO().WantCaptureMouse) {
-						float mx = event.button.x;
-						float my = event.button.y;
+					const bool clickInSceneView =
+						event.button.x >= sceneViewX && event.button.x < sceneViewX + sceneViewW &&
+						event.button.y >= sceneViewY && event.button.y < sceneViewY + sceneViewH;
+					if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN && event.button.button == SDL_BUTTON_LEFT
+						&& !ImGui::GetIO().WantCaptureMouse && clickInSceneView) {
+						// Coordinates relative to the scene viewport
+						float mx = event.button.x - sceneViewX;
+						float my = event.button.y - sceneViewY;
 
 						glm::mat4 viewMat = getView(camera);
-						glm::mat4 projMat = getProjection(winWidth, winHeight);
-						Ray ray = screenToWorldRay(mx, my, winWidth, winHeight, viewMat, projMat);
+						glm::mat4 projMat = getProjection(sceneViewW, sceneViewH);
+						Ray ray = screenToWorldRay(mx, my, sceneViewW, sceneViewH, viewMat, projMat);
 
 						bool clickedOnGizmo = false;
 
@@ -2883,7 +2913,7 @@ int main()
 									gizmoScaleVal,
 									15.0f,
 									viewMat, projMat,
-									winWidth, winHeight);
+									sceneViewW, sceneViewH);
 							}
 							else {
 								hitAxis = pickGizmoAxis(
@@ -2892,7 +2922,7 @@ int main()
 									gizmoScaleVal,
 									20.0f,
 									viewMat, projMat,
-									winWidth, winHeight);
+									sceneViewW, sceneViewH);
 							}
 
 							if (hitAxis != GizmoAxis::None) {
@@ -2914,6 +2944,7 @@ int main()
 							);
 
 							if (hit.hit()) {
+								clearIfcSelection();
 								gizmo.select(hit.instanceIndex);
 
 								auto& hitInst = modelManager->getInstances()[hit.instanceIndex];
@@ -2960,6 +2991,7 @@ int main()
 								}
 							}
 							else {
+								clearIfcSelection();
 								gizmo.deselect();
 							}
 						}
@@ -2975,11 +3007,11 @@ int main()
 						gizmo.selectedInstance < static_cast<int>(modelManager->getInstances().size())) {
 
 						auto& inst = modelManager->getInstances()[gizmo.selectedInstance];
-						glm::vec2 currentMouse(event.motion.x, event.motion.y);
+						glm::vec2 currentMouse(event.motion.x - sceneViewX, event.motion.y - sceneViewY);
 						glm::vec2 delta = currentMouse - gizmo.dragStart;
 
 						glm::mat4 viewMat = getView(camera);
-						glm::mat4 projMat = getProjection(winWidth, winHeight);
+						glm::mat4 projMat = getProjection(sceneViewW, sceneViewH);
 						glm::mat4 vp = projMat * viewMat;
 
 						// Determine axis direction
@@ -2989,8 +3021,8 @@ int main()
 						if (gizmo.activeAxis == GizmoAxis::Z) axisMask = glm::vec3(0, 0, 1);
 
 						// Project the axis direction to screen space to find the best mouse direction
-						glm::vec2 pixelCenter = worldToScreen(gizmo.originalPosition, vp, winWidth, winHeight);
-						glm::vec2 pixelAxisEnd = worldToScreen(gizmo.originalPosition + axisMask, vp, winWidth, winHeight);
+						glm::vec2 pixelCenter = worldToScreen(gizmo.originalPosition, vp, sceneViewW, sceneViewH);
+						glm::vec2 pixelAxisEnd = worldToScreen(gizmo.originalPosition + axisMask, vp, sceneViewW, sceneViewH);
 
 						glm::vec2 screenAxisDir = pixelAxisEnd - pixelCenter;
 						float screenAxisLen = glm::length(screenAxisDir);
@@ -3036,7 +3068,10 @@ int main()
 
 				// Only handle mouse if ImGui doesn't want it
 				if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN && event.button.button == SDL_BUTTON_RIGHT) {
-					if (!mouseEnabled && !imguiIO.WantCaptureMouse) {
+					const bool inSceneView =
+						event.button.x >= sceneViewX && event.button.x < sceneViewX + sceneViewW &&
+						event.button.y >= sceneViewY && event.button.y < sceneViewY + sceneViewH;
+					if (!mouseEnabled && !imguiIO.WantCaptureMouse && inSceneView) {
 						rightMouseHeld = true;
 					}
 				}
@@ -3146,1427 +3181,1452 @@ int main()
 					}
 				}
 				// ============================================
-				// MODEL MANAGER UI
-				// ============================================
-				ImGui::Begin("Model Manager");
-
-				// ImGui::Text("FPS: %.1f", ImGui::GetIO().Framerate);
-				ImGui::Text("Camera: (%.2f, %.2f, %.2f)",
-					camera.position.x, camera.position.y, camera.position.z);
-				ImGui::Separator();
-
-				// ============================================
-				// SCENE SAVE / LOAD
+				// EDITOR UI
 				// ============================================
 				static const std::string SCENES_ROOT = ".";
 				static const std::string MODELS_ROOT = "models";
 				static const std::string ANIMS_ROOT = ".";
-
-				ImGui::Text("Scene File:");
-				ImGui::InputText("##scenepath", sceneSavePath, sizeof(sceneSavePath));
-
-				// --- Browse for scene file (to load) ---
-				ImGui::SameLine();
-				if (ImGui::Button("Browse##scene")) {
-					namespace fs = std::filesystem;
-					fs::create_directories(SCENES_ROOT);
-					std::string absRoot = fs::weakly_canonical(fs::absolute(SCENES_ROOT)).string();
-
-					IGFD::FileDialogConfig config;
-					config.path = absRoot;
-					config.countSelectionMax = 1;
-					config.flags = ImGuiFileDialogFlags_Modal;
-
-					ImGuiFileDialog::Instance()->OpenDialog(
-						"BrowseSceneDlg",      // unique key
-						"Select Scene File",   // title
-						".scn",                // filter: ONLY .scn
-						config
-					);
-				}
-
-				// --- Save Scene (uses current path in text field) ---
-				if (ImGui::Button("Save Scene")) {
-					namespace fs = std::filesystem;
-					fs::path savePath(sceneSavePath);
-
-					// Auto-append .scn if no extension
-					if (!savePath.has_extension()) {
-						savePath += ".scn";
-						strncpy(sceneSavePath, savePath.string().c_str(), sizeof(sceneSavePath) - 1);
-						sceneSavePath[sizeof(sceneSavePath) - 1] = '\0';
-					}
-
-					std::string ext = savePath.extension().string();
-					if (ext != ".scn") {
-						std::cerr << "[SCENE] Invalid extension: " << ext << ". Use .scn\n";
-					}
-					else {
-						if (SceneSerializer::Save(sceneSavePath, *modelManager)) {
-							std::cout << "[SCENE] Scene saved successfully\n";
-						}
-						else {
-							std::cerr << "[SCENE] Failed to save scene\n";
-						}
-					}
-				}
-
-				ImGui::SameLine();
-
-				// --- Save As (opens dialog to pick save location) ---
-				if (ImGui::Button("Save As...")) {
-					namespace fs = std::filesystem;
-					fs::create_directories(SCENES_ROOT);
-					std::string absRoot = fs::weakly_canonical(fs::absolute(SCENES_ROOT)).string();
-
-					IGFD::FileDialogConfig config;
-					config.path = absRoot;
-					config.fileName = "untitled.scn";
-					config.countSelectionMax = 1;
-					config.flags = ImGuiFileDialogFlags_ConfirmOverwrite | ImGuiFileDialogFlags_Modal;
-
-					ImGuiFileDialog::Instance()->OpenDialog(
-						"SaveAsSceneDlg",
-						"Save Scene As",
-						".scn",
-						config
-					);
-				}
-
-				ImGui::SameLine();
-
-				// --- Load Scene (uses current path in text field) ---
-				if (ImGui::Button("Load Scene")) {
-					auto loaded = SceneSerializer::Load(sceneSavePath);
-					if (loaded.valid) {
-						gizmo.deselect();
-						device.waitIdle();
-
-						auto& currentInstances = modelManager->getInstances();
-						while (!currentInstances.empty()) {
-							modelManager->removeInstance(currentInstances.size() - 1);
-						}
-						while (!modelManager->getModels().empty()) {
-							modelManager->unloadModel(modelManager->getModels().size() - 1);
-						}
-
-						std::vector<int> fileToManagerIndex(loaded.models.size(), -1);
-						for (size_t i = 0; i < loaded.models.size(); ++i) {
-							std::ifstream testFile(loaded.models[i].path);
-							if (!testFile.good()) {
-								std::cerr << "[SCENE] Model file not found: " << loaded.models[i].path << "\n";
-								continue;
-							}
-							testFile.close();
-							modelManager->loadModelAsync(loaded.models[i].path, loaded.models[i].name);
-							fileToManagerIndex[i] = static_cast<int>(i);
-						}
-
-						pendingSceneLoad = true;
-						pendingScene = loaded;
-						std::cout << "[SCENE] Loading " << loaded.models.size() << " models...\n";
-					}
-				}
-
-				ImGui::SameLine();
-
-				if (ImGui::Button("Clear Scene")) {
-					gizmo.deselect();
-					device.waitIdle();
-					auto& currentInstances = modelManager->getInstances();
-					while (!currentInstances.empty()) {
-						modelManager->removeInstance(currentInstances.size() - 1);
-					}
-					while (!modelManager->getModels().empty()) {
-						modelManager->unloadModel(modelManager->getModels().size() - 1);
-					}
-				}
-
-				ImGui::Separator();
-
-				static char modelPath[512] = "models/";
-				ImGui::InputText("Model Path", modelPath, sizeof(modelPath));
-
-				if (ImGui::Button("Load Custom")) {
-					modelManager->loadModelAsync(modelPath);
-				}
-
-				ImGui::SameLine();
-
-				// --- Browse for 3D model ---
-				if (ImGui::Button("Browse##model")) {
-					namespace fs = std::filesystem;
-					fs::create_directories(MODELS_ROOT);
-					std::string absRoot = fs::weakly_canonical(fs::absolute(MODELS_ROOT)).string();
-
-					IGFD::FileDialogConfig config;
-					config.path = absRoot;
-					config.countSelectionMax = 1;
-					config.flags = ImGuiFileDialogFlags_Modal;
-
-					ImGuiFileDialog::Instance()->OpenDialog(
-						"BrowseModelDlg",
-						"Select 3D Model",
-						"{.gltf,.glb,.obj,.ifc}, .gltf,.glb,.obj,.ifc",   // allowed model formats
-						config
-					);
-				}
-
-				ImGui::Separator();
-
-				ImVec2 dialogSize = ImVec2(600, 400);
-
-				if (ImGuiFileDialog::Instance()->Display("BrowseSceneDlg",
-					ImGuiWindowFlags_NoCollapse, dialogSize))
-				{
-					if (ImGuiFileDialog::Instance()->IsOk()) {
-						std::string selectedPath = ImGuiFileDialog::Instance()->GetFilePathName();
-
-						auto rel = makeRelativeIfInside(selectedPath, SCENES_ROOT);
-						if (rel.has_value()) {
-							strncpy(sceneSavePath, rel.value().c_str(), sizeof(sceneSavePath) - 1);
-							sceneSavePath[sizeof(sceneSavePath) - 1] = '\0';
-						}
-						else {
-							std::cerr << "[SCENE] File must be inside \"" << SCENES_ROOT << "/\"\n";
-						}
-					}
-					ImGuiFileDialog::Instance()->Close();
-				}
-
-				// --- Dialog: Save As Scene ---
-				if (ImGuiFileDialog::Instance()->Display("SaveAsSceneDlg",
-					ImGuiWindowFlags_NoCollapse, dialogSize))
-				{
-					if (ImGuiFileDialog::Instance()->IsOk()) {
-						std::string selectedPath = ImGuiFileDialog::Instance()->GetFilePathName();
-
-						// Enforce .scn extension
-						namespace fs = std::filesystem;
-						fs::path p(selectedPath);
-						if (!p.has_extension() || p.extension() != ".scn") {
-							p.replace_extension(".scn");
-						}
-
-						auto rel = makeRelativeIfInside(p.string(), SCENES_ROOT);
-						if (rel.has_value()) {
-							strncpy(sceneSavePath, rel.value().c_str(), sizeof(sceneSavePath) - 1);
-							sceneSavePath[sizeof(sceneSavePath) - 1] = '\0';
-
-							if (SceneSerializer::Save(sceneSavePath, *modelManager)) {
-								std::cout << "[SCENE] Scene saved to: " << sceneSavePath << "\n";
-							}
-							else {
-								std::cerr << "[SCENE] Failed to save scene\n";
-							}
-						}
-						else {
-							std::cerr << "[SCENE] Save location must be inside \"" << SCENES_ROOT << "/\"\n";
-						}
-					}
-					ImGuiFileDialog::Instance()->Close();
-				}
-
-				// --- Dialog: Browse Model ---
-				if (ImGuiFileDialog::Instance()->Display("BrowseModelDlg",
-					ImGuiWindowFlags_NoCollapse, dialogSize))
-				{
-					if (ImGuiFileDialog::Instance()->IsOk()) {
-						std::string selectedPath = ImGuiFileDialog::Instance()->GetFilePathName();
-
-						auto rel = makeRelativeIfInside(selectedPath, MODELS_ROOT);
-						if (rel.has_value()) {
-							strncpy(modelPath, rel.value().c_str(), sizeof(modelPath) - 1);
-							modelPath[sizeof(modelPath) - 1] = '\0';
-
-							namespace fs = std::filesystem;
-							std::string name = fs::path(modelPath).stem().string();
-							modelManager->loadModelAsync(modelPath, name);
-						}
-						else {
-							std::cerr << "[MODEL] File must be inside \"" << MODELS_ROOT << "/\"\n";
-						}
-					}
-					ImGuiFileDialog::Instance()->Close();
-				}
-
-				// Loading tasks
-				const auto& tasks = modelManager->getLoadingTasks();
-				if (!tasks.empty()) {
-					ImGui::Text("Loading:");
-					for (const auto& task : tasks) {
-						const char* stateStr = "Unknown";
-						switch (task.state) {
-						case LoadingState::LoadingCPU: stateStr = "Parsing..."; break;
-						case LoadingState::UploadingGPU: stateStr = "Uploading..."; break;
-						case LoadingState::Failed: stateStr = "FAILED"; break;
-						default: break;
-						}
-						ImGui::BulletText("%s - %s", task.name.c_str(), stateStr);
-					}
-					ImGui::Separator();
-				}
-
-				// Loaded Models
-				if (ImGui::CollapsingHeader("Loaded Models", ImGuiTreeNodeFlags_DefaultOpen))
-				{
-					ImGui::Text("Model Count: %zu", modelManager->getModels().size());
-					const auto& models = modelManager->getModels();
-					static int selectedModel = -1;
-					size_t vertexCount = 0;
-					for (size_t i = 0; i < models.size(); ++i) {
-						const auto& model = models[i];
-						ImGui::PushID(static_cast<int>(i));
-
-						bool isSelected = (selectedModel == static_cast<int>(i));
-						if (ImGui::Selectable(model->name.c_str(), isSelected)) {
-							selectedModel = static_cast<int>(i);
-						}
-
-						// Right-click context menu
-						if (ImGui::BeginPopupContextItem()) {
-							if (ImGui::MenuItem("Create Instance")) {
-								modelManager->createInstance(i, camera.position + glm::vec3(0, 0, 0));
-							}
-							if (ImGui::MenuItem("Create at Origin")) {
-								modelManager->createInstance(i, glm::vec3(0.0f));
-							}
-							ImGui::Separator();
-							if (ImGui::MenuItem("Unload")) {
-								if (gizmo.selectedInstance >= 0) {
-									const auto& insts = modelManager->getInstances();
-									if (gizmo.selectedInstance >= static_cast<int>(insts.size())) {
-										gizmo.deselect();
-									}
-									else {
-										GPUModel* model = modelManager->getModel(insts[gizmo.selectedInstance].modelIndex);
-										if (!model || !model->isValid()) {
-											gizmo.deselect();  // <-- THIS might be firing!
-										}
-									}
-								}
-								modelManager->unloadModel(i);
-								selectedModel = -1;
-								gizmo.deselect();
-							}
-							ImGui::EndPopup();
-						}
-
-
-						ImGui::SameLine();
-						ImGui::TextDisabled("(%zu verts, %zu tex)",
-							model->vertexCount, model->textures.size());
-						ImGui::PopID();
-					}
-				}
-				ImGui::Separator();
-
-				// Instances
-				ImGui::Text("Scene Instances: %zu", modelManager->getInstances().size());
+				static GizmoMode editorTool = GizmoMode::Translate;
+				const ImVec2 dialogSize(760, 480);
 				auto& instances = modelManager->getInstances();
+				ImGuiIO& uiIO = ImGui::GetIO();
 
-				for (size_t i = 0; i < instances.size(); ++i) {
-					auto& inst = instances[i];
-					ImGui::PushID(static_cast<int>(i) + 10000);
-
-					ImGui::Checkbox("##vis", &inst.visible);
-					ImGui::SameLine();
-
-					// Use gizmo.selectedInstance as single source of truth
-					bool isSelected = (gizmo.selectedInstance == static_cast<int>(i));
-					if (ImGui::Selectable(inst.name.c_str(), isSelected)) {
-						gizmo.select(static_cast<int>(i));
+				auto formatCount = [](size_t value) {
+					std::string digits = std::to_string(value);
+					std::string out;
+					for (size_t i = 0; i < digits.size(); ++i) {
+						if (i > 0 && (digits.size() - i) % 3 == 0) out += ',';
+						out += digits[i];
 					}
+					return out;
+				};
+				auto cameraFront = [&]() {
+					return glm::normalize(glm::vec3(
+						cos(glm::radians(camera.yaw)) * cos(glm::radians(camera.pitch)),
+						sin(glm::radians(camera.pitch)),
+						sin(glm::radians(camera.yaw)) * cos(glm::radians(camera.pitch))));
+				};
+				auto validInstance = [&](int index) {
+					return index >= 0 && index < static_cast<int>(instances.size());
+				};
 
-					if (ImGui::BeginPopupContextItem()) {
-						if (ImGui::MenuItem("Delete")) {
-							if (gizmo.selectedInstance == static_cast<int>(i)) {
-								gizmo.deselect();
-							}
-							else if (gizmo.selectedInstance > static_cast<int>(i)) {
-								gizmo.selectedInstance--;
-							}
-							modelManager->removeInstance(i);
-						}
-						if (ImGui::MenuItem("Copy")) {
-							if (gizmo.selectedInstance == static_cast<int>(i)) {
-								gizmo.deselect();
-							}
-							else if (gizmo.selectedInstance > static_cast<int>(i)) {
-								gizmo.selectedInstance--;
-							}
-							modelManager->createInstance(instances[i].modelIndex, instances[i].position, instances[i].rotation, instances[i].scale);
-						}
-						ImGui::EndPopup();
-					}
-					// vertexCount += modelManager->getModel(inst.modelIndex)->vertexCount;
-					ImGui::PopID();
+				// ---------- Selection ----------
+				if (!validInstance(gizmo.selectedInstance) && gizmo.selectedInstance != -1)
+					gizmo.deselect();
+				if (selectedInstanceForProperties != -1 &&
+					(!validInstance(selectedInstanceForProperties) || !instances[selectedInstanceForProperties].ifcScene)) {
+					selectedInstanceForProperties = -1;
+					selectedIfcKind = IfcSelectionKind::kNone;
+					selectedIfcGuid.clear();
 				}
-				// ImGui::TextDisabled("(Verts in scene %zu)",
-//					vertexCount);
-				// Single unified inspector
-				ImGui::Separator();
-				if (gizmo.selectedInstance >= 0 &&
-					gizmo.selectedInstance < static_cast<int>(instances.size())) {
 
-					/*GPUModel* gpuModel = modelManager->getModel(
-						instances[gizmo.selectedInstance].modelIndex);*/
+				auto selectInstance = [&](int index) {
+					clearIfcSelection();
+					gizmo.select(index);
+				};
+				auto deselectAll = [&]() {
+					clearIfcSelection();
+					gizmo.deselect();
+				};
+				auto selectIfcElement = [&](int instIndex, IfcScene& scene, const std::string& guid) {
+					clearIfcSelection();
+					auto it = scene.elements.find(guid);
+					if (it == scene.elements.end()) return;
+					it->second.selected = true;
+					gizmo.select(instIndex);
+					selectedIfcGuid = guid;
+					selectedIfcKind = IfcSelectionKind::kElement;
+					selectedInstanceForProperties = instIndex;
+					int submeshIdx = IfcScene::findSubmeshByGuid(scene, guid);
+					if (submeshIdx >= 0) {
+						gizmo.outlineInstanceIndex = instIndex;
+						gizmo.outlineSubmeshIndex = static_cast<size_t>(submeshIdx);
+					}
+				};
+				auto selectIfcSpatial = [&](int instIndex, IfcScene& scene, const std::string& guid) {
+					clearIfcSelection();
+					auto it = scene.spatial.find(guid);
+					if (it == scene.spatial.end()) return;
+					it->second.selected = true;
+					gizmo.select(instIndex);
+					selectedIfcGuid = guid;
+					selectedIfcKind = IfcSelectionKind::kSpatial;
+					selectedInstanceForProperties = instIndex;
+					for (const auto& elemGuid : it->second.elementGuids) {
+						int submeshIdx = IfcScene::findSubmeshByGuid(scene, elemGuid);
+						if (submeshIdx >= 0) {
+							gizmo.outlineInstanceIndex = instIndex;
+							gizmo.outlineSubmeshIndex = static_cast<size_t>(submeshIdx);
+							break;
+						}
+					}
+				};
 
-					if (instances[gizmo.selectedInstance].ifcScene) {
-						IfcScene& scene = instances[gizmo.selectedInstance].ifcScene.value();
+				// ---------- IFC visibility helpers ----------
+				auto showAllIfc = [](IfcScene& scene) {
+					for (auto& [g, e] : scene.elements) e.visible = true;
+					for (auto& [g, s] : scene.spatial) s.visible = true;
+					scene.syncVisibilityCache();
+				};
+				auto hideAllIfc = [](IfcScene& scene) {
+					for (auto& [g, e] : scene.elements) e.visible = false;
+					for (auto& [g, s] : scene.spatial) s.visible = false;
+					scene.syncVisibilityCache();
+				};
+				auto isolateIfcElement = [](IfcScene& scene, const std::string& guid) {
+					for (auto& [g, e] : scene.elements) e.visible = (g == guid);
+					for (auto& [g, s] : scene.spatial) s.visible = false;
+					auto it = scene.elements.find(guid);
+					if (it != scene.elements.end()) {
+						std::string parent = it->second.parentSpatialGuid;
+						while (!parent.empty()) {
+							auto sit = scene.spatial.find(parent);
+							if (sit == scene.spatial.end()) break;
+							sit->second.visible = true;
+							parent = sit->second.parentGuid;
+						}
+					}
+					scene.syncVisibilityCache();
+				};
 
-						if (selectionChangedFromViewport && !selectedIfcGuid.empty())
-						{
-							openSpatialGuids.clear();
+				// ---------- Object actions ----------
+				auto focusOnInstance = [&](int index) {
+					if (!validInstance(index)) return;
+					const auto& inst = instances[index];
+					GPUModel* model = modelManager->getModel(inst.modelIndex);
+					if (!model) return;
+					const float maxScale = std::max({ inst.scale.x, inst.scale.y, inst.scale.z });
+					glm::vec3 center = glm::vec3(inst.getTransformMatrix() * glm::vec4(model->boundsCenter, 1.0f));
+					float radius = model->boundsRadius * maxScale;
 
-							if (selectedIfcKind == IfcSelectionKind::kElement)
-							{
-								auto eit = scene.elements.find(selectedIfcGuid);
-								if (eit != scene.elements.end())
-								{
-									// Walk up the spatial hierarchy from the element's parent
-									std::string parentGuid = eit->second.parentSpatialGuid;
-									while (!parentGuid.empty())
-									{
-										openSpatialGuids.insert(parentGuid);
-										auto sit = scene.spatial.find(parentGuid);
-										if (sit == scene.spatial.end()) break;
-										parentGuid = sit->second.parentGuid;
-									}
-								}
+					// Frame the selected IFC element instead of the whole model when there is one.
+					if (selectedInstanceForProperties == index && selectedIfcKind == IfcSelectionKind::kElement && inst.ifcScene) {
+						int submeshIdx = IfcScene::findSubmeshByGuid(*inst.ifcScene, selectedIfcGuid);
+						if (submeshIdx >= 0) {
+							const auto& sub = model->submeshes[submeshIdx];
+							if (sub.boundsMin.x <= sub.boundsMax.x) {
+								center = getSubmeshWorldCenter(model, submeshIdx, inst);
+								radius = glm::length(sub.boundsMax - sub.boundsMin) * 0.5f * maxScale;
 							}
-							else if (selectedIfcKind == IfcSelectionKind::kSpatial)
-							{
-								// Open the node itself and all its ancestors
-								std::string guid = selectedIfcGuid;
-								while (!guid.empty())
-								{
+						}
+					}
+					// 60 degree vertical FOV: a sphere of radius r fits at distance r / sin(30deg) = 2r.
+					camera.position = center - cameraFront() * std::max(radius * 2.2f, 1.0f);
+				};
+				auto addModelToScene = [&](size_t modelIndex, bool atOrigin) {
+					GPUModel* model = modelManager->getModel(modelIndex);
+					if (!model) return;
+					glm::vec3 position(0.0f);
+					if (!atOrigin)
+						position = camera.position + cameraFront() * std::max(model->boundsRadius * 2.2f, 2.0f) - model->boundsCenter;
+					size_t newIndex = modelManager->createInstance(modelIndex, position);
+					selectInstance(static_cast<int>(newIndex));
+					setStatus("Added " + model->name + " to the scene");
+				};
+				auto deleteInstance = [&](int index) {
+					if (!validInstance(index)) return;
+					const std::string name = instances[index].name;
+					// Annotations reference instances by index.
+					annotations.erase(std::remove_if(annotations.begin(), annotations.end(),
+						[&](const Annotation& a) { return a.instanceIndex == index; }), annotations.end());
+					for (auto& a : annotations)
+						if (a.instanceIndex > index) --a.instanceIndex;
+					deselectAll();
+					modelManager->removeInstance(static_cast<size_t>(index));
+					setStatus("Deleted " + name);
+				};
+				auto duplicateInstance = [&](int index) {
+					if (!validInstance(index)) return;
+					const size_t modelIndex = instances[index].modelIndex;
+					const glm::vec3 position = instances[index].position;
+					const glm::vec3 rotation = instances[index].rotation;
+					const glm::vec3 scale = instances[index].scale;
+					const std::string name = instances[index].name;
+					GPUModel* model = modelManager->getModel(modelIndex);
+					const float offset = model ? model->boundsRadius * std::max({ scale.x, scale.y, scale.z }) : 1.0f;
+					size_t newIndex = modelManager->createInstance(modelIndex, position + glm::vec3(offset, 0.0f, 0.0f), rotation, scale);
+					selectInstance(static_cast<int>(newIndex));
+					setStatus("Duplicated " + name);
+				};
+				auto unloadModel = [&](size_t modelIndex) {
+					GPUModel* model = modelManager->getModel(modelIndex);
+					if (!model) return;
+					const std::string name = model->name;
+					// Instances of this model disappear and the rest shift down; remap annotation indices.
+					std::vector<int> remap(instances.size(), -1);
+					int next = 0;
+					for (size_t k = 0; k < instances.size(); ++k)
+						remap[k] = instances[k].modelIndex == modelIndex ? -1 : next++;
+					annotations.erase(std::remove_if(annotations.begin(), annotations.end(), [&](const Annotation& a) {
+						return !validInstance(a.instanceIndex) || remap[a.instanceIndex] < 0;
+						}), annotations.end());
+					for (auto& a : annotations) a.instanceIndex = remap[a.instanceIndex];
+					deselectAll();
+					modelManager->unloadModel(modelIndex);
+					setStatus("Unloaded " + name);
+				};
+
+				// ---------- File actions ----------
+				auto openFileDialog = [&](const char* key, const char* title, const char* filters,
+					const std::string& root, const char* defaultFileName, bool confirmOverwrite) {
+					namespace fs = std::filesystem;
+					fs::create_directories(root);
+					IGFD::FileDialogConfig config;
+					config.path = fs::weakly_canonical(fs::absolute(root)).string();
+					config.countSelectionMax = 1;
+					config.flags = ImGuiFileDialogFlags_Modal;
+					if (confirmOverwrite) config.flags |= ImGuiFileDialogFlags_ConfirmOverwrite;
+					if (defaultFileName) config.fileName = defaultFileName;
+					ImGuiFileDialog::Instance()->OpenDialog(key, title, filters, config);
+				};
+				auto clearScene = [&]() {
+					deselectAll();
+					(void)device.waitIdle();
+					while (!instances.empty())
+						modelManager->removeInstance(instances.size() - 1);
+					while (!modelManager->getModels().empty())
+						modelManager->unloadModel(modelManager->getModels().size() - 1);
+					annotations.clear();
+					pendingSceneLoad = false;
+				};
+				auto saveSceneTo = [&](const std::string& path) {
+					if (SceneSerializer::Save(path, *modelManager))
+						setStatus("Scene saved: " + path);
+					else
+						setStatus("Failed to save scene: " + path, true);
+				};
+				auto openScene = [&](const std::string& path) {
+					auto loaded = SceneSerializer::Load(path);
+					if (!loaded.valid) {
+						setStatus("Failed to open scene: " + path, true);
+						return;
+					}
+					clearScene();
+					size_t queued = 0;
+					for (const auto& m : loaded.models) {
+						if (!std::filesystem::exists(m.path)) {
+							setStatus("Model file not found: " + m.path, true);
+							continue;
+						}
+						modelManager->loadModelAsync(m.path, m.name);
+						++queued;
+					}
+					pendingScene = loaded;
+					pendingSceneLoad = true;
+					strncpy(sceneSavePath, path.c_str(), sizeof(sceneSavePath) - 1);
+					sceneSavePath[sizeof(sceneSavePath) - 1] = '\0';
+					setStatus("Opening " + path + " (" + std::to_string(queued) + " models)...");
+				};
+				auto openSceneDialog = [&]() { openFileDialog("BrowseSceneDlg", "Open Scene", ".scn", SCENES_ROOT, nullptr, false); };
+				auto saveSceneAs = [&]() { openFileDialog("SaveAsSceneDlg", "Save Scene As", ".scn", SCENES_ROOT, "untitled.scn", true); };
+				auto saveScene = [&]() {
+					if (sceneSavePath[0] == '\0') saveSceneAs();
+					else saveSceneTo(sceneSavePath);
+				};
+				auto importModel = [&]() {
+					openFileDialog("BrowseModelDlg", "Import 3D Model",
+						"3D Models{.gltf,.glb,.obj,.fbx,.ifc},.gltf,.glb,.obj,.fbx,.ifc", MODELS_ROOT, nullptr, false);
+				};
+				auto requestAnnotation = [&]() {
+					if (selectedIfcKind == IfcSelectionKind::kElement && validInstance(selectedInstanceForProperties)) {
+						annotationTargetGuid = selectedIfcGuid;
+						annotationTargetInstance = selectedInstanceForProperties;
+						annotationText[0] = '\0';
+						showAnnotationPopup = true;
+					}
+				};
+
+				// ---------- Keyboard shortcuts ----------
+				bool openControlsPopup = false;
+				bool openAboutPopup = false;
+				const bool hasSelection = validInstance(gizmo.selectedInstance);
+				if (!uiIO.WantTextInput) {
+					if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_O)) openSceneDialog();
+					if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_S)) saveSceneAs();
+					if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_S)) saveScene();
+					if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_I)) importModel();
+					if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_D) && hasSelection) duplicateInstance(gizmo.selectedInstance);
+					if (ImGui::IsKeyChordPressed(ImGuiKey_Delete) && hasSelection) deleteInstance(gizmo.selectedInstance);
+					if (ImGui::IsKeyChordPressed(ImGuiKey_F) && hasSelection) focusOnInstance(gizmo.selectedInstance);
+					if (ImGui::IsKeyChordPressed(ImGuiKey_Escape) && !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId)) deselectAll();
+					if (ImGui::IsKeyChordPressed(ImGuiKey_Q)) editorTool = GizmoMode::None;
+					if (ImGui::IsKeyChordPressed(ImGuiKey_1)) editorTool = GizmoMode::Translate;
+					if (ImGui::IsKeyChordPressed(ImGuiKey_2)) editorTool = GizmoMode::Rotate;
+					if (ImGui::IsKeyChordPressed(ImGuiKey_3)) editorTool = GizmoMode::Scale;
+					if (ImGui::IsKeyChordPressed(ImGuiKey_F1)) openControlsPopup = true;
+				}
+				// The gizmo shows the active tool on the selected object ("Select" tool = no gizmo).
+				gizmo.mode = validInstance(gizmo.selectedInstance) ? editorTool : GizmoMode::None;
+
+				// Window title reflects the open scene.
+				{
+					static std::string lastTitle;
+					std::string title = std::string("MirasEngine - ") + (sceneSavePath[0] ? sceneSavePath : "Untitled");
+					if (title != lastTitle) {
+						SDL_SetWindowTitle(window, title.c_str());
+						lastTitle = title;
+					}
+				}
+
+				// ---------- Main menu bar ----------
+				if (ImGui::BeginMainMenuBar()) {
+					if (ImGui::BeginMenu("File")) {
+						if (ImGui::MenuItem("New Scene")) {
+							clearScene();
+							sceneSavePath[0] = '\0';
+							setStatus("New scene");
+						}
+						if (ImGui::MenuItem("Open Scene...", "Ctrl+O")) openSceneDialog();
+						if (ImGui::MenuItem("Save Scene", "Ctrl+S")) saveScene();
+						if (ImGui::MenuItem("Save Scene As...", "Ctrl+Shift+S")) saveSceneAs();
+						ImGui::Separator();
+						if (ImGui::MenuItem("Import Model...", "Ctrl+I")) importModel();
+						ImGui::Separator();
+						if (ImGui::MenuItem("Exit", "Alt+F4")) running = false;
+						ImGui::EndMenu();
+					}
+					if (ImGui::BeginMenu("Edit")) {
+						if (ImGui::MenuItem("Duplicate", "Ctrl+D", false, hasSelection)) duplicateInstance(gizmo.selectedInstance);
+						if (ImGui::MenuItem("Delete", "Del", false, hasSelection)) deleteInstance(gizmo.selectedInstance);
+						if (ImGui::MenuItem("Deselect", "Esc", false, hasSelection)) deselectAll();
+						ImGui::Separator();
+						if (ImGui::MenuItem("Focus Selected", "F", false, hasSelection)) focusOnInstance(gizmo.selectedInstance);
+						if (ImGui::MenuItem("Add Annotation...", "M", false, selectedIfcKind == IfcSelectionKind::kElement)) requestAnnotation();
+						ImGui::Separator();
+						if (ImGui::MenuItem("Select Tool", "Q", editorTool == GizmoMode::None)) editorTool = GizmoMode::None;
+						if (ImGui::MenuItem("Move Tool", "1", editorTool == GizmoMode::Translate)) editorTool = GizmoMode::Translate;
+						if (ImGui::MenuItem("Rotate Tool", "2", editorTool == GizmoMode::Rotate)) editorTool = GizmoMode::Rotate;
+						if (ImGui::MenuItem("Scale Tool", "3", editorTool == GizmoMode::Scale)) editorTool = GizmoMode::Scale;
+						ImGui::EndMenu();
+					}
+					if (ImGui::BeginMenu("View")) {
+						ImGui::MenuItem("Outliner", nullptr, &showOutliner);
+						ImGui::MenuItem("Inspector", nullptr, &showInspector);
+						ImGui::MenuItem("Camera Animation", nullptr, &showAnimationPanel);
+						ImGui::MenuItem("Annotations", nullptr, &showAnnotationsPanel);
+						ImGui::MenuItem("Statistics", nullptr, &showStatisticsPanel);
+						ImGui::Separator();
+						ImGui::MenuItem("Show Annotations in Viewport", nullptr, &showAnnotations);
+						ImGui::MenuItem("Show Camera Path", nullptr, &showAnimationPath);
+						ImGui::Separator();
+						if (ImGui::MenuItem("Fly Mode (hide UI)", "Shift+`")) {
+							mouseEnabled = true;
+							SDL_SetWindowRelativeMouseMode(window, true);
+						}
+						if (ImGui::MenuItem("Reset Layout")) resetEditorLayout = true;
+						ImGui::EndMenu();
+					}
+					if (ImGui::BeginMenu("Help")) {
+						if (ImGui::MenuItem("Controls", "F1")) openControlsPopup = true;
+						if (ImGui::MenuItem("About MirasEngine")) openAboutPopup = true;
+						ImGui::EndMenu();
+					}
+
+					const char* sceneLabel = sceneSavePath[0] ? sceneSavePath : "Untitled scene";
+					const float labelWidth = ImGui::CalcTextSize(sceneLabel).x;
+					ImGui::SameLine(ImGui::GetWindowWidth() - labelWidth - ImGui::GetStyle().WindowPadding.x * 2);
+					ImGui::TextDisabled("%s", sceneLabel);
+					ImGui::EndMainMenuBar();
+				}
+
+				ImGuiViewport* mainViewport = ImGui::GetMainViewport();
+				const ImGuiWindowFlags barFlags = ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoSavedSettings;
+
+				// ---------- Toolbar ----------
+				ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8, 5));
+				if (ImGui::BeginViewportSideBar("##Toolbar", mainViewport, ImGuiDir_Up, ImGui::GetFrameHeight() + 10.0f, barFlags)) {
+					auto toolButton = [&](const char* label, GizmoMode tool, const char* tooltip) {
+						const bool active = editorTool == tool;
+						if (active) {
+							ImGui::PushStyleColor(ImGuiCol_Button, EditorStyle::kAccent);
+							ImGui::PushStyleColor(ImGuiCol_ButtonHovered, EditorStyle::kAccentHover);
+						}
+						if (ImGui::Button(label, ImVec2(64, 0))) editorTool = tool;
+						if (active) ImGui::PopStyleColor(2);
+						ImGui::SetItemTooltip("%s", tooltip);
+						ImGui::SameLine(0, 2);
+					};
+					toolButton("Select", GizmoMode::None, "Select objects without a transform gizmo (Q)");
+					toolButton("Move", GizmoMode::Translate, "Move the selected object (1)");
+					toolButton("Rotate", GizmoMode::Rotate, "Rotate the selected object (2)");
+					toolButton("Scale", GizmoMode::Scale, "Scale the selected object (3)");
+
+					ImGui::SameLine(0, 16);
+					ImGui::BeginDisabled(!hasSelection);
+					if (ImGui::Button("Focus")) focusOnInstance(gizmo.selectedInstance);
+					ImGui::SetItemTooltip("Move the camera to the selection (F)");
+					ImGui::EndDisabled();
+
+					ImGui::SameLine(0, 16);
+					ImGui::AlignTextToFramePadding();
+					ImGui::TextDisabled("Camera speed");
+					ImGui::SameLine();
+					ImGui::SetNextItemWidth(140);
+					ImGui::SliderFloat("##cameraSpeed", &camera.speed, 0.5f, 200.0f, "%.1f", ImGuiSliderFlags_Logarithmic);
+					ImGui::SetItemTooltip("WASD movement speed (hold Shift for 4x)");
+
+					ImGui::SameLine(0, 16);
+					ImGui::Checkbox("Annotations", &showAnnotations);
+					ImGui::SameLine();
+					ImGui::Checkbox("Camera path", &showAnimationPath);
+
+					const float flyWidth = ImGui::CalcTextSize("Fly Mode").x + ImGui::GetStyle().FramePadding.x * 2;
+					ImGui::SameLine(ImGui::GetWindowWidth() - flyWidth - 8);
+					if (ImGui::Button("Fly Mode")) {
+						mouseEnabled = true;
+						SDL_SetWindowRelativeMouseMode(window, true);
+					}
+					ImGui::SetItemTooltip("Hide the UI and look around with the mouse (Shift+` or Esc to exit)");
+				}
+				ImGui::End();
+				ImGui::PopStyleVar();
+
+				// ---------- Status bar ----------
+				if (ImGui::BeginViewportSideBar("##StatusBar", mainViewport, ImGuiDir_Down, ImGui::GetFrameHeight(), barFlags | ImGuiWindowFlags_MenuBar)) {
+					if (ImGui::BeginMenuBar()) {
+						const auto& tasks = modelManager->getLoadingTasks();
+						if (!tasks.empty()) {
+							static const char spinner[] = "|/-\\";
+							const char spin = spinner[static_cast<int>(ImGui::GetTime() * 8.0) % 4];
+							ImGui::TextColored(EditorStyle::kHighlight, "%c  Loading %s%s", spin, tasks.front().name.c_str(),
+								tasks.size() > 1 ? (" (+" + std::to_string(tasks.size() - 1) + " more)").c_str() : "");
+						}
+						else {
+							const bool recent = ImGui::GetTime() - statusMessageTime < 5.0;
+							const ImVec4 color = statusIsError ? EditorStyle::kError
+								: (recent ? ImGui::GetStyleColorVec4(ImGuiCol_Text) : EditorStyle::kTextDim);
+							ImGui::TextColored(color, "%s", statusMessage.c_str());
+						}
+
+						size_t triangles = 0;
+						for (const auto& inst : instances)
+							if (inst.visible)
+								if (GPUModel* m = modelManager->getModel(inst.modelIndex)) triangles += m->indexCount / 3;
+						char right[256];
+						snprintf(right, sizeof(right), "Objects: %zu   Models: %zu   Triangles: %s   |   %.0f FPS (%.2f ms)",
+							instances.size(), modelManager->getModels().size(), formatCount(triangles).c_str(),
+							uiIO.Framerate, 1000.0f / std::max(uiIO.Framerate, 0.001f));
+						const float rightWidth = ImGui::CalcTextSize(right).x;
+						ImGui::SameLine(ImGui::GetWindowWidth() - rightWidth - 12);
+						ImGui::TextDisabled("%s", right);
+						ImGui::EndMenuBar();
+					}
+				}
+				ImGui::End();
+
+				// ---------- Dock space + default layout ----------
+				const ImGuiID dockspaceId = ImGui::GetID("EditorDockSpace");
+				if (resetEditorLayout || ImGui::DockBuilderGetNode(dockspaceId) == nullptr) {
+					resetEditorLayout = false;
+					ImGui::DockBuilderRemoveNode(dockspaceId);
+					ImGui::DockBuilderAddNode(dockspaceId, ImGuiDockNodeFlags_DockSpace);
+					ImGui::DockBuilderSetNodeSize(dockspaceId, mainViewport->WorkSize);
+					ImGuiID center = dockspaceId;
+					ImGuiID left = ImGui::DockBuilderSplitNode(center, ImGuiDir_Left, 0.22f, nullptr, &center);
+					ImGuiID right = ImGui::DockBuilderSplitNode(center, ImGuiDir_Right, 0.30f, nullptr, &center);
+					ImGuiID bottom = ImGui::DockBuilderSplitNode(center, ImGuiDir_Down, 0.30f, nullptr, &center);
+					ImGui::DockBuilderDockWindow("Outliner", left);
+					ImGui::DockBuilderDockWindow("Inspector", right);
+					ImGui::DockBuilderDockWindow("Camera Animation", bottom);
+					ImGui::DockBuilderDockWindow("Annotations", bottom);
+					ImGui::DockBuilderDockWindow("Statistics", bottom);
+					ImGui::DockBuilderFinish(dockspaceId);
+					showOutliner = showInspector = showAnimationPanel = showAnnotationsPanel = showStatisticsPanel = true;
+				}
+				ImGui::DockSpaceOverViewport(dockspaceId, mainViewport, ImGuiDockNodeFlags_PassthruCentralNode);
+
+				// The 3D scene is rendered into the central (empty) dock area.
+				if (ImGuiDockNode* centralNode = ImGui::DockBuilderGetCentralNode(dockspaceId)) {
+					sceneViewX = centralNode->Pos.x;
+					sceneViewY = centralNode->Pos.y;
+					sceneViewW = std::max(centralNode->Size.x, 1.0f);
+					sceneViewH = std::max(centralNode->Size.y, 1.0f);
+				}
+				else {
+					sceneViewX = mainViewport->WorkPos.x;
+					sceneViewY = mainViewport->WorkPos.y;
+					sceneViewW = std::max(mainViewport->WorkSize.x, 1.0f);
+					sceneViewH = std::max(mainViewport->WorkSize.y, 1.0f);
+				}
+
+				// ---------- Viewport overlay ----------
+				{
+					ImGui::SetNextWindowPos(ImVec2(sceneViewX + 10, sceneViewY + 10));
+					ImGui::SetNextWindowBgAlpha(0.55f);
+					const ImGuiWindowFlags overlayFlags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+						ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav |
+						ImGuiWindowFlags_NoDocking | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoMouseInputs;
+					if (ImGui::Begin("##ViewportOverlay", nullptr, overlayFlags)) {
+						const char* toolName = editorTool == GizmoMode::None ? "Select"
+							: editorTool == GizmoMode::Translate ? "Move"
+							: editorTool == GizmoMode::Rotate ? "Rotate" : "Scale";
+						ImGui::Text("Perspective  |  %s tool", toolName);
+						ImGui::TextDisabled("LMB select   RMB+drag look   WASD move   F focus");
+					}
+					ImGui::End();
+				}
+
+				// ---------- Outliner ----------
+				if (showOutliner) {
+					if (ImGui::Begin("Outliner", &showOutliner)) {
+						static ImGuiTextFilter outlinerFilter;
+						ImGui::SetNextItemWidth(-FLT_MIN);
+						if (ImGui::InputTextWithHint("##outlinerSearch", "Search objects and IFC elements...",
+							outlinerFilter.InputBuf, IM_ARRAYSIZE(outlinerFilter.InputBuf)))
+							outlinerFilter.Build();
+						const bool filtering = outlinerFilter.IsActive();
+
+						// Models (assets)
+						if (ImGui::CollapsingHeader("Models", ImGuiTreeNodeFlags_DefaultOpen)) {
+							const auto& models = modelManager->getModels();
+							const auto& tasks = modelManager->getLoadingTasks();
+							int deferredUnload = -1;
+							for (size_t i = 0; i < models.size(); ++i) {
+								const auto& model = models[i];
+								ImGui::PushID(static_cast<int>(i));
+								if (ImGui::Selectable(model->name.c_str(), false, ImGuiSelectableFlags_AllowDoubleClick) &&
+									ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
+									addModelToScene(i, false);
+								if (ImGui::BeginItemTooltip()) {
+									ImGui::TextUnformatted(model->sourcePath.c_str());
+									ImGui::TextDisabled("%s vertices, %s triangles, %zu textures",
+										formatCount(model->vertexCount).c_str(), formatCount(model->indexCount / 3).c_str(),
+										model->textures.size());
+									ImGui::TextDisabled("Double-click to add to the scene");
+									ImGui::EndTooltip();
+								}
+								if (ImGui::BeginPopupContextItem()) {
+									if (ImGui::MenuItem("Add to Scene")) addModelToScene(i, false);
+									if (ImGui::MenuItem("Add at Origin")) addModelToScene(i, true);
+									ImGui::Separator();
+									if (ImGui::MenuItem("Unload")) deferredUnload = static_cast<int>(i);
+									ImGui::EndPopup();
+								}
+								ImGui::PopID();
+							}
+							for (const auto& task : tasks) {
+								const char* state = task.state == LoadingState::LoadingCPU ? "parsing"
+									: task.state == LoadingState::UploadingGPU ? "uploading"
+									: task.state == LoadingState::Failed ? "failed" : "queued";
+								ImGui::TextDisabled("%s  (%s...)", task.name.c_str(), state);
+							}
+							if (models.empty() && tasks.empty())
+								ImGui::TextDisabled("No models loaded.");
+							if (ImGui::Button("Import Model...", ImVec2(-FLT_MIN, 0))) importModel();
+							if (deferredUnload >= 0) unloadModel(static_cast<size_t>(deferredUnload));
+						}
+
+						// Scene hierarchy
+						if (ImGui::CollapsingHeader("Scene", ImGuiTreeNodeFlags_DefaultOpen)) {
+							// Compact rows: small visibility checkboxes and tight spacing, like editor hierarchies.
+							ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(3, 1));
+							ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(6, 3));
+							if (instances.empty())
+								ImGui::TextDisabled("The scene is empty.\nDouble-click a model above to add it.");
+
+							// A viewport pick expands the tree down to the picked element.
+							int forceOpenInstance = -1;
+							if (selectionChangedFromViewport && !selectedIfcGuid.empty() && validInstance(selectedInstanceForProperties)) {
+								IfcScene& scene = *instances[selectedInstanceForProperties].ifcScene;
+								openSpatialGuids.clear();
+								std::string guid = selectedIfcKind == IfcSelectionKind::kElement
+									? (scene.elements.count(selectedIfcGuid) ? scene.elements[selectedIfcGuid].parentSpatialGuid : std::string())
+									: selectedIfcGuid;
+								while (!guid.empty()) {
 									openSpatialGuids.insert(guid);
 									auto sit = scene.spatial.find(guid);
 									if (sit == scene.spatial.end()) break;
 									guid = sit->second.parentGuid;
 								}
+								forceOpenInstance = selectedInstanceForProperties;
+								selectionChangedFromViewport = false;
 							}
 
-							selectionChangedFromViewport = false; // consumed
-						}
+							auto drawElementRow = [&](int instIndex, IfcScene& scene, IfcElement& elem) {
+								ImGui::PushID(elem.guid.c_str());
+								if (ImGui::Checkbox("##ev", &elem.visible))
+									scene.syncVisibilityCache();
+								ImGui::SameLine();
+								ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen |
+									ImGuiTreeNodeFlags_SpanAvailWidth;
+								if (elem.selected) flags |= ImGuiTreeNodeFlags_Selected;
+								const char* name = elem.name.empty() ? elem.type.c_str() : elem.name.c_str();
+								ImGui::TreeNodeEx("##elem", flags, "%s", name);
+								const bool clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
+								const bool doubleClicked = ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left);
+								if (clicked || (ImGui::IsItemFocused() && ImGui::IsKeyPressed(ImGuiKey_Enter)))
+									selectIfcElement(instIndex, scene, elem.guid);
+								if (doubleClicked)
+									focusOnInstance(instIndex);
+								if (elem.selected && selectedIfcKind == IfcSelectionKind::kElement && !openSpatialGuids.empty()) {
+									ImGui::SetScrollHereY(0.5f);
+									openSpatialGuids.clear();
+								}
+								if (ImGui::BeginPopupContextItem("ElementContextMenu")) {
+									if (ImGui::MenuItem("Select")) selectIfcElement(instIndex, scene, elem.guid);
+									if (ImGui::MenuItem("Focus", "F")) { selectIfcElement(instIndex, scene, elem.guid); focusOnInstance(instIndex); }
+									if (ImGui::MenuItem("Add Annotation...", "M")) { selectIfcElement(instIndex, scene, elem.guid); requestAnnotation(); }
+									ImGui::Separator();
+									if (ImGui::MenuItem("Isolate")) isolateIfcElement(scene, elem.guid);
+									if (ImGui::MenuItem(elem.visible ? "Hide" : "Show")) { elem.visible = !elem.visible; scene.syncVisibilityCache(); }
+									if (ImGui::MenuItem("Show All")) showAllIfc(scene);
+									ImGui::Separator();
+									if (ImGui::MenuItem("Copy GUID")) ImGui::SetClipboardText(elem.guid.c_str());
+									ImGui::EndPopup();
+								}
+								if (ImGui::BeginItemTooltip()) {
+									ImGui::Text("%s", name);
+									ImGui::TextDisabled("%s", elem.type.c_str());
+									if (!elem.storey.empty()) ImGui::TextDisabled("Storey: %s", elem.storey.c_str());
+									ImGui::EndTooltip();
+								}
+								ImGui::SameLine();
+								ImGui::TextDisabled("%s", elem.type.c_str());
+								ImGui::PopID();
+							};
 
-						ImGui::Separator();
-						ImGui::Text("IFC Hierarchy (%zu elements, %zu spatial)",
-							scene.elements.size(), scene.spatial.size());
-
-						// show all / hide all
-						if (ImGui::Button("Show All##ifc")) {
-							for (auto& [guid, elem] : scene.elements)
-								elem.visible = true;
-							for (auto& [guid, node] : scene.spatial)
-								node.visible = true;
-
-							scene.syncVisibilityCache();
-						}
-						ImGui::SameLine();
-						if (ImGui::Button("Hide All##ifc")) {
-							for (auto& [guid, elem] : scene.elements)
-								elem.visible = false;
-							for (auto& [guid, node] : scene.spatial)
-								node.visible = false;
-
-							scene.syncVisibilityCache();
-						}
-
-						ImGui::Separator();
-
-						auto clearPreviousSelection = [&]() {
-							if (selectedIfcKind == IfcSelectionKind::kElement) {
-								auto it = scene.elements.find(selectedIfcGuid);
-								if (it != scene.elements.end()) it->second.selected = false;
-							}
-							else if (selectedIfcKind == IfcSelectionKind::kSpatial) {
-								auto it = scene.spatial.find(selectedIfcGuid);
-								if (it != scene.spatial.end()) it->second.selected = false;
-							}
-						};
-
-						// recursive spatial tree drawing
-						std::function<void(const std::string&)> drawSpatialNode =
-							[&](const std::string& spatialGuid)
-							{
+							std::function<void(int, IfcScene&, const std::string&)> drawSpatialNode =
+								[&](int instIndex, IfcScene& scene, const std::string& spatialGuid) {
 								auto it = scene.spatial.find(spatialGuid);
 								if (it == scene.spatial.end()) return;
-
 								IfcSpatialNode& node = it->second;
 
-								bool hasElements = !node.elementGuids.empty();
 								bool hasChildren = false;
 								for (const auto& childGuid : node.childSpatialGuids) {
 									auto cit = scene.spatial.find(childGuid);
-									if (cit != scene.spatial.end()) {
-										if (!cit->second.elementGuids.empty() ||
-											!cit->second.childSpatialGuids.empty()) {
-											hasChildren = true;
-											break;
-										}
+									if (cit != scene.spatial.end() &&
+										(!cit->second.elementGuids.empty() || !cit->second.childSpatialGuids.empty())) {
+										hasChildren = true;
+										break;
 									}
 								}
-
-								if (!hasElements && !hasChildren)
-									return;
+								if (node.elementGuids.empty() && !hasChildren) return;
 
 								ImGui::PushID(node.guid.c_str());
-
-								// checkbox for whole branch visibility
-								bool branchVis = node.visible;
-								if (ImGui::Checkbox("##sv", &branchVis)) {
-									scene.setVisibilityRecursive(node.guid, branchVis);
+								bool branchVisible = node.visible;
+								if (ImGui::Checkbox("##sv", &branchVisible)) {
+									scene.setVisibilityRecursive(node.guid, branchVisible);
 									scene.syncVisibilityCache();
 								}
 								ImGui::SameLine();
 
-								// count elements under this branch
-								std::size_t elemAndSpatialCount = node.elementGuids.size() 
-									+ node.childSpatialGuids.size();
-
-								ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_OpenOnDoubleClick;
-								if (node.childSpatialGuids.empty() && node.elementGuids.empty()) flags |= ImGuiTreeNodeFlags_Leaf;
+								ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_OpenOnDoubleClick |
+									ImGuiTreeNodeFlags_SpanAvailWidth;
 								if (node.selected) flags |= ImGuiTreeNodeFlags_Selected;
-
-								bool mustBeOpen = openSpatialGuids.count(node.guid) > 0;
-								if (mustBeOpen)
+								if (openSpatialGuids.count(node.guid))
 									ImGui::SetNextItemOpen(true, ImGuiCond_Always);
 
-								bool open = ImGui::TreeNodeEx(node.guid.c_str(), flags, "%s: %s (%zu)",
-									node.type.c_str(), node.name.c_str(), elemAndSpatialCount);
-
-								if (selectedIfcKind == IfcSelectionKind::kSpatial &&
-									node.guid == selectedIfcGuid &&
-									openSpatialGuids.count(node.guid))
-								{
+								const char* label = node.name.empty() ? node.type.c_str() : node.name.c_str();
+								const bool open = ImGui::TreeNodeEx("##spatial", flags, "%s", label);
+								if (ImGui::IsItemClicked(ImGuiMouseButton_Left) && !ImGui::IsItemToggledOpen())
+									selectIfcSpatial(instIndex, scene, node.guid);
+								if (node.selected && selectedIfcKind == IfcSelectionKind::kSpatial && openSpatialGuids.count(node.guid)) {
 									ImGui::SetScrollHereY(0.5f);
 									openSpatialGuids.clear();
 								}
-
-								if (ImGui::IsItemClicked(ImGuiMouseButton_Left) ||
-									(ImGui::IsItemFocused() && ImGui::IsKeyPressed(ImGuiKey_Enter))) {
-									// deselect previous
-									for (auto& [g, e] : scene.elements)
-										e.selected = false;
-									for (auto& [g, s] : scene.spatial)
-										s.selected = false;
-									node.selected = true;
-									selectedIfcGuid = node.guid;
-									selectedIfcKind = IfcSelectionKind::kSpatial;
-									selectedInstanceForProperties = gizmo.selectedInstance;
-
-									gizmo.outlineInstanceIndex = -1;
-									gizmo.outlineSubmeshIndex = std::numeric_limits<size_t>::max();
-									for (const auto& elemGuid : node.elementGuids) {
-										int submeshIdx = IfcScene::findSubmeshByGuid(scene, elemGuid);
-										if (submeshIdx >= 0) {
-											gizmo.outlineInstanceIndex = gizmo.selectedInstance;
-											gizmo.outlineSubmeshIndex = static_cast<size_t>(submeshIdx);
-											break; // outline first found element
-										}
-									}
-								}
-
 								if (ImGui::BeginPopupContextItem("SpatialContextMenu")) {
-									if (ImGui::MenuItem("Properties")) {
-										selectedIfcGuid = node.guid;
-										selectedIfcKind = IfcSelectionKind::kSpatial;
-										selectedInstanceForProperties = gizmo.selectedInstance;
-										showPropertiesWindow = true;
+									if (ImGui::MenuItem("Select")) selectIfcSpatial(instIndex, scene, node.guid);
+									ImGui::Separator();
+									if (ImGui::MenuItem("Show Branch")) { scene.setVisibilityRecursive(node.guid, true); scene.syncVisibilityCache(); }
+									if (ImGui::MenuItem("Hide Branch")) { scene.setVisibilityRecursive(node.guid, false); scene.syncVisibilityCache(); }
+									if (ImGui::MenuItem("Show Only This Branch")) {
+										hideAllIfc(scene);
+										scene.setVisibilityRecursive(node.guid, true);
+										scene.syncVisibilityCache();
 									}
-
+									ImGui::Separator();
+									if (ImGui::MenuItem("Copy GUID")) ImGui::SetClipboardText(node.guid.c_str());
 									ImGui::EndPopup();
 								}
-
-								// tooltip with details
-								if (ImGui::IsItemHovered() && !ImGui::IsPopupOpen("ElementContextMenu")) {
-									ImGui::BeginTooltip();
-									ImGui::Text("GUID: %s", node.guid.c_str());
-									ImGui::Text("Type: %s", node.type.c_str());
-									ImGui::Text("Children: %zu", node.childSpatialGuids.size());
-									ImGui::Text("Elements: %zu", node.elementGuids.size());
-									ImGui::EndTooltip();
-								}
+								ImGui::SameLine();
+								ImGui::TextDisabled("%s  (%zu)", node.type.c_str(), node.elementGuids.size() + node.childSpatialGuids.size());
 
 								if (open) {
-									// draw child spatial nodes
-									for (const auto& childGuid : node.childSpatialGuids) {
-										drawSpatialNode(childGuid);
-									}
+									for (const auto& childGuid : node.childSpatialGuids)
+										drawSpatialNode(instIndex, scene, childGuid);
 
-									// draw contained elements
 									ImGuiListClipper clipper;
 									clipper.Begin(static_cast<int>(node.elementGuids.size()));
+									if (!openSpatialGuids.empty() && selectedIfcKind == IfcSelectionKind::kElement) {
+										auto sel = std::find(node.elementGuids.begin(), node.elementGuids.end(), selectedIfcGuid);
+										if (sel != node.elementGuids.end())
+											clipper.IncludeItemByIndex(static_cast<int>(sel - node.elementGuids.begin()));
+									}
 									while (clipper.Step()) {
-										for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; ++i) {
-											const auto& elemGuid = node.elementGuids[i];
-
-											auto eit = scene.elements.find(elemGuid);
-											if (eit == scene.elements.end()) continue;
-
-											IfcElement& elem = eit->second;
-
-											ImGui::PushID(elem.guid.c_str());
-
-											// element visibility checkbox
-											if (ImGui::Checkbox("##ev", &elem.visible)) {
-												scene.syncVisibilityCache();
-											}
-											ImGui::SameLine();
-
-											// leaf node
-											ImGuiTreeNodeFlags elemFlags =
-												ImGuiTreeNodeFlags_Leaf |
-												ImGuiTreeNodeFlags_NoTreePushOnOpen;
-
-											if (elem.selected)
-												elemFlags |= ImGuiTreeNodeFlags_Selected;
-
-											const char* displayName = elem.name.empty() ? elem.type.c_str() : elem.name.c_str();
-											ImGui::TreeNodeEx(elem.guid.c_str(), elemFlags, "%s", displayName);
-
-											if (selectedIfcKind == IfcSelectionKind::kElement &&
-												elem.guid == selectedIfcGuid &&
-												!openSpatialGuids.empty()) 
-											{                              
-												ImGui::SetScrollHereY(0.5f);
-												openSpatialGuids.clear(); 
-											}
-
-											// click to select
-											if (ImGui::IsItemClicked(ImGuiMouseButton_Left) ||
-												(ImGui::IsItemFocused() && ImGui::IsKeyPressed(ImGuiKey_Enter))) {
-												// deselect previous
-												for (auto& [g, e] : scene.elements)
-													e.selected = false;
-												for (auto& [g, s] : scene.spatial)
-													s.selected = false;
-												elem.selected = true;
-												selectedIfcGuid = elem.guid;
-												selectedIfcKind = IfcSelectionKind::kElement;
-												selectedInstanceForProperties = gizmo.selectedInstance;
-
-												int submeshIdx = IfcScene::findSubmeshByGuid(scene, elem.guid);
-												if (submeshIdx >= 0) {
-													gizmo.outlineInstanceIndex = gizmo.selectedInstance;
-													gizmo.outlineSubmeshIndex = static_cast<size_t>(submeshIdx);
-												}
-												else {
-													gizmo.outlineInstanceIndex = -1;
-													gizmo.outlineSubmeshIndex = std::numeric_limits<size_t>::max();
-												}
-											}
-
-											if (ImGui::BeginPopupContextItem("ElementContextMenu")) {
-												if (ImGui::MenuItem("Properties")) {
-													selectedIfcGuid = elem.guid;
-													selectedIfcKind = IfcSelectionKind::kElement;
-													selectedInstanceForProperties = gizmo.selectedInstance;
-													showPropertiesWindow = true;
-												}
-
-												ImGui::EndPopup();
-											}
-
-											// tooltip with full details
-											if (ImGui::IsItemHovered() && !ImGui::IsPopupOpen("ElementContextMenu")) {
-												ImGui::BeginTooltip();
-												ImGui::Text("GUID: %s", elem.guid.c_str());
-												ImGui::Text("Type: %s", elem.type.c_str());
-												ImGui::Text("Name: %s", elem.name.c_str());
-												ImGui::Text("Tag: %s", elem.tag.c_str());
-												ImGui::Text("Storey: %s", elem.storey.c_str());
-												ImGui::Text("Parent spatial GUID: %s", elem.parentSpatialGuid.c_str());
-
-												if (!elem.objectType.empty())
-													ImGui::Text("ObjectType: %s", elem.objectType.c_str());
-
-												if (elem.typeInfo) {
-													ImGui::Separator();
-													ImGui::Text("TypeInfo:");
-													ImGui::Text("  Type: %s", elem.typeInfo->type.c_str());
-													ImGui::Text("  Name: %s", elem.typeInfo->name.c_str());
-												}
-
-												/*if (!elem.data.empty()) {
-													ImGui::Separator();
-													ImGui::Text("Properties:");
-													for (auto& [k, v] : elem.data) {
-														ImGui::Text("  %s = %s", k.c_str(), v.c_str());
-													}
-												}*/
-
-												ImGui::EndTooltip();
-											}
-
-											ImGui::PopID();
+										for (int e = clipper.DisplayStart; e < clipper.DisplayEnd; ++e) {
+											auto eit = scene.elements.find(node.elementGuids[e]);
+											if (eit != scene.elements.end())
+												drawElementRow(instIndex, scene, eit->second);
 										}
 									}
-
 									ImGui::TreePop();
 								}
-
 								ImGui::PopID();
 							};
 
-						// draw from roots
-						for (const auto& rootGuid : scene.roots) {
-							drawSpatialNode(rootGuid);
-						}
+							// Search results are shown as a flat list per object (like Unity's hierarchy search).
+							struct SearchCache { std::string filter; size_t elementCount = 0; std::vector<std::string> guids; };
+							static std::vector<SearchCache> searchCaches;
+							searchCaches.resize(instances.size());
 
-						/*static int cachedOrphanInstance = -1;
-						static std::vector<std::string> cachedOrphanGuids;
-
-						if (gizmo.selectedInstance != cachedOrphanInstance) {
-							cachedOrphanInstance = gizmo.selectedInstance;
-							cachedOrphanGuids.clear();
-							for (const auto& [guid, elem] : scene.elements) {
-								if (elem.parentSpatialGuid.empty() ||
-									scene.spatial.find(elem.parentSpatialGuid) == scene.spatial.end()) {
-									cachedOrphanGuids.push_back(guid);
-								}
-							}
-						}
-
-						if (!cachedOrphanGuids.empty()) {
-							ImGui::Separator();
-							if (ImGui::TreeNode("Unassigned Elements")) {
-								for (const auto& guid : cachedOrphanGuids) {
-									auto eit = scene.elements.find(guid);
-									if (eit == scene.elements.end()) continue;
-
-									IfcElement& elem = eit->second;
-
-									ImGui::PushID(elem.guid.c_str());
-									if (ImGui::Checkbox("##ev", &elem.visible)) {
-										scene.syncVisibilityCache();
+							int deferredDelete = -1, deferredDuplicate = -1, deferredFocus = -1;
+							for (int i = 0; i < static_cast<int>(instances.size()); ++i) {
+								auto& inst = instances[i];
+								std::vector<std::string>* matches = nullptr;
+								if (filtering) {
+									if (inst.ifcScene) {
+										SearchCache& cache = searchCaches[i];
+										if (cache.filter != outlinerFilter.InputBuf || cache.elementCount != inst.ifcScene->elements.size()) {
+											cache.filter = outlinerFilter.InputBuf;
+											cache.elementCount = inst.ifcScene->elements.size();
+											cache.guids.clear();
+											for (const auto& [guid, elem] : inst.ifcScene->elements)
+												if (outlinerFilter.PassFilter(elem.name.c_str()) || outlinerFilter.PassFilter(elem.type.c_str()))
+													cache.guids.push_back(guid);
+											std::sort(cache.guids.begin(), cache.guids.end(), [&](const std::string& a, const std::string& b) {
+												return inst.ifcScene->elements[a].name < inst.ifcScene->elements[b].name;
+												});
+										}
+										matches = &cache.guids;
 									}
+									if (!outlinerFilter.PassFilter(inst.name.c_str()) && (!matches || matches->empty()))
+										continue;
+								}
+
+								ImGui::PushID(i);
+								ImGui::Checkbox("##visible", &inst.visible);
+								ImGui::SetItemTooltip(inst.visible ? "Hide object" : "Show object");
+								ImGui::SameLine();
+
+								ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_SpanAvailWidth;
+								if (!inst.ifcScene) flags |= ImGuiTreeNodeFlags_Leaf;
+								if (gizmo.selectedInstance == i && selectedIfcKind == IfcSelectionKind::kNone)
+									flags |= ImGuiTreeNodeFlags_Selected;
+								if (forceOpenInstance == i || (filtering && matches && !matches->empty()))
+									ImGui::SetNextItemOpen(true, ImGuiCond_Always);
+
+								const bool open = ImGui::TreeNodeEx("##instance", flags, "%s", inst.name.c_str());
+								if (ImGui::IsItemClicked(ImGuiMouseButton_Left) && !ImGui::IsItemToggledOpen())
+									selectInstance(i);
+								if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
+									deferredFocus = i;
+								if (ImGui::BeginPopupContextItem("InstanceContextMenu")) {
+									if (ImGui::MenuItem("Focus", "F")) deferredFocus = i;
+									if (ImGui::MenuItem("Duplicate", "Ctrl+D")) deferredDuplicate = i;
+									if (ImGui::MenuItem("Delete", "Del")) deferredDelete = i;
+									if (inst.ifcScene) {
+										ImGui::Separator();
+										if (ImGui::MenuItem("Show All Elements")) showAllIfc(*inst.ifcScene);
+										if (ImGui::MenuItem("Hide All Elements")) hideAllIfc(*inst.ifcScene);
+									}
+									ImGui::EndPopup();
+								}
+								if (inst.ifcScene) {
 									ImGui::SameLine();
-
-									ImGui::TreeNodeEx(elem.guid.c_str(), ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen,
-										"%s: %s", elem.type.c_str(), elem.name.c_str());
-
-									ImGui::PopID();
-								}
-								ImGui::TreePop();
-							}
-						}*/
-					}
-
-					auto& sel = instances[gizmo.selectedInstance];
-					ImGui::Text("Selected: %s", sel.name.c_str());
-
-					const char* modeStr = "None";
-					if (gizmo.mode == GizmoMode::Translate) modeStr = "Translate (1)";
-					if (gizmo.mode == GizmoMode::Rotate) modeStr = "Rotate (2)";
-					if (gizmo.mode == GizmoMode::Scale) modeStr = "Scale (3)";
-					ImGui::Text("Gizmo: %s", modeStr);
-
-					if (ImGui::Button("Translate")) gizmo.mode = GizmoMode::Translate;
-					ImGui::SameLine();
-					if (ImGui::Button("Rotate")) gizmo.mode = GizmoMode::Rotate;
-					ImGui::SameLine();
-					if (ImGui::Button("Scale")) gizmo.mode = GizmoMode::Scale;
-
-					ImGui::DragFloat3("Position", &sel.position[0], 0.1f);
-					ImGui::DragFloat3("Rotation", &sel.rotation[0], 1.0f);
-					ImGui::DragFloat3("Scale", &sel.scale[0], 0.01f, 0.01f, 100.0f);
-
-					if (ImGui::Button("Deselect")) {
-						gizmo.deselect();
-					}
-				}
-				else {
-					ImGui::Text("Click on model to select (in viewport)");
-					ImGui::Text("Or click instance in list above");
-					ImGui::Text("Keys 1/2/3 for Translate/Rotate/Scale");
-				}
-
-				if (showPropertiesWindow &&
-					selectedInstanceForProperties >= 0 &&
-					selectedInstanceForProperties < static_cast<int>(instances.size()) &&
-					instances[selectedInstanceForProperties].ifcScene &&
-					selectedIfcKind != IfcSelectionKind::kNone) {
-			
-					IfcScene& scene = instances[selectedInstanceForProperties].ifcScene.value();
-
-					ImGui::SetNextWindowSize(ImVec2(450, 550), ImGuiCond_FirstUseEver);
-					static ImGuiTextFilter propertyFilter;
-					if (selectedIfcKind == IfcSelectionKind::kElement) {
-						auto it = scene.elements.find(selectedIfcGuid);
-						if (it != scene.elements.end()) {
-							IfcElement& elem = it->second;
-
-							std::string windowTitle = "Properties: " + elem.type + "###PropertiesWindow";
-
-							if (ImGui::Begin(windowTitle.c_str(), &showPropertiesWindow)) {
-
-								// Basic Info Section
-								if (ImGui::CollapsingHeader("Basic Information", ImGuiTreeNodeFlags_DefaultOpen)) {
-									ImGui::Text("GUID:"); ImGui::SameLine(120);
-									ImGui::TextColored(ImVec4(0.8f, 0.8f, 0.2f, 1.0f), "%s", elem.guid.c_str());
-
-									ImGui::Text("Type:"); ImGui::SameLine(120);
-									ImGui::Text("%s", elem.type.c_str());
-
-									ImGui::Text("Name:"); ImGui::SameLine(120);
-									ImGui::Text("%s", elem.name.c_str());
-
-									ImGui::Text("Tag:"); ImGui::SameLine(120);
-									ImGui::Text("%s", elem.tag.c_str());
-
-									ImGui::Text("Storey:"); ImGui::SameLine(120);
-									ImGui::Text("%s", elem.storey.c_str());
-
-									ImGui::Text("Parent GUID:"); ImGui::SameLine(120);
-									ImGui::TextWrapped("%s", elem.parentSpatialGuid.c_str());
-
-									if (!elem.objectType.empty()) {
-										ImGui::Text("ObjectType:"); ImGui::SameLine(120);
-										ImGui::Text("%s", elem.objectType.c_str());
-									}
+									ImGui::TextDisabled("(%s)", formatCount(inst.ifcScene->elements.size()).c_str());
 								}
 
-								// Type Info Section
-								if (elem.typeInfo && ImGui::CollapsingHeader("Type Information", ImGuiTreeNodeFlags_DefaultOpen)) {
-									ImGui::Text("Type:"); ImGui::SameLine(120);
-									ImGui::Text("%s", elem.typeInfo->type.c_str());
-
-									ImGui::Text("Name:"); ImGui::SameLine(120);
-									ImGui::Text("%s", elem.typeInfo->name.c_str());
-								}
-
-								// Properties Section (elem.data)
-								if (!elem.data.empty() && ImGui::CollapsingHeader("Properties", ImGuiTreeNodeFlags_DefaultOpen)) {
-
-									propertyFilter.Draw("Filter properties...");
-
-									ImGui::BeginChild("PropertiesList", ImVec2(0, 300), true);
-									if (ImGui::BeginTable("PropsTable", 2, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable | ImGuiTableFlags_ScrollY)) {
-										ImGui::TableSetupColumn("Property", ImGuiTableColumnFlags_WidthStretch, 0.4f);
-										ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch, 0.6f);
-										ImGui::TableHeadersRow();
-
-										for (const auto& [k, v] : elem.data) {
-											if (propertyFilter.PassFilter(k.c_str()) || propertyFilter.PassFilter(v.c_str())) {
-												ImGui::TableNextRow();
-												ImGui::TableNextColumn(); ImGui::TextWrapped("%s", k.c_str());
-												ImGui::TableNextColumn(); ImGui::TextWrapped("%s", v.c_str());
+								if (open) {
+									if (inst.ifcScene) {
+										IfcScene& scene = *inst.ifcScene;
+										if (matches) {
+											ImGuiListClipper clipper;
+											clipper.Begin(static_cast<int>(matches->size()));
+											while (clipper.Step()) {
+												for (int m = clipper.DisplayStart; m < clipper.DisplayEnd; ++m) {
+													auto eit = scene.elements.find((*matches)[m]);
+													if (eit != scene.elements.end())
+														drawElementRow(i, scene, eit->second);
+												}
 											}
 										}
-										ImGui::EndTable();
-									}
-
-									ImGui::EndChild();
-								}
-
-								ImGui::Separator();
-								if (ImGui::Button("Close")) showPropertiesWindow = false;
-							}
-							ImGui::End();
-						}
-					}
-					else if (selectedIfcKind == IfcSelectionKind::kSpatial) {
-						auto it = scene.spatial.find(selectedIfcGuid);
-						if (it != scene.spatial.end()) {
-							IfcSpatialNode& node = it->second;
-
-							ImGui::SetNextWindowSize(ImVec2(450, 550), ImGuiCond_FirstUseEver);
-
-							std::string windowTitle = "Properties: " + node.type;
-							if (!node.name.empty()) windowTitle += " - " + node.name;
-							windowTitle += "###PropertiesWindow";
-
-							if (ImGui::Begin(windowTitle.c_str(), &showPropertiesWindow)) {
-								if (ImGui::CollapsingHeader("Basic Information", ImGuiTreeNodeFlags_DefaultOpen)) {
-									ImGui::Text("GUID:"); ImGui::SameLine(120);
-									ImGui::TextColored(ImVec4(0.8f, 0.8f, 0.2f, 1.0f), "%s", node.guid.c_str());
-
-									ImGui::Text("Type:"); ImGui::SameLine(120);
-									ImGui::Text("%s", node.type.c_str());
-
-									ImGui::Text("Name:"); ImGui::SameLine(120);
-									ImGui::Text("%s", node.name.c_str());
-
-									ImGui::Text("LongName:"); ImGui::SameLine(120);
-									ImGui::Text("%s", node.longName.c_str());
-
-									ImGui::Text("Parent GUID:"); ImGui::SameLine(120);
-									ImGui::TextWrapped("%s", node.parentGuid.c_str());
-
-									ImGui::Text("Children:"); ImGui::SameLine(120);
-									ImGui::Text("%zu", node.childSpatialGuids.size());
-
-									ImGui::Text("Elements:"); ImGui::SameLine(120);
-									ImGui::Text("%zu", node.elementGuids.size());
-								}
-
-								if (!node.data.empty() && ImGui::CollapsingHeader("Properties", ImGuiTreeNodeFlags_DefaultOpen)) {
-
-									// We re-use the exact same filter from the Element block
-									propertyFilter.Draw("Filter properties...");
-
-									ImGui::BeginChild("SpatialPropertiesList", ImVec2(0, 300), true);
-
-									if (ImGui::BeginTable("SpatialPropsTable", 2,
-										ImGuiTableFlags_Borders |
-										ImGuiTableFlags_RowBg |
-										ImGuiTableFlags_Resizable |
-										ImGuiTableFlags_ScrollY)) {
-
-										ImGui::TableSetupColumn("Property", ImGuiTableColumnFlags_WidthStretch, 0.4f);
-										ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch, 0.6f);
-										ImGui::TableHeadersRow();
-
-										for (const auto& [k, v] : node.data) {
-											// Replaced std::transform loops with lightning-fast PassFilter
-											if (propertyFilter.PassFilter(k.c_str()) || propertyFilter.PassFilter(v.c_str())) {
-												ImGui::TableNextRow();
-												ImGui::TableNextColumn();
-												ImGui::TextWrapped("%s", k.c_str());
-												ImGui::TableNextColumn();
-												ImGui::TextWrapped("%s", v.c_str());
-											}
+										else {
+											for (const auto& rootGuid : scene.roots)
+												drawSpatialNode(i, scene, rootGuid);
 										}
-
-										ImGui::EndTable();
 									}
-
-									ImGui::EndChild();
-									ImGui::Text("Total: %zu properties", node.data.size());
+									ImGui::TreePop();
 								}
-
-								ImGui::Separator();
-								if (ImGui::Button("Close"))
-									showPropertiesWindow = false;
+								ImGui::PopID();
 							}
-							ImGui::End();
+							static int openPathFramesLeft = 0;
+							if (forceOpenInstance >= 0) openPathFramesLeft = 3;
+							if (!openSpatialGuids.empty() && --openPathFramesLeft <= 0) openSpatialGuids.clear();
+
+							if (deferredFocus >= 0) {
+								if (gizmo.selectedInstance != deferredFocus) selectInstance(deferredFocus);
+								focusOnInstance(deferredFocus);
+							}
+							if (deferredDuplicate >= 0) duplicateInstance(deferredDuplicate);
+							if (deferredDelete >= 0) deleteInstance(deferredDelete);
+							ImGui::PopStyleVar(2);
 						}
 					}
+					ImGui::End();
 				}
 
+				// ---------- Inspector ----------
+				if (showInspector) {
+					if (focusInspectorNextFrame) {
+						ImGui::SetNextWindowFocus();
+						focusInspectorNextFrame = false;
+					}
+					if (ImGui::Begin("Inspector", &showInspector)) {
+						if (!validInstance(gizmo.selectedInstance)) {
+							ImGui::Spacing();
+							ImGui::TextDisabled("Nothing selected.");
+							ImGui::Spacing();
+							ImGui::TextWrapped("Click an object in the viewport or in the Outliner to see and edit its properties here.");
+						}
+						else {
+							const int selIndex = gizmo.selectedInstance;
+							auto& sel = instances[selIndex];
+							GPUModel* selModel = modelManager->getModel(sel.modelIndex);
 
-				ImGui::End();
+							// Header: visibility + editable name
+							ImGui::Checkbox("##visible", &sel.visible);
+							ImGui::SetItemTooltip("Visible");
+							ImGui::SameLine();
+							char nameBuf[256];
+							strncpy(nameBuf, sel.name.c_str(), sizeof(nameBuf) - 1);
+							nameBuf[sizeof(nameBuf) - 1] = '\0';
+							ImGui::SetNextItemWidth(-FLT_MIN);
+							if (ImGui::InputText("##name", nameBuf, sizeof(nameBuf)))
+								sel.name = nameBuf;
+							if (selModel) {
+								ImGui::TextDisabled("Model: %s", selModel->name.c_str());
+								ImGui::TextDisabled("%s vertices, %s triangles",
+									formatCount(selModel->vertexCount).c_str(), formatCount(selModel->indexCount / 3).c_str());
+							}
+							ImGui::Spacing();
+
+							if (ImGui::CollapsingHeader("Transform", ImGuiTreeNodeFlags_DefaultOpen)) {
+								EditorStyle::vec3Control("Position", &sel.position.x, 0.0f, 0.1f);
+								EditorStyle::vec3Control("Rotation", &sel.rotation.x, 0.0f, 0.5f);
+								if (EditorStyle::vec3Control("Scale", &sel.scale.x, 1.0f, 0.01f, 0.01f, 1000.0f))
+									sel.scale = glm::max(sel.scale, glm::vec3(0.01f));
+
+								ImGui::Spacing();
+								const float buttonWidth = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x * 2) / 3.0f;
+								if (ImGui::Button("Focus", ImVec2(buttonWidth, 0))) focusOnInstance(selIndex);
+								ImGui::SameLine();
+								if (ImGui::Button("Duplicate", ImVec2(buttonWidth, 0))) duplicateInstance(selIndex);
+								ImGui::SameLine();
+								ImGui::PushStyleColor(ImGuiCol_ButtonHovered, EditorStyle::kDanger);
+								const bool deletePressed = ImGui::Button("Delete", ImVec2(buttonWidth, 0));
+								ImGui::PopStyleColor();
+								if (deletePressed) deleteInstance(selIndex);
+							}
+
+							// IFC selection details
+							if (validInstance(gizmo.selectedInstance) && selectedIfcKind != IfcSelectionKind::kNone &&
+								selectedInstanceForProperties == gizmo.selectedInstance &&
+								instances[gizmo.selectedInstance].ifcScene) {
+								IfcScene& scene = *instances[gizmo.selectedInstance].ifcScene;
+								const std::unordered_map<std::string, std::string>* properties = nullptr;
+
+								const ImGuiTableFlags infoFlags = ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV;
+								if (selectedIfcKind == IfcSelectionKind::kElement) {
+									auto it = scene.elements.find(selectedIfcGuid);
+									if (it != scene.elements.end()) {
+										IfcElement& elem = it->second;
+										properties = &elem.data;
+										if (ImGui::CollapsingHeader("IFC Element", ImGuiTreeNodeFlags_DefaultOpen)) {
+											if (ImGui::BeginTable("##ifcElementInfo", 2, infoFlags)) {
+												ImGui::TableSetupColumn("Key", ImGuiTableColumnFlags_WidthFixed, 100.0f);
+												ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch);
+												EditorStyle::keyValueRow("Name", elem.name.c_str());
+												EditorStyle::keyValueRow("Class", elem.type.c_str());
+												EditorStyle::keyValueRow("GUID", elem.guid.c_str());
+												EditorStyle::keyValueRow("Tag", elem.tag.c_str());
+												EditorStyle::keyValueRow("Storey", elem.storey.c_str());
+												EditorStyle::keyValueRow("Object type", elem.objectType.c_str());
+												if (elem.typeInfo) {
+													EditorStyle::keyValueRow("Type name", elem.typeInfo->name.c_str());
+													EditorStyle::keyValueRow("Type class", elem.typeInfo->type.c_str());
+													EditorStyle::keyValueRow("Predefined", elem.typeInfo->predefinedType.c_str());
+												}
+												ImGui::EndTable();
+											}
+
+											const float buttonWidth = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) / 2.0f;
+											if (ImGui::Button("Isolate", ImVec2(buttonWidth, 0))) isolateIfcElement(scene, elem.guid);
+											ImGui::SameLine();
+											if (ImGui::Button("Show All", ImVec2(buttonWidth, 0))) showAllIfc(scene);
+											if (ImGui::Button("Add Annotation (M)", ImVec2(buttonWidth, 0))) requestAnnotation();
+											ImGui::SameLine();
+											if (ImGui::Button("Copy GUID", ImVec2(buttonWidth, 0))) {
+												ImGui::SetClipboardText(elem.guid.c_str());
+												setStatus("GUID copied to clipboard");
+											}
+
+											// Same-name counts (cached per selection; this walks every element).
+											static std::string countedGuid;
+											static int countedInstance = -1;
+											static size_t countInModel = 0, countInScene = 0;
+											if (countedGuid != elem.guid || countedInstance != gizmo.selectedInstance) {
+												countedGuid = elem.guid;
+												countedInstance = gizmo.selectedInstance;
+												countInModel = countInScene = 0;
+												if (!elem.name.empty()) {
+													for (int k = 0; k < static_cast<int>(instances.size()); ++k) {
+														if (!instances[k].ifcScene) continue;
+														for (const auto& [g, other] : instances[k].ifcScene->elements) {
+															if (other.name == elem.name) {
+																++countInScene;
+																if (k == gizmo.selectedInstance) ++countInModel;
+															}
+														}
+													}
+												}
+											}
+											ImGui::TextDisabled("Elements with this name: %s in this model, %s in the scene",
+												formatCount(countInModel).c_str(), formatCount(countInScene).c_str());
+										}
+									}
+								}
+								else {
+									auto it = scene.spatial.find(selectedIfcGuid);
+									if (it != scene.spatial.end()) {
+										IfcSpatialNode& node = it->second;
+										properties = &node.data;
+										if (ImGui::CollapsingHeader("IFC Spatial Structure", ImGuiTreeNodeFlags_DefaultOpen)) {
+											if (ImGui::BeginTable("##ifcSpatialInfo", 2, infoFlags)) {
+												ImGui::TableSetupColumn("Key", ImGuiTableColumnFlags_WidthFixed, 100.0f);
+												ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch);
+												EditorStyle::keyValueRow("Name", node.name.c_str());
+												EditorStyle::keyValueRow("Long name", node.longName.c_str());
+												EditorStyle::keyValueRow("Class", node.type.c_str());
+												EditorStyle::keyValueRow("GUID", node.guid.c_str());
+												EditorStyle::keyValueRow("Sub-spaces", std::to_string(node.childSpatialGuids.size()).c_str());
+												EditorStyle::keyValueRow("Elements", std::to_string(node.elementGuids.size()).c_str());
+												ImGui::EndTable();
+											}
+											const float buttonWidth = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) / 2.0f;
+											if (ImGui::Button("Show Only This", ImVec2(buttonWidth, 0))) {
+												hideAllIfc(scene);
+												scene.setVisibilityRecursive(node.guid, true);
+												scene.syncVisibilityCache();
+											}
+											ImGui::SameLine();
+											if (ImGui::Button("Show All", ImVec2(buttonWidth, 0))) showAllIfc(scene);
+										}
+									}
+								}
+
+								// Property sets: keys are "PsetName.Property", grouped like BIM tools do.
+								if (properties && !properties->empty()) {
+									char header[64];
+									snprintf(header, sizeof(header), "Properties (%zu)###IfcProperties", properties->size());
+									if (ImGui::CollapsingHeader(header, ImGuiTreeNodeFlags_DefaultOpen)) {
+										static ImGuiTextFilter propertyFilter;
+										ImGui::SetNextItemWidth(-FLT_MIN);
+										if (ImGui::InputTextWithHint("##propertyFilter", "Filter properties...",
+											propertyFilter.InputBuf, IM_ARRAYSIZE(propertyFilter.InputBuf)))
+											propertyFilter.Build();
+
+										std::map<std::string, std::vector<std::pair<std::string, const std::string*>>> groups;
+										for (const auto& [key, value] : *properties) {
+											if (!propertyFilter.PassFilter(key.c_str()) && !propertyFilter.PassFilter(value.c_str()))
+												continue;
+											const size_t dot = key.find('.');
+											std::string group = dot == std::string::npos ? "General" : key.substr(0, dot);
+											std::string name = dot == std::string::npos ? key : key.substr(dot + 1);
+											groups[group].emplace_back(std::move(name), &value);
+										}
+										if (groups.empty())
+											ImGui::TextDisabled("No properties match the filter.");
+										for (auto& [group, entries] : groups) {
+											std::sort(entries.begin(), entries.end());
+											ImGui::SetNextItemOpen(true, ImGuiCond_Once);
+											if (ImGui::TreeNodeEx(group.c_str(), ImGuiTreeNodeFlags_SpanAvailWidth, "%s  (%zu)", group.c_str(), entries.size())) {
+												if (ImGui::BeginTable("##props", 2, infoFlags | ImGuiTableFlags_Resizable)) {
+													ImGui::TableSetupColumn("Property", ImGuiTableColumnFlags_WidthStretch, 0.45f);
+													ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch, 0.55f);
+													for (const auto& [name, value] : entries) {
+														ImGui::TableNextRow();
+														ImGui::TableNextColumn();
+														ImGui::TextColored(EditorStyle::kTextDim, "%s", name.c_str());
+														ImGui::TableNextColumn();
+														ImGui::TextWrapped("%s", value->c_str());
+														if (ImGui::BeginPopupContextItem(name.c_str())) {
+															if (ImGui::MenuItem("Copy Value")) ImGui::SetClipboardText(value->c_str());
+															ImGui::EndPopup();
+														}
+													}
+													ImGui::EndTable();
+												}
+												ImGui::TreePop();
+											}
+										}
+									}
+								}
+							}
+						}
+					}
+					ImGui::End();
+				}
+
+				// ---------- Annotation popup ----------
 				if (showAnnotationPopup) {
 					ImGui::OpenPopup("Add Annotation");
-					showAnnotationPopup = false; 
+					showAnnotationPopup = false;
 				}
-
-				if (ImGui::BeginPopupModal("Add Annotation", nullptr,
-					ImGuiWindowFlags_AlwaysAutoResize))
-				{
-					ImGui::Text("Add annotation to element:");
-
-					if (annotationTargetInstance >= 0 &&
-						annotationTargetInstance < static_cast<int>(instances.size()) &&
-						instances[annotationTargetInstance].ifcScene)
-					{
-						IfcScene& scene = instances[annotationTargetInstance].ifcScene.value();
+				ImGui::SetNextWindowPos(mainViewport->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+				if (ImGui::BeginPopupModal("Add Annotation", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+					if (validInstance(annotationTargetInstance) && instances[annotationTargetInstance].ifcScene) {
+						IfcScene& scene = *instances[annotationTargetInstance].ifcScene;
 						auto eit = scene.elements.find(annotationTargetGuid);
 						if (eit != scene.elements.end()) {
-							ImGui::TextColored(ImVec4(0.8f, 0.8f, 0.2f, 1.0f),
-								"%s: %s", eit->second.type.c_str(), eit->second.name.c_str());
-							ImGui::TextDisabled("GUID: %s", eit->second.guid.c_str());
+							ImGui::TextColored(EditorStyle::kHighlight, "%s", eit->second.name.empty() ? eit->second.type.c_str() : eit->second.name.c_str());
+							ImGui::TextDisabled("%s   %s", eit->second.type.c_str(), eit->second.guid.c_str());
 						}
 					}
-
-					ImGui::Separator();
-
+					ImGui::Spacing();
 					if (ImGui::IsWindowAppearing())
 						ImGui::SetKeyboardFocusHere();
+					ImGui::SetNextItemWidth(420);
+					const bool enterPressed = ImGui::InputTextWithHint("##annottext", "Annotation text", annotationText,
+						sizeof(annotationText), ImGuiInputTextFlags_EnterReturnsTrue);
+					ImGui::Spacing();
 
-					bool enterPressed = ImGui::InputText("##annottext", annotationText,
-						sizeof(annotationText),
-						ImGuiInputTextFlags_EnterReturnsTrue);
-
-					ImGui::Separator();
-
-					if (ImGui::Button("OK", ImVec2(120, 0)) || enterPressed) {
-						if (strlen(annotationText) > 0) {
+					if (ImGui::Button("Add", ImVec2(120, 0)) || enterPressed) {
+						if (strlen(annotationText) > 0 && validInstance(annotationTargetInstance)) {
 							Annotation ann;
 							ann.text = annotationText;
 							ann.ifcGuid = annotationTargetGuid;
 							ann.instanceIndex = annotationTargetInstance;
-
 							const auto& inst = instances[annotationTargetInstance];
+							ann.worldPosition = inst.position;
 							GPUModel* model = modelManager->getModel(inst.modelIndex);
 							if (model && inst.ifcScene) {
-								int submeshIdx = IfcScene::findSubmeshByGuid(inst.ifcScene.value(), annotationTargetGuid);
-								if (submeshIdx >= 0) {
-									ann.worldPosition = getSubmeshWorldCenter(model,
-										submeshIdx, inst);
-								}
-								else {
-									ann.worldPosition = inst.position;
-								}
+								int submeshIdx = IfcScene::findSubmeshByGuid(*inst.ifcScene, annotationTargetGuid);
+								if (submeshIdx >= 0)
+									ann.worldPosition = getSubmeshWorldCenter(model, submeshIdx, inst);
 							}
-							else {
-								ann.worldPosition = inst.position;
-							}
-
 							annotations.push_back(ann);
-							std::cout << "[ANNOTATION] Added: \"" << ann.text
-								<< "\" to " << ann.ifcGuid << "\n";
+							setStatus("Annotation added");
 						}
 						ImGui::CloseCurrentPopup();
 					}
-
 					ImGui::SameLine();
-
-					if (ImGui::Button("Cancel", ImVec2(120, 0))) {
+					if (ImGui::Button("Cancel", ImVec2(120, 0)) || ImGui::IsKeyPressed(ImGuiKey_Escape))
 						ImGui::CloseCurrentPopup();
-					}
-
 					ImGui::EndPopup();
 				}
 
-				if (showAnnotations  && !annotations.empty()) {
+				// ---------- Annotations drawn in the viewport ----------
+				if (showAnnotations && !annotations.empty()) {
 					glm::mat4 viewMat = getView(camera);
-					glm::mat4 projMat = getProjection(winWidth, winHeight);
+					glm::mat4 projMat = getProjection(sceneViewW, sceneViewH);
 					glm::mat4 vp = projMat * viewMat;
 
-					ImDrawList* drawList = ImGui::GetForegroundDrawList();
-
-					for (size_t ai = 0; ai < annotations.size(); ++ai) {
-						const auto& ann = annotations[ai];
-
-						if (ann.instanceIndex < 0 ||
-							ann.instanceIndex >= static_cast<int>(instances.size()))
-							continue;
-
-						const auto& inst = instances[ann.instanceIndex];
-						if (!inst.visible) continue;
+					// Background draw list: labels stay behind the editor panels.
+					ImDrawList* drawList = ImGui::GetBackgroundDrawList();
+					drawList->PushClipRect(ImVec2(sceneViewX, sceneViewY), ImVec2(sceneViewX + sceneViewW, sceneViewY + sceneViewH), true);
+					for (const auto& ann : annotations) {
+						if (!validInstance(ann.instanceIndex) || !instances[ann.instanceIndex].visible) continue;
 
 						glm::vec4 clipPos = vp * glm::vec4(ann.worldPosition, 1.0f);
-
 						if (clipPos.w <= 0.0f) continue;
-
 						glm::vec3 ndc = glm::vec3(clipPos) / clipPos.w;
+						if (ndc.x < -1.0f || ndc.x > 1.0f || ndc.y < -1.0f || ndc.y > 1.0f) continue;
 
-						if (ndc.x < -1.0f || ndc.x > 1.0f ||
-							ndc.y < -1.0f || ndc.y > 1.0f)
-							continue;
+						const float screenX = sceneViewX + (ndc.x * 0.5f + 0.5f) * sceneViewW;
+						const float screenY = sceneViewY + (ndc.y * 0.5f + 0.5f) * sceneViewH;
+						const float dist = glm::distance(camera.position, ann.worldPosition);
+						const float alpha = glm::clamp(1.0f - (dist - 50.0f) / 100.0f, 0.1f, 1.0f);
 
-						float screenX = (ndc.x * 0.5f + 0.5f) * winWidth;
-						float screenY = (ndc.y * 0.5f + 0.5f) * winHeight;
-
-						float dist = glm::distance(camera.position, ann.worldPosition);
-						float alpha = glm::clamp(1.0f - (dist - 50.0f) / 100.0f, 0.1f, 1.0f);
-
-						ImVec2 textSize = ImGui::CalcTextSize(ann.text.c_str());
-						float padding = 6.0f;
-						ImVec2 boxMin(screenX - padding, screenY - padding);
-						ImVec2 boxMax(screenX + textSize.x + padding, screenY + textSize.y + padding);
-
-						ImU32 bgColor = IM_COL32(30, 30, 30, (int)(200 * alpha));
-						ImU32 borderColor = IM_COL32(255, 200, 50, (int)(255 * alpha));
-						ImU32 textColor = IM_COL32(255, 255, 255, (int)(255 * alpha));
+						const ImVec2 textSize = ImGui::CalcTextSize(ann.text.c_str());
+						const float padding = 6.0f;
+						const ImVec2 boxMin(screenX - padding, screenY - padding);
+						const ImVec2 boxMax(screenX + textSize.x + padding, screenY + textSize.y + padding);
+						const ImU32 bgColor = IM_COL32(30, 30, 30, (int)(200 * alpha));
+						const ImU32 borderColor = IM_COL32(255, 200, 50, (int)(255 * alpha));
+						const ImU32 textColor = IM_COL32(255, 255, 255, (int)(255 * alpha));
 
 						drawList->AddRectFilled(boxMin, boxMax, bgColor, 4.0f);
 						drawList->AddRect(boxMin, boxMax, borderColor, 4.0f, 0, 1.5f);
-						drawList->AddLine(
-							ImVec2(screenX + textSize.x * 0.5f, boxMax.y),
-							ImVec2(screenX + textSize.x * 0.5f, boxMax.y + 10.0f),
-							borderColor, 1.5f);
-						drawList->AddCircleFilled(
-							ImVec2(screenX + textSize.x * 0.5f, boxMax.y + 10.0f),
-							3.0f, borderColor);
-
+						drawList->AddLine(ImVec2(screenX + textSize.x * 0.5f, boxMax.y),
+							ImVec2(screenX + textSize.x * 0.5f, boxMax.y + 10.0f), borderColor, 1.5f);
+						drawList->AddCircleFilled(ImVec2(screenX + textSize.x * 0.5f, boxMax.y + 10.0f), 3.0f, borderColor);
 						drawList->AddText(ImVec2(screenX, screenY), textColor, ann.text.c_str());
 					}
+					drawList->PopClipRect();
 				}
 
-				if (!annotations.empty()) {
-					ImGui::Begin("Annotations");
-
-					if (showAnnotations) {
-						if (ImGui::Button("Hide Annotations")) {
-							showAnnotations = false;
-						}
-					}
-					else {
-						if (ImGui::Button("Show Annotations")) {
-							showAnnotations = true;
-						}
-					}
-
-					for (size_t ai = 0; ai < annotations.size();) {
-						ImGui::PushID(static_cast<int>(ai));
-
-						bool isValid = (ai < annotations.size() &&
-							annotations[ai].instanceIndex >= 0 &&
-							annotations[ai].instanceIndex < static_cast<int>(instances.size()));
-
-						if (isValid && instances[annotations[ai].instanceIndex].ifcScene) {
-							IfcScene& scene = instances[annotations[ai].instanceIndex].ifcScene.value();
-							auto eit = scene.elements.find(annotations[ai].ifcGuid);
-							if (eit != scene.elements.end()) {
-								ImGui::TextDisabled("[%s]", eit->second.type.c_str());
-								ImGui::SameLine();
-							}
-						}
-
-						ImGui::Text("\"%s\"", annotations[ai].text.c_str());
-
+				// ---------- Annotations panel ----------
+				if (showAnnotationsPanel) {
+					if (ImGui::Begin("Annotations", &showAnnotationsPanel)) {
+						ImGui::Checkbox("Show in viewport", &showAnnotations);
 						ImGui::SameLine();
+						ImGui::BeginDisabled(selectedIfcKind != IfcSelectionKind::kElement);
+						if (ImGui::Button("Add to Selected (M)")) requestAnnotation();
+						ImGui::EndDisabled();
+						ImGui::SameLine();
+						ImGui::BeginDisabled(annotations.empty());
+						if (ImGui::Button("Clear All")) annotations.clear();
+						ImGui::EndDisabled();
+						ImGui::Separator();
 
-						if (ImGui::SmallButton("Select")) {
-							if (isValid && instances[annotations[ai].instanceIndex].ifcScene) {
-								IfcScene& scene = instances[annotations[ai].instanceIndex].ifcScene.value();
-
-								for (auto& [g, e] : scene.elements) e.selected = false;
-								for (auto& [g, s] : scene.spatial)  s.selected = false;
-
-								auto eit = scene.elements.find(annotations[ai].ifcGuid);
-								if (eit != scene.elements.end()) {
-									eit->second.selected = true;
-									selectedIfcGuid = annotations[ai].ifcGuid;
-									selectedIfcKind = IfcSelectionKind::kElement;
-									selectedInstanceForProperties = annotations[ai].instanceIndex;
-									gizmo.select(annotations[ai].instanceIndex);
-
-									int submeshIdx = IfcScene::findSubmeshByGuid(scene, annotations[ai].ifcGuid);
-									if (submeshIdx >= 0) {
-										gizmo.outlineInstanceIndex = annotations[ai].instanceIndex;
-										gizmo.outlineSubmeshIndex = static_cast<size_t>(submeshIdx);
-									}
-
+						if (annotations.empty()) {
+							ImGui::TextDisabled("No annotations yet.");
+							ImGui::TextWrapped("Select an IFC element (in the viewport or Outliner) and press M to pin a note to it.");
+						}
+						else if (ImGui::BeginTable("##annotations", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV |
+							ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_ScrollY)) {
+							ImGui::TableSetupScrollFreeze(0, 1);
+							ImGui::TableSetupColumn("Note", ImGuiTableColumnFlags_WidthStretch, 0.5f);
+							ImGui::TableSetupColumn("Element", ImGuiTableColumnFlags_WidthStretch, 0.5f);
+							ImGui::TableSetupColumn("##actions", ImGuiTableColumnFlags_WidthFixed, 90.0f);
+							ImGui::TableHeadersRow();
+							int deferredRemove = -1;
+							for (int ai = 0; ai < static_cast<int>(annotations.size()); ++ai) {
+								const Annotation& ann = annotations[ai];
+								ImGui::PushID(ai);
+								ImGui::TableNextRow();
+								ImGui::TableNextColumn();
+								ImGui::TextWrapped("%s", ann.text.c_str());
+								ImGui::TableNextColumn();
+								const bool valid = validInstance(ann.instanceIndex) && instances[ann.instanceIndex].ifcScene;
+								IfcElement* target = nullptr;
+								if (valid) {
+									auto eit = instances[ann.instanceIndex].ifcScene->elements.find(ann.ifcGuid);
+									if (eit != instances[ann.instanceIndex].ifcScene->elements.end()) target = &eit->second;
+								}
+								if (target) ImGui::TextDisabled("%s", target->name.empty() ? target->type.c_str() : target->name.c_str());
+								else ImGui::TextDisabled("(missing)");
+								ImGui::TableNextColumn();
+								ImGui::BeginDisabled(!target);
+								if (ImGui::SmallButton("Go to")) {
+									selectIfcElement(ann.instanceIndex, *instances[ann.instanceIndex].ifcScene, ann.ifcGuid);
 									selectionChangedFromViewport = true;
+									focusOnInstance(ann.instanceIndex);
 								}
+								ImGui::EndDisabled();
+								ImGui::SameLine();
+								if (ImGui::SmallButton("Delete")) deferredRemove = ai;
+								ImGui::PopID();
 							}
+							ImGui::EndTable();
+							if (deferredRemove >= 0) annotations.erase(annotations.begin() + deferredRemove);
 						}
-
-						ImGui::SameLine();
-
-						// Delete annotation
-						if (ImGui::SmallButton("X")) {
-							annotations.erase(annotations.begin() + ai);
-							ImGui::PopID();
-							continue;
-						}
-
-						ImGui::PopID();
-						++ai;
 					}
-
-					ImGui::Separator();
-					if (ImGui::Button("Clear All Annotations")) {
-						annotations.clear();
-					}
-
 					ImGui::End();
 				}
 
-				static std::string lastSelectedGuid = "";
-				static int lastSelectedInstance = -1;
-				static std::string cachedElementType = "";
-				static size_t cachedCountInModel = 0;
-				static size_t cachedCountInScene = 0;
+				// ---------- Statistics panel ----------
+				if (showStatisticsPanel) {
+					if (ImGui::Begin("Statistics", &showStatisticsPanel)) {
+						static float frameTimes[240] = {};
+						static int frameTimeOffset = 0;
+						frameTimes[frameTimeOffset] = 1000.0f * uiIO.DeltaTime;
+						frameTimeOffset = (frameTimeOffset + 1) % IM_ARRAYSIZE(frameTimes);
+						char overlay[64];
+						snprintf(overlay, sizeof(overlay), "%.0f FPS  (%.2f ms)", uiIO.Framerate, 1000.0f / std::max(uiIO.Framerate, 0.001f));
+						ImGui::PlotLines("##frameTimes", frameTimes, IM_ARRAYSIZE(frameTimes), frameTimeOffset, overlay,
+							0.0f, 33.3f, ImVec2(-FLT_MIN, 60.0f));
 
-				if (selectedIfcKind != IfcSelectionKind::kNone && selectedInstanceForProperties != -1) {
-
-					// 2. Only recalculate if the user clicked on a DIFFERENT element
-					if (selectedIfcGuid != lastSelectedGuid || selectedInstanceForProperties != lastSelectedInstance) {
-
-						// Update the trackers
-						lastSelectedGuid = selectedIfcGuid;
-						lastSelectedInstance = selectedInstanceForProperties;
-
-						// Reset counts
-						cachedCountInModel = 0;
-						cachedCountInScene = 0;
-						cachedElementType = "";
-
-						IfcScene& scene = instances[selectedInstanceForProperties].ifcScene.value();
-
-						if (selectedIfcKind == IfcSelectionKind::kElement) {
-							auto it = scene.elements.find(selectedIfcGuid);
-							if (it != scene.elements.end()) {
-								cachedElementType = it->second.name;
-							}
-
-							if (!cachedElementType.empty()) {
-								for (int sceneIterator = 0; sceneIterator != instances.size(); ++sceneIterator) {
-									if (!instances[sceneIterator].ifcScene) continue;
-
-									const auto& instScene = instances[sceneIterator].ifcScene.value();
-
-									// 3. CRITICAL: Use const auto& to prevent copying the map pair every loop!
-									for (const auto& el : instScene.elements) {
-										if (el.second.name == cachedElementType) {
-											++cachedCountInScene;
-											if (sceneIterator == selectedInstanceForProperties) {
-												++cachedCountInModel;
-											}
-										}
-									}
-								}
+						size_t visibleObjects = 0, sceneVertices = 0, sceneTriangles = 0, textures = 0;
+						for (const auto& inst : instances) {
+							if (!inst.visible) continue;
+							++visibleObjects;
+							if (GPUModel* m = modelManager->getModel(inst.modelIndex)) {
+								sceneVertices += m->vertexCount;
+								sceneTriangles += m->indexCount / 3;
 							}
 						}
-						else if (selectedIfcKind == IfcSelectionKind::kSpatial) {
-							auto it = scene.spatial.find(selectedIfcGuid); // Fixed this from scene.elements
-							if (it != scene.spatial.end()) {
-								cachedElementType = it->second.name;
-							}
+						for (const auto& m : modelManager->getModels()) textures += m->textures.size();
 
-							if (!cachedElementType.empty()) {
-								for (int sceneIterator = 0; sceneIterator != instances.size(); ++sceneIterator) {
-									if (!instances[sceneIterator].ifcScene) continue;
-
-									const auto& instScene = instances[sceneIterator].ifcScene.value();
-
-									// 3. CRITICAL: Use const auto& here as well
-									for (const auto& el : instScene.spatial) {
-										if (el.second.name == cachedElementType) {
-											++cachedCountInScene;
-											if (sceneIterator == selectedInstanceForProperties) {
-												++cachedCountInModel;
-											}
-										}
-									}
-								}
-							}
+						if (ImGui::BeginTable("##stats", 2, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_SizingStretchProp)) {
+							ImGui::TableSetupColumn("Key", ImGuiTableColumnFlags_WidthFixed, 140.0f);
+							ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch);
+							EditorStyle::keyValueRow("Objects", (std::to_string(visibleObjects) + " visible / " + std::to_string(instances.size())).c_str());
+							EditorStyle::keyValueRow("Models loaded", std::to_string(modelManager->getModels().size()).c_str());
+							EditorStyle::keyValueRow("Scene vertices", formatCount(sceneVertices).c_str());
+							EditorStyle::keyValueRow("Scene triangles", formatCount(sceneTriangles).c_str());
+							EditorStyle::keyValueRow("Textures", std::to_string(textures).c_str());
+							char buf[96];
+							snprintf(buf, sizeof(buf), "%.2f, %.2f, %.2f", camera.position.x, camera.position.y, camera.position.z);
+							EditorStyle::keyValueRow("Camera position", buf);
+							snprintf(buf, sizeof(buf), "yaw %.1f, pitch %.1f", camera.yaw, camera.pitch);
+							EditorStyle::keyValueRow("Camera rotation", buf);
+							snprintf(buf, sizeof(buf), "%u x %u px", fbWidth, fbHeight);
+							EditorStyle::keyValueRow("Window", buf);
+							snprintf(buf, sizeof(buf), "%.0f x %.0f", sceneViewW, sceneViewH);
+							EditorStyle::keyValueRow("Viewport", buf);
+							ImGui::EndTable();
 						}
 					}
-
-					// 4. Draw ImGui instantly using the cached data (Zero performance hit)
-					ImGui::Begin("Element Counter");
-					ImGui::Text("Type: %s", cachedElementType.c_str());
-					ImGui::Separator();
-					ImGui::Text("Count:");
-					ImGui::Text("In model: %zu", cachedCountInModel);
-					ImGui::Text("In scene: %zu", cachedCountInScene);
 					ImGui::End();
-
-				}
-				else {
-					// Reset cache trigger if nothing is selected
-					lastSelectedGuid = "";
-					lastSelectedInstance = -1;
 				}
 
-				// ============================================
-				// CAMERA ANIMATION UI
-				// ============================================
-				ImGui::Begin("Camera Animation");
+				// ---------- Camera animation panel ----------
+				if (showAnimationPanel) {
+					if (ImGui::Begin("Camera Animation", &showAnimationPanel)) {
+						auto& animPath = cameraAnimator.getPath();
+						static char pathName[128] = "CameraPath1";
+						static char animSavePath[256] = "camera_path.cmap";
+						static float newKeyframeTime = 0.0f;
+						static bool newKeyframeCurved = true;
+						static int selectedKeyframe = -1;
+						static bool pathNameApplied = false;
+						if (!pathNameApplied) { animPath.name = pathName; pathNameApplied = true; }
 
-				auto& animPath = cameraAnimator.getPath();
+						// Transport
+						const AnimationPlayState playState = cameraAnimator.getPlayState();
+						auto transportButton = [&](const char* label, bool active) {
+							if (active) ImGui::PushStyleColor(ImGuiCol_Button, EditorStyle::kAccent);
+							const bool pressed = ImGui::Button(label, ImVec2(70, 0));
+							if (active) ImGui::PopStyleColor();
+							return pressed;
+						};
+						ImGui::BeginDisabled(animPath.keyframes.size() < 2);
+						if (transportButton("Play", playState == AnimationPlayState::Playing)) cameraAnimator.play();
+						ImGui::SameLine(0, 2);
+						if (transportButton("Pause", playState == AnimationPlayState::Paused)) cameraAnimator.pause();
+						ImGui::SameLine(0, 2);
+						if (transportButton("Stop", false)) cameraAnimator.stop();
+						ImGui::EndDisabled();
+						ImGui::SameLine(0, 12);
+						ImGui::Checkbox("Loop", &animPath.loop);
+						ImGui::SameLine(0, 12);
+						float speed = cameraAnimator.getPlaybackSpeed();
+						ImGui::SetNextItemWidth(140);
+						if (ImGui::SliderFloat("##speed", &speed, 0.1f, 5.0f, "Speed %.1fx"))
+							cameraAnimator.setPlaybackSpeed(speed);
+						ImGui::SameLine(0, 12);
+						ImGui::SetNextItemWidth(-FLT_MIN);
+						if (ImGui::InputTextWithHint("##pathName", "Path name", pathName, sizeof(pathName)))
+							animPath.name = pathName;
 
-				// Path name
-				static char pathName[128] = "CameraPath1";
-				ImGui::InputText("Path Name", pathName, sizeof(pathName));
-				animPath.name = pathName;
+						const float duration = cameraAnimator.getDuration();
+						const float current = cameraAnimator.getCurrentTime();
+						char progressText[64];
+						snprintf(progressText, sizeof(progressText), "%.1fs / %.1fs", current, duration);
+						ImGui::ProgressBar(duration > 0.0f ? current / duration : 0.0f, ImVec2(-FLT_MIN, 0), progressText);
 
-				ImGui::Separator();
+						// Keyframe list + details side by side
+						const float listWidth = ImGui::GetContentRegionAvail().x * 0.55f;
+						const float footerHeight = ImGui::GetFrameHeightWithSpacing() + ImGui::GetStyle().ItemSpacing.y;
+						bool pathModified = false;
+						if (ImGui::BeginChild("##keyframeList", ImVec2(listWidth, -footerHeight), ImGuiChildFlags_Borders)) {
+							ImGui::SetNextItemWidth(90);
+							ImGui::DragFloat("##newTime", &newKeyframeTime, 0.1f, 0.0f, 600.0f, "at %.1f s");
+							ImGui::SameLine();
+							ImGui::Checkbox("Curve", &newKeyframeCurved);
+							ImGui::SameLine();
+							if (ImGui::Button("+ Keyframe from Camera")) {
+								cameraAnimator.addKeyframe(CameraAnimator::makeKeyframe(
+									camera.position, camera.yaw, camera.pitch, newKeyframeTime, newKeyframeCurved));
+								newKeyframeTime += 2.0f;
+								rebuildPathVisualization();
+							}
 
-				// === PLAYBACK CONTROLS ===
-				ImGui::Text("Playback");
-
-				AnimationPlayState playState = cameraAnimator.getPlayState();
-				const char* stateText = "Stopped";
-				if (playState == AnimationPlayState::Playing) stateText = "Playing";
-				if (playState == AnimationPlayState::Paused) stateText = "Paused";
-				ImGui::Text("State: %s", stateText);
-
-				if (ImGui::Button("Play")) {
-					cameraAnimator.play();
-				}
-				ImGui::SameLine();
-				if (ImGui::Button("Pause")) {
-					cameraAnimator.pause();
-				}
-				ImGui::SameLine();
-				if (ImGui::Button("Stop")) {
-					cameraAnimator.stop();
-				}
-
-				float speed = cameraAnimator.getPlaybackSpeed();
-				if (ImGui::SliderFloat("Speed", &speed, 0.1f, 5.0f, "%.1fx")) {
-					cameraAnimator.setPlaybackSpeed(speed);
-				}
-
-				// Timeline scrubber
-				float currentTime = cameraAnimator.getCurrentTime();
-				float duration = cameraAnimator.getDuration();
-				if (duration > 0.0f) {
-					if (ImGui::SliderFloat("Timeline", &currentTime, 0.0f, duration, "%.2fs")) {
-						// Allow scrubbing when not playing
-						if (!cameraAnimator.isPlaying()) {
-							// Manually set time for preview
-							// We need a setter for this - using a small hack
-							cameraAnimator.stop();
-							// Force time through play+pause at the right moment
-							// Better: add a setCurrentTime method
+							if (animPath.keyframes.empty()) {
+								ImGui::TextDisabled("No keyframes. Position the camera and click '+ Keyframe from Camera'.");
+							}
+							else if (ImGui::BeginTable("##keyframes", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV |
+								ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingStretchProp)) {
+								ImGui::TableSetupScrollFreeze(0, 1);
+								ImGui::TableSetupColumn("#", ImGuiTableColumnFlags_WidthFixed, 30.0f);
+								ImGui::TableSetupColumn("Time", ImGuiTableColumnFlags_WidthStretch);
+								ImGui::TableSetupColumn("Interpolation", ImGuiTableColumnFlags_WidthStretch);
+								ImGui::TableHeadersRow();
+								for (int k = 0; k < static_cast<int>(animPath.keyframes.size()); ++k) {
+									const auto& kf = animPath.keyframes[k];
+									ImGui::TableNextRow();
+									ImGui::TableNextColumn();
+									char label[16];
+									snprintf(label, sizeof(label), "%d", k);
+									if (ImGui::Selectable(label, selectedKeyframe == k, ImGuiSelectableFlags_SpanAllColumns))
+										selectedKeyframe = k;
+									ImGui::TableNextColumn();
+									ImGui::Text("%.2f s", kf.timestamp);
+									ImGui::TableNextColumn();
+									ImGui::TextDisabled("%s", kf.useCurve ? "Curve" : "Linear");
+								}
+								ImGui::EndTable();
+							}
 						}
-					}
+						ImGui::EndChild();
+						ImGui::SameLine();
+						if (ImGui::BeginChild("##keyframeDetails", ImVec2(0, -footerHeight), ImGuiChildFlags_Borders)) {
+							if (selectedKeyframe >= static_cast<int>(animPath.keyframes.size())) selectedKeyframe = -1;
+							if (selectedKeyframe < 0) {
+								ImGui::TextDisabled("Select a keyframe to edit it.");
+							}
+							else {
+								auto& kf = animPath.keyframes[selectedKeyframe];
+								ImGui::Text("Keyframe %d", selectedKeyframe);
+								ImGui::Separator();
+								pathModified |= EditorStyle::vec3Control("Position", &kf.position.x, 0.0f, 0.1f, 0.0f, 0.0f, 80.0f);
+								pathModified |= EditorStyle::vec3Control("Look at", &kf.lookTarget.x, 0.0f, 0.1f, 0.0f, 0.0f, 80.0f);
+								EditorStyle::propertyLabel("Time", 80.0f);
+								pathModified |= ImGui::DragFloat("##time", &kf.timestamp, 0.1f, 0.0f, 600.0f, "%.2f s");
+								EditorStyle::propertyLabel("Curve", 80.0f);
+								pathModified |= ImGui::Checkbox("##curve", &kf.useCurve);
 
-					// Progress bar
-					float progress = duration > 0.0f ? currentTime / duration : 0.0f;
-					ImGui::ProgressBar(progress, ImVec2(-1, 0),
-						(std::to_string((int)currentTime) + "s / " + std::to_string((int)duration) + "s").c_str());
-				}
+								if (ImGui::Button("Go to")) {
+									camera.position = kf.position;
+									glm::vec3 dir = glm::normalize(kf.lookTarget - kf.position);
+									camera.yaw = glm::degrees(atan2(dir.z, dir.x));
+									camera.pitch = glm::degrees(asin(glm::clamp(dir.y, -1.0f, 1.0f)));
+								}
+								ImGui::SetItemTooltip("Move the camera to this keyframe");
+								ImGui::SameLine();
+								if (ImGui::Button("Set from Camera")) {
+									kf = CameraAnimator::makeKeyframe(camera.position, camera.yaw, camera.pitch, kf.timestamp, kf.useCurve);
+									pathModified = true;
+								}
+								ImGui::SameLine();
+								if (ImGui::Button("Delete")) {
+									cameraAnimator.removeKeyframe(static_cast<size_t>(selectedKeyframe));
+									selectedKeyframe = -1;
+									pathModified = true;
+								}
+							}
+						}
+						ImGui::EndChild();
+						if (pathModified) {
+							animPath.recalculateDuration();
+							rebuildPathVisualization();
+						}
 
-				ImGui::Checkbox("Loop", &animPath.loop);
-
-				ImGui::Separator();
-
-				// === ADD KEYFRAME ===
-				ImGui::Text("Add Keyframes");
-
-				static float newKeyframeTime = 0.0f;
-				static bool newKeyframeCurved = true;
-				ImGui::DragFloat("Time (s)", &newKeyframeTime, 0.1f, 0.0f, 600.0f, "%.1f s");
-				ImGui::Checkbox("Curved (Catmull-Rom)", &newKeyframeCurved);
-
-				if (ImGui::Button("Add Keyframe at Camera Position")) {
-					CameraKeyframe kf = CameraAnimator::makeKeyframe(
-						camera.position, camera.yaw, camera.pitch,
-						newKeyframeTime, newKeyframeCurved
-					);
-					cameraAnimator.addKeyframe(kf);
-
-					// Auto-increment time for next keyframe
-					newKeyframeTime += 2.0f;
-
-					rebuildPathVisualization();
-				}
-
-				if (ImGui::Button("Add Keyframe at Origin")) {
-					CameraKeyframe kf;
-					kf.position = glm::vec3(0.0f);
-					kf.lookTarget = glm::vec3(0.0f, 0.0f, -10.0f);
-					kf.timestamp = newKeyframeTime;
-					kf.useCurve = newKeyframeCurved;
-					cameraAnimator.addKeyframe(kf);
-					newKeyframeTime += 2.0f;
-					rebuildPathVisualization();
-				}
-
-				ImGui::Separator();
-
-				// === KEYFRAME LIST ===
-				ImGui::Text("Keyframes: %zu", animPath.keyframes.size());
-
-				bool pathModified = false;
-
-				for (size_t i = 0; i < animPath.keyframes.size(); ++i) {
-					auto& kf = animPath.keyframes[i];
-					ImGui::PushID(static_cast<int>(i));
-
-					bool nodeOpen = ImGui::TreeNode("", "KF %zu - %.1fs %s",
-						i, kf.timestamp, kf.useCurve ? "(Curve)" : "(Line)");
-
-					if (nodeOpen) {
-						if (ImGui::DragFloat3("Position", &kf.position[0], 0.1f)) pathModified = true;
-						if (ImGui::DragFloat3("Look At", &kf.lookTarget[0], 0.1f)) pathModified = true;
-						if (ImGui::DragFloat("Time", &kf.timestamp, 0.1f, 0.0f, 600.0f)) pathModified = true;
-						if (ImGui::Checkbox("Curved", &kf.useCurve)) pathModified = true;
-
-						if (ImGui::Button("Set to Camera")) {
-							kf = CameraAnimator::makeKeyframe(
-								camera.position, camera.yaw, camera.pitch,
-								kf.timestamp, kf.useCurve
-							);
-							pathModified = true;
+						// File row
+						ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.4f);
+						ImGui::InputTextWithHint("##animFile", "camera_path.cmap", animSavePath, sizeof(animSavePath));
+						ImGui::SameLine();
+						if (ImGui::Button("Open...")) openFileDialog("BrowseAnimDlg", "Open Camera Path", ".cmap", ANIMS_ROOT, nullptr, false);
+						ImGui::SameLine();
+						if (ImGui::Button("Save")) {
+							cameraAnimator.savePath(animSavePath);
+							setStatus(std::string("Camera path saved: ") + animSavePath);
 						}
 						ImGui::SameLine();
-						if (ImGui::Button("Go to")) {
-							// Move camera to this keyframe position
-							camera.position = kf.position;
-							float yaw, pitch;
-							CameraAnimator::makeKeyframe(kf.position, 0, 0, 0); // dummy
-							glm::vec3 dir = glm::normalize(kf.lookTarget - kf.position);
-							camera.yaw = glm::degrees(atan2(dir.z, dir.x));
-							camera.pitch = glm::degrees(asin(glm::clamp(dir.y, -1.0f, 1.0f)));
+						if (ImGui::Button("Reload")) {
+							if (cameraAnimator.loadPath(animSavePath)) {
+								strncpy(pathName, cameraAnimator.getPath().name.c_str(), sizeof(pathName) - 1);
+								rebuildPathVisualization();
+								setStatus(std::string("Camera path loaded: ") + animSavePath);
+							}
+							else setStatus(std::string("Failed to load camera path: ") + animSavePath, true);
 						}
 						ImGui::SameLine();
-						if (ImGui::Button("Delete")) {
-							cameraAnimator.removeKeyframe(i);
-							pathModified = true;
-							ImGui::TreePop();
-							ImGui::PopID();
-							break; // List changed, exit loop
+						ImGui::BeginDisabled(animPath.keyframes.empty());
+						if (ImGui::Button("Clear Keyframes")) {
+							cameraAnimator.clearKeyframes();
+							selectedKeyframe = -1;
+							rebuildPathVisualization();
 						}
+						ImGui::EndDisabled();
 
-						ImGui::TreePop();
+						// Dialog lives here because it writes the panel's static path buffer.
+						if (ImGuiFileDialog::Instance()->Display("BrowseAnimDlg", ImGuiWindowFlags_NoCollapse, dialogSize)) {
+							if (ImGuiFileDialog::Instance()->IsOk()) {
+								auto rel = makeRelativeIfInside(ImGuiFileDialog::Instance()->GetFilePathName(), ANIMS_ROOT);
+								if (rel.has_value()) {
+									strncpy(animSavePath, rel.value().c_str(), sizeof(animSavePath) - 1);
+									animSavePath[sizeof(animSavePath) - 1] = '\0';
+									if (cameraAnimator.loadPath(animSavePath)) {
+										strncpy(pathName, cameraAnimator.getPath().name.c_str(), sizeof(pathName) - 1);
+										rebuildPathVisualization();
+										setStatus(std::string("Camera path loaded: ") + animSavePath);
+									}
+								}
+								else setStatus("Camera paths must be inside the application folder", true);
+							}
+							ImGuiFileDialog::Instance()->Close();
+						}
 					}
-
-					ImGui::PopID();
+					ImGui::End();
 				}
 
-				if (pathModified) {
-					animPath.recalculateDuration();
-					rebuildPathVisualization();
-				}
-
-				ImGui::Separator();
-
-				// === VISUALIZATION ===
-				ImGui::Checkbox("Show Path", &showAnimationPath);
-
-				ImGui::Separator();
-
-				// === SAVE/LOAD ===
-				static char animSavePath[256] = "camera_path.cmap";
-				ImGui::InputText("Anim File", animSavePath, sizeof(animSavePath));
-
-
-				// --- Browse for Camera Animation ---
-				if (ImGui::Button("Browse##animation")) {
-					namespace fs = std::filesystem;
-					fs::create_directories(ANIMS_ROOT);
-					std::string absRoot = fs::weakly_canonical(fs::absolute(ANIMS_ROOT)).string();
-
-					IGFD::FileDialogConfig config;
-					config.path = absRoot;
-					config.countSelectionMax = 1;
-					config.flags = ImGuiFileDialogFlags_Modal;
-
-					ImGuiFileDialog::Instance()->OpenDialog(
-						"BrowseAnimDlg",
-						"Select camera animation",
-						".cmap",
-						config
-					);
-				}
-
-				if (ImGuiFileDialog::Instance()->Display("BrowseAnimDlg",
-					ImGuiWindowFlags_NoCollapse, dialogSize))
-				{
+				// ---------- File dialogs ----------
+				if (ImGuiFileDialog::Instance()->Display("BrowseSceneDlg", ImGuiWindowFlags_NoCollapse, dialogSize)) {
 					if (ImGuiFileDialog::Instance()->IsOk()) {
-						std::string selectedPath = ImGuiFileDialog::Instance()->GetFilePathName();
-
-						auto rel = makeRelativeIfInside(selectedPath, ANIMS_ROOT);
+						auto rel = makeRelativeIfInside(ImGuiFileDialog::Instance()->GetFilePathName(), SCENES_ROOT);
+						if (rel.has_value()) openScene(rel.value());
+						else setStatus("Scenes must be inside the application folder", true);
+					}
+					ImGuiFileDialog::Instance()->Close();
+				}
+				if (ImGuiFileDialog::Instance()->Display("SaveAsSceneDlg", ImGuiWindowFlags_NoCollapse, dialogSize)) {
+					if (ImGuiFileDialog::Instance()->IsOk()) {
+						std::filesystem::path p(ImGuiFileDialog::Instance()->GetFilePathName());
+						if (!p.has_extension() || p.extension() != ".scn") p.replace_extension(".scn");
+						auto rel = makeRelativeIfInside(p.string(), SCENES_ROOT);
 						if (rel.has_value()) {
-							strncpy(animSavePath, rel.value().c_str(), sizeof(animSavePath) - 1);
-							animSavePath[sizeof(animSavePath) - 1] = '\0';
+							strncpy(sceneSavePath, rel.value().c_str(), sizeof(sceneSavePath) - 1);
+							sceneSavePath[sizeof(sceneSavePath) - 1] = '\0';
+							saveSceneTo(sceneSavePath);
 						}
-						else {
-							std::cerr << "[ANIMS] File must be inside \"" << ANIMS_ROOT << "/\"\n";
+						else setStatus("Scenes must be saved inside the application folder", true);
+					}
+					ImGuiFileDialog::Instance()->Close();
+				}
+				if (ImGuiFileDialog::Instance()->Display("BrowseModelDlg", ImGuiWindowFlags_NoCollapse, dialogSize)) {
+					if (ImGuiFileDialog::Instance()->IsOk()) {
+						auto rel = makeRelativeIfInside(ImGuiFileDialog::Instance()->GetFilePathName(), MODELS_ROOT);
+						if (rel.has_value()) {
+							const std::string name = std::filesystem::path(rel.value()).stem().string();
+							modelManager->loadModelAsync(rel.value(), name);
+							setStatus("Importing " + name + "...");
 						}
+						else setStatus("Models must be inside the \"" + MODELS_ROOT + "\" folder", true);
 					}
 					ImGuiFileDialog::Instance()->Close();
 				}
 
-				if (ImGui::Button("Save Path")) {
-					cameraAnimator.savePath(animSavePath);
-				}
-				ImGui::SameLine();
-				if (ImGui::Button("Load Path")) {
-					if (cameraAnimator.loadPath(animSavePath)) {
-						strncpy(pathName, cameraAnimator.getPath().name.c_str(), sizeof(pathName) - 1);
-						rebuildPathVisualization();
+				// ---------- Help popups ----------
+				if (openControlsPopup) ImGui::OpenPopup("Controls");
+				if (openAboutPopup) ImGui::OpenPopup("About MirasEngine");
+				ImGui::SetNextWindowPos(mainViewport->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+				if (ImGui::BeginPopupModal("Controls", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+					if (ImGui::BeginTable("##controls", 2, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV)) {
+						ImGui::TableSetupColumn("Input", ImGuiTableColumnFlags_WidthFixed, 170.0f);
+						ImGui::TableSetupColumn("Action", ImGuiTableColumnFlags_WidthFixed, 300.0f);
+						const char* rows[][2] = {
+							{ "Left click", "Select object / IFC element" },
+							{ "Right mouse + drag", "Look around" },
+							{ "W A S D", "Move camera" },
+							{ "Shift (hold)", "Move 4x faster" },
+							{ "F", "Focus selection" },
+							{ "Q / 1 / 2 / 3", "Select / Move / Rotate / Scale tool" },
+							{ "M", "Annotate selected IFC element" },
+							{ "Ctrl+D", "Duplicate selected object" },
+							{ "Delete", "Delete selected object" },
+							{ "Esc", "Deselect / leave fly mode" },
+							{ "Shift+`", "Toggle fly mode (hide UI)" },
+							{ "Ctrl+O / Ctrl+S", "Open / save scene" },
+							{ "Ctrl+Shift+S", "Save scene as" },
+							{ "Ctrl+I", "Import model" },
+						};
+						for (const auto& row : rows) {
+							ImGui::TableNextRow();
+							ImGui::TableNextColumn();
+							ImGui::TextColored(EditorStyle::kHighlight, "%s", row[0]);
+							ImGui::TableNextColumn();
+							ImGui::TextUnformatted(row[1]);
+						}
+						ImGui::EndTable();
 					}
+					ImGui::Spacing();
+					if (ImGui::Button("Close", ImVec2(120, 0)) || ImGui::IsKeyPressed(ImGuiKey_Escape))
+						ImGui::CloseCurrentPopup();
+					ImGui::EndPopup();
 				}
-				ImGui::SameLine();
-				if (ImGui::Button("Clear All")) {
-					cameraAnimator.clearKeyframes();
-					rebuildPathVisualization();
+				ImGui::SetNextWindowPos(mainViewport->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+				if (ImGui::BeginPopupModal("About MirasEngine", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+					ImGui::Text("MirasEngine");
+					ImGui::TextDisabled("Vulkan 1.3 renderer and IFC/BIM viewer");
+					ImGui::Separator();
+					ImGui::Text("Dear ImGui %s", ImGui::GetVersion());
+					ImGui::Spacing();
+					if (ImGui::Button("Close", ImVec2(120, 0)) || ImGui::IsKeyPressed(ImGuiKey_Escape))
+						ImGui::CloseCurrentPopup();
+					ImGui::EndPopup();
 				}
-
-				ImGui::End();
 
 				// Finalize ImGui frame (must call before RenderDrawData)
 				ImGui::Render();
@@ -4661,7 +4721,7 @@ int main()
 
 			FrameUBO frameData{};
 			frameData.view = getView(camera);
-			frameData.proj = getProjection(float(fbWidth), float(fbHeight));
+			frameData.proj = getProjection(sceneViewW, sceneViewH);
 			frameData.lightSpaceMatrix = calculateLightSpaceMatrix(sunLight, sceneBounds.center, sceneBounds.radius);
 			frameData.cameraPos = glm::vec4(camera.position, 0.0f);
 			frameData.lightDir = glm::vec4(sunLight.direction, 0.0f);
@@ -5196,8 +5256,15 @@ int main()
 			};
 			cmd.bindShadersEXT(2, stages, shaders);
 			cmd.setPrimitiveTopology(vk::PrimitiveTopology::eTriangleList);
-			const vk::Viewport viewport{ 0, 0, float(fbWidth), float(fbHeight), 0.f, 1.f };
-			const vk::Rect2D rect{ {0,0},{fbWidth, fbHeight} };
+			// The scene is drawn only into the editor's central viewport area (window coords -> pixels).
+			const float pixelScaleX = float(fbWidth) / winWidth;
+			const float pixelScaleY = float(fbHeight) / winHeight;
+			const int32_t viewX0 = std::clamp(static_cast<int32_t>(std::lround(sceneViewX * pixelScaleX)), 0, int32_t(fbWidth) - 1);
+			const int32_t viewY0 = std::clamp(static_cast<int32_t>(std::lround(sceneViewY * pixelScaleY)), 0, int32_t(fbHeight) - 1);
+			const int32_t viewX1 = std::clamp(static_cast<int32_t>(std::lround((sceneViewX + sceneViewW) * pixelScaleX)), viewX0 + 1, int32_t(fbWidth));
+			const int32_t viewY1 = std::clamp(static_cast<int32_t>(std::lround((sceneViewY + sceneViewH) * pixelScaleY)), viewY0 + 1, int32_t(fbHeight));
+			const vk::Viewport viewport{ float(viewX0), float(viewY0), float(viewX1 - viewX0), float(viewY1 - viewY0), 0.f, 1.f };
+			const vk::Rect2D rect{ { viewX0, viewY0 }, { uint32_t(viewX1 - viewX0), uint32_t(viewY1 - viewY0) } };
 			cmd.setViewport(0, viewport);
 			cmd.setScissor(0, rect);
 			cmd.setRasterizerDiscardEnable(false);

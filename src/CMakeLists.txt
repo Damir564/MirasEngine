@@ -19,7 +19,7 @@
   engine/SceneSerializer.h 
   engine/CameraAnimation.h 
   engine/CameraAnimation.cpp 
-  engine/FileDialog.h "engine/IfcConverter.h" "engine/IfcLayerInfo.h" "engine/IfcNodeParser.h" "engine/IfcScene.h" "engine/IfcSceneLoader.h" "engine/IfcSceneLoader.cpp" "engine/IfcScene.cpp" )
+  engine/FileDialog.h "engine/IfcConverter.h" "engine/IfcLayerInfo.h" "engine/IfcNodeParser.h" "engine/IfcScene.h" "engine/IfcSceneLoader.h" "engine/IfcSceneLoader.cpp" "engine/IfcScene.cpp" "engine/EditorStyle.h" )
 
 if (CMAKE_VERSION VERSION_GREATER 3.12)
   set_property(TARGET engine PROPERTY CXX_STANDARD 20)
