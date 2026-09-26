@@ -26,6 +26,8 @@ struct GPUModel {
     std::vector<vk::DescriptorSet> textureDescriptorSets;
 
     std::vector<SubmeshInfo> submeshes;
+    // Submesh indices sorted by texture set, so consecutive draws can share one indirect call.
+    std::vector<uint32_t> drawOrder;
     size_t vertexCount = 0;
     size_t indexCount = 0;
 

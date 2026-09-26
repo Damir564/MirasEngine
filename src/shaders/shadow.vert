@@ -17,16 +17,34 @@ layout(set = 0, binding = 0) uniform FrameUBO {
     float shadowBias;
 } ubo;
 
-layout(push_constant) uniform ShadowData {
-    mat4 modelMatrix;
-    float alphaCutoff;
+// Must match GpuDrawData / GpuTransform in main.cpp
+struct DrawData {
+    vec4 baseColor;
+    uint transformIndex;
     int alphaMode;
-} pc;
+    float metallic;
+    float roughness;
+    float alphaCutoff;
+    float _pad0;
+    float _pad1;
+    float _pad2;
+};
+
+struct TransformData {
+    mat4 model;
+    mat4 normal;
+};
+
+layout(std430, set = 0, binding = 1) readonly buffer DrawBuffer { DrawData draws[]; };
+layout(std430, set = 0, binding = 2) readonly buffer TransformBuffer { TransformData transforms[]; };
 
 layout(location = 0) out vec2 fragTexCoord;
+layout(location = 1) flat out uint fragDrawIndex;
 
 void main() {
-    vec4 worldPos = pc.modelMatrix * vec4(inPosition, 1.0);
-    gl_Position = ubo.lightSpaceMatrix * worldPos;
+    uint drawIndex = gl_InstanceIndex;
+    mat4 model = transforms[draws[drawIndex].transformIndex].model;
+    gl_Position = ubo.lightSpaceMatrix * (model * vec4(inPosition, 1.0));
     fragTexCoord = inTexCoord;
+    fragDrawIndex = drawIndex;
 }

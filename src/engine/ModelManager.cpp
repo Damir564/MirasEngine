@@ -2,6 +2,8 @@
 #include <iostream>
 #include <algorithm>
 #include <filesystem>
+#include <numeric>
+#include <tuple>
 #include "stb_image.h"
 #include "Shadow.h"
 #include "IfcLayerInfo.h"
@@ -336,6 +338,14 @@ size_t ModelManager::uploadModelToGPU(Mesh& mesh, const std::string& name, const
     gpuModel->name = name;
     gpuModel->sourcePath = path;
     gpuModel->submeshes = mesh.submeshes;
+    gpuModel->drawOrder.resize(mesh.submeshes.size());
+    std::iota(gpuModel->drawOrder.begin(), gpuModel->drawOrder.end(), 0u);
+    std::stable_sort(gpuModel->drawOrder.begin(), gpuModel->drawOrder.end(), [&](uint32_t a, uint32_t b) {
+        const Material& ma = mesh.submeshes[a].material;
+        const Material& mb = mesh.submeshes[b].material;
+        return std::tie(ma.baseColorTextureIndex, ma.normalTextureIndex, ma.metallicRoughnessTextureIndex) <
+            std::tie(mb.baseColorTextureIndex, mb.normalTextureIndex, mb.metallicRoughnessTextureIndex);
+        });
     gpuModel->vertexCount = mesh.vertices.size();
     gpuModel->indexCount = mesh.indices.size();
     gpuModel->ifcScene = mesh.ifcScene;

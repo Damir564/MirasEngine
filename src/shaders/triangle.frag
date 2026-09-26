@@ -6,6 +6,7 @@ layout(location = 1) in vec3 fragNormal;
 layout(location = 2) in vec2 fragTexCoord;
 layout(location = 3) in mat3 TBN;
 layout(location = 6) in vec4 fragPosLightSpace;
+layout(location = 7) flat in uint fragDrawIndex;
 
 // Set 0: Frame UBO
 layout(set = 0, binding = 0) uniform FrameUBO {
@@ -27,14 +28,20 @@ layout(set = 3, binding = 0) uniform sampler2D mrSampler;
 // Set 4: Shadow Map
 layout(set = 4, binding = 0) uniform sampler2DShadow shadowMapSampler;
 
-layout(push_constant) uniform MeshData {
-    mat4 modelMatrix;
+// Must match GpuDrawData in main.cpp
+struct DrawData {
     vec4 baseColor;
+    uint transformIndex;
+    int alphaMode;
     float metallic;
     float roughness;
     float alphaCutoff;
-    int alphaMode;
-} pc;
+    float _pad0;
+    float _pad1;
+    float _pad2;
+};
+
+layout(std430, set = 0, binding = 1) readonly buffer DrawBuffer { DrawData draws[]; };
 
 layout(location = 0) out vec4 outColor;
 
@@ -129,6 +136,7 @@ vec3 calcLight(vec3 N, vec3 V, vec3 L, vec3 lightColor, float lightIntensity,
 }
 
 void main() {
+    DrawData pc = draws[fragDrawIndex];
     vec4 texColor = texture(baseColorSampler, fragTexCoord);
     float finalAlpha = texColor.a * pc.baseColor.a;
 
