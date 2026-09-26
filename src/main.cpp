@@ -1724,7 +1724,7 @@ int main()
 	SDL_Window* window = SDL_CreateWindow(
 		"Vulkan SDL3",
 		SCREEN_WIDTH, SCREEN_HEIGHT,
-		SDL_WINDOW_VULKAN
+		SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE
 	);
 
 	if (!window) {
@@ -1925,17 +1925,24 @@ int main()
 	// ------------------------
 	// 10. Create Swapchain
 	// ------------------------
-	vkb::SwapchainBuilder swapchain_builder{ vkbDevice };
-	auto swap_ret = swapchain_builder
-		.set_desired_extent(SCREEN_WIDTH, SCREEN_HEIGHT)
-		.set_desired_format(VkSurfaceFormatKHR{
-		VK_FORMAT_B8G8R8A8_SRGB,
-		VK_COLOR_SPACE_SRGB_NONLINEAR_KHR
-			})
-		.set_desired_present_mode(VK_PRESENT_MODE_MAILBOX_KHR)
-		.add_fallback_present_mode(VK_PRESENT_MODE_IMMEDIATE_KHR)
-		.add_fallback_present_mode(VK_PRESENT_MODE_FIFO_KHR)
-		.build();
+	// Also used to recreate the swapchain when the window is resized.
+	auto buildSwapchain = [&](uint32_t width, uint32_t height, VkSwapchainKHR oldSwapchain) {
+		return vkb::SwapchainBuilder{ vkbDevice }
+			.set_old_swapchain(oldSwapchain)
+			.set_desired_extent(width, height)
+			.set_desired_format(VkSurfaceFormatKHR{
+				VK_FORMAT_B8G8R8A8_SRGB,
+				VK_COLOR_SPACE_SRGB_NONLINEAR_KHR
+				})
+			.set_desired_present_mode(VK_PRESENT_MODE_MAILBOX_KHR)
+			.add_fallback_present_mode(VK_PRESENT_MODE_IMMEDIATE_KHR)
+			.add_fallback_present_mode(VK_PRESENT_MODE_FIFO_KHR)
+			.build();
+	};
+
+	int windowPixelWidth = 0, windowPixelHeight = 0;
+	SDL_GetWindowSizeInPixels(window, &windowPixelWidth, &windowPixelHeight);
+	auto swap_ret = buildSwapchain(static_cast<uint32_t>(windowPixelWidth), static_cast<uint32_t>(windowPixelHeight), VK_NULL_HANDLE);
 	if (!swap_ret) {
 		std::cerr << "Failed to create Swapchain\n";
 		vmaDestroyAllocator(allocator);
@@ -1946,7 +1953,10 @@ int main()
 		SDL_Quit();
 		return -1;
 	}
-	vkb::Swapchain vkbSwapchain = swap_ret.value();	
+	vkb::Swapchain vkbSwapchain = swap_ret.value();
+	// Current render size in pixels; follows the swapchain on every resize.
+	uint32_t fbWidth = vkbSwapchain.extent.width;
+	uint32_t fbHeight = vkbSwapchain.extent.height;
 
 	// ------------------------
 	// 11a. Create Depth Image & View
@@ -1956,7 +1966,7 @@ int main()
 	// Image
 	vk::ImageCreateInfo depthImageInfo{};
 	depthImageInfo.imageType = vk::ImageType::e2D;
-	depthImageInfo.extent = vk::Extent3D{ (int)SCREEN_WIDTH, (int)SCREEN_HEIGHT, 1 };
+	depthImageInfo.extent = vk::Extent3D{ fbWidth, fbHeight, 1 };
 	depthImageInfo.mipLevels = 1;
 	depthImageInfo.arrayLayers = 1;
 	depthImageInfo.format = depthFormat;
@@ -2698,7 +2708,62 @@ int main()
 		std::string annotationTargetGuid = "";
 		int annotationTargetInstance = -1;
 		bool showAnnotations = true;
+		// Rebuilds the swapchain and depth buffer for the current window size. Returns false when
+		// there is nothing to render into (window minimized / zero-sized) or recreation failed.
+		bool swapchainDirty = false;
+		auto recreateSwapchain = [&]() -> bool {
+			int pixelWidth = 0, pixelHeight = 0;
+			SDL_GetWindowSizeInPixels(window, &pixelWidth, &pixelHeight);
+			if (pixelWidth <= 0 || pixelHeight <= 0)
+				return false;
+
+			// SDL can still report the old size while the window is being minimized; the surface
+			// extent is authoritative and a swapchain cannot be created while it is 0x0.
+			auto surfaceCaps = physicalDevice.getSurfaceCapabilitiesKHR(vk::SurfaceKHR(surface));
+			if (surfaceCaps.result != vk::Result::eSuccess ||
+				surfaceCaps.value.currentExtent.width == 0 || surfaceCaps.value.currentExtent.height == 0)
+				return false;
+
+			(void)device.waitIdle();
+
+			auto newSwapchain = buildSwapchain(static_cast<uint32_t>(pixelWidth), static_cast<uint32_t>(pixelHeight), vkbSwapchain.swapchain);
+			if (!newSwapchain) {
+				std::cerr << "Failed to recreate swapchain: " << newSwapchain.error().message() << "\n";
+				return false;
+			}
+
+			vkbSwapchain.destroy_image_views(swapchainImageViews);
+			vkb::destroy_swapchain(vkbSwapchain);
+			vkbSwapchain = newSwapchain.value();
+			swapchainImages = vkbSwapchain.get_images().value();
+			swapchainImageViews = vkbSwapchain.get_image_views().value();
+			fbWidth = vkbSwapchain.extent.width;
+			fbHeight = vkbSwapchain.extent.height;
+
+			// "Render finished" semaphores are indexed by swapchain image.
+			while (renderFinishedSemaphores.size() < swapchainImages.size())
+				renderFinishedSemaphores.push_back(device.createSemaphoreUnique({}).value);
+
+			device.destroyImageView(depthImageView);
+			vmaDestroyImage(allocator, depthImage, depthAlloc);
+			depthImageInfo.extent = vk::Extent3D{ fbWidth, fbHeight, 1 };
+			VmaAllocationCreateInfo depthAllocInfo{};
+			depthAllocInfo.usage = VMA_MEMORY_USAGE_GPU_ONLY;
+			VkImage newDepthImage = VK_NULL_HANDLE;
+			if (vmaCreateImage(allocator, reinterpret_cast<VkImageCreateInfo*>(&depthImageInfo), &depthAllocInfo, &newDepthImage, &depthAlloc, nullptr) != VK_SUCCESS)
+				throw std::runtime_error("Failed to recreate depth image");
+			depthImage = vk::Image(newDepthImage);
+			depthViewInfo.image = depthImage;
+			depthImageView = device.createImageView(depthViewInfo).value;
+			return true;
+		};
+
 		while (running) {
+			// Mouse coordinates and ImGui use window coordinates; rendering uses fbWidth/fbHeight (pixels).
+			int winWidthInt = 0, winHeightInt = 0;
+			SDL_GetWindowSize(window, &winWidthInt, &winHeightInt);
+			const float winWidth = static_cast<float>(std::max(winWidthInt, 1));
+			const float winHeight = static_cast<float>(std::max(winHeightInt, 1));
 			uint32_t currentTime = SDL_GetTicks();
 			float dt = (currentTime - lastTime) / 1000.0f; // convert ms to seconds
 			lastTime = currentTime;
@@ -2717,6 +2782,9 @@ int main()
 
 				if (event.type == SDL_EVENT_QUIT)
 					running = false;
+
+				if (event.type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED || event.type == SDL_EVENT_WINDOW_RESIZED)
+					swapchainDirty = true;
 
 				// Only handle keyboard if ImGui doesn't want it
 				if (mouseEnabled || !imguiIO.WantCaptureKeyboard) {
@@ -2794,8 +2862,8 @@ int main()
 						float my = event.button.y;
 
 						glm::mat4 viewMat = getView(camera);
-						glm::mat4 projMat = getProjection(SCREEN_WIDTH, SCREEN_HEIGHT);
-						Ray ray = screenToWorldRay(mx, my, SCREEN_WIDTH, SCREEN_HEIGHT, viewMat, projMat);
+						glm::mat4 projMat = getProjection(winWidth, winHeight);
+						Ray ray = screenToWorldRay(mx, my, winWidth, winHeight, viewMat, projMat);
 
 						bool clickedOnGizmo = false;
 
@@ -2815,7 +2883,7 @@ int main()
 									gizmoScaleVal,
 									15.0f,
 									viewMat, projMat,
-									SCREEN_WIDTH, SCREEN_HEIGHT);
+									winWidth, winHeight);
 							}
 							else {
 								hitAxis = pickGizmoAxis(
@@ -2824,7 +2892,7 @@ int main()
 									gizmoScaleVal,
 									20.0f,
 									viewMat, projMat,
-									SCREEN_WIDTH, SCREEN_HEIGHT);
+									winWidth, winHeight);
 							}
 
 							if (hitAxis != GizmoAxis::None) {
@@ -2911,7 +2979,7 @@ int main()
 						glm::vec2 delta = currentMouse - gizmo.dragStart;
 
 						glm::mat4 viewMat = getView(camera);
-						glm::mat4 projMat = getProjection(SCREEN_WIDTH, SCREEN_HEIGHT);
+						glm::mat4 projMat = getProjection(winWidth, winHeight);
 						glm::mat4 vp = projMat * viewMat;
 
 						// Determine axis direction
@@ -2921,8 +2989,8 @@ int main()
 						if (gizmo.activeAxis == GizmoAxis::Z) axisMask = glm::vec3(0, 0, 1);
 
 						// Project the axis direction to screen space to find the best mouse direction
-						glm::vec2 pixelCenter = worldToScreen(gizmo.originalPosition, vp, SCREEN_WIDTH, SCREEN_HEIGHT);
-						glm::vec2 pixelAxisEnd = worldToScreen(gizmo.originalPosition + axisMask, vp, SCREEN_WIDTH, SCREEN_HEIGHT);
+						glm::vec2 pixelCenter = worldToScreen(gizmo.originalPosition, vp, winWidth, winHeight);
+						glm::vec2 pixelAxisEnd = worldToScreen(gizmo.originalPosition + axisMask, vp, winWidth, winHeight);
 
 						glm::vec2 screenAxisDir = pixelAxisEnd - pixelCenter;
 						float screenAxisLen = glm::length(screenAxisDir);
@@ -2992,6 +3060,19 @@ int main()
 						camera.pitch = glm::clamp(camera.pitch, -89.0f, 89.0f);
 					}
 				}
+			}
+
+			// While minimized the drawable size is 0x0 and no swapchain can exist; idle until restored.
+			if ((SDL_GetWindowFlags(window) & SDL_WINDOW_MINIMIZED) || winWidthInt <= 0 || winHeightInt <= 0) {
+				SDL_Delay(10);
+				continue;
+			}
+			if (swapchainDirty) {
+				if (!recreateSwapchain()) {
+					SDL_Delay(10);
+					continue;
+				}
+				swapchainDirty = false;
 			}
 
 			// Camera movement - only if ImGui doesn't want keyboard
@@ -4043,7 +4124,7 @@ int main()
 
 				if (showAnnotations  && !annotations.empty()) {
 					glm::mat4 viewMat = getView(camera);
-					glm::mat4 projMat = getProjection(SCREEN_WIDTH, SCREEN_HEIGHT);
+					glm::mat4 projMat = getProjection(winWidth, winHeight);
 					glm::mat4 vp = projMat * viewMat;
 
 					ImDrawList* drawList = ImGui::GetForegroundDrawList();
@@ -4068,8 +4149,8 @@ int main()
 							ndc.y < -1.0f || ndc.y > 1.0f)
 							continue;
 
-						float screenX = (ndc.x * 0.5f + 0.5f) * SCREEN_WIDTH;
-						float screenY = (ndc.y * 0.5f + 0.5f) * SCREEN_HEIGHT;
+						float screenX = (ndc.x * 0.5f + 0.5f) * winWidth;
+						float screenY = (ndc.y * 0.5f + 0.5f) * winHeight;
 
 						float dist = glm::distance(camera.position, ann.worldPosition);
 						float alpha = glm::clamp(1.0f - (dist - 50.0f) / 100.0f, 0.1f, 1.0f);
@@ -4541,10 +4622,9 @@ int main()
 			vk::SwapchainKHR swapchainHPP(vkbSwapchain.swapchain);
 
 			(void)device.waitForFences(inFlightFences[currentFrame].get(), VK_TRUE, UINT64_MAX);
-			(void)device.resetFences(inFlightFences[currentFrame].get());
 
 			uint32_t imageIndex = 0;
-			
+
 			vk::Result result = device.acquireNextImageKHR(
 				swapchainHPP,             // swapchain
 				UINT64_MAX,            // timeout, UINT64_MAX = infinite
@@ -4553,10 +4633,20 @@ int main()
 				&imageIndex            // output: index of the acquired image
 			);
 
+			if (result == vk::Result::eErrorOutOfDateKHR) {
+				// Window changed size; rebuild the swapchain next iteration and skip this frame.
+				swapchainDirty = true;
+				continue;
+			}
 			if (result != vk::Result::eSuccess && result != vk::Result::eSuboptimalKHR) {
 				std::cerr << "Failed to acquireNextImageKHR\n";
 				return -1;
 			}
+			if (result == vk::Result::eSuboptimalKHR)
+				swapchainDirty = true;
+
+			// Reset only once we know this frame will be submitted; otherwise the next wait would hang.
+			(void)device.resetFences(inFlightFences[currentFrame].get());
 			// ============================================
 			// CAMERA ANIMATION UPDATE
 			// ============================================
@@ -4571,7 +4661,7 @@ int main()
 
 			FrameUBO frameData{};
 			frameData.view = getView(camera);
-			frameData.proj = getProjection(SCREEN_WIDTH, SCREEN_HEIGHT);
+			frameData.proj = getProjection(float(fbWidth), float(fbHeight));
 			frameData.lightSpaceMatrix = calculateLightSpaceMatrix(sunLight, sceneBounds.center, sceneBounds.radius);
 			frameData.cameraPos = glm::vec4(camera.position, 0.0f);
 			frameData.lightDir = glm::vec4(sunLight.direction, 0.0f);
@@ -5090,7 +5180,7 @@ int main()
 				.setClearValue(vk::ClearValue(vk::ClearDepthStencilValue{ 1.0f, 0 }));
 
 			vk::RenderingInfo renderInfo{};
-			renderInfo.setRenderArea({ {0,0},{(int)SCREEN_WIDTH, (int)SCREEN_HEIGHT} })
+			renderInfo.setRenderArea({ {0,0},{fbWidth, fbHeight} })
 				.setLayerCount(1)
 				.setColorAttachments(colorAttachment)
 				.setPDepthAttachment(&depthAttachment)
@@ -5106,8 +5196,8 @@ int main()
 			};
 			cmd.bindShadersEXT(2, stages, shaders);
 			cmd.setPrimitiveTopology(vk::PrimitiveTopology::eTriangleList);
-			const vk::Viewport viewport{ 0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, 0.f, 1.f };
-			const vk::Rect2D rect{ {0,0},{(int)SCREEN_WIDTH, (int)SCREEN_HEIGHT} };
+			const vk::Viewport viewport{ 0, 0, float(fbWidth), float(fbHeight), 0.f, 1.f };
+			const vk::Rect2D rect{ {0,0},{fbWidth, fbHeight} };
 			cmd.setViewport(0, viewport);
 			cmd.setScissor(0, rect);
 			cmd.setRasterizerDiscardEnable(false);
@@ -5498,8 +5588,12 @@ int main()
 				.setSwapchains(swapchainHPP)
 				.setImageIndices(imageIndex);
 
-			vk::Result presentResult = presentQueue.presentKHR(present);
-			if (presentResult != vk::Result::eSuccess && presentResult != vk::Result::eSuboptimalKHR) {
+			// Pointer overload: returns the raw result instead of asserting on eErrorOutOfDateKHR.
+			vk::Result presentResult = presentQueue.presentKHR(&present);
+			if (presentResult == vk::Result::eErrorOutOfDateKHR || presentResult == vk::Result::eSuboptimalKHR) {
+				swapchainDirty = true;
+			}
+			else if (presentResult != vk::Result::eSuccess) {
 				std::cerr << "Failed to present\n";
 			}
 
