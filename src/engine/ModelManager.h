@@ -19,8 +19,8 @@ struct GPUModel {
     std::string name;
     std::string sourcePath;
 
-    std::unique_ptr<VertexBuffer> vertexBuffer;
-    std::unique_ptr<IndexBuffer> indexBuffer;
+    std::unique_ptr<DeviceBuffer> vertexBuffer;
+    std::unique_ptr<DeviceBuffer> indexBuffer;
 
     std::vector<std::unique_ptr<TextureImage>> textures;
     std::vector<vk::DescriptorSet> textureDescriptorSets;
@@ -92,6 +92,7 @@ public:
 
     size_t createInstance(size_t modelIndex, const glm::vec3& position = glm::vec3(0.0f), const glm::vec3& rotation = glm::vec3(0.0f), const glm::vec3& scale = glm::vec3(1.0f));
     void removeInstance(size_t instanceIndex);
+    void reserveInstances(size_t additional) { m_instances.reserve(m_instances.size() + additional); }
     ModelInstance* getInstance(size_t instanceIndex);
 
     const std::vector<std::unique_ptr<GPUModel>>& getModels() const { return m_models; }
@@ -134,4 +135,7 @@ private:
 
     std::mutex m_mutex;
     size_t m_nextInstanceId = 0;
+
+    bool m_canGenerateMipsSrgb = false;
+    bool m_canGenerateMipsUnorm = false;
 };

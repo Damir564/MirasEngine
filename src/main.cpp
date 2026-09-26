@@ -1091,121 +1091,95 @@ void processFastGltfNode(fastgltf::Asset& asset, size_t nodeIndex, const glm::ma
 			if (posAttrIt == primitive.attributes.end()) continue;
 			auto& posAccessor = asset.accessors[posAttrIt->accessorIndex];
 
+			// Vertices and indices are written straight into the output arrays (no per-primitive temporaries).
+			const size_t vCount = posAccessor.count;
+			const size_t baseVertex = result.vertices.size();
+			const size_t baseIndex = result.indices.size();
+
 			// === INDICES ===
-			std::vector<uint32_t> localIndices;
 			if (primitive.indicesAccessor.has_value()) {
 				auto& idxAccessor = asset.accessors[primitive.indicesAccessor.value()];
 				sub.indexCount = static_cast<uint32_t>(idxAccessor.count);
-				fastgltf::iterateAccessor<std::uint32_t>(asset, idxAccessor, [&](std::uint32_t idx) {
-					localIndices.push_back(idx);
+				result.indices.resize(baseIndex + idxAccessor.count);
+				uint32_t* dst = result.indices.data() + baseIndex;
+				fastgltf::iterateAccessorWithIndex<std::uint32_t>(asset, idxAccessor, [dst](std::uint32_t idx, size_t i) {
+					dst[i] = idx;
 					});
 			}
 			else {
-				sub.indexCount = static_cast<uint32_t>(posAccessor.count);
-				for (size_t i = 0; i < posAccessor.count; ++i) localIndices.push_back((uint32_t)i);
+				sub.indexCount = static_cast<uint32_t>(vCount);
+				result.indices.resize(baseIndex + vCount);
+				std::iota(result.indices.begin() + baseIndex, result.indices.end(), 0u);
+			}
+			const uint32_t* localIndices = result.indices.data() + baseIndex;
+			const size_t localIndexCount = sub.indexCount;
+
+			// === VERTICES ===
+			result.vertices.resize(baseVertex + vCount);
+			Vertex* verts = result.vertices.data() + baseVertex;
+			for (size_t i = 0; i < vCount; ++i) {
+				verts[i].normal = glm::vec3(0.0f);
+				verts[i].texCoord = glm::vec2(0.0f);
+				verts[i].tangent = glm::vec4(1.0f, 0.0f, 0.0f, 1.0f);
 			}
 
-			// === DATA ARRAYS ===
-			size_t vCount = posAccessor.count;
-			std::vector<glm::vec3> positions(vCount);
-			// Initialize with 0
-			std::vector<glm::vec3> normals(vCount, glm::vec3(0.0f));
-			std::vector<glm::vec2> texcoords(vCount, glm::vec2(0.0f));
-			// Initialize tangents to valid vector to avoid NaN in normalization later
-			std::vector<glm::vec4> tangents(vCount, glm::vec4(1.0f, 0.0f, 0.0f, 1.0f));
-
-			// Load Positions
 			fastgltf::iterateAccessorWithIndex<fastgltf::math::fvec3>(asset, posAccessor,
-				[&](fastgltf::math::fvec3 v, size_t i) {
-					positions[i] = glm::vec3(v.x(), v.y(), v.z());
+				[verts](fastgltf::math::fvec3 v, size_t i) {
+					verts[i].position = glm::vec3(v.x(), v.y(), v.z());
 				});
 
-			// Load Normals (if they exist)
 			bool hasNormals = false;
 			if (auto it = primitive.findAttribute("NORMAL"); it != primitive.attributes.end()) {
 				hasNormals = true;
 				fastgltf::iterateAccessorWithIndex<fastgltf::math::fvec3>(asset, asset.accessors[it->accessorIndex],
-					[&](fastgltf::math::fvec3 v, size_t i) {
-						normals[i] = glm::vec3(v.x(), v.y(), v.z());
+					[verts](fastgltf::math::fvec3 v, size_t i) {
+						verts[i].normal = glm::vec3(v.x(), v.y(), v.z());
 					});
 			}
 
-			// === GENERATE NORMALS IF MISSING ===
 			if (!hasNormals) {
-				// Iterate over triangles to calculate face normals
-				for (size_t i = 0; i < localIndices.size(); i += 3) {
-					// Protect against out of bounds if index count isn't multiple of 3
-					if (i + 2 >= localIndices.size()) break;
-
+				for (size_t i = 0; i + 2 < localIndexCount; i += 3) {
 					uint32_t i0 = localIndices[i];
 					uint32_t i1 = localIndices[i + 1];
 					uint32_t i2 = localIndices[i + 2];
-
-					glm::vec3 p0 = positions[i0];
-					glm::vec3 p1 = positions[i1];
-					glm::vec3 p2 = positions[i2];
-
-					glm::vec3 edge1 = p1 - p0;
-					glm::vec3 edge2 = p2 - p0;
-					// Cross product gives the normal perpendicular to the face
-					glm::vec3 faceNormal = glm::normalize(glm::cross(edge1, edge2));
-
-					// Accumulate normals (smooth shading approximation)
-					normals[i0] += faceNormal;
-					normals[i1] += faceNormal;
-					normals[i2] += faceNormal;
+					glm::vec3 faceNormal = glm::normalize(glm::cross(
+						verts[i1].position - verts[i0].position,
+						verts[i2].position - verts[i0].position));
+					verts[i0].normal += faceNormal;
+					verts[i1].normal += faceNormal;
+					verts[i2].normal += faceNormal;
 				}
-
-				// Normalize results
-				for (auto& n : normals) {
-					if (glm::length(n) > 0.0001f)
-						n = glm::normalize(n);
-					else
-						n = glm::vec3(0.0f, 1.0f, 0.0f); // Fallback
+				for (size_t i = 0; i < vCount; ++i) {
+					glm::vec3& n = verts[i].normal;
+					n = glm::length(n) > 0.0001f ? glm::normalize(n) : glm::vec3(0.0f, 1.0f, 0.0f);
 				}
 			}
 
-			// Load UVs
 			if (auto it = primitive.findAttribute("TEXCOORD_0"); it != primitive.attributes.end()) {
 				fastgltf::iterateAccessorWithIndex<fastgltf::math::fvec2>(asset, asset.accessors[it->accessorIndex],
-					[&](fastgltf::math::fvec2 v, size_t i) {
-						texcoords[i] = glm::vec2(v.x(), v.y());
+					[verts](fastgltf::math::fvec2 v, size_t i) {
+						verts[i].texCoord = glm::vec2(v.x(), v.y());
 					});
 			}
 
-			// Load Tangents
 			if (auto it = primitive.findAttribute("TANGENT"); it != primitive.attributes.end()) {
 				fastgltf::iterateAccessorWithIndex<fastgltf::math::fvec4>(asset, asset.accessors[it->accessorIndex],
-					[&](fastgltf::math::fvec4 v, size_t i) {
-						tangents[i] = glm::vec4(v.x(), v.y(), v.z(), v.w());
+					[verts](fastgltf::math::fvec4 v, size_t i) {
+						verts[i].tangent = glm::vec4(v.x(), v.y(), v.z(), v.w());
 					});
 			}
 
-			// === TRANSFORM AND PUSH ===
+			// === TRANSFORM IN PLACE ===
 			for (size_t i = 0; i < vCount; ++i) {
-				Vertex v{};
-				v.position = glm::vec3(globalTransform * glm::vec4(positions[i], 1.0f));
+				Vertex& v = verts[i];
+				v.position = glm::vec3(globalTransform * glm::vec4(v.position, 1.0f));
+				v.normal = glm::normalize(normalMatrix * v.normal);
 
-				// Apply Normal Matrix
-				v.normal = glm::normalize(normalMatrix * normals[i]);
-
-				// Handle Tangents safely
-				glm::vec3 tXYZ = glm::vec3(tangents[i]);
-				// Only normalize if length is valid to prevent NaN
-				if (glm::length(tXYZ) > 0.0001f) {
-					glm::vec3 transformedTangent = glm::normalize(normalMatrix * tXYZ);
-					v.tangent = glm::vec4(transformedTangent, tangents[i].w);
-				}
-				else {
+				glm::vec3 tXYZ = glm::vec3(v.tangent);
+				if (glm::length(tXYZ) > 0.0001f)
+					v.tangent = glm::vec4(glm::normalize(normalMatrix * tXYZ), v.tangent.w);
+				else
 					v.tangent = glm::vec4(1.0f, 0.0f, 0.0f, 1.0f);
-				}
-
-				v.texCoord = texcoords[i];
-				result.vertices.push_back(v);
-			}
-
-			for (uint32_t idx : localIndices) {
-				result.indices.push_back(idx);
 			}
 
 			// === MATERIALS (Existing logic) ===
@@ -1302,17 +1276,21 @@ void processFastGltfNode(fastgltf::Asset& asset, size_t nodeIndex, const glm::ma
 	}
 }
 
-size_t calculateTotalVertices(const fastgltf::Asset& asset) {
-	size_t totalVertices = 0;
-	for (const auto& mesh : asset.meshes) {
-		for (const auto& primitive : mesh.primitives) {
+// Counts vertices/indices over the scene's node tree (meshes can be instanced by several nodes).
+void calculateTotals(const fastgltf::Asset& asset, size_t nodeIndex, size_t& totalVertices, size_t& totalIndices) {
+	const auto& node = asset.nodes[nodeIndex];
+	if (node.meshIndex.has_value()) {
+		for (const auto& primitive : asset.meshes[*node.meshIndex].primitives) {
 			auto it = primitive.findAttribute("POSITION");
-			if (it != primitive.attributes.end()) {
-				totalVertices += asset.accessors[it->accessorIndex].count;
-			}
+			if (it == primitive.attributes.end()) continue;
+			size_t vCount = asset.accessors[it->accessorIndex].count;
+			totalVertices += vCount;
+			totalIndices += primitive.indicesAccessor.has_value()
+				? asset.accessors[*primitive.indicesAccessor].count : vCount;
 		}
 	}
-	return totalVertices;
+	for (size_t child : node.children)
+		calculateTotals(asset, child, totalVertices, totalIndices);
 }
 
 inline void computeAllSubmeshBounds(Mesh& mesh)
@@ -1443,27 +1421,21 @@ void buildIfcScene(
 		}
 	}
 
-	std::vector<std::string> toRemove;
-	for (auto& [guid, elem] : scene.elements) {
-		if (elem.submeshIndex == std::numeric_limits<std::size_t>::max())
-			toRemove.push_back(guid);
-	}
+	const std::size_t elementCountBefore = scene.elements.size();
+	std::erase_if(scene.elements, [](const auto& kv) {
+		return kv.second.submeshIndex == std::numeric_limits<std::size_t>::max();
+		});
 
-	for (auto& guid : toRemove) {
-		scene.elements.erase(guid);
-
-		for (auto& [sg, sn] : scene.spatial) {
-			auto& ev = sn.elementGuids;
-			ev.erase(
-				std::remove(ev.begin(), ev.end(), guid),
-				ev.end());
-		}
+	for (auto& [sg, sn] : scene.spatial) {
+		std::erase_if(sn.elementGuids, [&](const std::string& guid) {
+			return !scene.elements.contains(guid);
+			});
 	}
 
 	std::size_t matched = scene.submeshToGuid.size();
 
 	std::cout << "[IFC] " << scene.elements.size() << " elements with geometry, "
-		<< toRemove.size() << " without geometry removed, "
+		<< (elementCountBefore - scene.elements.size()) << " without geometry removed, "
 		<< matched << " submeshes matched\n";
 }
 
@@ -1481,16 +1453,18 @@ Mesh loadWithFastGltf(const std::string& path) {
 		throw std::runtime_error("Failed to parse: " + std::string(fastgltf::getErrorMessage(error)));
 	}
 	auto& asset = assetRet.get();
-	size_t totalVerts = calculateTotalVertices(asset);
-	result.vertices.reserve(totalVerts);
-	result.indices.reserve(totalVerts);
 	std::unordered_map<std::string, int> textureCache;
 
 	size_t sceneIndex = asset.defaultScene.value_or(0);
 	if (asset.scenes.empty()) return result;
 
-
 	const auto& scene = asset.scenes[sceneIndex];
+
+	size_t totalVerts = 0, totalIndices = 0;
+	for (size_t nodeIndex : scene.nodeIndices)
+		calculateTotals(asset, nodeIndex, totalVerts, totalIndices);
+	result.vertices.reserve(totalVerts);
+	result.indices.reserve(totalIndices);
 	glm::mat4 rootTransform(1.0f);
 
 	for (size_t nodeIndex : scene.nodeIndices) {
@@ -1523,22 +1497,25 @@ Mesh loadWithFastGltf(const std::string& path) {
 }
 
 IfcScene beginLoadIfcScene(const std::string& ifcPath, const std::string& glbPath, const std::string jsonPath) {
-	IfcScene ifcScene = {};
+	// Metadata JSON parsing is independent of the glTF node walk, so overlap them.
+	auto metadataFuture = std::async(std::launch::async, [jsonPath]() {
+		IfcScene scene{};
+		if (!loadIfcScene(jsonPath, scene)) {
+			std::cerr << "[IFC] Warning: failed to load metadata from " << jsonPath << "\n";
+		}
+		return scene;
+		});
 
-	
-	if (!loadIfcScene(jsonPath, ifcScene)) {
-		std::cerr << "[IFC] Warning: failed to load metadata from " << jsonPath << "\n";
-	}
 	fastgltf::Parser parser;
 	auto gltfFile = fastgltf::MappedGltfFile::FromPath(glbPath);
 	if (!gltfFile)
-		return ifcScene;
+		return metadataFuture.get();
 
 	auto assetRet = parser.loadGltf(gltfFile.get(),
 		std::filesystem::path(glbPath).parent_path(), fastgltf::Options::None);
 
 	if (assetRet.error() != fastgltf::Error::None)
-		return ifcScene;
+		return metadataFuture.get();
 
 	auto& asset = assetRet.get();
 	std::vector<size_t> submeshNodeMap;
@@ -1559,20 +1536,26 @@ IfcScene beginLoadIfcScene(const std::string& ifcPath, const std::string& glbPat
 			walk(ni);
 	}
 
+	IfcScene ifcScene = metadataFuture.get();
 	buildIfcScene(ifcScene, asset, submeshNodeMap);
-	
 
 	return ifcScene;
 }
 
 Mesh loadIfcModel(const std::string& ifcPath) {
+	// IfcConvert (geometry) and the metadata extractor are separate processes; run them concurrently.
+	auto jsonFuture = std::async(std::launch::async, [ifcPath]() { return IfcConverter::toJson(ifcPath); });
+
 	auto glbOpt = IfcConverter::toGlb(ifcPath);
-	if (!glbOpt) throw std::runtime_error("IFC conversion failed to GLB: " + ifcPath);
+	if (!glbOpt) {
+		jsonFuture.wait();
+		throw std::runtime_error("IFC conversion failed to GLB: " + ifcPath);
+	}
 	std::string glbPath = *glbOpt;
 
 	Mesh result = loadWithFastGltf(glbPath);
 
-	auto jsonOpt = IfcConverter::toJson(ifcPath);
+	auto jsonOpt = jsonFuture.get();
 	if (!jsonOpt) throw std::runtime_error("IFC conversion failed to JSON: " + ifcPath);
 	std::string jsonPath = *jsonOpt;
 	result.ifcScene = beginLoadIfcScene(ifcPath, glbPath, jsonPath);
@@ -1646,13 +1629,23 @@ Mesh loadModelSmart(const std::string& path) {
 		std::cout << "[CACHE] Found valid cache for: " << path << ". Loading... ";
 		auto start = std::chrono::high_resolution_clock::now();
 
-		if (ModelSerializer::LoadFromCache(cachePath, result)) {
-			if (isIfc) {
-				fs::path fileStem = fsPath.stem();
-				std::string jsonPath = pathToUtf8((fsPath.parent_path() / "converted" / fileStem)) + ".json";
-				std::string glbPath = pathToUtf8((fsPath.parent_path() / "converted" / fileStem)) + ".glb";
-				result.ifcScene = beginLoadIfcScene(path, glbPath, jsonPath);
-			}
+		std::future<IfcScene> ifcFuture;
+		if (isIfc) {
+			fs::path fileStem = fsPath.stem();
+			std::string jsonPath = pathToUtf8((fsPath.parent_path() / "converted" / fileStem)) + ".json";
+			std::string glbPath = pathToUtf8((fsPath.parent_path() / "converted" / fileStem)) + ".glb";
+			ifcFuture = std::async(std::launch::async, [path, glbPath, jsonPath]() {
+				return beginLoadIfcScene(path, glbPath, jsonPath);
+				});
+		}
+
+		const bool cacheLoaded = ModelSerializer::LoadFromCache(cachePath, result);
+		if (ifcFuture.valid()) {
+			IfcScene scene = ifcFuture.get();
+			if (cacheLoaded) result.ifcScene = std::move(scene);
+		}
+
+		if (cacheLoaded) {
 			auto end = std::chrono::high_resolution_clock::now();
 			std::chrono::duration<float, std::milli> duration = end - start;
 			// std::cout << "Done (" << duration.count() << "ms)\n";
@@ -1927,7 +1920,9 @@ int main()
 		VK_FORMAT_B8G8R8A8_SRGB,
 		VK_COLOR_SPACE_SRGB_NONLINEAR_KHR
 			})
-		.set_desired_present_mode(VK_PRESENT_MODE_FIFO_KHR)
+		.set_desired_present_mode(VK_PRESENT_MODE_MAILBOX_KHR)
+		.add_fallback_present_mode(VK_PRESENT_MODE_IMMEDIATE_KHR)
+		.add_fallback_present_mode(VK_PRESENT_MODE_FIFO_KHR)
 		.build();
 	if (!swap_ret) {
 		std::cerr << "Failed to create Swapchain\n";
@@ -2073,6 +2068,7 @@ int main()
 		samplerInfo.unnormalizedCoordinates = VK_FALSE;
 		samplerInfo.compareEnable = VK_FALSE;
 		samplerInfo.mipmapMode = vk::SamplerMipmapMode::eLinear;
+		samplerInfo.maxLod = VK_LOD_CLAMP_NONE;
 
 		vk::UniqueSampler textureSampler = device.createSamplerUnique(samplerInfo).value;
 
@@ -3024,6 +3020,7 @@ int main()
 						}
 
 						// Create all instances
+						modelManager->reserveInstances(pendingScene.instances.size());
 						for (const auto& inst : pendingScene.instances) {
 							if (inst.fileModelIndex >= fileToManager.size()) continue;
 							int managerIdx = fileToManager[inst.fileModelIndex];
@@ -4494,6 +4491,7 @@ int main()
 								}
 							}
 						}
+						modelManager->reserveInstances(pendingScene.instances.size());
 						for (const auto& inst : pendingScene.instances) {
 							if (inst.fileModelIndex >= fileToManager.size()) continue;
 							int managerIdx = fileToManager[inst.fileModelIndex];
@@ -4558,20 +4556,24 @@ int main()
 			memcpy(frameUBOs[currentFrame].mapped, &frameData, sizeof(FrameUBO));
 
 			// PRE-PASS. CULLING AND BATCHING
+			constexpr uint8_t kVisibleMain = 1;
+			constexpr uint8_t kVisibleShadow = 2;
+
 			struct InstanceRenderData {
 				const ModelInstance* instance;
 				glm::mat4 transform;
+				const uint8_t* submeshFlags;
 			};
 
 			struct RenderBatch {
-				GPUModel* model;
+				GPUModel* model = nullptr;
 				std::vector<InstanceRenderData> instances;
 			};
 
 			std::unordered_map<size_t, RenderBatch> shadowBatches;
 			std::unordered_map<size_t, RenderBatch> mainBatches;
 
-			static glm::mat4 lightSpaceMatrix = frameData.lightSpaceMatrix;
+			const glm::mat4& lightSpaceMatrix = frameData.lightSpaceMatrix;
 			float maxShadowDistance = 150.0f;
 
 			// --- MULTITHREADED CULLING START ---
@@ -4582,22 +4584,32 @@ int main()
 				const ModelInstance* instance = nullptr;
 				size_t modelIndex = 0;
 				GPUModel* gpuModel = nullptr;
+				FrustumPlanes mainPlanes{};
+				FrustumPlanes shadowPlanes{};
+				std::vector<uint8_t> submeshFlags;
 			};
 
 			const auto& instances = modelManager->getInstances();
-			std::vector<CullResult> cullResults(instances.size());
+			// Static so per-instance flag vectors keep their capacity across frames.
+			static std::vector<CullResult> cullResults;
+			cullResults.resize(instances.size());
 
-			// Create indices array [0, 1, 2, ... N]
-			std::vector<size_t> indices(instances.size());
+			static std::vector<size_t> indices;
+			indices.resize(instances.size());
 			std::iota(indices.begin(), indices.end(), 0);
 
-			// 1. Parallel Math Phase (No locks, threads write to their own index)
+			const glm::mat4 viewProj = frameData.proj * frameData.view;
+
+			// 1. Per-instance phase: transform + whole-model culling.
 			std::for_each(std::execution::par, indices.begin(), indices.end(), [&](size_t i) {
 				const auto& inst = instances[i];
 				auto& res = cullResults[i];
 
 				res.instance = &inst;
 				res.modelIndex = inst.modelIndex;
+				res.gpuModel = nullptr;
+				res.visibleMain = false;
+				res.visibleShadow = false;
 
 				if (!inst.visible) return;
 
@@ -4607,49 +4619,106 @@ int main()
 				res.gpuModel = gpuModel;
 				res.transform = inst.getTransformMatrix();
 
-				// Main view culling
-				glm::mat4 MVP_main = frameData.proj * frameData.view * res.transform;
-				res.visibleMain = isAABBVisible(gpuModel->boundsMin, gpuModel->boundsMax, MVP_main);
+				res.mainPlanes = extractFrustumPlanes(viewProj * res.transform);
+				res.visibleMain = isAABBInFrustum(res.mainPlanes, gpuModel->boundsMin, gpuModel->boundsMax);
 
-				// Shadow culling
 				glm::vec3 worldCenter = glm::vec3(res.transform * glm::vec4(gpuModel->boundsCenter, 1.0f));
 				float maxScale = std::max({ inst.scale.x, inst.scale.y, inst.scale.z });
 				float distToCamera = glm::distance(worldCenter, camera.position) - (gpuModel->boundsRadius * maxScale);
 
 				if (distToCamera < maxShadowDistance) {
-					glm::mat4 MVP_shadow = lightSpaceMatrix * res.transform;
-					res.visibleShadow = isAABBVisible(gpuModel->boundsMin, gpuModel->boundsMax, MVP_shadow);
+					res.shadowPlanes = extractFrustumPlanes(lightSpaceMatrix * res.transform);
+					res.visibleShadow = isAABBInFrustum(res.shadowPlanes, gpuModel->boundsMin, gpuModel->boundsMax);
+				}
+
+				res.submeshFlags.assign(gpuModel->submeshes.size(), 0);
+				});
+
+			// 2. Per-submesh phase, split into chunks so a single huge model still uses all cores.
+			struct CullChunk { size_t instanceIdx; size_t begin; size_t end; };
+			static std::vector<CullChunk> cullChunks;
+			cullChunks.clear();
+			constexpr size_t kCullChunkSize = 1024;
+			for (size_t i = 0; i < cullResults.size(); ++i) {
+				const auto& res = cullResults[i];
+				if (!res.gpuModel || !(res.visibleMain || res.visibleShadow)) continue;
+				const size_t n = res.gpuModel->submeshes.size();
+				for (size_t b = 0; b < n; b += kCullChunkSize)
+					cullChunks.push_back({ i, b, std::min(b + kCullChunkSize, n) });
+			}
+
+			std::for_each(std::execution::par, cullChunks.begin(), cullChunks.end(), [&](const CullChunk& chunk) {
+				auto& res = cullResults[chunk.instanceIdx];
+				const auto& submeshes = res.gpuModel->submeshes;
+				const IfcScene* ifc = res.instance->ifcScene ? &*res.instance->ifcScene : nullptr;
+
+				for (size_t s = chunk.begin; s < chunk.end; ++s) {
+					if (ifc && !ifc->isSubmeshVisible(s)) continue;
+
+					const SubmeshInfo& sub = submeshes[s];
+					const bool validBounds = sub.boundsMin.x <= sub.boundsMax.x;
+					uint8_t flags = 0;
+					if (res.visibleMain &&
+						(!validBounds || isAABBInFrustum(res.mainPlanes, sub.boundsMin, sub.boundsMax)))
+						flags |= kVisibleMain;
+					if (res.visibleShadow && sub.material.alphaMode != AlphaMode::BLEND &&
+						(!validBounds || isAABBInFrustum(res.shadowPlanes, sub.boundsMin, sub.boundsMax)))
+						flags |= kVisibleShadow;
+					res.submeshFlags[s] = flags;
 				}
 				});
 
-			// 2. Sequential Aggregation Phase (Fast, safely modifies unordered_maps)
+			// 3. Sequential aggregation. Also hashes everything that affects the shadow map so
+			// the shadow pass can be skipped when nothing relevant changed.
+			uint64_t shadowHash = 1469598103934665603ull;
+			auto hashBytes = [&shadowHash](const void* data, size_t size) {
+				const uint8_t* p = static_cast<const uint8_t*>(data);
+				for (size_t i = 0; i < size; ++i) {
+					shadowHash ^= p[i];
+					shadowHash *= 1099511628211ull;
+				}
+			};
+			hashBytes(&lightSpaceMatrix, sizeof(glm::mat4));
+
 			for (const auto& res : cullResults) {
-				if (!res.gpuModel) continue; // Skip invalid or invisible base objects
+				if (!res.gpuModel) continue;
+
+				InstanceRenderData renderData{ res.instance, res.transform, res.submeshFlags.data() };
 
 				if (res.visibleMain) {
-					if (mainBatches.find(res.modelIndex) == mainBatches.end()) {
-						mainBatches[res.modelIndex] = { res.gpuModel, {} };
-					}
-					mainBatches[res.modelIndex].instances.push_back({ res.instance, res.transform });
+					auto& batch = mainBatches[res.modelIndex];
+					batch.model = res.gpuModel;
+					batch.instances.push_back(renderData);
 				}
 
 				if (res.visibleShadow) {
-					if (shadowBatches.find(res.modelIndex) == shadowBatches.end()) {
-						shadowBatches[res.modelIndex] = { res.gpuModel, {} };
+					auto& batch = shadowBatches[res.modelIndex];
+					batch.model = res.gpuModel;
+					batch.instances.push_back(renderData);
+
+					hashBytes(&res.gpuModel, sizeof(res.gpuModel));
+					hashBytes(&res.transform, sizeof(glm::mat4));
+					for (uint8_t f : res.submeshFlags) {
+						shadowHash ^= (f & kVisibleShadow);
+						shadowHash *= 1099511628211ull;
 					}
-					shadowBatches[res.modelIndex].instances.push_back({ res.instance, res.transform });
 				}
 			}
+
+			static uint64_t lastShadowHash = 0;
+			static bool shadowMapValid = false;
+			const bool renderShadowMap = !shadowMapValid || shadowHash != lastShadowHash;
+			lastShadowHash = shadowHash;
+			shadowMapValid = true;
 			auto startShadowPass = std::chrono::high_resolution_clock::now();
 			// Record command buffer to clear blue
 			vk::CommandBuffer cmd = commandBuffers[currentFrame].get();
 			(void)cmd.reset();
 			(void)cmd.begin({ vk::CommandBufferUsageFlagBits::eOneTimeSubmit });
 
-			// Shadow pass
-			{
-				glm::mat4 lightSpaceMatrix = calculateLightSpaceMatrix(sunLight, sceneBounds.center, sceneBounds.radius);
-
+			// Shadow pass (skipped when the shadow-caster set is unchanged; the map keeps its
+			// previous contents in DepthStencilReadOnlyOptimal)
+			if (renderShadowMap) {
 				// Transition shadow map to depth attachment
 				vk::ImageMemoryBarrier2 shadowBarrier{};
 				shadowBarrier.setSrcStageMask(vk::PipelineStageFlagBits2::eFragmentShader)
@@ -4745,8 +4814,11 @@ int main()
 
 						if (sub.material.alphaMode == AlphaMode::BLEND) continue;
 
-						bool alphaChanged = (static_cast<int>(sub.material.alphaMode) != lastAlphaMode) ||
-							(sub.material.alphaCutoff != lastAlphaCutoff);
+						bool anyVisible = false;
+						for (const auto& renderData : batch.instances) {
+							if (renderData.submeshFlags[si] & kVisibleShadow) { anyVisible = true; break; }
+						}
+						if (!anyVisible) continue;
 
 						if (sub.material.alphaMode == AlphaMode::MASK) {
 							vk::DescriptorSet targetSet = (sub.material.baseColorTextureIndex >= 0 &&
@@ -4761,7 +4833,7 @@ int main()
 						}
 
 						for (const auto& renderData : batch.instances) {
-							if (renderData.instance->ifcScene && !renderData.instance->ifcScene->isSubmeshVisible(si))
+							if (!(renderData.submeshFlags[si] & kVisibleShadow))
 								continue;
 
 							ShadowPushConstants shadowPc{};
@@ -4935,6 +5007,12 @@ int main()
 
 					if (sub.material.alphaMode == AlphaMode::BLEND) continue;
 
+					bool anyVisible = false;
+					for (const auto& renderData : batch.instances) {
+						if (renderData.submeshFlags[si] & kVisibleMain) { anyVisible = true; break; }
+					}
+					if (!anyVisible) continue;
+
 					if (currentlyBlending) {
 						cmd.setColorBlendEnableEXT(0, VK_FALSE);
 						cmd.setDepthWriteEnable(VK_TRUE);
@@ -4951,7 +5029,7 @@ int main()
 					}
 
 					for (const auto& renderData : batch.instances) {
-						if (renderData.instance->ifcScene && !renderData.instance->ifcScene->isSubmeshVisible(si)) continue;
+						if (!(renderData.submeshFlags[si] & kVisibleMain)) continue;
 
 						MeshPushConstants pc{};
 						pc.modelMatrix = renderData.transform;
@@ -4967,6 +5045,7 @@ int main()
 				}
 			}
 
+			std::vector<InstanceRenderData> sortedInstances;
 			for (const auto& [modelIdx, batch] : mainBatches) {
 				GPUModel* gpuModel = batch.model;
 				bool buffersBound = false;
@@ -4977,7 +5056,20 @@ int main()
 					// Skip Opaque/Mask in Pass B
 					if (sub.material.alphaMode != AlphaMode::BLEND) continue;
 
+					bool anyVisible = false;
+					for (const auto& renderData : batch.instances) {
+						if (renderData.submeshFlags[si] & kVisibleMain) { anyVisible = true; break; }
+					}
+					if (!anyVisible) continue;
+
 					if (!buffersBound) {
+						sortedInstances = batch.instances;
+						std::sort(sortedInstances.begin(), sortedInstances.end(), [&](const InstanceRenderData& a, const InstanceRenderData& b) {
+							float distA = glm::distance(camera.position, a.instance->position);
+							float distB = glm::distance(camera.position, b.instance->position);
+							return distA > distB;
+							});
+
 						vk::Buffer modelBuffers[1] = { gpuModel->vertexBuffer->getBuffer() };
 						vk::DeviceSize modelOffsets[1] = { 0 };
 						vk::DeviceSize modelSizes[1] = { sizeof(Vertex) * gpuModel->vertexCount };
@@ -5010,15 +5102,8 @@ int main()
 						cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipelineLayout, 1, 3, boundMaterialSets, 0, nullptr);
 					}
 
-					std::vector<InstanceRenderData> sortedInstances = batch.instances;
-					std::sort(sortedInstances.begin(), sortedInstances.end(), [&](const InstanceRenderData& a, const InstanceRenderData& b) {
-						float distA = glm::distance(camera.position, a.instance->position);
-						float distB = glm::distance(camera.position, b.instance->position);
-						return distA > distB;
-						});
-
 					for (const auto& renderData : sortedInstances) {
-						if (renderData.instance->ifcScene && !renderData.instance->ifcScene->isSubmeshVisible(si)) continue;
+						if (!(renderData.submeshFlags[si] & kVisibleMain)) continue;
 
 						MeshPushConstants pc{};
 						pc.modelMatrix = renderData.transform;

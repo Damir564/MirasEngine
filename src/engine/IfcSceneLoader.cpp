@@ -17,17 +17,22 @@ bool loadIfcScene(const std::string& jsonPath, IfcScene& scene)
 {
     scene = {};
 
-    std::ifstream f(jsonPath);
+    std::ifstream f(jsonPath, std::ios::binary | std::ios::ate);
     if (!f.is_open())
     {
         std::cerr << "[IFC] Cannot open " << jsonPath << "\n";
         return false;
     }
 
+    // Parsing from a contiguous buffer is much faster than from an istream.
+    std::string content(static_cast<size_t>(f.tellg()), '\0');
+    f.seekg(0);
+    f.read(content.data(), static_cast<std::streamsize>(content.size()));
+
     json root;
     try
     {
-        root = json::parse(f);
+        root = json::parse(content.data(), content.data() + content.size());
     }
     catch (const std::exception& e)
     {
@@ -49,6 +54,7 @@ bool loadIfcScene(const std::string& jsonPath, IfcScene& scene)
 
     if (root.contains("spatial") && root["spatial"].is_object())
     {
+        scene.spatial.reserve(root["spatial"].size());
         for (auto& [guid, sj] : root["spatial"].items())
         {
             IfcSpatialNode node;
@@ -99,6 +105,7 @@ bool loadIfcScene(const std::string& jsonPath, IfcScene& scene)
 
     if (root.contains("elements") && root["elements"].is_object())
     {
+        scene.elements.reserve(root["elements"].size());
         for (auto& [guid, ej] : root["elements"].items())
         {
             IfcElement elem;

@@ -7,41 +7,21 @@
 #include "IfcLayerInfo.h"
 #include "IfcScene.h"
 
-// TextureImage class - move from main.cpp or keep inline here
 class TextureImage {
 public:
-    TextureImage(VmaAllocator allocator, vk::Device device, vk::CommandPool cmdPool,
-        vk::Queue queue, const TextureData& data, vk::Format format)
-        : m_allocator(allocator), m_device(device) {
-
-        vk::DeviceSize imageSize = data.width * data.height * 4;
-
-        VkBufferCreateInfo stagingInfo = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
-        stagingInfo.size = imageSize;
-        stagingInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-        VmaAllocationCreateInfo stagingAllocInfo = {};
-        stagingAllocInfo.usage = VMA_MEMORY_USAGE_CPU_ONLY;
-
-        VkBuffer stagingBuffer;
-        VmaAllocation stagingAlloc;
-        vmaCreateBuffer(allocator, &stagingInfo, &stagingAllocInfo, &stagingBuffer, &stagingAlloc, nullptr);
-
-        void* mapped;
-        vmaMapMemory(allocator, stagingAlloc, &mapped);
-        memcpy(mapped, data.pixels, static_cast<size_t>(imageSize));
-        vmaUnmapMemory(allocator, stagingAlloc);
+    TextureImage(VmaAllocator allocator, vk::Device device, uint32_t width, uint32_t height,
+        vk::Format format, uint32_t mipLevels)
+        : m_allocator(allocator), m_device(device), m_width(width), m_height(height), m_mipLevels(mipLevels) {
 
         VkImageCreateInfo imageInfo = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
         imageInfo.imageType = VK_IMAGE_TYPE_2D;
-        imageInfo.extent.width = data.width;
-        imageInfo.extent.height = data.height;
-        imageInfo.extent.depth = 1;
-        imageInfo.mipLevels = 1;
+        imageInfo.extent = { width, height, 1 };
+        imageInfo.mipLevels = mipLevels;
         imageInfo.arrayLayers = 1;
         imageInfo.format = static_cast<VkFormat>(format);
         imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
         imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        imageInfo.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        imageInfo.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
         imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
         imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
@@ -49,38 +29,16 @@ public:
         imageAllocInfo.usage = VMA_MEMORY_USAGE_GPU_ONLY;
 
         VkImage rawImage;
-        vmaCreateImage(allocator, &imageInfo, &imageAllocInfo, &rawImage, &m_allocation, nullptr);
+        if (vmaCreateImage(allocator, &imageInfo, &imageAllocInfo, &rawImage, &m_allocation, nullptr) != VK_SUCCESS)
+            throw std::runtime_error("Failed to create texture image");
         m_image = vk::Image(rawImage);
-
-        vk::CommandBufferAllocateInfo allocInfo(cmdPool, vk::CommandBufferLevel::ePrimary, 1);
-        vk::UniqueCommandBuffer cmd = std::move(device.allocateCommandBuffersUnique(allocInfo).value[0]);
-
-        cmd->begin(vk::CommandBufferBeginInfo(vk::CommandBufferUsageFlagBits::eOneTimeSubmit));
-
-        transitionLayout(cmd.get(), vk::ImageLayout::eUndefined, vk::ImageLayout::eTransferDstOptimal);
-
-        vk::BufferImageCopy region{};
-        region.imageSubresource = { vk::ImageAspectFlagBits::eColor, 0, 0, 1 };
-        region.imageExtent = vk::Extent3D{ (uint32_t)data.width, (uint32_t)data.height, 1 };
-        cmd->copyBufferToImage(vk::Buffer(stagingBuffer), m_image, vk::ImageLayout::eTransferDstOptimal, 1, &region);
-
-        transitionLayout(cmd.get(), vk::ImageLayout::eTransferDstOptimal, vk::ImageLayout::eShaderReadOnlyOptimal);
-
-        cmd->end();
-        vk::SubmitInfo submitInfo{};
-        submitInfo.setCommandBufferCount(1);
-        submitInfo.setPCommandBuffers(&cmd.get());
-        queue.submit(submitInfo, nullptr);
-        queue.waitIdle();
-
-        vmaDestroyBuffer(allocator, stagingBuffer, stagingAlloc);
 
         vk::ImageViewCreateInfo viewInfo{};
         viewInfo.image = m_image;
         viewInfo.viewType = vk::ImageViewType::e2D;
         viewInfo.format = format;
         viewInfo.subresourceRange.aspectMask = vk::ImageAspectFlagBits::eColor;
-        viewInfo.subresourceRange.levelCount = 1;
+        viewInfo.subresourceRange.levelCount = mipLevels;
         viewInfo.subresourceRange.layerCount = 1;
         m_view = device.createImageView(viewInfo).value;
     }
@@ -93,50 +51,174 @@ public:
     TextureImage(const TextureImage&) = delete;
     TextureImage& operator=(const TextureImage&) = delete;
 
-    TextureImage(TextureImage&& other) noexcept
-        : m_allocator(other.m_allocator), m_device(other.m_device), m_image(other.m_image),
-        m_allocation(other.m_allocation), m_view(other.m_view) {
-        other.m_image = nullptr; other.m_view = nullptr; other.m_allocation = nullptr;
-    }
-
+    vk::Image getImage() const { return m_image; }
     vk::ImageView getView() const { return m_view; }
+    uint32_t width() const { return m_width; }
+    uint32_t height() const { return m_height; }
+    uint32_t mipLevels() const { return m_mipLevels; }
 
 private:
-    void transitionLayout(vk::CommandBuffer cmd, vk::ImageLayout oldLayout, vk::ImageLayout newLayout) {
-        vk::ImageMemoryBarrier barrier{};
-        barrier.oldLayout = oldLayout;
-        barrier.newLayout = newLayout;
-        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        barrier.image = m_image;
-        barrier.subresourceRange.aspectMask = vk::ImageAspectFlagBits::eColor;
-        barrier.subresourceRange.levelCount = 1;
-        barrier.subresourceRange.layerCount = 1;
-
-        vk::PipelineStageFlags sourceStage;
-        vk::PipelineStageFlags destinationStage;
-
-        if (oldLayout == vk::ImageLayout::eUndefined && newLayout == vk::ImageLayout::eTransferDstOptimal) {
-            barrier.srcAccessMask = vk::AccessFlagBits::eNone;
-            barrier.dstAccessMask = vk::AccessFlagBits::eTransferWrite;
-            sourceStage = vk::PipelineStageFlagBits::eTopOfPipe;
-            destinationStage = vk::PipelineStageFlagBits::eTransfer;
-        }
-        else if (oldLayout == vk::ImageLayout::eTransferDstOptimal && newLayout == vk::ImageLayout::eShaderReadOnlyOptimal) {
-            barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
-            barrier.dstAccessMask = vk::AccessFlagBits::eShaderRead;
-            sourceStage = vk::PipelineStageFlagBits::eTransfer;
-            destinationStage = vk::PipelineStageFlagBits::eFragmentShader;
-        }
-        cmd.pipelineBarrier(sourceStage, destinationStage, {}, 0, nullptr, 0, nullptr, 1, &barrier);
-    }
-
     VmaAllocator m_allocator;
     vk::Device m_device;
     vk::Image m_image;
     VmaAllocation m_allocation = nullptr;
     vk::ImageView m_view;
+    uint32_t m_width, m_height, m_mipLevels;
 };
+
+namespace {
+
+// Records every copy for one model into a single command buffer backed by one staging
+// buffer, then submits once and waits on a fence (instead of a queue.waitIdle per resource).
+class UploadBatch {
+public:
+    UploadBatch(VmaAllocator allocator, vk::Device device, vk::CommandPool pool, vk::Queue queue, vk::DeviceSize stagingSize)
+        : m_allocator(allocator), m_device(device), m_pool(pool), m_queue(queue) {
+        VkBufferCreateInfo stagingInfo = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+        stagingInfo.size = std::max<vk::DeviceSize>(stagingSize, 16);
+        stagingInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+        VmaAllocationCreateInfo stagingAllocInfo = {};
+        stagingAllocInfo.usage = VMA_MEMORY_USAGE_CPU_ONLY;
+        stagingAllocInfo.flags = VMA_ALLOCATION_CREATE_MAPPED_BIT;
+        VmaAllocationInfo info{};
+        if (vmaCreateBuffer(allocator, &stagingInfo, &stagingAllocInfo, &m_staging, &m_stagingAlloc, &info) != VK_SUCCESS)
+            throw std::runtime_error("Failed to create staging buffer");
+        m_mapped = static_cast<char*>(info.pMappedData);
+
+        vk::CommandBufferAllocateInfo allocInfo(pool, vk::CommandBufferLevel::ePrimary, 1);
+        m_cmd = device.allocateCommandBuffers(allocInfo).value[0];
+        (void)m_cmd.begin(vk::CommandBufferBeginInfo(vk::CommandBufferUsageFlagBits::eOneTimeSubmit));
+    }
+
+    ~UploadBatch() {
+        m_device.freeCommandBuffers(m_pool, m_cmd);
+        vmaDestroyBuffer(m_allocator, m_staging, m_stagingAlloc);
+    }
+
+    static vk::DeviceSize alignUp(vk::DeviceSize v) { return (v + 15) & ~vk::DeviceSize(15); }
+
+    void copyToBuffer(const DeviceBuffer& dst, const void* data, vk::DeviceSize size) {
+        vk::DeviceSize offset = stage(data, size);
+        vk::BufferCopy region(offset, 0, size);
+        m_cmd.copyBuffer(vk::Buffer(m_staging), dst.getBuffer(), 1, &region);
+    }
+
+    void copyToImage(const TextureImage& img, const void* pixels, bool generateMips) {
+        const vk::DeviceSize size = vk::DeviceSize(img.width()) * img.height() * 4;
+        vk::DeviceSize offset = stage(pixels, size);
+        const uint32_t levels = img.mipLevels();
+
+        imageBarrier(img.getImage(), 0, levels,
+            vk::ImageLayout::eUndefined, vk::ImageLayout::eTransferDstOptimal,
+            vk::PipelineStageFlagBits2::eNone, vk::AccessFlagBits2::eNone,
+            vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite);
+
+        vk::BufferImageCopy region{};
+        region.bufferOffset = offset;
+        region.imageSubresource = { vk::ImageAspectFlagBits::eColor, 0, 0, 1 };
+        region.imageExtent = vk::Extent3D{ img.width(), img.height(), 1 };
+        m_cmd.copyBufferToImage(vk::Buffer(m_staging), img.getImage(), vk::ImageLayout::eTransferDstOptimal, 1, &region);
+
+        int32_t w = static_cast<int32_t>(img.width());
+        int32_t h = static_cast<int32_t>(img.height());
+        for (uint32_t level = 1; generateMips && level < levels; ++level) {
+            imageBarrier(img.getImage(), level - 1, 1,
+                vk::ImageLayout::eTransferDstOptimal, vk::ImageLayout::eTransferSrcOptimal,
+                vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite,
+                vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferRead);
+
+            int32_t nw = std::max(w / 2, 1), nh = std::max(h / 2, 1);
+            vk::ImageBlit blit{};
+            blit.srcSubresource = { vk::ImageAspectFlagBits::eColor, level - 1, 0, 1 };
+            blit.srcOffsets[1] = vk::Offset3D{ w, h, 1 };
+            blit.dstSubresource = { vk::ImageAspectFlagBits::eColor, level, 0, 1 };
+            blit.dstOffsets[1] = vk::Offset3D{ nw, nh, 1 };
+            m_cmd.blitImage(img.getImage(), vk::ImageLayout::eTransferSrcOptimal,
+                img.getImage(), vk::ImageLayout::eTransferDstOptimal, 1, &blit, vk::Filter::eLinear);
+
+            imageBarrier(img.getImage(), level - 1, 1,
+                vk::ImageLayout::eTransferSrcOptimal, vk::ImageLayout::eShaderReadOnlyOptimal,
+                vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferRead,
+                vk::PipelineStageFlagBits2::eFragmentShader, vk::AccessFlagBits2::eShaderSampledRead);
+            w = nw; h = nh;
+        }
+
+        const uint32_t lastLevel = generateMips ? levels - 1 : 0;
+        imageBarrier(img.getImage(), lastLevel, levels - lastLevel,
+            vk::ImageLayout::eTransferDstOptimal, vk::ImageLayout::eShaderReadOnlyOptimal,
+            vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite,
+            vk::PipelineStageFlagBits2::eFragmentShader, vk::AccessFlagBits2::eShaderSampledRead);
+    }
+
+    void submitAndWait() {
+        vk::MemoryBarrier2 barrier{};
+        barrier.srcStageMask = vk::PipelineStageFlagBits2::eTransfer;
+        barrier.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
+        barrier.dstStageMask = vk::PipelineStageFlagBits2::eVertexAttributeInput | vk::PipelineStageFlagBits2::eIndexInput;
+        barrier.dstAccessMask = vk::AccessFlagBits2::eVertexAttributeRead | vk::AccessFlagBits2::eIndexRead;
+        vk::DependencyInfo dep{};
+        dep.setMemoryBarriers(barrier);
+        m_cmd.pipelineBarrier2(dep);
+        (void)m_cmd.end();
+
+        vk::Fence fence = m_device.createFence({}).value;
+        vk::SubmitInfo submitInfo{};
+        submitInfo.setCommandBuffers(m_cmd);
+        (void)m_queue.submit(submitInfo, fence);
+        (void)m_device.waitForFences(fence, VK_TRUE, UINT64_MAX);
+        m_device.destroyFence(fence);
+    }
+
+private:
+    vk::DeviceSize stage(const void* data, vk::DeviceSize size) {
+        vk::DeviceSize offset = m_cursor;
+        memcpy(m_mapped + offset, data, static_cast<size_t>(size));
+        m_cursor = alignUp(offset + size);
+        return offset;
+    }
+
+    void imageBarrier(vk::Image image, uint32_t baseMip, uint32_t mipCount,
+        vk::ImageLayout oldLayout, vk::ImageLayout newLayout,
+        vk::PipelineStageFlags2 srcStage, vk::AccessFlags2 srcAccess,
+        vk::PipelineStageFlags2 dstStage, vk::AccessFlags2 dstAccess) {
+        vk::ImageMemoryBarrier2 b{};
+        b.srcStageMask = srcStage; b.srcAccessMask = srcAccess;
+        b.dstStageMask = dstStage; b.dstAccessMask = dstAccess;
+        b.oldLayout = oldLayout; b.newLayout = newLayout;
+        b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.image = image;
+        b.subresourceRange = { vk::ImageAspectFlagBits::eColor, baseMip, mipCount, 0, 1 };
+        vk::DependencyInfo dep{};
+        dep.setImageMemoryBarriers(b);
+        m_cmd.pipelineBarrier2(dep);
+    }
+
+    VmaAllocator m_allocator;
+    vk::Device m_device;
+    vk::CommandPool m_pool;
+    vk::Queue m_queue;
+    VkBuffer m_staging = VK_NULL_HANDLE;
+    VmaAllocation m_stagingAlloc = nullptr;
+    char* m_mapped = nullptr;
+    vk::DeviceSize m_cursor = 0;
+    vk::CommandBuffer m_cmd;
+};
+
+uint32_t mipLevelCount(uint32_t w, uint32_t h) {
+    uint32_t levels = 1;
+    while ((w | h) >> levels) ++levels;
+    return levels;
+}
+
+bool supportsLinearBlit(vk::PhysicalDevice physicalDevice, vk::Format format) {
+    auto features = physicalDevice.getFormatProperties(format).optimalTilingFeatures;
+    return (features & vk::FormatFeatureFlagBits::eBlitSrc) &&
+        (features & vk::FormatFeatureFlagBits::eBlitDst) &&
+        (features & vk::FormatFeatureFlagBits::eSampledImageFilterLinear);
+}
+
+} // namespace
 
 // External function declarations - these remain in main.cpp
 extern Mesh loadModelSmart(const std::string& path);
@@ -165,6 +247,12 @@ ModelManager::ModelManager(VmaAllocator allocator, vk::Device device, vk::Comman
     , m_textureSetLayout(textureSetLayout)
     , m_textureSampler(textureSampler)
 {
+    VmaAllocatorInfo allocatorInfo{};
+    vmaGetAllocatorInfo(allocator, &allocatorInfo);
+    vk::PhysicalDevice physicalDevice(allocatorInfo.physicalDevice);
+    m_canGenerateMipsSrgb = supportsLinearBlit(physicalDevice, vk::Format::eR8G8B8A8Srgb);
+    m_canGenerateMipsUnorm = supportsLinearBlit(physicalDevice, vk::Format::eR8G8B8A8Unorm);
+
     createDefaultTextures();
 }
 
@@ -175,31 +263,22 @@ ModelManager::~ModelManager() {
 }
 
 void ModelManager::createDefaultTextures() {
-    // White default texture
-    TextureData whiteData;
-    whiteData.width = 1; whiteData.height = 1; whiteData.channels = 4;
-    static unsigned char whitePixels[] = { 255, 255, 255, 255 };
-    whiteData.pixels = whitePixels;
-    m_defaultBaseColor = std::make_unique<TextureImage>(
-        m_allocator, m_device, m_cmdPool, m_queue, whiteData, vk::Format::eR8G8B8A8Srgb);
+    static const unsigned char whitePixels[] = { 255, 255, 255, 255 };
+    static const unsigned char normalPixels[] = { 128, 128, 255, 255 };
+    static const unsigned char mrPixels[] = { 0, 128, 0, 255 };
+
+    m_defaultBaseColor = std::make_unique<TextureImage>(m_allocator, m_device, 1, 1, vk::Format::eR8G8B8A8Srgb, 1);
+    m_defaultNormal = std::make_unique<TextureImage>(m_allocator, m_device, 1, 1, vk::Format::eR8G8B8A8Unorm, 1);
+    m_defaultMR = std::make_unique<TextureImage>(m_allocator, m_device, 1, 1, vk::Format::eR8G8B8A8Unorm, 1);
+
+    UploadBatch batch(m_allocator, m_device, m_cmdPool, m_queue, 3 * 16);
+    batch.copyToImage(*m_defaultBaseColor, whitePixels, false);
+    batch.copyToImage(*m_defaultNormal, normalPixels, false);
+    batch.copyToImage(*m_defaultMR, mrPixels, false);
+    batch.submitAndWait();
+
     m_defaultBaseColorSet = allocateTextureDescriptorSet(m_defaultBaseColor->getView());
-
-    // Normal default
-    TextureData normalData;
-    normalData.width = 1; normalData.height = 1; normalData.channels = 4;
-    static unsigned char normalPixels[] = { 128, 128, 255, 255 };
-    normalData.pixels = normalPixels;
-    m_defaultNormal = std::make_unique<TextureImage>(
-        m_allocator, m_device, m_cmdPool, m_queue, normalData, vk::Format::eR8G8B8A8Unorm);
     m_defaultNormalSet = allocateTextureDescriptorSet(m_defaultNormal->getView());
-
-    // Metallic-Roughness default
-    TextureData mrData;
-    mrData.width = 1; mrData.height = 1; mrData.channels = 4;
-    static unsigned char mrPixels[] = { 0, 128, 0, 255 };
-    mrData.pixels = mrPixels;
-    m_defaultMR = std::make_unique<TextureImage>(
-        m_allocator, m_device, m_cmdPool, m_queue, mrData, vk::Format::eR8G8B8A8Unorm);
     m_defaultMRSet = allocateTextureDescriptorSet(m_defaultMR->getView());
 }
 
@@ -261,21 +340,41 @@ size_t ModelManager::uploadModelToGPU(Mesh& mesh, const std::string& name, const
     gpuModel->indexCount = mesh.indices.size();
     gpuModel->ifcScene = mesh.ifcScene;
 
-    // Create buffers
-    gpuModel->vertexBuffer = std::make_unique<VertexBuffer>(m_allocator, m_device, mesh.vertices);
-    gpuModel->indexBuffer = std::make_unique<IndexBuffer>(m_allocator, m_device, mesh.indices);
+    const vk::DeviceSize vertexBytes = sizeof(Vertex) * std::max<size_t>(mesh.vertices.size(), 1);
+    const vk::DeviceSize indexBytes = sizeof(uint32_t) * std::max<size_t>(mesh.indices.size(), 1);
 
-    // Upload textures
-    for (auto& texData : mesh.textureData) {
-        vk::Format fmt = texData.isLinear ? vk::Format::eR8G8B8A8Unorm : vk::Format::eR8G8B8A8Srgb;
-        auto tex = std::make_unique<TextureImage>(m_allocator, m_device, m_cmdPool, m_queue, texData, fmt);
+    vk::DeviceSize stagingSize = UploadBatch::alignUp(vertexBytes) + UploadBatch::alignUp(indexBytes);
+    for (const auto& texData : mesh.textureData)
+        stagingSize += UploadBatch::alignUp(vk::DeviceSize(texData.width) * texData.height * 4);
 
-        vk::DescriptorSet set = allocateTextureDescriptorSet(tex->getView());
-        gpuModel->textureDescriptorSets.push_back(set);
-        gpuModel->textures.push_back(std::move(tex));
+    gpuModel->vertexBuffer = std::make_unique<DeviceBuffer>(m_allocator, vertexBytes, vk::BufferUsageFlagBits::eVertexBuffer);
+    gpuModel->indexBuffer = std::make_unique<DeviceBuffer>(m_allocator, indexBytes, vk::BufferUsageFlagBits::eIndexBuffer);
 
-        texData.free();
+    {
+        UploadBatch batch(m_allocator, m_device, m_cmdPool, m_queue, stagingSize);
+        if (!mesh.vertices.empty())
+            batch.copyToBuffer(*gpuModel->vertexBuffer, mesh.vertices.data(), sizeof(Vertex) * mesh.vertices.size());
+        if (!mesh.indices.empty())
+            batch.copyToBuffer(*gpuModel->indexBuffer, mesh.indices.data(), sizeof(uint32_t) * mesh.indices.size());
+
+        for (auto& texData : mesh.textureData) {
+            vk::Format fmt = texData.isLinear ? vk::Format::eR8G8B8A8Unorm : vk::Format::eR8G8B8A8Srgb;
+            bool canMip = texData.isLinear ? m_canGenerateMipsUnorm : m_canGenerateMipsSrgb;
+            uint32_t w = static_cast<uint32_t>(texData.width), h = static_cast<uint32_t>(texData.height);
+            uint32_t levels = canMip ? mipLevelCount(w, h) : 1;
+
+            auto tex = std::make_unique<TextureImage>(m_allocator, m_device, w, h, fmt, levels);
+            batch.copyToImage(*tex, texData.pixels, canMip);
+            gpuModel->textures.push_back(std::move(tex));
+        }
+
+        batch.submitAndWait();
     }
+
+    for (auto& tex : gpuModel->textures)
+        gpuModel->textureDescriptorSets.push_back(allocateTextureDescriptorSet(tex->getView()));
+    for (auto& texData : mesh.textureData)
+        texData.free();
 
     if (!mesh.vertices.empty()) {
         glm::vec3 bmin(FLT_MAX);

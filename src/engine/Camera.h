@@ -59,3 +59,27 @@ static bool isAABBVisible(const glm::vec3& minB, const glm::vec3& maxB, const gl
 	}
 	return true; // At least partially visible
 }
+
+struct FrustumPlanes {
+	glm::vec4 planes[6];
+};
+
+// Gribb-Hartmann extraction; planes are in the space the matrix maps from (e.g. model space for P*V*M).
+static FrustumPlanes extractFrustumPlanes(const glm::mat4& m) {
+	glm::vec4 r0(m[0][0], m[1][0], m[2][0], m[3][0]);
+	glm::vec4 r1(m[0][1], m[1][1], m[2][1], m[3][1]);
+	glm::vec4 r2(m[0][2], m[1][2], m[2][2], m[3][2]);
+	glm::vec4 r3(m[0][3], m[1][3], m[2][3], m[3][3]);
+	return { { r3 + r0, r3 - r0, r3 + r1, r3 - r1, r2, r3 - r2 } };
+}
+
+static bool isAABBInFrustum(const FrustumPlanes& f, const glm::vec3& minB, const glm::vec3& maxB) {
+	for (const glm::vec4& p : f.planes) {
+		glm::vec3 positive(p.x >= 0.0f ? maxB.x : minB.x,
+			p.y >= 0.0f ? maxB.y : minB.y,
+			p.z >= 0.0f ? maxB.z : minB.z);
+		if (p.x * positive.x + p.y * positive.y + p.z * positive.z + p.w < 0.0f)
+			return false;
+	}
+	return true;
+}
