@@ -2596,8 +2596,10 @@ int main()
 		pipelineRenderingInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO_KHR;
 		pipelineRenderingInfo.colorAttachmentCount = 1;
 		pipelineRenderingInfo.pColorAttachmentFormats = &colorFormat;
-		pipelineRenderingInfo.depthAttachmentFormat = VK_FORMAT_UNDEFINED;  // No depth for ImGui overlay
-		pipelineRenderingInfo.stencilAttachmentFormat = VK_FORMAT_UNDEFINED;
+		// ImGui is drawn inside the main pass, so its pipeline must declare the same depth/stencil format
+		// (its depth test is disabled, so this does not affect how the UI renders).
+		pipelineRenderingInfo.depthAttachmentFormat = static_cast<VkFormat>(depthFormat);
+		pipelineRenderingInfo.stencilAttachmentFormat = static_cast<VkFormat>(depthFormat);
 
 		// Zero-initialize as required
 		ImGui_ImplVulkan_InitInfo initInfo = {};
@@ -4792,10 +4794,10 @@ int main()
 				// Draw shadow pass for all model instances
 				const auto& shadowInstances = modelManager->getInstances();
 
-				int lastAlphaMode = -1;
-				float lastAlphaCutoff = -1.0f;
-
-				vk::DescriptorSet boundShadowSet = nullptr;
+				// The shadow fragment shader statically uses set 1, so it must be bound even
+				// when no submesh is alpha-masked.
+				vk::DescriptorSet boundShadowSet = modelManager->getDefaultBaseColorSet();
+				cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, shadowPipelineLayout, 1, 1, &boundShadowSet, 0, nullptr);
 
 				auto startShadowPassLoop = std::chrono::high_resolution_clock::now();
 				for (const auto& [modelIdx, batch] : shadowBatches) {
