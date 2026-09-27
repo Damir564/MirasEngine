@@ -1,55 +1,51 @@
 #version 460
-#extension GL_KHR_vulkan_glsl : enable
+#extension GL_GOOGLE_include_directive : require
 
-// Vertex attributes from VertexBuffer
+#include "frame_ubo.glsl"
+#include "draw_data.glsl"
+
 layout(location = 0) in vec3 inPosition;
-layout(location = 1) in vec3 inNormal;   
-layout(location = 2) in vec2 inTexCoord; // [cite: 30]
-layout(location = 3) in vec4 inTangent; // [cite: 30]
-layout(location = 4) in vec3 inOffset;   // [cite: 31]
-
-layout(push_constant) uniform MeshData {
-    mat4 view;
-    mat4 proj;
-    vec4 cameraPos;
-    vec4 baseColor;
-    float metallic;
-    float roughness;
-    float time;
-} pc;
+layout(location = 1) in vec3 inNormal;
+layout(location = 2) in vec2 inTexCoord;
+layout(location = 3) in vec4 inTangent;
 
 layout(location = 0) out vec3 fragWorldPos;
 layout(location = 1) out vec3 fragNormal;
 layout(location = 2) out vec2 fragTexCoord;
-layout(location = 3) out mat3 TBN; // NEW: Output TBN matrix
+layout(location = 3) out mat3 TBN;
+layout(location = 6) out vec4 fragPosLightSpace;
+layout(location = 7) flat out uint fragDrawIndex;
 
-void main()
-{
-   // Create Y-axis rotation matrix from time
-    float s = sin(pc.time);
-    float c = cos(pc.time);
-    mat3 rotY = mat3(
-        c, 0, s,
-        0, 1, 0,
-       -s, 0, c
-    );
-    rotY = mat3(1.0);
-    // 1. Rotate the vertex position before adding offset
-    vec3 rotatedPos = rotY * inPosition;
-    vec3 pos = rotatedPos + inOffset;
-    vec4 worldPosition = vec4(pos, 1.0);
+// mask.vert must produce bit-identical positions for its depth comparison.
+invariant gl_Position;
 
-    gl_Position = pc.proj * pc.view * worldPosition;
+void main() {
+    // firstInstance of each indirect command is the index of its DrawData entry
+    uint drawIndex = gl_InstanceIndex;
+    TransformData t = transforms[draws[drawIndex].transformIndex];
 
-    // 2. Transform Normal and Tangent by the same rotation
-    // This ensures the TBN frame rotates with the geometry
-    vec3 worldNormal = normalize(inNormal);
-    vec3 worldTangent = normalize(inTangent.xyz);
-    vec3 worldBitangent = cross(worldNormal, worldTangent) * inTangent.w;
+    vec4 worldPosition = t.model * vec4(inPosition, 1.0);
+    gl_Position = ubo.proj * ubo.view * worldPosition;
 
-    // 3. Set Outputs
+    mat3 normalMatrix = mat3(t.normal);
+    vec3 worldNormal = normalMatrix * inNormal;
+    worldNormal = dot(worldNormal, worldNormal) > 1e-12 ? normalize(worldNormal) : vec3(0.0, 1.0, 0.0);
+
+    // Meshes without UVs come with zero tangents; normalizing those gives NaN (black pixels).
+    vec3 worldTangent = normalMatrix * inTangent.xyz;
+    worldTangent -= worldNormal * dot(worldNormal, worldTangent);
+    if (dot(worldTangent, worldTangent) < 1e-12) {
+        vec3 axis = abs(worldNormal.y) < 0.99 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+        worldTangent = cross(axis, worldNormal);
+    }
+    worldTangent = normalize(worldTangent);
+    float handedness = inTangent.w < 0.0 ? -1.0 : 1.0;
+    vec3 worldBitangent = cross(worldNormal, worldTangent) * handedness;
+
     fragWorldPos = vec3(worldPosition);
     fragNormal = worldNormal;
     fragTexCoord = inTexCoord;
     TBN = mat3(worldTangent, worldBitangent, worldNormal);
+    fragPosLightSpace = ubo.lightSpaceMatrix * worldPosition;
+    fragDrawIndex = drawIndex;
 }

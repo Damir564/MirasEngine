@@ -1,18 +1,37 @@
 ﻿cmake_minimum_required (VERSION 3.21)
 
-# Enable Hot Reload for MSVC compilers if supported.
+# Default debug info is /Zi for every target (third-party libs like assimp add /Zi themselves,
+# so /ZI here would trigger "D9025 overriding '/Zi' with '/ZI'"). Hot Reload (/ZI) is enabled
+# only for the engine target in src/CMakeLists.txt.
 if (POLICY CMP0141)
   cmake_policy(SET CMP0141 NEW)
-  set(CMAKE_MSVC_DEBUG_INFORMATION_FORMAT "$<IF:$<AND:$<C_COMPILER_ID:MSVC>,$<CXX_COMPILER_ID:MSVC>>,$<$<CONFIG:Debug,RelWithDebInfo>:EditAndContinue>,$<$<CONFIG:Debug,RelWithDebInfo>:ProgramDatabase>>")
+  set(CMAKE_MSVC_DEBUG_INFORMATION_FORMAT "$<$<CONFIG:Debug,RelWithDebInfo>:ProgramDatabase>")
 endif()
 
 project ("MirasEngine")
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
 
 find_package(Vulkan REQUIRED)
 
 add_subdirectory(external)
 
 add_subdirectory(src)
+
+file(COPY ${CMAKE_SOURCE_DIR}/src/external/IfcConvert.exe
+     DESTINATION ${CMAKE_BINARY_DIR}/src/external)
+
+file(COPY ${CMAKE_SOURCE_DIR}/src/external/IfcConvert.config
+     DESTINATION ${CMAKE_BINARY_DIR}/src/external)
+
+# if .py changed, execute in external
+# .venv/scripts/activate
+# pyinstaller --onefile --clean --collect-all ifcopenshell .\extract_ifc_metadata.py
+# and then regenerate CMake
+
+file(COPY ${CMAKE_SOURCE_DIR}/src/external/dist/extract_ifc_metadata.exe
+    DESTINATION ${CMAKE_BINARY_DIR}/src/external)
 
 file(COPY ${CMAKE_SOURCE_DIR}/src/shaders
      DESTINATION ${CMAKE_BINARY_DIR}/src)
@@ -28,8 +47,9 @@ set(SHADER_OUT_DIR ${CMAKE_BINARY_DIR}/src/shaders)
 # Ensure output directory exists
 file(MAKE_DIRECTORY ${SHADER_OUT_DIR})
 
-# 2️⃣ Glob all GLSL shader files (vert, frag, etc.)
-file(GLOB SHADERS "${SHADER_SRC_DIR}/*.*")
+# 2️⃣ Glob the shader stages; *.glsl files are shared includes and only act as dependencies.
+file(GLOB SHADERS "${SHADER_SRC_DIR}/*.vert" "${SHADER_SRC_DIR}/*.frag" "${SHADER_SRC_DIR}/*.comp")
+file(GLOB SHADER_INCLUDES "${SHADER_SRC_DIR}/*.glsl")
 
 # List to hold SPIR-V output files
 set(SPIRV_FILES "")
@@ -52,8 +72,8 @@ foreach(SHADER_FILE ${SHADERS})
     add_custom_command(
         OUTPUT ${OUTPUT_FILE}
         COMMAND ${CMAKE_COMMAND} -E echo "Compiling ${SHADER_FILE} -> ${OUTPUT_FILE}"
-        COMMAND glslangValidator -V ${SHADER_FILE} -o ${OUTPUT_FILE}
-        DEPENDS ${SHADER_FILE}
+        COMMAND glslangValidator -V ${SHADER_FILE} -I${SHADER_SRC_DIR} -o ${OUTPUT_FILE}
+        DEPENDS ${SHADER_FILE} ${SHADER_INCLUDES}
         COMMENT "Compiling GLSL shader ${SHADER_FILE} to SPIR-V"
         VERBATIM
     )
