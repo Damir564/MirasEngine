@@ -3,6 +3,8 @@
 #include <glm/gtc/matrix_transform.hpp>
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <limits>
 #include <vector>
 #include <string>
 #include "ModelManager.h"
@@ -30,8 +32,10 @@ struct Gizmo {
     glm::vec3 originalPosition{ 0.0f };
     glm::vec3 originalRotation{ 0.0f };
     glm::vec3 originalScale{ 1.0f };
-    int outlineInstanceIndex = -1;
-    size_t outlineSubmeshIndex = std::numeric_limits<size_t>::max();
+    // Unit screen direction that counts as positive drag (the axis, or the ring tangent for rotation).
+    glm::vec2 dragDirection{ 1.0f, 0.0f };
+    // Screen pixels per world unit along the dragged axis (translation only).
+    float pixelsPerUnit = 1.0f;
 
     void select(int instanceIndex) {
         selectedInstance = instanceIndex;
@@ -45,8 +49,6 @@ struct Gizmo {
         mode = GizmoMode::None;
         activeAxis = GizmoAxis::None;
         isDragging = false;
-        outlineInstanceIndex = -1;
-        outlineSubmeshIndex = std::numeric_limits<size_t>::max();
     }
 };
 
@@ -246,64 +248,6 @@ inline float pointToSegment2D(const glm::vec2& point,
     return glm::length(point - closest);
 }
 
-// Pick gizmo axis in screen space
-// mousePixel: direct SDL mouse coordinates
-// gizmoScale: the SAME scale value used in the gizmo render transform
-inline GizmoAxis pickGizmoAxis(const glm::vec2& mousePixel,
-    const glm::vec3& gizmoCenter,
-    float gizmoScale,
-    float pickRadiusPixels,
-    const glm::mat4& view,
-    const glm::mat4& proj,
-    float screenWidth,
-    float screenHeight)
-{
-    struct AxisCandidate {
-        GizmoAxis axis;
-        glm::vec3 dir;
-    };
-
-    AxisCandidate axes[] = {
-        { GizmoAxis::X, glm::vec3(1, 0, 0) },
-        { GizmoAxis::Y, glm::vec3(0, 1, 0) },
-        { GizmoAxis::Z, glm::vec3(0, 0, 1) }
-    };
-
-    glm::mat4 vp = proj * view;
-
-    glm::vec4 centerClip = vp * glm::vec4(gizmoCenter, 1.0f);
-    if (centerClip.w <= 0.0f) return GizmoAxis::None;
-
-    float bestDist = pickRadiusPixels;
-    GizmoAxis bestAxis = GizmoAxis::None;
-
-    // The gizmo geometry has length 2.0f, scaled by gizmoScale in the model matrix
-    // The world-space endpoint is: gizmoCenter + dir * 2.0f * gizmoScale
-    float worldAxisLength = 2.0f * gizmoScale;
-
-    for (auto& a : axes) {
-        glm::vec3 axisEnd = gizmoCenter + a.dir * worldAxisLength;
-
-        glm::vec2 screenStart = worldToScreen(gizmoCenter, vp, screenWidth, screenHeight);
-        glm::vec2 screenEnd = worldToScreen(axisEnd, vp, screenWidth, screenHeight);
-
-        if (screenStart.x < -5000.0f || screenEnd.x < -5000.0f) continue;
-
-        float screenLen = glm::length(screenEnd - screenStart);
-        if (screenLen < 2.0f) continue;
-
-        float segT;
-        float pixelDist = pointToSegment2D(mousePixel, screenStart, screenEnd, segT);
-
-        if (pixelDist < bestDist) {
-            bestDist = pixelDist;
-            bestAxis = a.axis;
-        }
-    }
-
-    return bestAxis;
-}
-
 inline float getGizmoScale(const glm::vec3& gizmoPos, const glm::vec3& cameraPos,
     float desiredScreenSize = 0.15f,
     const glm::mat4& proj = glm::mat4(1.0f))
@@ -314,183 +258,125 @@ inline float getGizmoScale(const glm::vec3& gizmoPos, const glm::vec3& cameraPos
     return dist * tanHalfFov * desiredScreenSize;
 }
 
-inline float pointToCircle2D(const glm::vec2& point,
-    const glm::vec2& center, float radius)
+inline glm::vec3 gizmoAxisDirection(GizmoAxis axis)
 {
-    float dist = glm::length(point - center);
-    return std::abs(dist - radius);
+    switch (axis) {
+    case GizmoAxis::X: return { 1.0f, 0.0f, 0.0f };
+    case GizmoAxis::Y: return { 0.0f, 1.0f, 0.0f };
+    case GizmoAxis::Z: return { 0.0f, 0.0f, 1.0f };
+    default: return glm::vec3(0.0f);
+    }
 }
 
-// Pick rotation gizmo axis by testing against screen-space circles
-inline GizmoAxis pickRotateGizmoAxis(const glm::vec2& mousePixel,
-    const glm::vec3& gizmoCenter,
-    float gizmoScale,
-    float pickRadiusPixels,
-    const glm::mat4& view,
-    const glm::mat4& proj,
-    float screenWidth,
-    float screenHeight,
-    int segments = 32)
+// Transform gizmo geometry in world units of gizmoScale. Drawing and picking both go through
+// buildGizmoShape() so that what is clickable is exactly what is drawn.
+inline constexpr float kGizmoAxisLength = 2.0f;
+inline constexpr float kGizmoRingRadius = 1.5f;
+inline constexpr float kGizmoConeLength = 0.4f;
+inline constexpr float kGizmoConeRadius = 0.12f;
+inline constexpr float kGizmoCubeHalfSize = 0.12f;
+inline constexpr int kGizmoRingSegments = 64;
+
+struct GizmoAxisShape {
+    GizmoAxis axis = GizmoAxis::None;
+    // Move/scale: {center, tip}. Rotate: closed ring (first point repeated at the end).
+    std::vector<glm::vec3> world;
+    std::vector<glm::vec2> screen;
+    // Per ring point: faces the camera. Only the front half of a ring is pickable.
+    std::vector<uint8_t> front;
+    bool projected = false;
+    // View-space distance of the axis tip; larger = farther, drawn first.
+    float depth = 0.0f;
+};
+
+struct GizmoShape {
+    bool valid = false;
+    GizmoMode mode = GizmoMode::None;
+    glm::vec3 center{ 0.0f };
+    float scale = 1.0f;
+    glm::vec2 screenCenter{ 0.0f };
+    GizmoAxisShape axes[3];
+};
+
+inline GizmoShape buildGizmoShape(GizmoMode mode, const glm::vec3& center, const glm::vec3& cameraPos,
+    const glm::mat4& view, const glm::mat4& proj, float screenWidth, float screenHeight)
 {
-    struct AxisCandidate {
-        GizmoAxis axis;
-    };
+    GizmoShape shape;
+    shape.mode = mode;
+    shape.center = center;
+    const glm::mat4 vp = proj * view;
+    if (mode == GizmoMode::None || (vp * glm::vec4(center, 1.0f)).w <= 0.0001f)
+        return shape;
+    shape.scale = getGizmoScale(center, cameraPos, 0.15f, proj);
+    shape.screenCenter = worldToScreen(center, vp, screenWidth, screenHeight);
+    const glm::vec3 toCamera = cameraPos - center;
 
-    glm::mat4 vp = proj * view;
+    for (int i = 0; i < 3; ++i) {
+        GizmoAxisShape& axisShape = shape.axes[i];
+        axisShape.axis = static_cast<GizmoAxis>(i + 1);
+        const glm::vec3 dir = gizmoAxisDirection(axisShape.axis);
+        if (mode == GizmoMode::Rotate) {
+            const glm::vec3 u = gizmoAxisDirection(static_cast<GizmoAxis>((i + 1) % 3 + 1));
+            const glm::vec3 v = glm::cross(dir, u);
+            const float radius = kGizmoRingRadius * shape.scale;
+            for (int k = 0; k <= kGizmoRingSegments; ++k) {
+                const float angle = 2.0f * 3.14159265f * static_cast<float>(k) / kGizmoRingSegments;
+                const glm::vec3 offset = (u * std::cos(angle) + v * std::sin(angle)) * radius;
+                axisShape.world.push_back(center + offset);
+                axisShape.front.push_back(glm::dot(offset, toCamera) >= -0.02f * radius * glm::length(toCamera) ? 1 : 0);
+            }
+        }
+        else {
+            axisShape.world = { center, center + dir * (kGizmoAxisLength * shape.scale) };
+        }
+        axisShape.projected = true;
+        for (const glm::vec3& point : axisShape.world) {
+            const glm::vec2 screenPoint = worldToScreen(point, vp, screenWidth, screenHeight);
+            if (screenPoint.x < -5000.0f) axisShape.projected = false;
+            axisShape.screen.push_back(screenPoint);
+        }
+        axisShape.depth = -(view * glm::vec4(center + dir * shape.scale, 1.0f)).z;
+    }
+    shape.valid = true;
+    return shape;
+}
 
-    glm::vec4 centerClip = vp * glm::vec4(gizmoCenter, 1.0f);
-    if (centerClip.w <= 0.0f) return GizmoAxis::None;
+struct GizmoPick {
+    GizmoAxis axis = GizmoAxis::None;
+    // Rotate: the ring point under the mouse (drag direction follows the ring's tangent there).
+    glm::vec3 worldPoint{ 0.0f };
+};
 
-    // The rotation gizmo geometry uses radius = 1.5f, scaled by gizmoScale
-    float worldRadius = 1.5f * gizmoScale;
-    float step = 2.0f * 3.14159265f / segments;
-
+inline GizmoPick pickGizmoShape(const GizmoShape& shape, const glm::vec2& mouse, float pickRadiusPixels)
+{
+    GizmoPick best;
+    if (!shape.valid)
+        return best;
     float bestDist = pickRadiusPixels;
-    GizmoAxis bestAxis = GizmoAxis::None;
-
-    // Test X ring (YZ plane circle)
-    for (int i = 0; i < segments; ++i) {
-        float a0 = i * step, a1 = (i + 1) * step;
-        glm::vec3 p0 = gizmoCenter + glm::vec3(0, cosf(a0), sinf(a0)) * worldRadius;
-        glm::vec3 p1 = gizmoCenter + glm::vec3(0, cosf(a1), sinf(a1)) * worldRadius;
-
-        glm::vec2 s0 = worldToScreen(p0, vp, screenWidth, screenHeight);
-        glm::vec2 s1 = worldToScreen(p1, vp, screenWidth, screenHeight);
-        if (s0.x < -5000.0f || s1.x < -5000.0f) continue;
-
-        float segT;
-        float dist = pointToSegment2D(mousePixel, s0, s1, segT);
-        if (dist < bestDist) {
-            bestDist = dist;
-            bestAxis = GizmoAxis::X;
+    for (const GizmoAxisShape& axisShape : shape.axes) {
+        if (!axisShape.projected)
+            continue;
+        const size_t count = axisShape.screen.size();
+        for (size_t k = 0; k + 1 < count; ++k) {
+            if (shape.mode == GizmoMode::Rotate && !(axisShape.front[k] && axisShape.front[k + 1]))
+                continue;
+            glm::vec2 a = axisShape.screen[k];
+            glm::vec2 b = axisShape.screen[k + 1];
+            if (shape.mode != GizmoMode::Rotate && glm::length(b - a) < 2.0f)
+                continue;
+            float t = 0.0f;
+            const float dist = pointToSegment2D(mouse, a, b, t);
+            if (dist < bestDist) {
+                bestDist = dist;
+                best.axis = axisShape.axis;
+                best.worldPoint = glm::mix(axisShape.world[k], axisShape.world[k + 1], t);
+            }
         }
     }
-
-    // Test Y ring (XZ plane circle)
-    for (int i = 0; i < segments; ++i) {
-        float a0 = i * step, a1 = (i + 1) * step;
-        glm::vec3 p0 = gizmoCenter + glm::vec3(cosf(a0), 0, sinf(a0)) * worldRadius;
-        glm::vec3 p1 = gizmoCenter + glm::vec3(cosf(a1), 0, sinf(a1)) * worldRadius;
-
-        glm::vec2 s0 = worldToScreen(p0, vp, screenWidth, screenHeight);
-        glm::vec2 s1 = worldToScreen(p1, vp, screenWidth, screenHeight);
-        if (s0.x < -5000.0f || s1.x < -5000.0f) continue;
-
-        float segT;
-        float dist = pointToSegment2D(mousePixel, s0, s1, segT);
-        if (dist < bestDist) {
-            bestDist = dist;
-            bestAxis = GizmoAxis::Y;
-        }
-    }
-
-    // Test Z ring (XY plane circle)
-    for (int i = 0; i < segments; ++i) {
-        float a0 = i * step, a1 = (i + 1) * step;
-        glm::vec3 p0 = gizmoCenter + glm::vec3(cosf(a0), sinf(a0), 0) * worldRadius;
-        glm::vec3 p1 = gizmoCenter + glm::vec3(cosf(a1), sinf(a1), 0) * worldRadius;
-
-        glm::vec2 s0 = worldToScreen(p0, vp, screenWidth, screenHeight);
-        glm::vec2 s1 = worldToScreen(p1, vp, screenWidth, screenHeight);
-        if (s0.x < -5000.0f || s1.x < -5000.0f) continue;
-
-        float segT;
-        float dist = pointToSegment2D(mousePixel, s0, s1, segT);
-        if (dist < bestDist) {
-            bestDist = dist;
-            bestAxis = GizmoAxis::Z;
-        }
-    }
-
-    return bestAxis;
+    return best;
 }
 
 struct GizmoVertex {
     glm::vec3 position;
     glm::vec3 color;
 };
-
-inline std::vector<GizmoVertex> generateTranslateGizmoLines(float length = 2.0f) {
-    return {
-        {{ 0, 0, 0 }, { 1, 0, 0 }},
-        {{ length, 0, 0 }, { 1, 0, 0 }},
-        {{ length, 0, 0 }, { 1, 0, 0 }},
-        {{ length - 0.2f, 0.1f, 0 }, { 1, 0, 0 }},
-        {{ length, 0, 0 }, { 1, 0, 0 }},
-        {{ length - 0.2f, -0.1f, 0 }, { 1, 0, 0 }},
-
-        {{ 0, 0, 0 }, { 0, 1, 0 }},
-        {{ 0, length, 0 }, { 0, 1, 0 }},
-        {{ 0, length, 0 }, { 0, 1, 0 }},
-        {{ 0.1f, length - 0.2f, 0 }, { 0, 1, 0 }},
-        {{ 0, length, 0 }, { 0, 1, 0 }},
-        {{ -0.1f, length - 0.2f, 0 }, { 0, 1, 0 }},
-
-        {{ 0, 0, 0 }, { 0, 0, 1 }},
-        {{ 0, 0, length }, { 0, 0, 1 }},
-        {{ 0, 0, length }, { 0, 0, 1 }},
-        {{ 0, 0.1f, length - 0.2f }, { 0, 0, 1 }},
-        {{ 0, 0, length }, { 0, 0, 1 }},
-        {{ 0, -0.1f, length - 0.2f }, { 0, 0, 1 }},
-    };
-}
-
-inline std::vector<GizmoVertex> generateRotateGizmoLines(int segments = 32, float radius = 1.5f) {
-    std::vector<GizmoVertex> lines;
-    float step = 2.0f * 3.14159265f / segments;
-
-    for (int i = 0; i < segments; ++i) {
-        float a0 = i * step, a1 = (i + 1) * step;
-        lines.push_back({ { 0, cosf(a0) * radius, sinf(a0) * radius }, { 1, 0, 0 } });
-        lines.push_back({ { 0, cosf(a1) * radius, sinf(a1) * radius }, { 1, 0, 0 } });
-    }
-    for (int i = 0; i < segments; ++i) {
-        float a0 = i * step, a1 = (i + 1) * step;
-        lines.push_back({ { cosf(a0) * radius, 0, sinf(a0) * radius }, { 0, 1, 0 } });
-        lines.push_back({ { cosf(a1) * radius, 0, sinf(a1) * radius }, { 0, 1, 0 } });
-    }
-    for (int i = 0; i < segments; ++i) {
-        float a0 = i * step, a1 = (i + 1) * step;
-        lines.push_back({ { cosf(a0) * radius, sinf(a0) * radius, 0 }, { 0, 0, 1 } });
-        lines.push_back({ { cosf(a1) * radius, sinf(a1) * radius, 0 }, { 0, 0, 1 } });
-    }
-    return lines;
-}
-
-inline std::vector<GizmoVertex> generateScaleGizmoLines(float length = 2.0f) {
-    float box = 0.15f;
-    return {
-        {{ 0, 0, 0 }, { 1, 0, 0 }},
-        {{ length, 0, 0 }, { 1, 0, 0 }},
-        {{ length - box, -box, -box }, { 1, 0, 0 }},
-        {{ length + box, -box, -box }, { 1, 0, 0 }},
-        {{ length + box, -box, -box }, { 1, 0, 0 }},
-        {{ length + box, box, -box }, { 1, 0, 0 }},
-        {{ length + box, box, -box }, { 1, 0, 0 }},
-        {{ length - box, box, -box }, { 1, 0, 0 }},
-        {{ length - box, box, -box }, { 1, 0, 0 }},
-        {{ length - box, -box, -box }, { 1, 0, 0 }},
-
-        {{ 0, 0, 0 }, { 0, 1, 0 }},
-        {{ 0, length, 0 }, { 0, 1, 0 }},
-        {{ -box, length - box, -box }, { 0, 1, 0 }},
-        {{ box, length - box, -box }, { 0, 1, 0 }},
-        {{ box, length - box, -box }, { 0, 1, 0 }},
-        {{ box, length + box, -box }, { 0, 1, 0 }},
-        {{ box, length + box, -box }, { 0, 1, 0 }},
-        {{ -box, length + box, -box }, { 0, 1, 0 }},
-        {{ -box, length + box, -box }, { 0, 1, 0 }},
-        {{ -box, length - box, -box }, { 0, 1, 0 }},
-
-        {{ 0, 0, 0 }, { 0, 0, 1 }},
-        {{ 0, 0, length }, { 0, 0, 1 }},
-        {{ -box, -box, length - box }, { 0, 0, 1 }},
-        {{ box, -box, length - box }, { 0, 0, 1 }},
-        {{ box, -box, length - box }, { 0, 0, 1 }},
-        {{ box, box, length - box }, { 0, 0, 1 }},
-        {{ box, box, length - box }, { 0, 0, 1 }},
-        {{ -box, box, length - box }, { 0, 0, 1 }},
-        {{ -box, box, length - box }, { 0, 0, 1 }},
-        {{ -box, -box, length - box }, { 0, 0, 1 }},
-    };
-}

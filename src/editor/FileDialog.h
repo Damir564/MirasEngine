@@ -1,30 +1,13 @@
-﻿#pragma once
-
-//#include "../external/portable-file-dialogs.h"
-//#ifdef OPAQUE
-//#undef OPAQUE
-//#endif
-//#ifdef TRANSPARENT
-//#undef TRANSPARENT
-//#endif
-//#ifdef near
-//#undef near
-//#endif
-//#ifdef far
-//#undef far
-//#endif
-//#ifdef min
-//#undef min
-//#endif
-//#ifdef max
-//#undef max
-//#endif
+#pragma once
 
 #include "../external/ImGuiFileDialog.h"
+#include <algorithm>
 #include <filesystem>
+#include <optional>
+#include <string>
 
-// Returns relative path if file is inside rootDir, otherwise nullopt
-static std::optional<std::string> makeRelativeIfInside(
+// Returns the path relative to the working directory if filePath is inside rootDir, otherwise nullopt.
+inline std::optional<std::string> makeRelativeIfInside(
     const std::string& filePath,
     const std::string& rootDir)
 {
@@ -35,7 +18,6 @@ static std::optional<std::string> makeRelativeIfInside(
     std::string fileStr = absFile.string();
     std::string rootStr = absRoot.string();
 
-    // Check file is under root
     if (fileStr.rfind(rootStr, 0) != 0)
         return std::nullopt;
 

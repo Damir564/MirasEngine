@@ -6,8 +6,8 @@
 #include <tuple>
 #include "stb_image.h"
 #include "Shadow.h"
-#include "IfcLayerInfo.h"
 #include "IfcScene.h"
+#include "ModelLoader.h"
 
 class TextureImage {
 public:
@@ -222,10 +222,6 @@ bool supportsLinearBlit(vk::PhysicalDevice physicalDevice, vk::Format format) {
 
 } // namespace
 
-// External function declarations - these remain in main.cpp
-extern Mesh loadModelSmart(const std::string& path);
-// extern SceneBounds calculateSceneBounds(const std::vector<Vertex>& vertices, const std::vector<InstanceData>& instances);
-
 void TextureData::free() {
     if (pixels) {
         if (fromCache) {
@@ -259,7 +255,7 @@ ModelManager::ModelManager(VmaAllocator allocator, vk::Device device, vk::Comman
 }
 
 ModelManager::~ModelManager() {
-    m_device.waitIdle();
+    (void)m_device.waitIdle();
     m_models.clear();
     m_instances.clear();
 }
@@ -314,7 +310,8 @@ void ModelManager::loadModelAsync(const std::string& path, const std::string& na
 
     LoadingTask task;
     task.path = path;
-    task.name = name.empty() ? std::filesystem::path(path).stem().string() : name;
+    task.name = !name.empty() ? name
+        : path == kBuiltinCubePath ? std::string("Cube") : std::filesystem::path(path).stem().string();
     task.state = LoadingState::LoadingCPU;
 
     task.meshFuture = std::async(std::launch::async, [path]() {
@@ -428,7 +425,7 @@ void ModelManager::unloadModel(size_t modelIndex) {
         if (inst.modelIndex > modelIndex) inst.modelIndex--;
     }
 
-    m_device.waitIdle();
+    (void)m_device.waitIdle();
     m_models.erase(m_models.begin() + modelIndex);
 }
 
@@ -470,6 +467,14 @@ GPUModel* ModelManager::getModel(size_t index) {
         return m_models[index].get();
     }
     return nullptr;
+}
+
+std::optional<size_t> ModelManager::findModelByPath(const std::string& path) const {
+    for (size_t i = 0; i < m_models.size(); ++i) {
+        if (m_models[i] && m_models[i]->isValid() && m_models[i]->sourcePath == path)
+            return i;
+    }
+    return std::nullopt;
 }
 
 void ModelManager::update() {

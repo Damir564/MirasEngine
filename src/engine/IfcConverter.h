@@ -8,7 +8,7 @@
 
 #define IFC_CONVERT_PARAMS " --weld-vertices --use-element-names --y-up" /*  --weld-vertices --use-element-types*/
 
-static std::string pathToUtf8(const std::filesystem::path& p)
+inline std::string pathToUtf8(const std::filesystem::path& p)
 {
     auto u8 = p.u8string();
     return std::string(u8.begin(), u8.end());
@@ -33,7 +33,7 @@ public:
                 line.pop_back();
             }
             if (!line.empty()) {
-                params = "\ " + line;
+                params = " " + line;
                 std::cout << "[IFC] Config params: " << params << "\n";
             }
         }

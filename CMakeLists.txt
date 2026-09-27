@@ -47,8 +47,9 @@ set(SHADER_OUT_DIR ${CMAKE_BINARY_DIR}/src/shaders)
 # Ensure output directory exists
 file(MAKE_DIRECTORY ${SHADER_OUT_DIR})
 
-# 2️⃣ Glob all GLSL shader files (vert, frag, etc.)
-file(GLOB SHADERS "${SHADER_SRC_DIR}/*.*")
+# 2️⃣ Glob the shader stages; *.glsl files are shared includes and only act as dependencies.
+file(GLOB SHADERS "${SHADER_SRC_DIR}/*.vert" "${SHADER_SRC_DIR}/*.frag" "${SHADER_SRC_DIR}/*.comp")
+file(GLOB SHADER_INCLUDES "${SHADER_SRC_DIR}/*.glsl")
 
 # List to hold SPIR-V output files
 set(SPIRV_FILES "")
@@ -71,8 +72,8 @@ foreach(SHADER_FILE ${SHADERS})
     add_custom_command(
         OUTPUT ${OUTPUT_FILE}
         COMMAND ${CMAKE_COMMAND} -E echo "Compiling ${SHADER_FILE} -> ${OUTPUT_FILE}"
-        COMMAND glslangValidator -V ${SHADER_FILE} -o ${OUTPUT_FILE}
-        DEPENDS ${SHADER_FILE}
+        COMMAND glslangValidator -V ${SHADER_FILE} -I${SHADER_SRC_DIR} -o ${OUTPUT_FILE}
+        DEPENDS ${SHADER_FILE} ${SHADER_INCLUDES}
         COMMENT "Compiling GLSL shader ${SHADER_FILE} to SPIR-V"
         VERBATIM
     )

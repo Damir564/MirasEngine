@@ -11,7 +11,7 @@
 
 struct SceneFileHeader {
     char magic[4] = { 'S', 'C', 'N', 'E' };
-    uint32_t version = 1;
+    uint32_t version = 2;
     uint32_t modelCount = 0;
     uint32_t instanceCount = 0;
 };
@@ -29,8 +29,11 @@ struct SceneInstanceEntry {
     float rotX, rotY, rotZ;
     float scaleX, scaleY, scaleZ;
     bool visible = true;
-    // followed by: char name[nameLength]
+    // followed by (version 2+): float color[3]; then: char name[nameLength]
 };
+
+// Version 1 files have no per-instance color.
+inline constexpr uint32_t kSceneFileVersion = 2;
 
 class SceneSerializer {
 public:
@@ -115,6 +118,8 @@ public:
             entry.visible = inst.visible;
 
             file.write(reinterpret_cast<const char*>(&entry), sizeof(entry));
+            const float color[3] = { inst.color.r, inst.color.g, inst.color.b };
+            file.write(reinterpret_cast<const char*>(color), sizeof(color));
             file.write(inst.name.data(), entry.nameLength);
         }
 
@@ -136,6 +141,7 @@ public:
             glm::vec3 rotation;
             glm::vec3 scale;
             bool visible;
+            glm::vec3 color{ 1.0f };
         };
 
         std::vector<LoadedModel> models;
@@ -163,7 +169,7 @@ public:
             return scene;
         }
 
-        if (header.version != 1) {
+        if (header.version < 1 || header.version > kSceneFileVersion) {
             std::cerr << "[SCENE] Unsupported scene version: " << header.version << "\n";
             return scene;
         }
@@ -192,11 +198,20 @@ public:
             scene.instances[i].rotation = glm::vec3(entry.rotX, entry.rotY, entry.rotZ);
             scene.instances[i].scale = glm::vec3(entry.scaleX, entry.scaleY, entry.scaleZ);
             scene.instances[i].visible = entry.visible;
+            if (header.version >= 2) {
+                float color[3] = { 1.0f, 1.0f, 1.0f };
+                file.read(reinterpret_cast<char*>(color), sizeof(color));
+                scene.instances[i].color = glm::vec3(color[0], color[1], color[2]);
+            }
 
             scene.instances[i].name.resize(entry.nameLength);
             file.read(scene.instances[i].name.data(), entry.nameLength);
         }
 
+        if (!file) {
+            std::cerr << "[SCENE] Scene file is truncated: " << filepath << "\n";
+            return scene;
+        }
         scene.valid = true;
         std::cout << "[SCENE] Loaded: " << scene.models.size() << " models, "
             << scene.instances.size() << " instances from " << filepath << "\n";

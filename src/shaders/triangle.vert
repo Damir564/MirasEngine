@@ -1,42 +1,13 @@
 #version 460
-#extension GL_KHR_vulkan_glsl : enable
+#extension GL_GOOGLE_include_directive : require
+
+#include "frame_ubo.glsl"
+#include "draw_data.glsl"
 
 layout(location = 0) in vec3 inPosition;
 layout(location = 1) in vec3 inNormal;
 layout(location = 2) in vec2 inTexCoord;
 layout(location = 3) in vec4 inTangent;
-
-// Set 0: Frame UBO
-layout(set = 0, binding = 0) uniform FrameUBO {
-    mat4 view;
-    mat4 proj;
-    mat4 lightSpaceMatrix;
-    vec4 cameraPos;
-    vec4 lightDir;
-    float time;
-    float shadowBias;
-} ubo;
-
-// Must match GpuDrawData / GpuTransform in main.cpp
-struct DrawData {
-    vec4 baseColor;
-    uint transformIndex;
-    int alphaMode;
-    float metallic;
-    float roughness;
-    float alphaCutoff;
-    float _pad0;
-    float _pad1;
-    float _pad2;
-};
-
-struct TransformData {
-    mat4 model;
-    mat4 normal;
-};
-
-layout(std430, set = 0, binding = 1) readonly buffer DrawBuffer { DrawData draws[]; };
-layout(std430, set = 0, binding = 2) readonly buffer TransformBuffer { TransformData transforms[]; };
 
 layout(location = 0) out vec3 fragWorldPos;
 layout(location = 1) out vec3 fragNormal;
@@ -44,6 +15,9 @@ layout(location = 2) out vec2 fragTexCoord;
 layout(location = 3) out mat3 TBN;
 layout(location = 6) out vec4 fragPosLightSpace;
 layout(location = 7) flat out uint fragDrawIndex;
+
+// mask.vert must produce bit-identical positions for its depth comparison.
+invariant gl_Position;
 
 void main() {
     // firstInstance of each indirect command is the index of its DrawData entry
@@ -54,10 +28,19 @@ void main() {
     gl_Position = ubo.proj * ubo.view * worldPosition;
 
     mat3 normalMatrix = mat3(t.normal);
+    vec3 worldNormal = normalMatrix * inNormal;
+    worldNormal = dot(worldNormal, worldNormal) > 1e-12 ? normalize(worldNormal) : vec3(0.0, 1.0, 0.0);
 
-    vec3 worldNormal = normalize(normalMatrix * inNormal);
-    vec3 worldTangent = normalize(normalMatrix * inTangent.xyz);
-    vec3 worldBitangent = cross(worldNormal, worldTangent) * inTangent.w;
+    // Meshes without UVs come with zero tangents; normalizing those gives NaN (black pixels).
+    vec3 worldTangent = normalMatrix * inTangent.xyz;
+    worldTangent -= worldNormal * dot(worldNormal, worldTangent);
+    if (dot(worldTangent, worldTangent) < 1e-12) {
+        vec3 axis = abs(worldNormal.y) < 0.99 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+        worldTangent = cross(axis, worldNormal);
+    }
+    worldTangent = normalize(worldTangent);
+    float handedness = inTangent.w < 0.0 ? -1.0 : 1.0;
+    vec3 worldBitangent = cross(worldNormal, worldTangent) * handedness;
 
     fragWorldPos = vec3(worldPosition);
     fragNormal = worldNormal;

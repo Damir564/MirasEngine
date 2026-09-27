@@ -6,11 +6,12 @@
 #include <vector>
 #include <future>
 #include <mutex>
+#include <optional>
+#include <string>
 #include <glm/glm.hpp>
 #include <glm/ext/matrix_transform.hpp>
 #include "ModelTypes.h"
 #include "Buffers.h"
-// #include "IfcLayerInfo.h"
 #include "IfcScene.h"
 
 class TextureImage;
@@ -49,6 +50,8 @@ struct ModelInstance {
     glm::vec3 scale{ 1.0f };
     std::optional<IfcScene> ifcScene;
     bool visible = true;
+    // Multiplied into every submesh's base color.
+    glm::vec3 color{ 1.0f };
 
     glm::mat4 getTransformMatrix() const {
         glm::mat4 T = glm::translate(glm::mat4(1.0f), position);
@@ -101,6 +104,8 @@ public:
     std::vector<ModelInstance>& getInstances() { return m_instances; }
     const std::vector<ModelInstance>& getInstances() const { return m_instances; }
     GPUModel* getModel(size_t index);
+    // Index of a loaded model with this source path.
+    std::optional<size_t> findModelByPath(const std::string& path) const;
 
     void update();
 
