@@ -783,14 +783,15 @@ FrameUBO Renderer::buildFrameUBO(const FrameInput& input) const
 
     frameData.cameraPos = glm::vec4(input.cameraPosition, 1.0f);
     frameData.lightDir = glm::vec4(glm::normalize(input.sun.direction), 0.0f);
-    frameData.sunColor = glm::vec4(input.sun.color, input.sun.intensity * 3.0f);
+    // Zero radiance removes the sun disk, its haze and direct lighting (and the flare it causes) in one go.
+    frameData.sunColor = m_settings.sun ? glm::vec4(input.sun.color, input.sun.intensity * 3.0f) : glm::vec4(0.0f);
     frameData.skyZenith = glm::vec4(0.16f, 0.34f, 0.72f, 0.0f);
     frameData.skyHorizon = glm::vec4(0.62f, 0.74f, 0.88f, 0.0f);
     frameData.groundColor = glm::vec4(0.28f, 0.26f, 0.23f, 0.0f);
 
     const glm::vec2 depthRange = projectionDepthRange(input.proj);
     frameData.fogParams = glm::vec4(m_settings.fog ? 1.0f : 0.0f, depthRange.y * 0.6f, 0.0f, 0.0f);
-    frameData.shadowParams = glm::vec4(kShadowBias, m_settings.shadows ? 1.0f : 0.0f, m_settings.shadowDistance,
+    frameData.shadowParams = glm::vec4(kShadowBias, m_settings.shadows && m_settings.sun ? 1.0f : 0.0f, m_settings.shadowDistance,
         1.0f / static_cast<float>(std::max(m_shadowMap.size, 1u)));
     frameData.time = input.time;
     frameData.nearPlane = depthRange.x;
@@ -803,7 +804,7 @@ uint64_t Renderer::cullAndBatch(const FrameInput& input, const glm::mat4& viewPr
 {
     ModelManager& models = *input.models;
     const glm::vec3 cameraPos = input.cameraPosition;
-    const bool shadows = m_settings.shadows;
+    const bool shadows = m_settings.shadows && m_settings.sun;
     const float shadowDistance = m_settings.shadowDistance;
     const auto& instances = models.getInstances();
     m_cullResults.resize(instances.size());

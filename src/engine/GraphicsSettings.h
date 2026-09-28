@@ -10,6 +10,7 @@ struct GraphicsSettings {
     float shadowDistance = 150.0f;
     float viewDistance = 5000.0f; // camera far plane
     bool fog = true;
+    bool sun = true;           // off: no sun disk, haze or direct sunlight (and no shadows)
 
     bool operator==(const GraphicsSettings&) const = default;
 };

@@ -60,6 +60,7 @@ GraphicsSettings loadGraphicsSettings(const std::string& path)
     readField(json, "shadowDistance", settings.shadowDistance);
     readField(json, "viewDistance", settings.viewDistance);
     readField(json, "fog", settings.fog);
+    readField(json, "sun", settings.sun);
     return sanitizeGraphicsSettings(settings);
 }
 
@@ -74,6 +75,7 @@ bool saveGraphicsSettings(const GraphicsSettings& settings, const std::string& p
         { "shadowDistance", settings.shadowDistance },
         { "viewDistance", settings.viewDistance },
         { "fog", settings.fog },
+        { "sun", settings.sun },
     };
     std::ofstream file(path);
     if (!file) {

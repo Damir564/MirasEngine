@@ -62,6 +62,8 @@ bool drawGraphicsSettings(GraphicsSettings& settings, const RenderCapabilities& 
     changed |= ImGui::SliderFloat("View distance", &settings.viewDistance, 100.0f, 20000.0f, "%.0f m",
         ImGuiSliderFlags_Logarithmic | ImGuiSliderFlags_AlwaysClamp);
     changed |= ImGui::Checkbox("Fog", &settings.fog);
+    changed |= ImGui::Checkbox("Sun", &settings.sun);
+    ImGui::SetItemTooltip("Sun disk and direct sunlight. Turning it off also disables shadows.");
 
     ImGui::PopItemWidth();
     ImGui::Spacing();
