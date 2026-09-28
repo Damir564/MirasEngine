@@ -20,6 +20,13 @@ struct EngineContext {
     GraphicsSettings& settings;
 };
 
+// Asks Application to switch modes after the current frame.
+enum class ModeRequest {
+    None,
+    PlayScene,       // editor: play the open scene in a game session, keeping the editor suspended
+    ReturnToEditor,  // game started from the editor: stop and resume the editor
+};
+
 // What the application runs: the editor or the game. Application drives the
 // per-frame order: onEvent* -> update -> (drawUi if uiVisible) -> lateUpdate -> fillFrame.
 class AppMode {
@@ -36,4 +43,8 @@ public:
     // Application has already set the window size, ImGui draw data and time.
     virtual void fillFrame(FrameInput& frame) = 0;
     virtual bool quitRequested() const = 0;
+    // Returns and clears the pending request.
+    virtual ModeRequest takeModeRequest() { return ModeRequest::None; }
+    // Called when a suspended mode becomes active again.
+    virtual void onResume() {}
 };

@@ -18,18 +18,23 @@ layout(set = 4, binding = 0) uniform sampler2DShadow shadowMapSampler;
 
 layout(location = 0) out vec4 outColor;
 
+// Specialized to false for opaque draws: with no discard in the shader the GPU can depth test and
+// write before shading, so fragments hidden behind nearer geometry are never shaded.
+layout(constant_id = 0) const bool ALPHA_TEST = true;
+
 const float PI = 3.14159265359;
 const int ALPHA_MODE_OPAQUE = 0;
 const int ALPHA_MODE_MASK = 1;
 
+// The first four points are the outermost ones, one per quadrant (see calculateShadow).
 const vec2 POISSON[16] = vec2[](
-    vec2(-0.94201624, -0.39906216), vec2(0.94558609, -0.76890725),
-    vec2(-0.09418410, -0.92938870), vec2(0.34495938, 0.29387760),
-    vec2(-0.91588581, 0.45771432), vec2(-0.81544232, -0.87912464),
-    vec2(-0.38277543, 0.27676845), vec2(0.97484398, 0.75648379),
-    vec2(0.44323325, -0.97511554), vec2(0.53742981, -0.47373420),
-    vec2(-0.26496911, -0.41893023), vec2(0.79197514, 0.19090188),
-    vec2(-0.24188840, 0.99706507), vec2(-0.81409955, 0.91437590),
+    vec2(-0.81544232, -0.87912464), vec2(0.94558609, -0.76890725),
+    vec2(0.97484398, 0.75648379), vec2(-0.81409955, 0.91437590),
+    vec2(-0.94201624, -0.39906216), vec2(-0.09418410, -0.92938870),
+    vec2(0.34495938, 0.29387760), vec2(-0.91588581, 0.45771432),
+    vec2(-0.38277543, 0.27676845), vec2(0.44323325, -0.97511554),
+    vec2(0.53742981, -0.47373420), vec2(-0.26496911, -0.41893023),
+    vec2(0.79197514, 0.19090188), vec2(-0.24188840, 0.99706507),
     vec2(0.19984126, 0.78641367), vec2(0.14383161, -0.14100790));
 
 // Per-pixel pseudo-random angle; turns PCF banding into fine noise.
@@ -56,12 +61,19 @@ float calculateShadow(vec3 N, vec3 L, float distanceToCamera) {
     mat2 rotation = mat2(cos(angle), sin(angle), -sin(angle), cos(angle));
     float radius = ubo.shadowParams.w * 1.75;
 
+    float depth = projCoords.z - bias;
     float shadow = 0.0;
-    for (int i = 0; i < 16; ++i) {
-        vec2 offset = rotation * POISSON[i] * radius;
-        shadow += texture(shadowMapSampler, vec3(projCoords.xy + offset, projCoords.z - bias));
+    for (int i = 0; i < 4; ++i)
+        shadow += texture(shadowMapSampler, vec3(projCoords.xy + rotation * POISSON[i] * radius, depth));
+    // When the outer taps agree, the pixel is almost always fully lit or fully shadowed, so only
+    // penumbra pixels pay for the other 12 taps.
+    if (shadow > 0.0 && shadow < 4.0) {
+        for (int i = 4; i < 16; ++i)
+            shadow += texture(shadowMapSampler, vec3(projCoords.xy + rotation * POISSON[i] * radius, depth));
+        shadow /= 16.0;
+    } else {
+        shadow *= 0.25;
     }
-    shadow /= 16.0;
     return mix(shadow, 1.0, fade);
 }
 
@@ -107,17 +119,20 @@ vec3 calcLight(vec3 N, vec3 V, vec3 L, vec3 radiance, vec3 albedo, float metalli
 void main() {
     DrawData d = draws[fragDrawIndex];
     vec4 texColor = texture(baseColorSampler, fragTexCoord);
-    float finalAlpha = texColor.a * d.baseColor.a;
+    float finalAlpha = 1.0;
 
-    if (d.alphaMode == ALPHA_MODE_MASK) {
-        if (finalAlpha < d.alphaCutoff)
+    if (ALPHA_TEST) {
+        finalAlpha = texColor.a * d.baseColor.a;
+        if (d.alphaMode == ALPHA_MODE_MASK) {
+            if (finalAlpha < d.alphaCutoff)
+                discard;
+            finalAlpha = 1.0;
+        } else if (d.alphaMode == ALPHA_MODE_OPAQUE) {
+            finalAlpha = 1.0;
+        }
+        if (finalAlpha < 0.001)
             discard;
-        finalAlpha = 1.0;
-    } else if (d.alphaMode == ALPHA_MODE_OPAQUE) {
-        finalAlpha = 1.0;
     }
-    if (finalAlpha < 0.001)
-        discard;
 
     vec3 albedo = d.baseColor.rgb * texColor.rgb;
 
@@ -158,7 +173,10 @@ void main() {
     const float a = 2.51, b = 0.03, c = 2.43, dd = 0.59, e = 0.14;
     color = clamp((color * (a * color + b)) / (color * (c * color + dd) + e), 0.0, 1.0);
 
-    // The sky is not tone mapped, so fog blends towards it after tone mapping.
-    color = mix(color, skyGradient(-V), fogFactor(viewDistance));
+    // The sky is not tone mapped, so fog blends towards it after tone mapping. Nearby the fog is too
+    // thin to show, and the sky lookup is skipped.
+    float fog = fogFactor(viewDistance);
+    if (fog > 1e-4)
+        color = mix(color, skyGradient(-V), fog);
     outColor = vec4(color, finalAlpha);
 }

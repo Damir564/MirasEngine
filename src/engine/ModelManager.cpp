@@ -1,6 +1,8 @@
 #include "ModelManager.h"
 #include <iostream>
 #include <algorithm>
+#include <array>
+#include <bit>
 #include <filesystem>
 #include <numeric>
 #include <tuple>
@@ -100,9 +102,16 @@ public:
     static vk::DeviceSize alignUp(vk::DeviceSize v) { return (v + 15) & ~vk::DeviceSize(15); }
 
     void copyToBuffer(const DeviceBuffer& dst, const void* data, vk::DeviceSize size) {
-        vk::DeviceSize offset = stage(data, size);
+        memcpy(stageToBuffer(dst, size), data, static_cast<size_t>(size));
+    }
+
+    // Staging memory that is copied into dst on submit; the caller fills it before submitAndWait().
+    void* stageToBuffer(const DeviceBuffer& dst, vk::DeviceSize size) {
+        const vk::DeviceSize offset = m_cursor;
+        m_cursor = alignUp(offset + size);
         vk::BufferCopy region(offset, 0, size);
         m_cmd.copyBuffer(vk::Buffer(m_staging), dst.getBuffer(), 1, &region);
+        return m_mapped + offset;
     }
 
     void copyToImage(const TextureImage& img, const void* pixels, bool generateMips) {
@@ -211,6 +220,34 @@ uint32_t mipLevelCount(uint32_t w, uint32_t h) {
     uint32_t levels = 1;
     while ((w | h) >> levels) ++levels;
     return levels;
+}
+
+// Spreads the low 10 bits of v so that two zero bits separate each of them.
+uint32_t spreadBits(uint32_t v) {
+    v &= 0x3FFu;
+    v = (v ^ (v << 16)) & 0xFF0000FFu;
+    v = (v ^ (v << 8)) & 0x0300F00Fu;
+    v = (v ^ (v << 4)) & 0x030C30C3u;
+    v = (v ^ (v << 2)) & 0x09249249u;
+    return v;
+}
+
+// 30-bit Morton code of a point in the unit cube.
+uint32_t mortonCode(const glm::vec3& unit) {
+    const glm::uvec3 q(glm::clamp(unit, 0.0f, 1.0f) * 1023.0f);
+    return (spreadBits(q.x) << 2) | (spreadBits(q.y) << 1) | spreadBits(q.z);
+}
+
+// Sorts by alpha mode first. Floats are compared by their bits so NaNs cannot break the ordering.
+using MaterialKey = std::array<uint32_t, 11>;
+
+MaterialKey materialKey(const Material& m) {
+    auto bits = [](float f) { return std::bit_cast<uint32_t>(f); };
+    return { static_cast<uint32_t>(m.alphaMode),
+        static_cast<uint32_t>(m.baseColorTextureIndex), static_cast<uint32_t>(m.normalTextureIndex),
+        static_cast<uint32_t>(m.metallicRoughnessTextureIndex),
+        bits(m.baseColorFactor.r), bits(m.baseColorFactor.g), bits(m.baseColorFactor.b), bits(m.baseColorFactor.a),
+        bits(m.metallicFactor), bits(m.roughnessFactor), bits(m.alphaCutoff) };
 }
 
 bool supportsLinearBlit(vk::PhysicalDevice physicalDevice, vk::Format format) {
@@ -335,20 +372,20 @@ size_t ModelManager::uploadModelToGPU(Mesh& mesh, const std::string& name, const
     gpuModel->name = name;
     gpuModel->sourcePath = path;
     gpuModel->submeshes = mesh.submeshes;
-    gpuModel->drawOrder.resize(mesh.submeshes.size());
-    std::iota(gpuModel->drawOrder.begin(), gpuModel->drawOrder.end(), 0u);
-    std::stable_sort(gpuModel->drawOrder.begin(), gpuModel->drawOrder.end(), [&](uint32_t a, uint32_t b) {
-        const Material& ma = mesh.submeshes[a].material;
-        const Material& mb = mesh.submeshes[b].material;
-        return std::tie(ma.baseColorTextureIndex, ma.normalTextureIndex, ma.metallicRoughnessTextureIndex) <
-            std::tie(mb.baseColorTextureIndex, mb.normalTextureIndex, mb.metallicRoughnessTextureIndex);
-        });
+    // Ranges running past the index data are clamped so the GPU copy below stays in bounds.
+    size_t gpuIndexCount = 0;
+    for (SubmeshInfo& sub : gpuModel->submeshes) {
+        const size_t available = sub.indexOffset < mesh.indices.size() ? mesh.indices.size() - sub.indexOffset : 0;
+        sub.indexCount = static_cast<uint32_t>(std::min<size_t>(sub.indexCount, available));
+        gpuIndexCount += sub.indexCount;
+    }
+    buildDrawOrder(*gpuModel);
     gpuModel->vertexCount = mesh.vertices.size();
     gpuModel->indexCount = mesh.indices.size();
     gpuModel->ifcScene = mesh.ifcScene;
 
     const vk::DeviceSize vertexBytes = sizeof(Vertex) * std::max<size_t>(mesh.vertices.size(), 1);
-    const vk::DeviceSize indexBytes = sizeof(uint32_t) * std::max<size_t>(mesh.indices.size(), 1);
+    const vk::DeviceSize indexBytes = sizeof(uint32_t) * std::max<size_t>(gpuIndexCount, 1);
 
     vk::DeviceSize stagingSize = UploadBatch::alignUp(vertexBytes) + UploadBatch::alignUp(indexBytes);
     for (const auto& texData : mesh.textureData)
@@ -361,8 +398,21 @@ size_t ModelManager::uploadModelToGPU(Mesh& mesh, const std::string& name, const
         UploadBatch batch(m_allocator, m_device, m_cmdPool, m_queue, stagingSize);
         if (!mesh.vertices.empty())
             batch.copyToBuffer(*gpuModel->vertexBuffer, mesh.vertices.data(), sizeof(Vertex) * mesh.vertices.size());
-        if (!mesh.indices.empty())
-            batch.copyToBuffer(*gpuModel->indexBuffer, mesh.indices.data(), sizeof(uint32_t) * mesh.indices.size());
+        if (gpuIndexCount > 0) {
+            // Submeshes go in drawOrder with vertexOffset folded into the indices, so neighbours that
+            // share a material form one contiguous index range the renderer can draw with one command.
+            uint32_t* gpuIndices = static_cast<uint32_t*>(
+                batch.stageToBuffer(*gpuModel->indexBuffer, sizeof(uint32_t) * gpuIndexCount));
+            uint32_t cursor = 0;
+            for (uint32_t si : gpuModel->drawOrder) {
+                SubmeshInfo& sub = gpuModel->submeshes[si];
+                for (uint32_t i = 0; i < sub.indexCount; ++i)
+                    gpuIndices[cursor + i] = mesh.indices[sub.indexOffset + i] + sub.vertexOffset;
+                sub.indexOffset = cursor;
+                sub.vertexOffset = 0;
+                cursor += sub.indexCount;
+            }
+        }
 
         for (auto& texData : mesh.textureData) {
             vk::Format fmt = texData.isLinear ? vk::Format::eR8G8B8A8Unorm : vk::Format::eR8G8B8A8Srgb;
@@ -396,6 +446,17 @@ size_t ModelManager::uploadModelToGPU(Mesh& mesh, const std::string& name, const
         gpuModel->boundsMax = bmax;
         gpuModel->boundsCenter = (bmin + bmax) * 0.5f;
         gpuModel->boundsRadius = glm::length(bmax - bmin) * 0.5f;
+
+        gpuModel->collisionTriangles.reserve(mesh.indices.size());
+        for (const SubmeshInfo& sub : mesh.submeshes) {
+            for (uint32_t i = 0; i + 2 < sub.indexCount; i += 3) {
+                for (uint32_t k = 0; k < 3; ++k) {
+                    const size_t vertex = size_t(sub.vertexOffset) + mesh.indices[sub.indexOffset + i + k];
+                    gpuModel->collisionTriangles.push_back(
+                        vertex < mesh.vertices.size() ? mesh.vertices[vertex].position : glm::vec3(0.0f));
+                }
+            }
+        }
     }
 
     size_t index = m_models.size();
@@ -407,6 +468,53 @@ size_t ModelManager::uploadModelToGPU(Mesh& mesh, const std::string& name, const
         << m_models.back()->textures.size() << " textures\n";
 
     return index;
+}
+
+void ModelManager::buildDrawOrder(GPUModel& model) {
+    const std::vector<SubmeshInfo>& submeshes = model.submeshes;
+    const uint32_t count = static_cast<uint32_t>(submeshes.size());
+
+    glm::vec3 lo(FLT_MAX);
+    glm::vec3 hi(-FLT_MAX);
+    for (const SubmeshInfo& sub : submeshes) {
+        if (sub.boundsMin.x <= sub.boundsMax.x) {
+            lo = glm::min(lo, sub.boundsMin);
+            hi = glm::max(hi, sub.boundsMax);
+        }
+    }
+    const glm::vec3 extent = glm::max(hi - lo, glm::vec3(1e-6f));
+
+    std::vector<MaterialKey> keys(count);
+    std::vector<uint32_t> morton(count, 0);
+    for (uint32_t i = 0; i < count; ++i) {
+        const SubmeshInfo& sub = submeshes[i];
+        keys[i] = materialKey(sub.material);
+        if (sub.boundsMin.x <= sub.boundsMax.x)
+            morton[i] = mortonCode(((sub.boundsMin + sub.boundsMax) * 0.5f - lo) / extent);
+    }
+
+    model.drawOrder.resize(count);
+    std::iota(model.drawOrder.begin(), model.drawOrder.end(), 0u);
+    std::sort(model.drawOrder.begin(), model.drawOrder.end(), [&](uint32_t a, uint32_t b) {
+        return std::tie(keys[a], morton[a], a) < std::tie(keys[b], morton[b], b);
+        });
+
+    model.materialGroups.clear();
+    model.shadowGroups.clear();
+    for (uint32_t begin = 0; begin < count;) {
+        uint32_t end = begin + 1;
+        while (end < count && keys[model.drawOrder[end]] == keys[model.drawOrder[begin]])
+            ++end;
+        model.materialGroups.push_back({ begin, end });
+
+        // Opaque groups sort first, so while they are added the last shadow group is the opaque one.
+        const AlphaMode mode = submeshes[model.drawOrder[begin]].material.alphaMode;
+        if (mode == AlphaMode::MASK || (mode == AlphaMode::OPAQUE && model.shadowGroups.empty()))
+            model.shadowGroups.push_back({ begin, end });
+        else if (mode == AlphaMode::OPAQUE)
+            model.shadowGroups.back().end = end;
+        begin = end;
+    }
 }
 
 void ModelManager::unloadModel(size_t modelIndex) {

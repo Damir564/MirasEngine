@@ -100,6 +100,22 @@ FetchContent_Declare(
     GIT_SHALLOW TRUE
 )
 
+FetchContent_Declare(
+  JoltPhysics
+  GIT_REPOSITORY https://github.com/jrouwe/JoltPhysics.git
+  GIT_TAG v5.6.0
+  GIT_SHALLOW TRUE
+  SOURCE_SUBDIR Build
+)
+
+# Jolt defaults to the static CRT (/MT), which would clash with the /MD used by everything else.
+set(USE_STATIC_MSVC_RUNTIME_LIBRARY OFF CACHE BOOL "" FORCE)
+set(TARGET_UNIT_TESTS OFF CACHE BOOL "" FORCE)
+set(TARGET_HELLO_WORLD OFF CACHE BOOL "" FORCE)
+set(TARGET_PERFORMANCE_TEST OFF CACHE BOOL "" FORCE)
+set(TARGET_SAMPLES OFF CACHE BOOL "" FORCE)
+set(TARGET_VIEWER OFF CACHE BOOL "" FORCE)
+
 set(FASTGLTF_COMPILE_AS_CPP20 ON CACHE BOOL "" FORCE)
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 
@@ -118,6 +134,7 @@ FetchContent_MakeAvailable(
   fastgltf
   imgui
   nlohmann_json
+  JoltPhysics
 )
 
 add_library(imgui STATIC

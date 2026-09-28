@@ -164,8 +164,19 @@ void Editor::drawToolbar()
         ImGui::SameLine();
         ImGui::Checkbox("Camera path", &m_showCameraPath);
 
-        const float flyWidth = ImGui::CalcTextSize("Fly Mode").x + ImGui::GetStyle().FramePadding.x * 2;
-        ImGui::SameLine(ImGui::GetWindowWidth() - flyWidth - 8);
+        const ImGuiStyle& style = ImGui::GetStyle();
+        const float flyWidth = ImGui::CalcTextSize("Fly Mode").x + style.FramePadding.x * 2;
+        const float playWidth = 80.0f;
+        ImGui::SameLine(ImGui::GetWindowWidth() - flyWidth - playWidth - style.ItemSpacing.x - 8);
+        ImGui::BeginDisabled(!canPlay());
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.16f, 0.45f, 0.22f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.20f, 0.56f, 0.28f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.13f, 0.38f, 0.18f, 1.0f));
+        if (ImGui::Button("Play", ImVec2(playWidth, 0))) requestPlay();
+        ImGui::PopStyleColor(3);
+        ImGui::EndDisabled();
+        ImGui::SetItemTooltip("Play this scene with the player controller (F5). Esc pauses, F5 stops.");
+        ImGui::SameLine();
         if (ImGui::Button("Fly Mode")) setFlyMode(true);
         ImGui::SetItemTooltip("Hide the UI and look around with the mouse (Shift+` or Esc to exit)");
     }

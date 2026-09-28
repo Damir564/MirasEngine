@@ -16,6 +16,12 @@
 
 class TextureImage;
 
+// Range [begin, end) of positions in GPUModel::drawOrder.
+struct DrawGroup {
+    uint32_t begin = 0;
+    uint32_t end = 0;
+};
+
 struct GPUModel {
     std::string name;
     std::string sourcePath;
@@ -26,9 +32,17 @@ struct GPUModel {
     std::vector<std::unique_ptr<TextureImage>> textures;
     std::vector<vk::DescriptorSet> textureDescriptorSets;
 
+    // indexOffset/vertexOffset refer to the GPU buffers: vertexOffset is 0 (folded into the indices)
+    // and the index buffer stores the submeshes in drawOrder.
     std::vector<SubmeshInfo> submeshes;
-    // Submesh indices sorted by texture set, so consecutive draws can share one indirect call.
+    // Submesh indices sorted by alpha mode, then material, then spatially (Morton order). Neighbours
+    // with the same material are adjacent in the index buffer, so they can be drawn with one command.
     std::vector<uint32_t> drawOrder;
+    // Runs of drawOrder sharing an identical material.
+    std::vector<DrawGroup> materialGroups;
+    // What the shadow pass draws: all opaque submeshes as one group (material does not matter there),
+    // then each alpha-masked material. Blended submeshes cast no shadow.
+    std::vector<DrawGroup> shadowGroups;
     size_t vertexCount = 0;
     size_t indexCount = 0;
 
@@ -38,6 +52,9 @@ struct GPUModel {
     glm::vec3 boundsMax{ 0.0f };
 
     std::optional<IfcScene> ifcScene;
+
+    // Model-space triangle soup (3 positions per triangle) kept on the CPU for physics collision.
+    std::vector<glm::vec3> collisionTriangles;
 
     bool isValid() const { return vertexBuffer != nullptr && indexBuffer != nullptr; }
 };
@@ -118,6 +135,7 @@ public:
 
 private:
     size_t uploadModelToGPU(Mesh& mesh, const std::string& name, const std::string& path);
+    static void buildDrawOrder(GPUModel& model);
     void createDefaultTextures();
     vk::DescriptorSet allocateTextureDescriptorSet(vk::ImageView view);
 

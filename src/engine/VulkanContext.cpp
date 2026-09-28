@@ -98,6 +98,8 @@ bool VulkanContext::createDevice()
     features12.bufferDeviceAddress = VK_TRUE;
     features12.scalarBlockLayout = VK_TRUE;
     features12.storageBuffer8BitAccess = VK_TRUE;
+    // MAX-reduction sampling builds and reads the Hi-Z occlusion pyramid.
+    features12.samplerFilterMinmax = VK_TRUE;
 
     VkPhysicalDeviceFeatures coreFeatures{};
     coreFeatures.fragmentStoresAndAtomics = VK_TRUE;

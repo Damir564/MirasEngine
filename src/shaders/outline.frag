@@ -23,10 +23,12 @@ void main() {
         discard;
 
     float radius = clamp(pc.widthPixels, 1.0, float(MAX_RADIUS));
+    // Taps farther than radius + 0.5 are skipped below, so loop only over the square containing the rest.
+    int extent = int(radius + 0.5);
     float silhouette = 0.0;
     float visible = 0.0;
-    for (int y = -MAX_RADIUS; y <= MAX_RADIUS; ++y) {
-        for (int x = -MAX_RADIUS; x <= MAX_RADIUS; ++x) {
+    for (int y = -extent; y <= extent; ++y) {
+        for (int x = -extent; x <= extent; ++x) {
             float d = length(vec2(x, y));
             if (d > radius + 0.5)
                 continue;

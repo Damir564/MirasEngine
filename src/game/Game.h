@@ -2,6 +2,7 @@
 #include <string>
 #include "app/AppMode.h"
 #include "engine/Camera.h"
+#include "engine/Physics.h"
 #include "engine/Shadow.h"
 
 class Renderer;
@@ -9,10 +10,14 @@ class ModelManager;
 class SceneManager;
 struct GraphicsSettings;
 
-// Player mode: main menu, loads the level scene and lets the player fly around it.
+// Player mode: main menu, loads the level scene and lets the player walk around it with physics.
 class Game final : public AppMode {
 public:
+    // Plays the scene that is already loaded (the editor's) instead of showing the main menu.
+    struct PlayInEditor {};
+
     explicit Game(const EngineContext& engine, std::string levelPath = "level1.scn");
+    Game(const EngineContext& engine, PlayInEditor);
     ~Game() override;
 
     Game(const Game&) = delete;
@@ -24,6 +29,7 @@ public:
     void drawUi() override;
     void fillFrame(FrameInput& frame) override;
     bool quitRequested() const override { return m_quitRequested; }
+    ModeRequest takeModeRequest() override;
 
 private:
     enum class State {
@@ -38,9 +44,10 @@ private:
     void startLoading();
     void updateLoading(float dt);
     void failLoading(const std::string& message);
-    void frameSceneBounds();
-    void moveCamera(float dt);
+    void spawnPlayer();
+    void movePlayer(float dt);
     void returnToMainMenu();
+    void stopPlayInEditor();
 
     void drawMainMenu();
     void drawLoadingScreen();
@@ -62,7 +69,14 @@ private:
     std::string m_error;
     float m_loadingStallTime = 0.0f;
     bool m_quitRequested = false;
+    bool m_playInEditor = false;
+    ModeRequest m_modeRequest = ModeRequest::None;
 
     Camera m_camera;
+    PhysicsWorld m_physics;
+    glm::vec3 m_spawnPoint{ 0.0f };
+    // Falling below this (off the edge of the level) respawns the player.
+    float m_killHeight = -100.0f;
+    bool m_jumpRequested = false;
     DirectionalLight m_sun;
 };

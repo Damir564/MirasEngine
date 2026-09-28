@@ -20,6 +20,17 @@ constexpr uint8_t kVisibleMain = 1;
 constexpr uint8_t kVisibleShadow = 2;
 constexpr size_t kCullChunkSize = 1024;
 constexpr float kShadowBias = 0.0015f;
+// Draws smaller than this on screen (projected bounding-sphere diameter) are skipped.
+constexpr float kMinScreenPixels = 1.0f;
+// The shadow map is re-fitted only when the camera moves by 1/N of its radius, so it is not
+// re-rendered every frame while walking; the map is enlarged by that step to keep full coverage.
+constexpr float kShadowSnapDivisions = 8.0f;
+constexpr uint32_t kCullGroupSize = 64;
+constexpr uint32_t kReduceGroupSize = 8;
+constexpr uint32_t kMaxPyramidLevels = 16;
+// Merged draws stop growing at this many indices: large enough to amortize the per-draw cost, small
+// enough (with the Morton-ordered index buffer) to keep their bounds useful for occlusion culling.
+constexpr uint32_t kMaxMergedIndices = 1u << 15;
 // Unity's selection orange; occluded parts of the outline are drawn fainter.
 constexpr glm::vec3 kOutlineColor{ 1.0f, 0.4f, 0.0f };
 constexpr float kOutlineOccludedAlpha = 0.4f;
@@ -77,6 +88,15 @@ vk::ImageMemoryBarrier2 imageBarrier(vk::Image image, vk::ImageAspectFlags aspec
     return barrier;
 }
 
+void memoryBarrier(vk::CommandBuffer cmd, vk::PipelineStageFlags2 srcStage, vk::AccessFlags2 srcAccess,
+    vk::PipelineStageFlags2 dstStage, vk::AccessFlags2 dstAccess)
+{
+    const vk::MemoryBarrier2 barrier{ srcStage, srcAccess, dstStage, dstAccess };
+    vk::DependencyInfo info{};
+    info.setMemoryBarriers(barrier);
+    cmd.pipelineBarrier2(info);
+}
+
 void pipelineBarriers(vk::CommandBuffer cmd, std::span<const vk::ImageMemoryBarrier2> barriers)
 {
     vk::DependencyInfo info{};
@@ -103,6 +123,33 @@ glm::vec2 projectionDepthRange(const glm::mat4& proj)
     if (std::abs(a) < 1e-12f || std::abs(a + 1.0f) < 1e-12f)
         return { 0.1f, 1000.0f };
     return { b / a, b / (a + 1.0f) };
+}
+
+struct ShadowSphere {
+    glm::vec3 center;
+    float radius;
+};
+
+// Fits the shadow map to a sphere in front of the camera, so it covers what is actually on screen up
+// to the shadow distance. The center is snapped to a coarse world grid: the light matrix, and with it
+// the cached shadow map, then only changes after the camera moved (or turned) noticeably.
+ShadowSphere computeShadowSphere(const FrameInput& input, float shadowDistance)
+{
+    const glm::mat4 invView = glm::inverse(input.view);
+    const glm::vec3 forward = -glm::normalize(glm::vec3(invView[2]));
+    const float radius = shadowDistance * 0.5f;
+    const float step = radius / kShadowSnapDivisions;
+    const glm::vec3 center = input.cameraPosition + forward * radius;
+    // Rounding moves the center by at most step * sqrt(3) / 2, which the extra step of radius absorbs.
+    return { glm::floor(center / step + 0.5f) * step, radius + step };
+}
+
+uint32_t previousPowerOfTwo(uint32_t value)
+{
+    uint32_t result = 1;
+    while (result * 2 <= value)
+        result *= 2;
+    return result;
 }
 
 } // namespace
@@ -138,7 +185,7 @@ bool Renderer::init(VulkanContext& context, SDL_Window* window, const GraphicsSe
         m_framesInFlight = m_swapchain.imageCount();
 
         if (!createRenderTargets() || !createFrameResources() || !createDescriptors() ||
-            !createShaders() || !initImGuiBackend()) {
+            !createShaders() || !createOcclusionResources() || !initImGuiBackend()) {
             shutdown();
             return false;
         }
@@ -249,11 +296,12 @@ bool Renderer::createRenderTargets()
         };
         m_device.updateDescriptorSets(2, writes, 0, nullptr);
     }
-    return true;
+    return createDepthPyramid();
 }
 
 void Renderer::destroyRenderTargets()
 {
+    destroyDepthPyramid();
     destroyRenderImage(m_sceneDepth);
     destroyRenderImage(m_selectionMask);
     destroyRenderImage(m_msaaColor);
@@ -408,7 +456,10 @@ bool Renderer::createDescriptors()
         m_frameDrawBuffers.emplace_back(new FrameDrawBuffers{
             HostBuffer(m_allocator, vk::BufferUsageFlagBits::eStorageBuffer, sizeof(GpuDrawData) * 4096),
             HostBuffer(m_allocator, vk::BufferUsageFlagBits::eStorageBuffer, sizeof(GpuTransform) * 256),
-            HostBuffer(m_allocator, vk::BufferUsageFlagBits::eIndirectBuffer, sizeof(vk::DrawIndexedIndirectCommand) * 4096),
+            // The occlusion pass edits the commands in place, hence storage usage.
+            HostBuffer(m_allocator, vk::BufferUsageFlagBits::eIndirectBuffer | vk::BufferUsageFlagBits::eStorageBuffer,
+                sizeof(vk::DrawIndexedIndirectCommand) * 4096),
+            HostBuffer(m_allocator, vk::BufferUsageFlagBits::eStorageBuffer, sizeof(GpuCullBounds) * 4096),
         });
         writeDrawDescriptors(i);
     }
@@ -427,6 +478,256 @@ void Renderer::writeDrawDescriptors(uint32_t frame)
     m_device.updateDescriptorSets(2, writes, 0, nullptr);
 }
 
+bool Renderer::createDepthPyramid()
+{
+    m_occlusionHistory.valid = false;
+    const vk::Extent2D extent = m_swapchain.extent();
+    DepthPyramid& pyramid = m_depthPyramid;
+    // Power-of-two levels make every reduction step an exact 2x2 -> 1 footprint.
+    pyramid.width = previousPowerOfTwo(std::max(extent.width, 1u));
+    pyramid.height = previousPowerOfTwo(std::max(extent.height, 1u));
+    uint32_t levels = 1;
+    while ((std::max(pyramid.width, pyramid.height) >> levels) > 0 && levels < kMaxPyramidLevels)
+        ++levels;
+
+    vk::ImageCreateInfo imageInfo{};
+    imageInfo.imageType = vk::ImageType::e2D;
+    imageInfo.extent = vk::Extent3D{ pyramid.width, pyramid.height, 1 };
+    imageInfo.mipLevels = levels;
+    imageInfo.arrayLayers = 1;
+    imageInfo.format = vk::Format::eR32Sfloat;
+    imageInfo.tiling = vk::ImageTiling::eOptimal;
+    imageInfo.initialLayout = vk::ImageLayout::eUndefined;
+    imageInfo.usage = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled;
+    imageInfo.samples = vk::SampleCountFlagBits::e1;
+    imageInfo.sharingMode = vk::SharingMode::eExclusive;
+    VmaAllocationCreateInfo allocInfo{};
+    allocInfo.usage = VMA_MEMORY_USAGE_GPU_ONLY;
+    if (vmaCreateImage(m_allocator, reinterpret_cast<const VkImageCreateInfo*>(&imageInfo), &allocInfo,
+        &pyramid.image, &pyramid.allocation, nullptr) != VK_SUCCESS) {
+        std::cerr << "Failed to create depth pyramid\n";
+        pyramid.image = VK_NULL_HANDLE;
+        return false;
+    }
+
+    vk::ImageViewCreateInfo viewInfo{};
+    viewInfo.image = vk::Image(pyramid.image);
+    viewInfo.viewType = vk::ImageViewType::e2D;
+    viewInfo.format = vk::Format::eR32Sfloat;
+    viewInfo.subresourceRange = vk::ImageSubresourceRange{ vk::ImageAspectFlagBits::eColor, 0, levels, 0, 1 };
+    if (!takeResult(m_device.createImageView(viewInfo), pyramid.fullView, "depth pyramid view"))
+        return false;
+    pyramid.mipViews.resize(levels);
+    for (uint32_t level = 0; level < levels; ++level) {
+        viewInfo.subresourceRange = vk::ImageSubresourceRange{ vk::ImageAspectFlagBits::eColor, level, 1, 0, 1 };
+        if (!takeResult(m_device.createImageView(viewInfo), pyramid.mipViews[level], "depth pyramid mip view"))
+            return false;
+    }
+    // On the first call the pool does not exist yet; createOcclusionResources() allocates the sets then.
+    return !m_pyramidDescriptorPool || allocatePyramidSets();
+}
+
+void Renderer::destroyDepthPyramid()
+{
+    m_occlusionHistory.valid = false;
+    DepthPyramid& pyramid = m_depthPyramid;
+    for (vk::ImageView view : pyramid.mipViews)
+        if (view) m_device.destroyImageView(view);
+    if (pyramid.fullView) m_device.destroyImageView(pyramid.fullView);
+    if (pyramid.image) vmaDestroyImage(m_allocator, pyramid.image, pyramid.allocation);
+    // The sets go back to their pool in the next allocatePyramidSets().
+    pyramid = {};
+}
+
+bool Renderer::allocatePyramidSets()
+{
+    DepthPyramid& pyramid = m_depthPyramid;
+    (void)m_device.resetDescriptorPool(m_pyramidDescriptorPool);
+    pyramid.reduceSets.clear();
+    const uint32_t levels = static_cast<uint32_t>(pyramid.mipViews.size());
+    if (!pyramid.image || levels == 0)
+        return true;
+
+    const std::vector<vk::DescriptorSetLayout> layouts(levels, m_reduceSetLayout);
+    if (!takeResult(m_device.allocateDescriptorSets({ m_pyramidDescriptorPool, layouts }), pyramid.reduceSets,
+            "depth pyramid descriptor sets"))
+        return false;
+    for (uint32_t level = 0; level < levels; ++level) {
+        // Level 0 reduces the resolved scene depth; every other level reduces the one above it.
+        const vk::DescriptorImageInfo source = level == 0
+            ? vk::DescriptorImageInfo{ m_maxReductionSampler, m_sceneDepth.view, vk::ImageLayout::eShaderReadOnlyOptimal }
+            : vk::DescriptorImageInfo{ m_maxReductionSampler, pyramid.mipViews[level - 1], vk::ImageLayout::eGeneral };
+        const vk::DescriptorImageInfo destination{ nullptr, pyramid.mipViews[level], vk::ImageLayout::eGeneral };
+        const vk::WriteDescriptorSet writes[2] = {
+            { pyramid.reduceSets[level], 0, 0, 1, vk::DescriptorType::eCombinedImageSampler, &source },
+            { pyramid.reduceSets[level], 1, 0, 1, vk::DescriptorType::eStorageImage, &destination },
+        };
+        m_device.updateDescriptorSets(2, writes, 0, nullptr);
+    }
+    return true;
+}
+
+bool Renderer::createOcclusionResources()
+{
+    vk::SamplerReductionModeCreateInfo reduction{ vk::SamplerReductionMode::eMax };
+    vk::SamplerCreateInfo samplerInfo{};
+    samplerInfo.pNext = &reduction;
+    samplerInfo.magFilter = vk::Filter::eLinear;
+    samplerInfo.minFilter = vk::Filter::eLinear;
+    samplerInfo.mipmapMode = vk::SamplerMipmapMode::eNearest;
+    samplerInfo.addressModeU = vk::SamplerAddressMode::eClampToEdge;
+    samplerInfo.addressModeV = vk::SamplerAddressMode::eClampToEdge;
+    samplerInfo.addressModeW = vk::SamplerAddressMode::eClampToEdge;
+    samplerInfo.maxLod = static_cast<float>(kMaxPyramidLevels);
+    if (!takeResult(m_device.createSampler(samplerInfo), m_maxReductionSampler, "max-reduction sampler"))
+        return false;
+
+    const auto compute = vk::ShaderStageFlagBits::eCompute;
+    const vk::DescriptorSetLayoutBinding reduceBindings[2] = {
+        { 0, vk::DescriptorType::eCombinedImageSampler, 1, compute },
+        { 1, vk::DescriptorType::eStorageImage, 1, compute },
+    };
+    // Binding 0: transforms, 1: GpuCullBounds[], 2: indirect commands, 3: depth pyramid.
+    const vk::DescriptorSetLayoutBinding cullBindings[4] = {
+        { 0, vk::DescriptorType::eStorageBuffer, 1, compute },
+        { 1, vk::DescriptorType::eStorageBuffer, 1, compute },
+        { 2, vk::DescriptorType::eStorageBuffer, 1, compute },
+        { 3, vk::DescriptorType::eCombinedImageSampler, 1, compute },
+    };
+    if (!takeResult(m_device.createDescriptorSetLayout({ {}, 2, reduceBindings }), m_reduceSetLayout, "pyramid set layout") ||
+        !takeResult(m_device.createDescriptorSetLayout({ {}, 4, cullBindings }), m_cullSetLayout, "cull set layout"))
+        return false;
+
+    const vk::PushConstantRange reducePush{ compute, 0, sizeof(PyramidPushConstants) };
+    const vk::PushConstantRange cullPush{ compute, 0, sizeof(CullPushConstants) };
+    vk::PipelineLayoutCreateInfo reduceLayoutInfo{};
+    reduceLayoutInfo.setSetLayouts(m_reduceSetLayout).setPushConstantRanges(reducePush);
+    vk::PipelineLayoutCreateInfo cullLayoutInfo{};
+    cullLayoutInfo.setSetLayouts(m_cullSetLayout).setPushConstantRanges(cullPush);
+    if (!takeResult(m_device.createPipelineLayout(reduceLayoutInfo), m_reduceLayout, "pyramid pipeline layout") ||
+        !takeResult(m_device.createPipelineLayout(cullLayoutInfo), m_cullLayout, "cull pipeline layout"))
+        return false;
+
+    try {
+        m_reduceShader = createComputeShader(m_device, "shaders/depth_reduce.comp.spv", { &m_reduceSetLayout, 1 }, { &reducePush, 1 });
+        m_cullShader = createComputeShader(m_device, "shaders/occlusion_cull.comp.spv", { &m_cullSetLayout, 1 }, { &cullPush, 1 });
+    }
+    catch (const std::exception& e) {
+        std::cerr << "Failed to load occlusion culling shaders: " << e.what() << "\n";
+        return false;
+    }
+
+    const vk::DescriptorPoolSize cullPoolSizes[] = {
+        { vk::DescriptorType::eStorageBuffer, 3 * m_framesInFlight },
+        { vk::DescriptorType::eCombinedImageSampler, m_framesInFlight },
+    };
+    vk::DescriptorPoolCreateInfo cullPoolInfo{};
+    cullPoolInfo.maxSets = m_framesInFlight;
+    cullPoolInfo.setPoolSizes(cullPoolSizes);
+    const vk::DescriptorPoolSize pyramidPoolSizes[] = {
+        { vk::DescriptorType::eCombinedImageSampler, kMaxPyramidLevels },
+        { vk::DescriptorType::eStorageImage, kMaxPyramidLevels },
+    };
+    vk::DescriptorPoolCreateInfo pyramidPoolInfo{};
+    pyramidPoolInfo.maxSets = kMaxPyramidLevels;
+    pyramidPoolInfo.setPoolSizes(pyramidPoolSizes);
+    if (!takeResult(m_device.createDescriptorPool(cullPoolInfo), m_cullDescriptorPool, "cull descriptor pool") ||
+        !takeResult(m_device.createDescriptorPool(pyramidPoolInfo), m_pyramidDescriptorPool, "pyramid descriptor pool"))
+        return false;
+
+    const std::vector<vk::DescriptorSetLayout> cullLayouts(m_framesInFlight, m_cullSetLayout);
+    if (!takeResult(m_device.allocateDescriptorSets({ m_cullDescriptorPool, cullLayouts }), m_cullSets, "cull descriptor sets"))
+        return false;
+    return allocatePyramidSets();
+}
+
+void Renderer::destroyOcclusionResources()
+{
+    if (m_cullShader) m_device.destroyShaderEXT(m_cullShader);
+    if (m_reduceShader) m_device.destroyShaderEXT(m_reduceShader);
+    if (m_cullLayout) m_device.destroyPipelineLayout(m_cullLayout);
+    if (m_reduceLayout) m_device.destroyPipelineLayout(m_reduceLayout);
+    if (m_cullDescriptorPool) m_device.destroyDescriptorPool(m_cullDescriptorPool);
+    if (m_pyramidDescriptorPool) m_device.destroyDescriptorPool(m_pyramidDescriptorPool);
+    if (m_cullSetLayout) m_device.destroyDescriptorSetLayout(m_cullSetLayout);
+    if (m_reduceSetLayout) m_device.destroyDescriptorSetLayout(m_reduceSetLayout);
+    if (m_maxReductionSampler) m_device.destroySampler(m_maxReductionSampler);
+    m_cullShader = nullptr;
+    m_reduceShader = nullptr;
+    m_cullLayout = nullptr;
+    m_reduceLayout = nullptr;
+    m_cullDescriptorPool = nullptr;
+    m_pyramidDescriptorPool = nullptr;
+    m_cullSetLayout = nullptr;
+    m_reduceSetLayout = nullptr;
+    m_maxReductionSampler = nullptr;
+    m_cullSets.clear();
+    m_depthPyramid.reduceSets.clear();
+}
+
+// Disables main-pass draws whose bounds are hidden behind last frame's depth.
+void Renderer::recordOcclusionCull(vk::CommandBuffer cmd)
+{
+    if (!m_occlusionHistory.valid || m_occlusionCommandCount == 0 || m_cullSets.empty())
+        return;
+
+    // The pyramid was written by compute at the end of the previous frame.
+    memoryBarrier(cmd, vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite,
+        vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderSampledRead);
+
+    bindComputeShader(cmd, m_cullShader);
+    cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute, m_cullLayout, 0, 1, &m_cullSets[m_currentFrame], 0, nullptr);
+    CullPushConstants push{};
+    push.prevViewProj = m_occlusionHistory.viewProj;
+    push.viewRect = m_occlusionHistory.viewRect;
+    push.pyramidSize = glm::vec2(float(m_depthPyramid.width), float(m_depthPyramid.height));
+    // maxComputeWorkGroupCount[0] is only guaranteed to be 65535.
+    constexpr uint32_t maxPerDispatch = 65535u * kCullGroupSize;
+    for (uint32_t done = 0; done < m_occlusionCommandCount; done += maxPerDispatch) {
+        push.firstCommand = m_occlusionFirstCommand + done;
+        push.commandCount = std::min(m_occlusionCommandCount - done, maxPerDispatch);
+        cmd.pushConstants(m_cullLayout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
+        cmd.dispatch((push.commandCount + kCullGroupSize - 1) / kCullGroupSize, 1, 1);
+    }
+
+    memoryBarrier(cmd, vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite,
+        vk::PipelineStageFlagBits2::eDrawIndirect, vk::AccessFlagBits2::eIndirectCommandRead);
+}
+
+// Builds the max-depth pyramid of this frame's scene depth for next frame's occlusion culling.
+void Renderer::recordDepthPyramid(vk::CommandBuffer cmd, const FrameInput& input)
+{
+    DepthPyramid& pyramid = m_depthPyramid;
+    if (pyramid.reduceSets.empty())
+        return;
+
+    // Earlier contents are fully rewritten; the previous reader is this frame's cull dispatch.
+    vk::ImageMemoryBarrier2 toGeneral = imageBarrier(vk::Image(pyramid.image), vk::ImageAspectFlagBits::eColor,
+        vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eNone,
+        vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite,
+        vk::ImageLayout::eUndefined, vk::ImageLayout::eGeneral);
+    toGeneral.subresourceRange.levelCount = VK_REMAINING_MIP_LEVELS;
+    pipelineBarriers(cmd, { &toGeneral, 1 });
+
+    bindComputeShader(cmd, m_reduceShader);
+    for (uint32_t level = 0; level < pyramid.reduceSets.size(); ++level) {
+        const PyramidPushConstants push{ std::max(pyramid.width >> level, 1u), std::max(pyramid.height >> level, 1u) };
+        cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute, m_reduceLayout, 0, 1, &pyramid.reduceSets[level], 0, nullptr);
+        cmd.pushConstants(m_reduceLayout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
+        cmd.dispatch((push.dstWidth + kReduceGroupSize - 1) / kReduceGroupSize,
+            (push.dstHeight + kReduceGroupSize - 1) / kReduceGroupSize, 1);
+        memoryBarrier(cmd, vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderStorageWrite,
+            vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderSampledRead);
+    }
+
+    const vk::Extent2D extent = m_swapchain.extent();
+    const vk::Rect2D rect = sceneRect(input);
+    m_occlusionHistory.valid = true;
+    m_occlusionHistory.viewProj = input.proj * input.view;
+    m_occlusionHistory.viewRect = glm::vec4(float(rect.offset.x) / extent.width, float(rect.offset.y) / extent.height,
+        float(rect.extent.width) / extent.width, float(rect.extent.height) / extent.height);
+}
+
 bool Renderer::createShaders()
 {
     // Main: set 0 = frame data, sets 1-3 = base color / normal / metallic-roughness, set 4 = shadow map.
@@ -441,9 +742,17 @@ bool Renderer::createShaders()
     const vk::PushConstantRange gizmoPushRange{ vk::ShaderStageFlagBits::eVertex, 0, sizeof(glm::mat4) };
     const vk::PushConstantRange fxPushRange{ vk::ShaderStageFlagBits::eFragment, 0, sizeof(OutlinePushConstants) };
 
+    // triangle.frag's ALPHA_TEST (constant_id 0), turned off for opaque draws.
+    const vk::Bool32 alphaTestOff = VK_FALSE;
+    const vk::SpecializationMapEntry alphaTestEntry{ 0, 0, sizeof(vk::Bool32) };
+    const vk::SpecializationInfo opaqueSpecialization{ 1, &alphaTestEntry, sizeof(alphaTestOff), &alphaTestOff };
+
     try {
-        m_meshShaders = createShaderPair(m_device, "shaders/triangle.vert.spv", "shaders/triangle.frag.spv", meshLayouts);
-        m_shadowShaders = createShaderPair(m_device, "shaders/shadow.vert.spv", "shaders/shadow.frag.spv", shadowLayouts);
+        m_meshShaders = createShaderPair(m_device, "shaders/triangle.vert.spv", "shaders/triangle.frag.spv", meshLayouts,
+            {}, &opaqueSpecialization);
+        m_meshAlphaShaders = createShaderPair(m_device, "shaders/triangle.vert.spv", "shaders/triangle.frag.spv", meshLayouts);
+        m_shadowShaders = createShaderPair(m_device, "shaders/shadow.vert.spv", "shaders/shadow.frag.spv", shadowLayouts,
+            {}, nullptr, /*linked=*/false);
         m_gizmoShaders = createShaderPair(m_device, "shaders/gizmo.vert.spv", "shaders/gizmo.frag.spv",
             frameOnlyLayouts, { &gizmoPushRange, 1 });
         m_skyShaders = createShaderPair(m_device, "shaders/fullscreen.vert.spv", "shaders/sky.frag.spv",
@@ -573,8 +882,9 @@ void Renderer::shutdown()
     }
 
     destroyLineBuffer(m_pathLines);
+    destroyOcclusionResources();
 
-    for (ShaderPair* pair : { &m_meshShaders, &m_shadowShaders, &m_gizmoShaders, &m_skyShaders,
+    for (ShaderPair* pair : { &m_meshShaders, &m_meshAlphaShaders, &m_shadowShaders, &m_gizmoShaders, &m_skyShaders,
              &m_gridShaders, &m_maskShaders, &m_outlineShaders })
         destroyShaderPair(m_device, *pair);
     for (vk::PipelineLayout* layout : { &m_meshLayout, &m_shadowLayout, &m_gizmoLayout, &m_fxLayout }) {
@@ -738,28 +1048,30 @@ Renderer::FrameStatus Renderer::renderFrame(const FrameInput& input)
     const FrameUBO frameData = buildFrameUBO(input);
     memcpy(m_frameUBOs[m_currentFrame].mapped, &frameData, sizeof(FrameUBO));
 
-    FrameBatches batches;
-    const uint64_t shadowHash = cullAndBatch(input, frameData.proj * frameData.view, frameData.lightSpaceMatrix, batches);
+    const uint64_t shadowHash = cullAndBatch(input, frameData.proj * frameData.view, frameData.lightSpaceMatrix);
     const bool renderShadowMap = !m_shadowMapValid || shadowHash != m_lastShadowHash;
     m_lastShadowHash = shadowHash;
     m_shadowMapValid = true;
 
-    buildDrawStreams(input, batches, renderShadowMap);
+    buildDrawStreams(input, renderShadowMap);
     uploadDrawStreams();
 
     const vk::CommandBuffer cmd = m_commandBuffers[m_currentFrame];
     (void)cmd.reset();
     (void)cmd.begin({ vk::CommandBufferUsageFlagBits::eOneTimeSubmit });
 
+    recordOcclusionCull(cmd);
+
     // When skipped, the map keeps its previous contents in DepthStencilReadOnlyOptimal. With shadows
     // off it is still cleared once so the (unused) binding refers to an initialized image.
     if (renderShadowMap)
-        recordShadowPass(cmd, *input.models);
+        recordShadowPass(cmd);
 
     recordScenePass(cmd, imageIndex, input);
     const bool drawOutline = !m_highlightRuns.empty();
     if (drawOutline)
         recordSelectionMask(cmd, input);
+    recordDepthPyramid(cmd, input);
     recordOverlayPass(cmd, imageIndex, input, drawOutline);
 
     (void)cmd.end();
@@ -773,13 +1085,8 @@ FrameUBO Renderer::buildFrameUBO(const FrameInput& input) const
     frameData.proj = input.proj;
     frameData.invViewProj = glm::inverse(input.proj * input.view);
 
-    // Fit the shadow map to a sphere in front of the camera, so it covers what is actually on screen
-    // up to the shadow distance instead of the whole scene.
-    const glm::mat4 invView = glm::inverse(input.view);
-    const glm::vec3 forward = -glm::normalize(glm::vec3(invView[2]));
-    const float radius = m_settings.shadowDistance * 0.5f;
-    const glm::vec3 center = input.cameraPosition + forward * radius;
-    frameData.lightSpaceMatrix = calculateLightSpaceMatrix(input.sun, center, radius, m_shadowMap.size);
+    const ShadowSphere shadowSphere = computeShadowSphere(input, m_settings.shadowDistance);
+    frameData.lightSpaceMatrix = calculateLightSpaceMatrix(input.sun, shadowSphere.center, shadowSphere.radius, m_shadowMap.size);
 
     frameData.cameraPos = glm::vec4(input.cameraPosition, 1.0f);
     frameData.lightDir = glm::vec4(glm::normalize(input.sun.direction), 0.0f);
@@ -798,13 +1105,17 @@ FrameUBO Renderer::buildFrameUBO(const FrameInput& input) const
     return frameData;
 }
 
-uint64_t Renderer::cullAndBatch(const FrameInput& input, const glm::mat4& viewProj, const glm::mat4& lightSpaceMatrix,
-    FrameBatches& batches)
+uint64_t Renderer::cullAndBatch(const FrameInput& input, const glm::mat4& viewProj, const glm::mat4& lightSpaceMatrix)
 {
     ModelManager& models = *input.models;
     const glm::vec3 cameraPos = input.cameraPosition;
     const bool shadows = m_settings.shadows;
-    const float shadowDistance = m_settings.shadowDistance;
+    // Caster selection must not depend on the exact camera position, or the cached shadow map would be
+    // invalidated every frame; the snapped shadow sphere only changes in coarse steps.
+    const ShadowSphere shadowSphere = computeShadowSphere(input, m_settings.shadowDistance);
+    const float minCasterSize = 2.0f * shadowSphere.radius / static_cast<float>(std::max(m_shadowMap.size, 1u));
+    // Projected diameter in pixels = worldDiameter * pixelsPerUnitAtDistance1 / distance.
+    const float pixelsPerUnit = std::abs(input.proj[1][1]) * 0.5f * static_cast<float>(sceneRect(input).extent.height);
     const auto& instances = models.getInstances();
     m_cullResults.resize(instances.size());
     m_cullIndices.resize(instances.size());
@@ -832,11 +1143,13 @@ uint64_t Renderer::cullAndBatch(const FrameInput& input, const glm::mat4& viewPr
         res.mainPlanes = extractFrustumPlanes(viewProj * res.transform);
         res.visibleMain = isAABBInFrustum(res.mainPlanes, gpuModel->boundsMin, gpuModel->boundsMax);
 
+        const glm::vec3 absScale = glm::abs(inst.scale);
+        res.maxScale = std::max({ absScale.x, absScale.y, absScale.z });
+
         if (shadows) {
             glm::vec3 worldCenter = glm::vec3(res.transform * glm::vec4(gpuModel->boundsCenter, 1.0f));
-            float maxScale = std::max({ inst.scale.x, inst.scale.y, inst.scale.z });
-            float distToCamera = glm::distance(worldCenter, cameraPos) - (gpuModel->boundsRadius * maxScale);
-            if (distToCamera < shadowDistance) {
+            float distToShadowCenter = glm::distance(worldCenter, shadowSphere.center) - (gpuModel->boundsRadius * res.maxScale);
+            if (distToShadowCenter < shadowSphere.radius) {
                 res.shadowPlanes = extractFrustumPlanes(lightSpaceMatrix * res.transform);
                 res.visibleShadow = isAABBInFrustum(res.shadowPlanes, gpuModel->boundsMin, gpuModel->boundsMax);
             }
@@ -865,11 +1178,20 @@ uint64_t Renderer::cullAndBatch(const FrameInput& input, const glm::mat4& viewPr
 
             const SubmeshInfo& sub = submeshes[s];
             const bool validBounds = sub.boundsMin.x <= sub.boundsMax.x;
+            bool bigOnScreen = true;
+            bool bigInShadowMap = true;
+            if (validBounds) {
+                const float diameter = glm::length(sub.boundsMax - sub.boundsMin) * res.maxScale;
+                const glm::vec3 center = glm::vec3(res.transform * glm::vec4((sub.boundsMin + sub.boundsMax) * 0.5f, 1.0f));
+                const float distance = glm::distance(center, cameraPos);
+                bigOnScreen = distance <= diameter || diameter * pixelsPerUnit >= kMinScreenPixels * distance;
+                bigInShadowMap = diameter >= minCasterSize;
+            }
             uint8_t flags = 0;
-            if (res.visibleMain &&
+            if (res.visibleMain && bigOnScreen &&
                 (!validBounds || isAABBInFrustum(res.mainPlanes, sub.boundsMin, sub.boundsMax)))
                 flags |= kVisibleMain;
-            if (res.visibleShadow && sub.material.alphaMode != AlphaMode::BLEND &&
+            if (res.visibleShadow && bigInShadowMap && sub.material.alphaMode != AlphaMode::BLEND &&
                 (!validBounds || isAABBInFrustum(res.shadowPlanes, sub.boundsMin, sub.boundsMax)))
                 flags |= kVisibleShadow;
             res.submeshFlags[s] = flags;
@@ -883,21 +1205,30 @@ uint64_t Renderer::cullAndBatch(const FrameInput& input, const glm::mat4& viewPr
     if (shadows)
         shadowHash.bytes(&lightSpaceMatrix, sizeof(glm::mat4));
 
+    const size_t modelCount = models.getModels().size();
+    m_mainBatches.resize(modelCount);
+    m_shadowBatches.resize(modelCount);
+    for (RenderBatch& batch : m_mainBatches)
+        batch.instances.clear();
+    for (RenderBatch& batch : m_shadowBatches)
+        batch.instances.clear();
+
     m_frameTransforms.clear();
     for (const auto& res : m_cullResults) {
         if (!res.gpuModel || !(res.visibleMain || res.visibleShadow)) continue;
 
         const uint32_t transformIndex = pushTransform(res.transform);
-        InstanceRenderData renderData{ res.instance, res.transform, res.submeshFlags.data(), transformIndex };
+        const InstanceRenderData renderData{ res.instance, res.submeshFlags.data(), transformIndex,
+            glm::distance(cameraPos, res.instance->position) };
 
         if (res.visibleMain) {
-            auto& batch = batches.main[res.modelIndex];
+            RenderBatch& batch = m_mainBatches[res.modelIndex];
             batch.model = res.gpuModel;
             batch.instances.push_back(renderData);
         }
 
         if (res.visibleShadow) {
-            auto& batch = batches.shadow[res.modelIndex];
+            RenderBatch& batch = m_shadowBatches[res.modelIndex];
             batch.model = res.gpuModel;
             batch.instances.push_back(renderData);
 
@@ -907,6 +1238,13 @@ uint64_t Renderer::cullAndBatch(const FrameInput& input, const glm::mat4& viewPr
                 shadowHash.byte(f & kVisibleShadow);
         }
     }
+
+    // Near to far, so nearer opaque geometry fills the depth buffer first and hides what is behind it
+    // before that gets shaded. Blended draws walk the list backwards.
+    for (RenderBatch& batch : m_mainBatches)
+        std::sort(batch.instances.begin(), batch.instances.end(), [](const InstanceRenderData& a, const InstanceRenderData& b) {
+            return a.cameraDistance < b.cameraDistance;
+        });
     return shadowHash.value();
 }
 
@@ -928,26 +1266,72 @@ uint32_t Renderer::pushTransform(const glm::mat4& transform)
     return static_cast<uint32_t>(m_frameTransforms.size() - 1);
 }
 
-uint32_t Renderer::pushDrawData(const SubmeshInfo& sub, uint32_t transformIndex, const glm::vec3& tint)
+uint32_t Renderer::pushDrawData(const Material& material, uint32_t transformIndex, const glm::vec3& tint)
 {
     GpuDrawData d{};
-    d.baseColor = sub.material.baseColorFactor * glm::vec4(tint, 1.0f);
+    d.baseColor = material.baseColorFactor * glm::vec4(tint, 1.0f);
     d.transformIndex = transformIndex;
-    d.alphaMode = static_cast<int32_t>(sub.material.alphaMode);
-    d.metallic = sub.material.metallicFactor;
-    d.roughness = sub.material.roughnessFactor;
-    d.alphaCutoff = sub.material.alphaCutoff;
+    d.alphaMode = static_cast<int32_t>(material.alphaMode);
+    d.metallic = material.metallicFactor;
+    d.roughness = material.roughnessFactor;
+    d.alphaCutoff = material.alphaCutoff;
     m_frameDraws.push_back(d);
     return static_cast<uint32_t>(m_frameDraws.size() - 1);
 }
 
+bool Renderer::MergedDraw::tryAppend(const SubmeshInfo& sub)
+{
+    const bool subBounds = sub.boundsMin.x <= sub.boundsMax.x;
+    if (empty()) {
+        material = &sub.material;
+        firstIndex = sub.indexOffset;
+        indexCount = sub.indexCount;
+        vertexOffset = sub.vertexOffset;
+        boundsMin = sub.boundsMin;
+        boundsMax = sub.boundsMax;
+        validBounds = subBounds;
+        return true;
+    }
+    if (sub.indexOffset != firstIndex + indexCount || sub.vertexOffset != vertexOffset ||
+        indexCount + sub.indexCount > kMaxMergedIndices)
+        return false;
+    indexCount += sub.indexCount;
+    validBounds = validBounds && subBounds;
+    boundsMin = glm::min(boundsMin, sub.boundsMin);
+    boundsMax = glm::max(boundsMax, sub.boundsMax);
+    return true;
+}
+
+// Callers pass submeshes that may share one command: the same material, or (shadow and selection
+// passes) any material the shader ignores. ModelManager lays such runs out contiguously in the index buffer.
+void Renderer::appendInstanceDraws(std::vector<DrawRun>& runs, GPUModel* model, const vk::DescriptorSet sets[3],
+    bool blend, std::span<const uint32_t> order, const uint8_t* submeshFlags, uint8_t visibleFlag,
+    uint32_t transformIndex, const glm::vec3& tint, bool occlusionCullable)
+{
+    MergedDraw draw;
+    for (uint32_t si : order) {
+        if (submeshFlags && !(submeshFlags[si] & visibleFlag))
+            continue;
+        const SubmeshInfo& sub = model->submeshes[si];
+        if (sub.indexCount == 0 || draw.tryAppend(sub))
+            continue;
+        appendDraw(runs, model, sets, blend, draw, transformIndex, tint, occlusionCullable);
+        draw = {};
+        draw.tryAppend(sub);
+    }
+    if (!draw.empty())
+        appendDraw(runs, model, sets, blend, draw, transformIndex, tint, occlusionCullable);
+}
+
 void Renderer::appendDraw(std::vector<DrawRun>& runs, GPUModel* model, const vk::DescriptorSet sets[3], bool blend,
-    const SubmeshInfo& sub, uint32_t transformIndex, const glm::vec3& tint)
+    const MergedDraw& draw, uint32_t transformIndex, const glm::vec3& tint, bool occlusionCullable)
 {
     const uint32_t commandIndex = static_cast<uint32_t>(m_frameCommands.size());
-    const uint32_t drawIndex = pushDrawData(sub, transformIndex, tint);
+    const uint32_t drawIndex = pushDrawData(*draw.material, transformIndex, tint);
     m_frameCommands.push_back(vk::DrawIndexedIndirectCommand(
-        sub.indexCount, 1, sub.indexOffset, static_cast<int32_t>(sub.vertexOffset), drawIndex));
+        draw.indexCount, 1, draw.firstIndex, static_cast<int32_t>(draw.vertexOffset), drawIndex));
+    m_frameCullBounds.push_back({ draw.boundsMin, transformIndex, draw.boundsMax,
+        occlusionCullable && draw.validBounds ? 1u : 0u });
 
     if (!runs.empty()) {
         DrawRun& run = runs.back();
@@ -965,74 +1349,81 @@ void Renderer::appendDraw(std::vector<DrawRun>& runs, GPUModel* model, const vk:
     runs.push_back({ model, { sets[0], sets[1], sets[2] }, blend, commandIndex, 1 });
 }
 
-// Every visible (instance, submesh) pair becomes one GpuDrawData entry plus one indirect command whose
-// firstInstance points at that entry; compatible neighbours are merged into DrawRuns.
-void Renderer::buildDrawStreams(const FrameInput& input, FrameBatches& batches, bool renderShadowMap)
+// Every visible run of neighbouring submeshes (see appendInstanceDraws) becomes one GpuDrawData entry
+// plus one indirect command whose firstInstance points at that entry; compatible neighbouring commands
+// are merged into DrawRuns.
+void Renderer::buildDrawStreams(const FrameInput& input, bool renderShadowMap)
 {
     ModelManager& models = *input.models;
-    const glm::vec3 cameraPos = input.cameraPosition;
 
     m_frameDraws.clear();
     m_frameCommands.clear();
+    m_frameCullBounds.clear();
     m_shadowRuns.clear();
+    m_shadowMaskRuns.clear();
     m_opaqueRuns.clear();
+    m_maskRuns.clear();
     m_blendRuns.clear();
 
+    auto groupOrder = [](const GPUModel* model, const DrawGroup& group) {
+        return std::span<const uint32_t>(model->drawOrder.data() + group.begin, group.end - group.begin);
+    };
+    auto groupMaterial = [](const GPUModel* model, const DrawGroup& group) -> const Material& {
+        return model->submeshes[model->drawOrder[group.begin]].material;
+    };
+
     if (renderShadowMap) {
-        for (auto& [modelIdx, batch] : batches.shadow) {
+        for (const RenderBatch& batch : m_shadowBatches) {
+            if (batch.instances.empty()) continue;
             GPUModel* model = batch.model;
-            for (uint32_t si : model->drawOrder) {
-                const SubmeshInfo& sub = model->submeshes[si];
-                // Only alpha-masked submeshes need a specific texture in the shadow pass.
+            for (const DrawGroup& group : model->shadowGroups) {
+                const Material& material = groupMaterial(model, group);
+                // Only alpha-masked casters run a fragment shader, which samples their base color.
+                const bool masked = material.alphaMode == AlphaMode::MASK;
                 vk::DescriptorSet sets[3] = {};
-                if (sub.material.alphaMode == AlphaMode::MASK) {
+                if (masked) {
                     vk::DescriptorSet all[3];
-                    materialSets(models, model, sub.material, all);
+                    materialSets(models, model, material, all);
                     sets[0] = all[0];
                 }
-                for (const auto& rd : batch.instances)
-                    if (rd.submeshFlags[si] & kVisibleShadow)
-                        appendDraw(m_shadowRuns, model, sets, false, sub, rd.transformIndex, glm::vec3(1.0f));
+                for (const InstanceRenderData& rd : batch.instances)
+                    appendInstanceDraws(masked ? m_shadowMaskRuns : m_shadowRuns, model, sets, false,
+                        groupOrder(model, group), rd.submeshFlags, kVisibleShadow, rd.transformIndex, glm::vec3(1.0f), false);
             }
         }
     }
 
-    for (auto& [modelIdx, batch] : batches.main) {
+    m_occlusionFirstCommand = static_cast<uint32_t>(m_frameCommands.size());
+    for (const RenderBatch& batch : m_mainBatches) {
+        if (batch.instances.empty()) continue;
         GPUModel* model = batch.model;
-        for (uint32_t si : model->drawOrder) {
-            const SubmeshInfo& sub = model->submeshes[si];
-            if (sub.material.alphaMode == AlphaMode::BLEND) continue;
+        for (const DrawGroup& group : model->materialGroups) {
+            const Material& material = groupMaterial(model, group);
+            if (material.alphaMode == AlphaMode::BLEND) continue;
             vk::DescriptorSet sets[3];
-            materialSets(models, model, sub.material, sets);
-            for (const auto& rd : batch.instances)
-                if (rd.submeshFlags[si] & kVisibleMain)
-                    appendDraw(m_opaqueRuns, model, sets, false, sub, rd.transformIndex, rd.instance->color);
+            materialSets(models, model, material, sets);
+            std::vector<DrawRun>& runs = material.alphaMode == AlphaMode::MASK ? m_maskRuns : m_opaqueRuns;
+            for (const InstanceRenderData& rd : batch.instances)
+                appendInstanceDraws(runs, model, sets, false, groupOrder(model, group), rd.submeshFlags, kVisibleMain,
+                    rd.transformIndex, rd.instance->color, true);
         }
     }
 
-    std::vector<InstanceRenderData> sortedInstances;
-    for (auto& [modelIdx, batch] : batches.main) {
+    for (const RenderBatch& batch : m_mainBatches) {
+        if (batch.instances.empty()) continue;
         GPUModel* model = batch.model;
-        bool sorted = false;
-        for (std::size_t si = 0; si < model->submeshes.size(); ++si) {
-            const SubmeshInfo& sub = model->submeshes[si];
-            if (sub.material.alphaMode != AlphaMode::BLEND) continue;
-
-            if (!sorted) {
-                sortedInstances = batch.instances;
-                std::sort(sortedInstances.begin(), sortedInstances.end(), [&](const InstanceRenderData& a, const InstanceRenderData& b) {
-                    return glm::distance(cameraPos, a.instance->position) > glm::distance(cameraPos, b.instance->position);
-                });
-                sorted = true;
-            }
-
+        for (const DrawGroup& group : model->materialGroups) {
+            const Material& material = groupMaterial(model, group);
+            if (material.alphaMode != AlphaMode::BLEND) continue;
             vk::DescriptorSet sets[3];
-            materialSets(models, model, sub.material, sets);
-            for (const auto& rd : sortedInstances)
-                if (rd.submeshFlags[si] & kVisibleMain)
-                    appendDraw(m_blendRuns, model, sets, true, sub, rd.transformIndex, rd.instance->color);
+            materialSets(models, model, material, sets);
+            // Far to near.
+            for (auto rd = batch.instances.rbegin(); rd != batch.instances.rend(); ++rd)
+                appendInstanceDraws(m_blendRuns, model, sets, true, groupOrder(model, group), rd->submeshFlags,
+                    kVisibleMain, rd->transformIndex, rd->instance->color, true);
         }
     }
+    m_occlusionCommandCount = static_cast<uint32_t>(m_frameCommands.size()) - m_occlusionFirstCommand;
 
     buildHighlightStream(input);
 }
@@ -1055,21 +1446,31 @@ void Renderer::buildHighlightStream(const FrameInput& input)
         return;
 
     const IfcScene* ifc = inst.ifcScene ? &*inst.ifcScene : nullptr;
-    const uint32_t transformIndex = pushTransform(inst.getTransformMatrix());
-    const vk::DescriptorSet noSets[3] = {};
-    auto add = [&](size_t si) {
-        if (si >= model->submeshes.size() || (ifc && !ifc->isSubmeshVisible(si)))
-            return;
-        appendDraw(m_highlightRuns, model, noSets, false, model->submeshes[si], transformIndex, glm::vec3(1.0f));
+    m_highlightOrder.clear();
+    auto add = [&](uint32_t si) {
+        if (si < model->submeshes.size() && (!ifc || ifc->isSubmeshVisible(si)))
+            m_highlightOrder.push_back(si);
     };
     if (highlight.wholeInstance) {
-        for (size_t si = 0; si < model->submeshes.size(); ++si)
+        for (uint32_t si : model->drawOrder)
             add(si);
     }
     else {
         for (uint32_t si : highlight.submeshes)
             add(si);
+        // Index buffer order, so submeshes that are neighbours there merge into one draw.
+        std::sort(m_highlightOrder.begin(), m_highlightOrder.end(), [&](uint32_t a, uint32_t b) {
+            return model->submeshes[a].indexOffset < model->submeshes[b].indexOffset;
+        });
     }
+    if (m_highlightOrder.empty())
+        return;
+
+    // The mask shader ignores materials, so the draws merge across them.
+    const uint32_t transformIndex = pushTransform(inst.getTransformMatrix());
+    const vk::DescriptorSet noSets[3] = {};
+    appendInstanceDraws(m_highlightRuns, model, noSets, false, m_highlightOrder, nullptr, 0, transformIndex,
+        glm::vec3(1.0f), false);
 }
 
 void Renderer::uploadDrawStreams()
@@ -1083,11 +1484,30 @@ void Renderer::uploadDrawStreams()
     bool descriptorsStale = buffers.draws.reserve(drawBytes);
     descriptorsStale = buffers.transforms.reserve(transformBytes) || descriptorsStale;
     buffers.indirect.reserve(commandBytes);
+    const vk::DeviceSize cullBytes = sizeof(GpuCullBounds) * m_frameCullBounds.size();
+    buffers.cullBounds.reserve(cullBytes);
     if (descriptorsStale) writeDrawDescriptors(m_currentFrame);
 
     if (drawBytes) memcpy(buffers.draws.mapped(), m_frameDraws.data(), drawBytes);
     if (transformBytes) memcpy(buffers.transforms.mapped(), m_frameTransforms.data(), transformBytes);
     if (commandBytes) memcpy(buffers.indirect.mapped(), m_frameCommands.data(), commandBytes);
+    if (cullBytes) memcpy(buffers.cullBounds.mapped(), m_frameCullBounds.data(), cullBytes);
+
+    // Rewritten every frame (cheap) because any of these buffers may have just been reallocated.
+    if (!m_cullSets.empty() && m_depthPyramid.fullView) {
+        const vk::DescriptorBufferInfo transformsInfo(buffers.transforms.getBuffer(), 0, VK_WHOLE_SIZE);
+        const vk::DescriptorBufferInfo boundsInfo(buffers.cullBounds.getBuffer(), 0, VK_WHOLE_SIZE);
+        const vk::DescriptorBufferInfo commandsInfo(buffers.indirect.getBuffer(), 0, VK_WHOLE_SIZE);
+        const vk::DescriptorImageInfo pyramidInfo{ m_maxReductionSampler, m_depthPyramid.fullView, vk::ImageLayout::eGeneral };
+        const vk::DescriptorSet set = m_cullSets[m_currentFrame];
+        const vk::WriteDescriptorSet writes[4] = {
+            { set, 0, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &transformsInfo },
+            { set, 1, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &boundsInfo },
+            { set, 2, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &commandsInfo },
+            { set, 3, 0, 1, vk::DescriptorType::eCombinedImageSampler, &pyramidInfo },
+        };
+        m_device.updateDescriptorSets(4, writes, 0, nullptr);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1168,7 +1588,25 @@ void Renderer::recordRun(vk::CommandBuffer cmd, const DrawRun& run) const
     }
 }
 
-void Renderer::recordShadowPass(vk::CommandBuffer cmd, const ModelManager& models)
+void Renderer::recordShadowRuns(vk::CommandBuffer cmd, const std::vector<DrawRun>& runs)
+{
+    const GPUModel* boundModel = nullptr;
+    vk::DescriptorSet boundSet;
+    for (const DrawRun& run : runs) {
+        if (run.model != boundModel) {
+            bindModelBuffers(cmd, run.model);
+            boundModel = run.model;
+        }
+        // Only alpha-masked runs have a base color set; the others run no fragment shader.
+        if (run.sets[0] && run.sets[0] != boundSet) {
+            boundSet = run.sets[0];
+            cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, m_shadowLayout, 1, 1, &boundSet, 0, nullptr);
+        }
+        recordRun(cmd, run);
+    }
+}
+
+void Renderer::recordShadowPass(vk::CommandBuffer cmd)
 {
     const uint32_t size = m_shadowMap.size;
     const vk::Image shadowImage(m_shadowMap.image);
@@ -1195,8 +1633,7 @@ void Renderer::recordShadowPass(vk::CommandBuffer cmd, const ModelManager& model
         .setPDepthAttachment(&shadowDepthAttachment);
 
     cmd.beginRendering(shadowRenderInfo);
-    if (!m_shadowRuns.empty()) {
-        bindShaderPair(cmd, m_shadowShaders);
+    if (!m_shadowRuns.empty() || !m_shadowMaskRuns.empty()) {
         const vk::Viewport shadowViewport{ 0, 0, float(size), float(size), 0.f, 1.f };
         const vk::Rect2D shadowRect{ {0, 0}, {size, size} };
         setDefaultDrawState(cmd, vk::SampleCountFlagBits::e1, shadowViewport, shadowRect);
@@ -1208,22 +1645,13 @@ void Renderer::recordShadowPass(vk::CommandBuffer cmd, const ModelManager& model
         cmd.setVertexInputEXT(1, &m_meshBinding, static_cast<uint32_t>(m_meshAttributes.size()), m_meshAttributes.data());
 
         cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, m_shadowLayout, 0, 1, &m_frameSets[m_currentFrame], 0, nullptr);
-        // The shadow fragment shader statically uses set 1, so it must be bound even
-        // when no submesh is alpha-masked.
-        vk::DescriptorSet boundShadowSet = models.getDefaultBaseColorSet();
-        cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, m_shadowLayout, 1, 1, &boundShadowSet, 0, nullptr);
 
-        const GPUModel* boundModel = nullptr;
-        for (const DrawRun& run : m_shadowRuns) {
-            if (run.model != boundModel) {
-                bindModelBuffers(cmd, run.model);
-                boundModel = run.model;
-            }
-            if (run.sets[0] && run.sets[0] != boundShadowSet) {
-                boundShadowSet = run.sets[0];
-                cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, m_shadowLayout, 1, 1, &boundShadowSet, 0, nullptr);
-            }
-            recordRun(cmd, run);
+        // Opaque casters only write depth, so no fragment shader runs for them at all.
+        bindVertexShaderOnly(cmd, m_shadowShaders.vert);
+        recordShadowRuns(cmd, m_shadowRuns);
+        if (!m_shadowMaskRuns.empty()) {
+            bindShaderPair(cmd, m_shadowShaders);
+            recordShadowRuns(cmd, m_shadowMaskRuns);
         }
         cmd.setDepthBiasEnable(VK_FALSE);
     }
@@ -1247,7 +1675,7 @@ void Renderer::recordScenePass(vk::CommandBuffer cmd, uint32_t imageIndex, const
     const auto depthAccess = vk::AccessFlagBits2::eDepthStencilAttachmentRead | vk::AccessFlagBits2::eDepthStencilAttachmentWrite;
 
     // Previous contents are discarded. The scene depth was last sampled by the selection mask pass
-    // of an earlier frame, hence the fragment shader source stage.
+    // and the depth pyramid build of an earlier frame, hence the fragment and compute source stages.
     std::vector<vk::ImageMemoryBarrier2> barriers = {
         imageBarrier(swapImage, colorAspect,
             vk::PipelineStageFlagBits2::eColorAttachmentOutput, vk::AccessFlagBits2::eNone,
@@ -1255,7 +1683,8 @@ void Renderer::recordScenePass(vk::CommandBuffer cmd, uint32_t imageIndex, const
             vk::AccessFlagBits2::eColorAttachmentRead | vk::AccessFlagBits2::eColorAttachmentWrite,
             vk::ImageLayout::eUndefined, vk::ImageLayout::eColorAttachmentOptimal),
         imageBarrier(vk::Image(m_sceneDepth.image), depthAspect,
-            vk::PipelineStageFlagBits2::eFragmentShader | depthStages | vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+            vk::PipelineStageFlagBits2::eFragmentShader | vk::PipelineStageFlagBits2::eComputeShader | depthStages |
+                vk::PipelineStageFlagBits2::eColorAttachmentOutput,
             vk::AccessFlagBits2::eDepthStencilAttachmentWrite,
             // Depth resolves write in the color output stage with color attachment access.
             depthStages | vk::PipelineStageFlagBits2::eColorAttachmentOutput,
@@ -1314,9 +1743,6 @@ void Renderer::recordScenePass(vk::CommandBuffer cmd, uint32_t imageIndex, const
         float(rect.extent.width), float(rect.extent.height), 0.f, 1.f };
     setDefaultDrawState(cmd, m_samples, viewport, rect);
 
-    // Sky first, behind everything (no depth).
-    recordFullscreen(cmd, m_skyShaders);
-
     cmd.setDepthTestEnable(VK_TRUE);
     cmd.setDepthWriteEnable(VK_TRUE);
     cmd.setDepthCompareOp(vk::CompareOp::eLess);
@@ -1325,17 +1751,27 @@ void Renderer::recordScenePass(vk::CommandBuffer cmd, uint32_t imageIndex, const
     cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, m_meshLayout, 0, 1, &m_frameSets[m_currentFrame], 0, nullptr);
     cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, m_meshLayout, 4, 1, &m_shadowMapSet, 0, nullptr);
     recordMeshRuns(cmd, m_opaqueRuns);
+    // After the opaque draws, whose depth then rejects masked fragments hidden behind them.
+    if (!m_maskRuns.empty()) {
+        bindShaderPair(cmd, m_meshAlphaShaders);
+        recordMeshRuns(cmd, m_maskRuns);
+    }
 
     // Transparent-ish layers: depth-tested against the opaque scene, no depth writes.
     cmd.setDepthWriteEnable(VK_FALSE);
     cmd.setDepthCompareOp(vk::CompareOp::eLessOrEqual);
+
+    // The sky's triangle lies on the far plane, so drawn after the geometry it only shades the
+    // pixels nothing else covered.
+    recordFullscreen(cmd, m_skyShaders);
+
     setAlphaBlending(cmd, true);
 
     if (input.showGrid)
         recordFullscreen(cmd, m_gridShaders);
 
     if (!m_blendRuns.empty()) {
-        bindShaderPair(cmd, m_meshShaders);
+        bindShaderPair(cmd, m_meshAlphaShaders);
         cmd.setVertexInputEXT(1, &m_meshBinding, static_cast<uint32_t>(m_meshAttributes.size()), m_meshAttributes.data());
         cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, m_meshLayout, 0, 1, &m_frameSets[m_currentFrame], 0, nullptr);
         cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, m_meshLayout, 4, 1, &m_shadowMapSet, 0, nullptr);
@@ -1346,13 +1782,14 @@ void Renderer::recordScenePass(vk::CommandBuffer cmd, uint32_t imageIndex, const
     recordPathLines(cmd, input);
     cmd.endRendering();
 
-    // The resolved depth is sampled by the selection mask; the swapchain image is drawn on again
-    // by the overlay pass. Resolves count as attachment writes in the color output stage.
+    // The resolved depth is sampled by the selection mask and the depth pyramid build; the swapchain
+    // image is drawn on again by the overlay pass. Resolves count as attachment writes in the color output stage.
     const vk::ImageMemoryBarrier2 after[2] = {
         imageBarrier(vk::Image(m_sceneDepth.image), depthAspect,
             vk::PipelineStageFlagBits2::eLateFragmentTests | vk::PipelineStageFlagBits2::eColorAttachmentOutput,
             vk::AccessFlagBits2::eDepthStencilAttachmentWrite | vk::AccessFlagBits2::eColorAttachmentWrite,
-            vk::PipelineStageFlagBits2::eFragmentShader, vk::AccessFlagBits2::eShaderSampledRead,
+            vk::PipelineStageFlagBits2::eFragmentShader | vk::PipelineStageFlagBits2::eComputeShader,
+            vk::AccessFlagBits2::eShaderSampledRead,
             vk::ImageLayout::eDepthAttachmentOptimal, vk::ImageLayout::eShaderReadOnlyOptimal),
         imageBarrier(swapImage, colorAspect,
             vk::PipelineStageFlagBits2::eColorAttachmentOutput, vk::AccessFlagBits2::eColorAttachmentWrite,

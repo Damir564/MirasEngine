@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <iostream>
 #include <limits>
+#include <utility>
 #include "imgui.h"
 #include "app/SettingsUi.h"
 #include "engine/GraphicsSettings.h"
@@ -16,7 +17,9 @@
 namespace {
 constexpr float kButtonWidth = 320.0f;
 constexpr float kButtonHeight = 56.0f;
-constexpr float kSprintMultiplier = 3.0f;
+constexpr float kWalkSpeed = 4.5f;
+constexpr float kSprintMultiplier = 1.8f;
+constexpr float kEyeHeight = 1.65f;
 // Scene loads that make no progress this long (e.g. every model file missing) are reported as failed.
 constexpr float kLoadingStallSeconds = 1.0f;
 constexpr ImGuiWindowFlags kScreenFlags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
@@ -37,6 +40,28 @@ Game::Game(const EngineContext& engine, std::string levelPath)
     m_camera.position = glm::vec3(0.0f, 2.0f, 5.0f);
     SDL_SetWindowTitle(m_window, "MirasEngine");
     SDL_SetWindowRelativeMouseMode(m_window, false);
+}
+
+Game::Game(const EngineContext& engine, PlayInEditor)
+    : Game(engine, engine.scenes.currentPath())
+{
+    m_playInEditor = true;
+    SDL_SetWindowTitle(m_window, "MirasEngine - Playing (Esc: pause, F5: stop)");
+    // The scene is already open; if models are still streaming in, wait on the loading screen.
+    m_loadingStallTime = 0.0f;
+    setState(State::Loading);
+}
+
+ModeRequest Game::takeModeRequest()
+{
+    return std::exchange(m_modeRequest, ModeRequest::None);
+}
+
+void Game::stopPlayInEditor()
+{
+    m_physics.clear();
+    SDL_SetWindowRelativeMouseMode(m_window, false);
+    m_modeRequest = ModeRequest::ReturnToEditor;
 }
 
 Game::~Game()
@@ -89,7 +114,7 @@ void Game::updateLoading(float dt)
             failLoading("Failed to load " + m_levelPath + " (the scene is empty)");
             return;
         }
-        frameSceneBounds();
+        spawnPlayer();
         setState(State::Playing);
         return;
     }
@@ -105,6 +130,11 @@ void Game::updateLoading(float dt)
 void Game::failLoading(const std::string& message)
 {
     std::cerr << "[GAME] " << message << "\n";
+    if (m_playInEditor) {
+        stopPlayInEditor();
+        return;
+    }
+    m_physics.clear();
     m_scenes.clear();
     m_error = message;
     setState(State::MainMenu);
@@ -112,15 +142,22 @@ void Game::failLoading(const std::string& message)
 
 void Game::returnToMainMenu()
 {
+    if (m_playInEditor) {
+        stopPlayInEditor();
+        return;
+    }
+    m_physics.clear();
     m_scenes.clear();
     m_scenes.setCurrentPath({});
     m_error.clear();
     setState(State::MainMenu);
 }
 
-// Puts the camera where the whole loaded scene is in view, looking at its center from above and in front.
-void Game::frameSceneBounds()
+// Builds the level's colliders and drops the player above the middle of the scene.
+void Game::spawnPlayer()
 {
+    m_physics.buildStaticScene(m_models);
+
     glm::vec3 boundsMin(std::numeric_limits<float>::max());
     glm::vec3 boundsMax(std::numeric_limits<float>::lowest());
     bool any = false;
@@ -139,21 +176,19 @@ void Game::frameSceneBounds()
             any = true;
         }
     }
-    if (!any) {
-        m_camera.position = glm::vec3(0.0f, 2.0f, 5.0f);
-        m_camera.yaw = -90.0f;
-        m_camera.pitch = 0.0f;
-        return;
+    if (any) {
+        const glm::vec3 center = (boundsMin + boundsMax) * 0.5f;
+        m_spawnPoint = glm::vec3(center.x, boundsMax.y + 1.0f, center.z);
+        m_killHeight = boundsMin.y - 50.0f;
+    } else {
+        m_spawnPoint = glm::vec3(0.0f, 2.0f, 0.0f);
+        m_killHeight = -100.0f;
     }
-    const glm::vec3 center = (boundsMin + boundsMax) * 0.5f;
-    const float radius = std::max(glm::length(boundsMax - boundsMin) * 0.5f, 0.5f);
-    const glm::vec3 viewDir = glm::normalize(glm::vec3(0.0f, -0.35f, -1.0f));
-    // 60 degree vertical FOV: a sphere of radius r fits at distance r / sin(30deg) = 2r.
-    const float distance = std::max(radius * 2.2f, 2.0f);
-    m_camera.position = center - viewDir * distance;
-    m_camera.yaw = glm::degrees(std::atan2(viewDir.z, viewDir.x));
-    m_camera.pitch = glm::degrees(std::asin(viewDir.y));
-    m_camera.speed = std::clamp(radius * 0.5f, 5.0f, 200.0f);
+    m_physics.spawnPlayer(m_spawnPoint);
+    m_camera.yaw = -90.0f;
+    m_camera.pitch = 0.0f;
+    m_camera.position = m_spawnPoint + glm::vec3(0.0f, kEyeHeight, 0.0f);
+    m_jumpRequested = false;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -162,6 +197,10 @@ void Game::frameSceneBounds()
 
 void Game::onEvent(const SDL_Event& event)
 {
+    if (m_playInEditor && event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat && event.key.scancode == SDL_SCANCODE_F5) {
+        stopPlayInEditor();
+        return;
+    }
     if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat && event.key.scancode == SDL_SCANCODE_ESCAPE) {
         if (m_state == State::Playing) setState(State::Paused);
         else if (m_state == State::Paused) setState(State::Playing);
@@ -174,6 +213,8 @@ void Game::onEvent(const SDL_Event& event)
         setState(State::Paused);
         return;
     }
+    if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat && event.key.scancode == SDL_SCANCODE_SPACE)
+        m_jumpRequested = true;
     if (event.type == SDL_EVENT_MOUSE_MOTION) {
         m_camera.yaw += event.motion.xrel * m_camera.sensitivity;
         m_camera.pitch = glm::clamp(m_camera.pitch - event.motion.yrel * m_camera.sensitivity, -89.0f, 89.0f);
@@ -185,25 +226,30 @@ void Game::update(float dt)
     if (m_state == State::Loading)
         updateLoading(dt);
     else if (m_state == State::Playing)
-        moveCamera(dt);
+        movePlayer(dt);
+    m_jumpRequested = false;
 }
 
-void Game::moveCamera(float dt)
+void Game::movePlayer(float dt)
 {
     const bool* keys = SDL_GetKeyboardState(nullptr);
-    const glm::vec3 front = getFront(m_camera);
-    const glm::vec3 right = glm::normalize(glm::cross(front, glm::vec3(0, 1, 0)));
-    const bool sprint = keys[SDL_SCANCODE_LSHIFT] || keys[SDL_SCANCODE_RSHIFT];
-    const float step = m_camera.speed * dt * (sprint ? kSprintMultiplier : 1.0f);
+    // Walk on the horizontal plane regardless of where the player is looking.
+    const float yaw = glm::radians(m_camera.yaw);
+    const glm::vec3 forward(std::cos(yaw), 0.0f, std::sin(yaw));
+    const glm::vec3 right(-forward.z, 0.0f, forward.x);
     glm::vec3 move(0.0f);
-    if (keys[SDL_SCANCODE_W]) move += front;
-    if (keys[SDL_SCANCODE_S]) move -= front;
+    if (keys[SDL_SCANCODE_W]) move += forward;
+    if (keys[SDL_SCANCODE_S]) move -= forward;
     if (keys[SDL_SCANCODE_D]) move += right;
     if (keys[SDL_SCANCODE_A]) move -= right;
-    if (keys[SDL_SCANCODE_SPACE]) move.y += 1.0f;
-    if (keys[SDL_SCANCODE_LCTRL] || keys[SDL_SCANCODE_RCTRL]) move.y -= 1.0f;
+    const bool sprint = keys[SDL_SCANCODE_LSHIFT] || keys[SDL_SCANCODE_RSHIFT];
     if (glm::length(move) > 0.0f)
-        m_camera.position += glm::normalize(move) * step;
+        move = glm::normalize(move) * kWalkSpeed * (sprint ? kSprintMultiplier : 1.0f);
+
+    m_physics.updatePlayer(dt, move, m_jumpRequested);
+    if (m_physics.playerPosition().y < m_killHeight)
+        m_physics.spawnPlayer(m_spawnPoint);
+    m_camera.position = m_physics.playerPosition() + glm::vec3(0.0f, kEyeHeight, 0.0f);
 }
 
 void Game::fillFrame(FrameInput& frame)
@@ -323,8 +369,13 @@ void Game::drawPauseMenu()
             m_settingsReturn = State::Paused;
             setState(State::Settings);
         }
-        if (menuButton("Main Menu")) returnToMainMenu();
-        if (menuButton("Exit")) m_quitRequested = true;
+        if (m_playInEditor) {
+            if (menuButton("Stop (Back to Editor)")) stopPlayInEditor();
+        }
+        else {
+            if (menuButton("Main Menu")) returnToMainMenu();
+            if (menuButton("Exit")) m_quitRequested = true;
+        }
         ImGui::SetWindowFontScale(1.0f);
     }
     ImGui::End();

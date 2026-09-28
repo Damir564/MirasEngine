@@ -24,7 +24,9 @@ ShaderPair createShaderPair(vk::Device device,
     const std::filesystem::path& vertSpv,
     const std::filesystem::path& fragSpv,
     std::span<const vk::DescriptorSetLayout> setLayouts,
-    std::span<const vk::PushConstantRange> pushConstants)
+    std::span<const vk::PushConstantRange> pushConstants,
+    const vk::SpecializationInfo* fragSpecialization,
+    bool linked)
 {
     const std::vector<uint32_t> vertCode = loadSpirv(vertSpv);
     const std::vector<uint32_t> fragCode = loadSpirv(fragSpv);
@@ -32,7 +34,7 @@ ShaderPair createShaderPair(vk::Device device,
     auto makeInfo = [&](vk::ShaderStageFlagBits stage, const std::vector<uint32_t>& code) {
         vk::ShaderCreateInfoEXT info{};
         info.setStage(stage)
-            .setFlags(vk::ShaderCreateFlagBitsEXT::eLinkStage)
+            .setFlags(linked ? vk::ShaderCreateFlagBitsEXT::eLinkStage : vk::ShaderCreateFlagsEXT{})
             .setCodeType(vk::ShaderCodeTypeEXT::eSpirv)
             .setCodeSize(code.size() * sizeof(uint32_t))
             .setPCode(code.data())
@@ -49,6 +51,7 @@ ShaderPair createShaderPair(vk::Device device,
         makeInfo(vk::ShaderStageFlagBits::eFragment, fragCode),
     };
     infos[0].setNextStage(vk::ShaderStageFlagBits::eFragment);
+    infos[1].setPSpecializationInfo(fragSpecialization);
 
     // Linking only applies to shaders created in the same vkCreateShadersEXT call.
     auto created = device.createShadersEXT(infos);
@@ -59,6 +62,32 @@ ShaderPair createShaderPair(vk::Device device,
             fragSpv.string() + ": " + vk::to_string(created.result));
     }
     return { created.value[0], created.value[1] };
+}
+
+vk::ShaderEXT createComputeShader(vk::Device device,
+    const std::filesystem::path& compSpv,
+    std::span<const vk::DescriptorSetLayout> setLayouts,
+    std::span<const vk::PushConstantRange> pushConstants)
+{
+    const std::vector<uint32_t> code = loadSpirv(compSpv);
+    vk::ShaderCreateInfoEXT info{};
+    info.setStage(vk::ShaderStageFlagBits::eCompute)
+        .setCodeType(vk::ShaderCodeTypeEXT::eSpirv)
+        .setCodeSize(code.size() * sizeof(uint32_t))
+        .setPCode(code.data())
+        .setPName("main")
+        .setSetLayoutCount(static_cast<uint32_t>(setLayouts.size()))
+        .setPSetLayouts(setLayouts.data())
+        .setPushConstantRangeCount(static_cast<uint32_t>(pushConstants.size()))
+        .setPPushConstantRanges(pushConstants.data());
+    auto created = device.createShadersEXT(info);
+    if (created.result != vk::Result::eSuccess) {
+        for (vk::ShaderEXT shader : created.value)
+            if (shader) device.destroyShaderEXT(shader);
+        throw std::runtime_error("Failed to create compute shader object for " + compSpv.string() + ": " +
+            vk::to_string(created.result));
+    }
+    return created.value[0];
 }
 
 void destroyShaderPair(vk::Device device, ShaderPair& pair)

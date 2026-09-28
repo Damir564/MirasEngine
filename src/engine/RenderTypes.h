@@ -54,3 +54,29 @@ struct GpuTransform {
     glm::mat4 normal{ 1.0f };
 };
 static_assert(sizeof(GpuTransform) == 128);
+
+// Mirrors CullBounds in shaders/occlusion_cull.comp (std430); one per indirect command.
+struct GpuCullBounds {
+    glm::vec3 boundsMin{ 0.0f };
+    uint32_t transformIndex = 0;
+    glm::vec3 boundsMax{ 0.0f };
+    uint32_t cullable = 0; // 0 = always draw (no bounds, or not a main-pass draw)
+};
+static_assert(sizeof(GpuCullBounds) == 32);
+
+// Mirrors the push_constant block in shaders/occlusion_cull.comp.
+struct CullPushConstants {
+    glm::mat4 prevViewProj;
+    glm::vec4 viewRect;
+    glm::vec2 pyramidSize;
+    uint32_t firstCommand;
+    uint32_t commandCount;
+};
+static_assert(sizeof(CullPushConstants) == 96);
+
+// Mirrors the push_constant block in shaders/depth_reduce.comp.
+struct PyramidPushConstants {
+    uint32_t dstWidth;
+    uint32_t dstHeight;
+};
+static_assert(sizeof(PyramidPushConstants) == 8);

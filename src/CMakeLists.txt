@@ -29,6 +29,8 @@
   engine/ModelCache.cpp
   engine/ModelManager.h
   engine/ModelManager.cpp
+  engine/Physics.h
+  engine/Physics.cpp
   engine/Gizmo.h
   engine/SceneSerializer.h
   engine/SceneManager.h
@@ -97,6 +99,7 @@ target_link_libraries(engine PRIVATE
     fastgltf::fastgltf
     imgui
     nlohmann_json::nlohmann_json
+    Jolt
 )
 
 

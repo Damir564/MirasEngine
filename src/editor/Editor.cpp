@@ -1,7 +1,8 @@
-#include "Editor.h"
+﻿#include "Editor.h"
 #include <SDL3/SDL.h>
 #include <algorithm>
 #include <iostream>
+#include <utility>
 #include <cmath>
 #include <cstring>
 #include <exception>
@@ -62,8 +63,47 @@ void Editor::handleKeyDown(const SDL_KeyboardEvent& key)
 
     dropStaleGizmoSelection();
 
+    if (key.scancode == SDL_SCANCODE_F5)
+        requestPlay();
+
     if (!m_flyMode && key.scancode == SDL_SCANCODE_M && !m_selectedIfcGuid.empty())
         requestAnnotation();
+}
+
+bool Editor::canPlay() const
+{
+    return !m_models.getInstances().empty() && !m_scenes.isLoading();
+}
+
+void Editor::requestPlay()
+{
+    if (!canPlay()) {
+        setStatus("Nothing to play: add objects or wait for the scene to finish loading", true);
+        return;
+    }
+    if (m_flyMode)
+        setFlyMode(false);
+    m_rightMouseHeld = false;
+    m_modeRequest = ModeRequest::PlayScene;
+}
+
+ModeRequest Editor::takeModeRequest()
+{
+    return std::exchange(m_modeRequest, ModeRequest::None);
+}
+
+void Editor::onResume()
+{
+    // The game changed the title and mouse mode, and ImGui got no events while it ran.
+    m_windowTitle.clear();
+    m_rightMouseHeld = false;
+    m_cameraSpeedMultiplier = 1.0f;
+    SDL_SetWindowRelativeMouseMode(m_window, m_flyMode);
+    ImGuiIO& io = ImGui::GetIO();
+    io.AddMouseButtonEvent(ImGuiMouseButton_Left, false);
+    io.AddMouseButtonEvent(ImGuiMouseButton_Right, false);
+    io.ClearInputKeys();
+    setStatus("Play stopped");
 }
 
 void Editor::dropStaleGizmoSelection()

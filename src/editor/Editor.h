@@ -33,6 +33,8 @@ public:
     void drawUi() override;
     void fillFrame(FrameInput& frame) override;
     bool quitRequested() const override { return m_quitRequested; }
+    ModeRequest takeModeRequest() override;
+    void onResume() override;
 
     // Replaces the current scene and reports the outcome in the status bar.
     void openScene(const std::string& path);
@@ -107,6 +109,8 @@ private:
     void handleCameraLook(const SDL_Event& event);
     void moveCamera(float dt);
     void setFlyMode(bool enabled);
+    bool canPlay() const;
+    void requestPlay();
     bool sceneViewContains(float x, float y) const;
     // Projection of the scene view; rendering, picking, gizmos and annotations all use this one.
     glm::mat4 sceneProjection() const;
@@ -278,6 +282,7 @@ private:
     bool m_openControlsPopup = false;
     bool m_openAboutPopup = false;
     bool m_quitRequested = false;
+    ModeRequest m_modeRequest = ModeRequest::None;
     std::string m_windowTitle;
 
     // Status bar

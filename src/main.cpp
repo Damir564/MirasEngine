@@ -2,7 +2,6 @@
 #include "app/Application.h"
 #include <SDL3/SDL.h>
 #include <filesystem>
-
 int main(int argc, char** argv)
 {
     // Shaders, settings and helper exes are resolved relative to the executable's folder,

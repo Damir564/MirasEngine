@@ -6,7 +6,7 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
-#include <unordered_map>
+#include <span>
 #include <vector>
 #include "Buffers.h"
 #include "Camera.h"
@@ -109,6 +109,7 @@ private:
         HostBuffer draws;
         HostBuffer transforms;
         HostBuffer indirect;
+        HostBuffer cullBounds; // GpuCullBounds per indirect command
     };
 
     struct LineBuffer {
@@ -119,9 +120,9 @@ private:
 
     struct InstanceRenderData {
         const ModelInstance* instance;
-        glm::mat4 transform;
         const uint8_t* submeshFlags;
         uint32_t transformIndex;
+        float cameraDistance;
     };
 
     struct RenderBatch {
@@ -129,10 +130,19 @@ private:
         std::vector<InstanceRenderData> instances;
     };
 
-    // Visible models this frame, keyed by model index.
-    struct FrameBatches {
-        std::unordered_map<size_t, RenderBatch> main;
-        std::unordered_map<size_t, RenderBatch> shadow;
+    // Consecutive submeshes of one instance whose index ranges touch, drawn with a single command.
+    struct MergedDraw {
+        const Material* material = nullptr; // of the first submesh; null while empty
+        uint32_t firstIndex = 0;
+        uint32_t indexCount = 0;
+        uint32_t vertexOffset = 0;
+        glm::vec3 boundsMin{ 0.0f };
+        glm::vec3 boundsMax{ 0.0f };
+        bool validBounds = true;
+
+        bool empty() const { return material == nullptr; }
+        // False if sub does not continue the current range (or the draw is full); it is then left unchanged.
+        bool tryAppend(const SubmeshInfo& sub);
     };
 
     struct CullResult {
@@ -144,6 +154,7 @@ private:
         GPUModel* gpuModel = nullptr;
         FrustumPlanes mainPlanes{};
         FrustumPlanes shadowPlanes{};
+        float maxScale = 1.0f;
         std::vector<uint8_t> submeshFlags;
     };
 
@@ -151,6 +162,24 @@ private:
         VkImage image = VK_NULL_HANDLE;
         VmaAllocation allocation = VK_NULL_HANDLE;
         vk::ImageView view;
+    };
+
+    // Hi-Z pyramid of the previous frame's scene depth, used to skip draws hidden behind other geometry.
+    struct DepthPyramid {
+        VkImage image = VK_NULL_HANDLE;
+        VmaAllocation allocation = VK_NULL_HANDLE;
+        vk::ImageView fullView;
+        std::vector<vk::ImageView> mipViews;
+        std::vector<vk::DescriptorSet> reduceSets; // one per mip: source -> this mip
+        uint32_t width = 0;
+        uint32_t height = 0;
+    };
+
+    // What the pyramid was built from; culling reprojects this frame's bounds with it.
+    struct OcclusionHistory {
+        bool valid = false;
+        glm::mat4 viewProj{ 1.0f };
+        glm::vec4 viewRect{ 0.0f };
     };
 
     struct CullChunk {
@@ -174,6 +203,11 @@ private:
     bool createShaders();
     bool initImGuiBackend();
     bool createShadowMapResources();
+    bool createOcclusionResources();
+    void destroyOcclusionResources();
+    bool createDepthPyramid();
+    void destroyDepthPyramid();
+    bool allocatePyramidSets();
     bool createRenderTargets();
     void destroyRenderTargets();
     bool createRenderImage(vk::Format format, vk::ImageUsageFlags usage, vk::SampleCountFlagBits samples,
@@ -187,14 +221,17 @@ private:
     void destroyLineBuffer(LineBuffer& buffer);
 
     FrameUBO buildFrameUBO(const FrameInput& input) const;
-    // Returns the hash of everything that affects the shadow map.
-    uint64_t cullAndBatch(const FrameInput& input, const glm::mat4& viewProj, const glm::mat4& lightSpaceMatrix,
-        FrameBatches& batches);
-    void buildDrawStreams(const FrameInput& input, FrameBatches& batches, bool renderShadowMap);
+    // Fills m_mainBatches / m_shadowBatches. Returns the hash of everything that affects the shadow map.
+    uint64_t cullAndBatch(const FrameInput& input, const glm::mat4& viewProj, const glm::mat4& lightSpaceMatrix);
+    void buildDrawStreams(const FrameInput& input, bool renderShadowMap);
     void buildHighlightStream(const FrameInput& input);
+    // Emits the submeshes of `order` that have `visibleFlag` set, merging neighbours into as few commands as possible.
+    void appendInstanceDraws(std::vector<DrawRun>& runs, GPUModel* model, const vk::DescriptorSet sets[3], bool blend,
+        std::span<const uint32_t> order, const uint8_t* submeshFlags, uint8_t visibleFlag, uint32_t transformIndex,
+        const glm::vec3& tint, bool occlusionCullable);
     void appendDraw(std::vector<DrawRun>& runs, GPUModel* model, const vk::DescriptorSet sets[3], bool blend,
-        const SubmeshInfo& sub, uint32_t transformIndex, const glm::vec3& tint);
-    uint32_t pushDrawData(const SubmeshInfo& sub, uint32_t transformIndex, const glm::vec3& tint);
+        const MergedDraw& draw, uint32_t transformIndex, const glm::vec3& tint, bool occlusionCullable);
+    uint32_t pushDrawData(const Material& material, uint32_t transformIndex, const glm::vec3& tint);
     uint32_t pushTransform(const glm::mat4& transform);
     void materialSets(const ModelManager& models, const GPUModel* model, const Material& material,
         vk::DescriptorSet out[3]) const;
@@ -207,7 +244,10 @@ private:
     vk::Rect2D sceneRect(const FrameInput& input) const;
     void bindModelBuffers(vk::CommandBuffer cmd, const GPUModel* model) const;
     void recordRun(vk::CommandBuffer cmd, const DrawRun& run) const;
-    void recordShadowPass(vk::CommandBuffer cmd, const ModelManager& models);
+    void recordShadowRuns(vk::CommandBuffer cmd, const std::vector<DrawRun>& runs);
+    void recordOcclusionCull(vk::CommandBuffer cmd);
+    void recordDepthPyramid(vk::CommandBuffer cmd, const FrameInput& input);
+    void recordShadowPass(vk::CommandBuffer cmd);
     void recordScenePass(vk::CommandBuffer cmd, uint32_t imageIndex, const FrameInput& input);
     void recordMeshRuns(vk::CommandBuffer cmd, const std::vector<DrawRun>& runs);
     void recordFullscreen(vk::CommandBuffer cmd, const ShaderPair& shaders);
@@ -261,8 +301,9 @@ private:
     vk::DescriptorSet m_sceneDepthSet;
     vk::DescriptorSet m_selectionMaskSet;
 
-    ShaderPair m_meshShaders;
-    ShaderPair m_shadowShaders;
+    ShaderPair m_meshShaders;      // opaque: no alpha test, so depth is tested before shading
+    ShaderPair m_meshAlphaShaders; // alpha-masked and blended
+    ShaderPair m_shadowShaders;    // unlinked: opaque casters bind only the vertex shader
     ShaderPair m_gizmoShaders;
     ShaderPair m_skyShaders;
     ShaderPair m_gridShaders;
@@ -278,6 +319,20 @@ private:
 
     LineBuffer m_pathLines;
 
+    vk::Sampler m_maxReductionSampler;
+    vk::DescriptorSetLayout m_cullSetLayout;
+    vk::DescriptorSetLayout m_reduceSetLayout;
+    vk::PipelineLayout m_cullLayout;
+    vk::PipelineLayout m_reduceLayout;
+    vk::ShaderEXT m_cullShader;
+    vk::ShaderEXT m_reduceShader;
+    // Per-frame cull sets live in the first pool; the pyramid's sets are rebuilt with it in the second.
+    vk::DescriptorPool m_cullDescriptorPool;
+    vk::DescriptorPool m_pyramidDescriptorPool;
+    std::vector<vk::DescriptorSet> m_cullSets;
+    DepthPyramid m_depthPyramid;
+    OcclusionHistory m_occlusionHistory;
+
     vk::DescriptorPool m_imguiDescriptorPool;
     bool m_imguiInitialized = false;
 
@@ -285,11 +340,21 @@ private:
     std::vector<CullResult> m_cullResults;
     std::vector<size_t> m_cullIndices;
     std::vector<CullChunk> m_cullChunks;
+    // Visible instances this frame, indexed by model index.
+    std::vector<RenderBatch> m_mainBatches;
+    std::vector<RenderBatch> m_shadowBatches;
+    std::vector<uint32_t> m_highlightOrder;
     std::vector<GpuTransform> m_frameTransforms;
     std::vector<GpuDrawData> m_frameDraws;
     std::vector<vk::DrawIndexedIndirectCommand> m_frameCommands;
-    std::vector<DrawRun> m_shadowRuns;
+    std::vector<GpuCullBounds> m_frameCullBounds;
+    // Commands [first, first + count) are the main-pass draws the occlusion pass may disable.
+    uint32_t m_occlusionFirstCommand = 0;
+    uint32_t m_occlusionCommandCount = 0;
+    std::vector<DrawRun> m_shadowRuns;     // depth only
+    std::vector<DrawRun> m_shadowMaskRuns; // alpha-tested casters
     std::vector<DrawRun> m_opaqueRuns;
+    std::vector<DrawRun> m_maskRuns;
     std::vector<DrawRun> m_blendRuns;
     std::vector<DrawRun> m_highlightRuns;
 

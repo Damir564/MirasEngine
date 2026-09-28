@@ -7,6 +7,7 @@
 
 struct SDL_Window;
 class AppMode;
+struct EngineContext;
 class ModelManager;
 class SceneManager;
 
@@ -28,6 +29,8 @@ private:
     void initImGui();
     bool createModelManager();
     void createMode(const AppOptions& options);
+    EngineContext engineContext();
+    void handleModeRequest();
     void shutdown();
 
     int mainLoop(int exitAfterFrames);
@@ -55,4 +58,6 @@ private:
     std::unique_ptr<ModelManager> m_models;
     std::unique_ptr<SceneManager> m_scenes;
     std::unique_ptr<AppMode> m_mode;
+    // The editor while a scene it started is being played.
+    std::unique_ptr<AppMode> m_suspendedMode;
 };

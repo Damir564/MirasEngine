@@ -105,9 +105,14 @@ bool Application::createModelManager()
     }
 }
 
+EngineContext Application::engineContext()
+{
+    return EngineContext{ m_window, m_vulkan, m_renderer, *m_models, *m_scenes, m_settings };
+}
+
 void Application::createMode(const AppOptions& options)
 {
-    EngineContext context{ m_window, m_vulkan, m_renderer, *m_models, *m_scenes, m_settings };
+    EngineContext context = engineContext();
     if (options.mode == LaunchMode::Game) {
         // --scene replaces the default level.
         m_mode = options.scenePath.empty() ? std::make_unique<Game>(context)
@@ -120,9 +125,32 @@ void Application::createMode(const AppOptions& options)
     m_mode = std::move(editor);
 }
 
+void Application::handleModeRequest()
+{
+    switch (m_mode->takeModeRequest()) {
+    case ModeRequest::None:
+        break;
+    case ModeRequest::PlayScene:
+        if (!m_suspendedMode) {
+            m_suspendedMode = std::move(m_mode);
+            m_mode = std::make_unique<Game>(engineContext(), Game::PlayInEditor{});
+        }
+        break;
+    case ModeRequest::ReturnToEditor:
+        if (m_suspendedMode) {
+            // Destroy the game first: it releases the mouse and its physics world.
+            m_mode.reset();
+            m_mode = std::move(m_suspendedMode);
+            m_mode->onResume();
+        }
+        break;
+    }
+}
+
 void Application::shutdown()
 {
     m_mode.reset();
+    m_suspendedMode.reset();
     m_scenes.reset();
     // ModelManager frees descriptor sets and command buffers from the renderer's pools.
     m_models.reset();
@@ -181,6 +209,7 @@ int Application::mainLoop(int exitAfterFrames)
         const Renderer::FrameStatus status = m_renderer.renderFrame(frame);
         if (status == Renderer::FrameStatus::Failed)
             return -1;
+        handleModeRequest();
         if (status == Renderer::FrameStatus::Skipped)
             continue;
         limitFrameRate(frameStartNs);
