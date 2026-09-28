@@ -100,6 +100,24 @@ FetchContent_Declare(
     GIT_SHALLOW TRUE
 )
 
+# web-ifc (native IFC parsing + geometry). Its own CMakeLists always builds test executables and
+# redeclares glm, so it and its header-only deps are only downloaded here ("SOURCE_SUBDIR none"
+# skips add_subdirectory) and compiled as the web_ifc target below.
+FetchContent_Declare(web_ifc
+    GIT_REPOSITORY https://github.com/ThatOpen/engine_web-ifc.git
+    GIT_TAG 0.78
+    GIT_SHALLOW TRUE
+    SOURCE_SUBDIR none)
+FetchContent_Declare(webifc_fastfloat GIT_REPOSITORY https://github.com/fastfloat/fast_float GIT_TAG b0ab987b3dfdde13fa1915f65ef2a5c068d9208c SOURCE_SUBDIR none)
+FetchContent_Declare(webifc_tinynurbs GIT_REPOSITORY https://github.com/QuimMoya/tinynurbs GIT_TAG 47115cd9b6e922b27bbc4ab01fdeac2e9ea597a4 SOURCE_SUBDIR none)
+# Stable earcut release instead of the master commit web-ifc pins: that revision corrupts its node
+# ring on some wall profiles (null deref in Earcut::isEar) under MSVC. The API web-ifc uses is unchanged.
+FetchContent_Declare(webifc_earcut GIT_REPOSITORY https://github.com/mapbox/earcut.hpp GIT_TAG v2.2.4 SOURCE_SUBDIR none)
+FetchContent_Declare(webifc_cdt GIT_REPOSITORY https://github.com/artem-ogre/CDT GIT_TAG 2068d015b9db3c92481e869b0c1f669b96a1d70a SOURCE_SUBDIR none)
+FetchContent_Declare(webifc_spdlog GIT_REPOSITORY https://github.com/gabime/spdlog GIT_TAG 79524ddd08a4ec981b7fea76afd08ee05f83755d SOURCE_SUBDIR none)
+FetchContent_Declare(webifc_stduuid GIT_REPOSITORY https://github.com/mariusbancila/stduuid GIT_TAG 3afe7193facd5d674de709fccc44d5055e144d7a SOURCE_SUBDIR none)
+FetchContent_Declare(webifc_unordered_dense GIT_REPOSITORY https://github.com/martinus/unordered_dense GIT_TAG 1c8636e810d7e4a485d17bb9cbd6dccb5fe4e284 SOURCE_SUBDIR none)
+
 set(FASTGLTF_COMPILE_AS_CPP20 ON CACHE BOOL "" FORCE)
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 
@@ -118,7 +136,37 @@ FetchContent_MakeAvailable(
   fastgltf
   imgui
   nlohmann_json
+  web_ifc
+  webifc_fastfloat
+  webifc_tinynurbs
+  webifc_earcut
+  webifc_cdt
+  webifc_spdlog
+  webifc_stduuid
+  webifc_unordered_dense
 )
+
+file(GLOB_RECURSE WEB_IFC_SOURCES CONFIGURE_DEPENDS ${web_ifc_SOURCE_DIR}/src/cpp/web-ifc/*.cpp)
+add_library(web_ifc STATIC ${WEB_IFC_SOURCES})
+set_target_properties(web_ifc PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
+target_include_directories(web_ifc
+    # Public: web-ifc's own headers pull these in transitively.
+    PUBLIC
+        ${web_ifc_SOURCE_DIR}/src/cpp
+        ${webifc_unordered_dense_SOURCE_DIR}/include
+        ${webifc_fastfloat_SOURCE_DIR}/include
+        ${webifc_tinynurbs_SOURCE_DIR}/include
+        ${webifc_earcut_SOURCE_DIR}/include
+        ${webifc_cdt_SOURCE_DIR}/CDT/include
+        ${webifc_spdlog_SOURCE_DIR}/include
+        ${webifc_stduuid_SOURCE_DIR}/include
+)
+target_link_libraries(web_ifc PUBLIC glm::glm-header-only)
+if (MSVC)
+    # Third-party code: silence its warnings; the schema tables need /bigobj.
+    target_compile_options(web_ifc PRIVATE /utf-8 /bigobj /W0)
+    target_compile_definitions(web_ifc PRIVATE _USE_MATH_DEFINES NOMINMAX)
+endif()
 
 add_library(imgui STATIC
     ${imgui_SOURCE_DIR}/imgui.cpp
