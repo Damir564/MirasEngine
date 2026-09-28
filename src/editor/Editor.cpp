@@ -410,7 +410,6 @@ void Editor::handleShortcuts()
     if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_O)) openSceneDialog();
     if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_S)) saveSceneAsDialog();
     if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_S)) saveScene();
-    if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_I)) importIfcDirectDialog();
     if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_I)) importModelDialog();
     if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_D) && selection) duplicateInstance(m_gizmo.selectedInstance);
     if (ImGui::IsKeyChordPressed(ImGuiKey_Delete) && selection) deleteInstance(m_gizmo.selectedInstance);

@@ -169,7 +169,6 @@ private:
     void openSceneDialog();
     void saveSceneAsDialog();
     void importModelDialog();
-    void importIfcDirectDialog();
     void drawFileDialogs();
 
     // ---- EditorGizmo.cpp ----

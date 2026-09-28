@@ -560,8 +560,6 @@ Mesh importIfc(std::istream& file, const std::string& ifcPath)
     webifc::manager::ModelManager manager(false);
     manager.SetLogLevel(kSpdlogLevelError);
     webifc::manager::LoaderSettings settings;
-    // Georeferenced models sit kilometres from the origin; recentre to keep float precision.
-    settings.COORDINATE_TO_ORIGIN = true;
     const uint32_t modelID = manager.CreateModel(settings);
 
     IfcLoader* loader = manager.GetIfcLoader(modelID);

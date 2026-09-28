@@ -51,7 +51,6 @@ void Editor::drawFileMenu()
     if (ImGui::MenuItem("Save Scene As...", "Ctrl+Shift+S")) saveSceneAsDialog();
     ImGui::Separator();
     if (ImGui::MenuItem("Import Model...", "Ctrl+I")) importModelDialog();
-    if (ImGui::MenuItem("Import IFC (Direct)...", "Ctrl+Shift+I")) importIfcDirectDialog();
     ImGui::Separator();
     if (ImGui::MenuItem("Exit", "Alt+F4")) m_quitRequested = true;
     ImGui::EndMenu();
@@ -334,7 +333,6 @@ void Editor::drawControlsPopup()
             { "Ctrl+O / Ctrl+S", "Open / save scene" },
             { "Ctrl+Shift+S", "Save scene as" },
             { "Ctrl+I", "Import model" },
-            { "Ctrl+Shift+I", "Import IFC directly (web-ifc)" },
         };
         for (const auto& row : kRows) {
             ImGui::TableNextRow();
@@ -400,11 +398,6 @@ void Editor::importModelDialog()
         "3D Models{.gltf,.glb,.obj,.fbx,.ifc},.gltf,.glb,.obj,.fbx,.ifc", kModelsRoot, nullptr, false);
 }
 
-void Editor::importIfcDirectDialog()
-{
-    openFileDialog("BrowseIfcDirectDlg", "Import IFC (Direct, web-ifc)", ".ifc", kModelsRoot, nullptr, false);
-}
-
 void Editor::drawFileDialogs()
 {
     ImGuiFileDialog* dialog = ImGuiFileDialog::Instance();
@@ -434,20 +427,9 @@ void Editor::drawFileDialogs()
             const auto rel = makeRelativeIfInside(dialog->GetFilePathName(), kModelsRoot);
             if (rel.has_value()) {
                 const std::string name = std::filesystem::path(rel.value()).stem().string();
-                m_models.loadModelAsync(rel.value(), name);
+                const bool isIfc = std::filesystem::path(rel.value()).extension() == ".ifc";
+                m_models.loadModelAsync(isIfc ? kIfcDirectPrefix + rel.value() : rel.value(), name);
                 setStatus("Importing " + name + "...");
-            }
-            else setStatus(std::string("Models must be inside the \"") + kModelsRoot + "\" folder", true);
-        }
-        dialog->Close();
-    }
-    if (dialog->Display("BrowseIfcDirectDlg", ImGuiWindowFlags_NoCollapse, kDialogSize)) {
-        if (dialog->IsOk()) {
-            const auto rel = makeRelativeIfInside(dialog->GetFilePathName(), kModelsRoot);
-            if (rel.has_value()) {
-                const std::string name = std::filesystem::path(rel.value()).stem().string();
-                m_models.loadModelAsync(kIfcDirectPrefix + rel.value(), name);
-                setStatus("Importing " + name + " (direct IFC)...");
             }
             else setStatus(std::string("Models must be inside the \"") + kModelsRoot + "\" folder", true);
         }
