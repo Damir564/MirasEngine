@@ -97,7 +97,6 @@ target_link_libraries(engine PRIVATE
     vk-bootstrap::vk-bootstrap
     SDL3::SDL3
     glm::glm-header-only
-    assimp
     stb_image
     fastgltf::fastgltf
     imgui

@@ -1,6 +1,6 @@
 ﻿cmake_minimum_required (VERSION 3.21)
 
-# Default debug info is /Zi for every target (third-party libs like assimp add /Zi themselves,
+# Default debug info is /Zi for every target (third-party libs may add /Zi themselves,
 # so /ZI here would trigger "D9025 overriding '/Zi' with '/ZI'"). Hot Reload (/ZI) is enabled
 # only for the engine target in src/CMakeLists.txt.
 if (POLICY CMP0141)

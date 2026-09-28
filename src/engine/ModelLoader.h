@@ -8,7 +8,7 @@
 inline constexpr const char* kBuiltinCubePath = "builtin:cube";
 bool isBuiltinModelPath(const std::string& path);
 
-// Loads a model from disk (glTF/GLB via fastgltf, IFC via web-ifc, everything else via assimp),
+// Loads a model from disk (glTF/GLB via fastgltf, IFC via web-ifc; other formats are rejected),
 // going through the .cache file next to the source when it is up to date (IFC caches also hold
 // the element metadata).
 // Builtin paths return generated geometry and never touch the disk or the cache.

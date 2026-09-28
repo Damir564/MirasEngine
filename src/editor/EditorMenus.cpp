@@ -394,7 +394,7 @@ void Editor::saveSceneAsDialog()
 void Editor::importModelDialog()
 {
     openFileDialog("BrowseModelDlg", "Import 3D Model",
-        "3D Models{.gltf,.glb,.obj,.fbx,.ifc},.gltf,.glb,.obj,.fbx,.ifc", kModelsRoot, nullptr, false);
+        "3D Models{.gltf,.glb,.ifc},.gltf,.glb,.ifc", kModelsRoot, nullptr, false);
 }
 
 void Editor::drawFileDialogs()
@@ -402,9 +402,7 @@ void Editor::drawFileDialogs()
     ImGuiFileDialog* dialog = ImGuiFileDialog::Instance();
     if (dialog->Display("BrowseSceneDlg", ImGuiWindowFlags_NoCollapse, kDialogSize)) {
         if (dialog->IsOk()) {
-            const auto rel = makeRelativeIfInside(dialog->GetFilePathName(), kScenesRoot);
-            if (rel.has_value()) openScene(rel.value());
-            else setStatus("Scenes must be inside the application folder", true);
+            openScene(toStoredPath(dialog->GetFilePathName()));
         }
         dialog->Close();
     }
@@ -412,24 +410,17 @@ void Editor::drawFileDialogs()
         if (dialog->IsOk()) {
             std::filesystem::path path(dialog->GetFilePathName());
             if (!path.has_extension() || path.extension() != ".scn") path.replace_extension(".scn");
-            const auto rel = makeRelativeIfInside(path.string(), kScenesRoot);
-            if (rel.has_value()) {
-                m_scenes.setCurrentPath(rel.value());
-                saveSceneTo(m_scenes.currentPath());
-            }
-            else setStatus("Scenes must be saved inside the application folder", true);
+            m_scenes.setCurrentPath(toStoredPath(path.string()));
+            saveSceneTo(m_scenes.currentPath());
         }
         dialog->Close();
     }
     if (dialog->Display("BrowseModelDlg", ImGuiWindowFlags_NoCollapse, kDialogSize)) {
         if (dialog->IsOk()) {
-            const auto rel = makeRelativeIfInside(dialog->GetFilePathName(), kModelsRoot);
-            if (rel.has_value()) {
-                const std::string name = std::filesystem::path(rel.value()).stem().string();
-                m_models.loadModelAsync(rel.value(), name);
-                setStatus("Importing " + name + "...");
-            }
-            else setStatus(std::string("Models must be inside the \"") + kModelsRoot + "\" folder", true);
+            const std::string path = toStoredPath(dialog->GetFilePathName());
+            const std::string name = std::filesystem::path(path).stem().string();
+            m_models.loadModelAsync(path, name);
+            setStatus("Importing " + name + "...");
         }
         dialog->Close();
     }
