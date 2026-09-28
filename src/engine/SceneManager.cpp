@@ -2,7 +2,7 @@
 #include "ModelLoader.h"
 #include "ModelManager.h"
 #include <filesystem>
-#include <iostream>
+#include "Log.h"
 
 SceneManager::SceneManager(ModelManager& models, vk::Device device)
     : m_models(models), m_device(device)
@@ -18,7 +18,7 @@ SceneManager::OpenResult SceneManager::open(const std::string& path)
 
     clear();
     for (const auto& model : loaded.models) {
-        if (!isBuiltinModelPath(model.path) && !std::filesystem::exists(modelSourceFile(model.path))) {
+        if (!isBuiltinModelPath(model.path) && !std::filesystem::exists(model.path)) {
             result.missingFiles.push_back(model.path);
             continue;
         }
@@ -90,5 +90,5 @@ void SceneManager::instantiatePendingScene()
     }
 
     m_pendingLoad = false;
-    std::cout << "[SCENE] All instances created\n";
+    LOG_INFO("[SCENE] All instances created\n");
 }

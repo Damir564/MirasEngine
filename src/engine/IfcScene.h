@@ -6,7 +6,6 @@
 #include <optional>
 #include <cstddef>
 #include <limits>
-#include <iostream>
 #include <algorithm>
 #include <glm/ext/vector_float3.hpp>
 
@@ -141,11 +140,6 @@ struct IfcScene {
         for (auto& cg : it->second.childSpatialGuids)
             setVisibilityRecursive(cg, vis);
     }
-
-    
-
-    static void printSpatialTree(const IfcScene& scene, const std::string& spatialGuid, int depth = 0);
-    static void printIfcScene(const IfcScene& scene);
 };
 
 

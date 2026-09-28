@@ -1,7 +1,6 @@
 #include "Editor.h"
 #include <SDL3/SDL.h>
 #include <algorithm>
-#include <iostream>
 #include <cmath>
 #include <cstring>
 #include <exception>
@@ -9,6 +8,7 @@
 #include "engine/ModelLoader.h"
 #include "engine/ModelManager.h"
 #include "engine/SceneManager.h"
+#include "engine/Log.h"
 
 Editor::Editor(const EngineContext& engine)
     : m_window(engine.window)
@@ -26,7 +26,7 @@ Editor::Editor(const EngineContext& engine)
     m_sceneView = { 0.0f, 0.0f, static_cast<float>(std::max(width, 1)), static_cast<float>(std::max(height, 1)) };
 
     m_cameraAnimator.getPath().name = m_pathName;
-    std::cout << "Camera animation system initialized\n";
+    LOG_INFO("Camera animation system initialized\n");
 
     SDL_SetWindowRelativeMouseMode(m_window, m_flyMode);
 }
@@ -186,8 +186,8 @@ void Editor::selectPickedSubmesh(const SubmeshHitResult& hit)
 
     auto& instance = m_models.getInstances()[hit.instanceIndex];
     if (!instance.ifcScene.has_value()) {
-        std::cout << "[PICK] Instance " << hit.instanceIndex << " | Submesh " << hit.submeshIndex
-            << " | t: " << hit.t << "\n";
+        LOG_INFO("[PICK] Instance " << hit.instanceIndex << " | Submesh " << hit.submeshIndex
+            << " | t: " << hit.t << "\n");
         return;
     }
 
@@ -196,7 +196,7 @@ void Editor::selectPickedSubmesh(const SubmeshHitResult& hit)
     for (auto& [guid, node] : scene.spatial) node.selected = false;
 
     if (hit.ifcGuid.empty()) {
-        std::cout << "[PICK] IFC model hit but no GUID for submesh " << hit.submeshIndex << "\n";
+        LOG_INFO("[PICK] IFC model hit but no GUID for submesh " << hit.submeshIndex << "\n");
         return;
     }
     auto it = scene.elements.find(hit.ifcGuid);
@@ -208,13 +208,13 @@ void Editor::selectPickedSubmesh(const SubmeshHitResult& hit)
     m_ifcSelectionKind = IfcSelectionKind::Element;
     m_ifcSelectionInstance = hit.instanceIndex;
     m_selectionChangedFromViewport = true;
-    std::cout << "[PICK] IFC Hit"
+    LOG_INFO("[PICK] IFC Hit"
         << " | Type: " << it->second.type
         << " | Name: " << it->second.name
         << " | GUID: " << hit.ifcGuid
         << " | Submesh: " << hit.submeshIndex
         << " | t: " << hit.t
-        << "\n";
+        << "\n");
 }
 
 void Editor::dragGizmo(float mouseX, float mouseY)
@@ -438,7 +438,10 @@ void Editor::setStatus(const std::string& message, bool isError)
     m_statusMessage = message;
     m_statusIsError = isError;
     m_statusTime = ImGui::GetTime();
-    (isError ? std::cerr : std::cout) << "[EDITOR] " << message << "\n";
+    if (isError)
+        LOG_ERROR("[EDITOR] " << message << "\n");
+    else
+        LOG_INFO("[EDITOR] " << message << "\n");
 }
 
 std::string Editor::formatCount(size_t value)

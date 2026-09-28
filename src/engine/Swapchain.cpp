@@ -1,6 +1,6 @@
 #include "Swapchain.h"
 #include "VulkanContext.h"
-#include <iostream>
+#include "Log.h"
 
 Swapchain::~Swapchain()
 {
@@ -13,7 +13,7 @@ bool Swapchain::create(VulkanContext& context, uint32_t width, uint32_t height, 
     m_context = &context;
     std::string error;
     if (!build(width, height, vsync, VK_NULL_HANDLE, error)) {
-        std::cerr << "Failed to create Swapchain: " << error << "\n";
+        LOG_ERROR("Failed to create Swapchain: " << error << "\n");
         return false;
     }
     return true;
@@ -32,7 +32,7 @@ bool Swapchain::recreate(uint32_t width, uint32_t height, bool vsync)
 
     std::string error;
     if (!build(width, height, vsync, m_swapchain.swapchain, error)) {
-        std::cerr << "Failed to recreate swapchain: " << error << "\n";
+        LOG_ERROR("Failed to recreate swapchain: " << error << "\n");
         return false;
     }
     return true;

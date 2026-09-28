@@ -49,6 +49,13 @@ FetchContent_Declare(
   GIT_SHALLOW TRUE
 )
 
+# Only windowing, events and Vulkan surfaces are used; drop the other subsystems and renderers.
+foreach(SDL_UNUSED_OPTION
+    SDL_AUDIO SDL_GPU SDL_RENDER SDL_CAMERA SDL_JOYSTICK SDL_HAPTIC SDL_HIDAPI SDL_POWER SDL_SENSOR
+    SDL_DIALOG SDL_TRAY SDL_OPENGL SDL_OPENGLES SDL_TEST_LIBRARY)
+  set(${SDL_UNUSED_OPTION} OFF CACHE BOOL "" FORCE)
+endforeach()
+
 FetchContent_Declare(
   glm
   GIT_REPOSITORY https://github.com/g-truc/glm.git
@@ -66,11 +73,17 @@ FetchContent_Declare(
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 set(ASSIMP_BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 
-set(ASSIMP_BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 set(ASSIMP_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(ASSIMP_BUILD_SAMPLES OFF CACHE BOOL "" FORCE)
 set(ASSIMP_BUILD_DOCS OFF CACHE BOOL "" FORCE)
 set(ASSIMP_BUILD_ASSIMP_TOOLS OFF CACHE BOOL "" FORCE)
+set(ASSIMP_INSTALL OFF CACHE BOOL "" FORCE)
+# assimp only imports OBJ and FBX (glTF goes through fastgltf, IFC through web-ifc).
+set(ASSIMP_NO_EXPORT ON CACHE BOOL "" FORCE)
+set(ASSIMP_BUILD_ALL_EXPORTERS_BY_DEFAULT OFF CACHE BOOL "" FORCE)
+set(ASSIMP_BUILD_ALL_IMPORTERS_BY_DEFAULT OFF CACHE BOOL "" FORCE)
+set(ASSIMP_BUILD_OBJ_IMPORTER ON CACHE BOOL "" FORCE)
+set(ASSIMP_BUILD_FBX_IMPORTER ON CACHE BOOL "" FORCE)
 
 FetchContent_Declare(
     stb
@@ -146,6 +159,9 @@ FetchContent_MakeAvailable(
   webifc_unordered_dense
 )
 
+# SDL forces /GL- on SDL_mslibc.c, which conflicts with LTCG (D9025/C4652), so SDL is left out of it.
+set_target_properties(SDL3-static PROPERTIES INTERPROCEDURAL_OPTIMIZATION_RELEASE OFF)
+
 file(GLOB_RECURSE WEB_IFC_SOURCES CONFIGURE_DEPENDS ${web_ifc_SOURCE_DIR}/src/cpp/web-ifc/*.cpp)
 add_library(web_ifc STATIC ${WEB_IFC_SOURCES})
 set_target_properties(web_ifc PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
@@ -170,7 +186,6 @@ endif()
 
 add_library(imgui STATIC
     ${imgui_SOURCE_DIR}/imgui.cpp
-    ${imgui_SOURCE_DIR}/imgui_demo.cpp
     ${imgui_SOURCE_DIR}/imgui_draw.cpp
     ${imgui_SOURCE_DIR}/imgui_tables.cpp
     ${imgui_SOURCE_DIR}/imgui_widgets.cpp

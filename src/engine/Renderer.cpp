@@ -11,8 +11,8 @@
 #include <cmath>
 #include <cstring>
 #include <execution>
-#include <iostream>
 #include <numeric>
+#include "Log.h"
 
 namespace {
 
@@ -35,7 +35,7 @@ template <typename T>
 bool takeResult(vk::ResultValue<T>&& created, T& out, const char* what)
 {
     if (created.result != vk::Result::eSuccess) {
-        std::cerr << "Failed to create " << what << ": " << vk::to_string(created.result) << "\n";
+        LOG_ERROR("Failed to create " << what << ": " << vk::to_string(created.result) << "\n");
         return false;
     }
     out = std::move(created.value);
@@ -144,7 +144,7 @@ bool Renderer::init(VulkanContext& context, SDL_Window* window, const GraphicsSe
         }
     }
     catch (const std::exception& e) {
-        std::cerr << "Renderer initialization failed: " << e.what() << "\n";
+        LOG_ERROR("Renderer initialization failed: " << e.what() << "\n");
         shutdown();
         return false;
     }
@@ -192,7 +192,7 @@ bool Renderer::createRenderImage(vk::Format format, vk::ImageUsageFlags usage, v
 
     if (vmaCreateImage(m_allocator, reinterpret_cast<const VkImageCreateInfo*>(&imageInfo), &allocInfo,
         &out.image, &out.allocation, nullptr) != VK_SUCCESS) {
-        std::cerr << "Failed to create render target image\n";
+        LOG_ERROR("Failed to create render target image\n");
         out = {};
         return false;
     }
@@ -300,7 +300,7 @@ bool Renderer::createFrameResources()
 
         VmaAllocationInfo allocationInfo{};
         if (vmaCreateBuffer(m_allocator, &bufferInfo, &uboAllocInfo, &ubo.buffer, &ubo.allocation, &allocationInfo) != VK_SUCCESS) {
-            std::cerr << "Failed to create UBO buffer\n";
+            LOG_ERROR("Failed to create UBO buffer\n");
             ubo = {};
             return false;
         }
@@ -456,7 +456,7 @@ bool Renderer::createShaders()
             fxLayouts, { &fxPushRange, 1 });
     }
     catch (const std::exception& e) {
-        std::cerr << "Failed to load shaders: " << e.what() << "\n";
+        LOG_ERROR("Failed to load shaders: " << e.what() << "\n");
         return false;
     }
 
@@ -487,12 +487,12 @@ bool Renderer::createLineBuffer(const std::vector<GizmoVertex>& vertices, LineBu
 
     LineBuffer created;
     if (vmaCreateBuffer(m_allocator, &bufferInfo, &allocInfo, &created.buffer, &created.allocation, nullptr) != VK_SUCCESS) {
-        std::cerr << "Failed to create line vertex buffer\n";
+        LOG_ERROR("Failed to create line vertex buffer\n");
         return false;
     }
     void* mapped = nullptr;
     if (vmaMapMemory(m_allocator, created.allocation, &mapped) != VK_SUCCESS) {
-        std::cerr << "Failed to map line vertex buffer\n";
+        LOG_ERROR("Failed to map line vertex buffer\n");
         vmaDestroyBuffer(m_allocator, created.buffer, created.allocation);
         return false;
     }
@@ -546,7 +546,7 @@ bool Renderer::initImGuiBackend()
         return vkGetInstanceProcAddr(static_cast<VkInstance>(userData), functionName);
     }, instance);
     if (!loaded || !ImGui_ImplVulkan_Init(&initInfo)) {
-        std::cerr << "Failed to initialize the ImGui Vulkan backend\n";
+        LOG_ERROR("Failed to initialize the ImGui Vulkan backend\n");
         return false;
     }
     m_imguiInitialized = true;
@@ -646,7 +646,7 @@ void Renderer::applySettings(const GraphicsSettings& requested)
         (void)m_device.waitIdle();
         destroyRenderTargets();
         if (!createRenderTargets())
-            std::cerr << "Failed to recreate render targets for MSAA " << settings.msaaSamples << "x\n";
+            LOG_ERROR("Failed to recreate render targets for MSAA " << settings.msaaSamples << "x\n");
     }
 
     if (old.shadowMapSize != settings.shadowMapSize) {
@@ -656,7 +656,7 @@ void Renderer::applySettings(const GraphicsSettings& requested)
             createShadowMapResources();
         }
         catch (const std::exception& e) {
-            std::cerr << e.what() << "; falling back to 1024\n";
+            LOG_ERROR(e.what() << "; falling back to 1024\n");
             m_settings.shadowMapSize = 1024;
             createShadowMapResources();
         }
@@ -726,7 +726,7 @@ Renderer::FrameStatus Renderer::renderFrame(const FrameInput& input)
         return FrameStatus::Skipped;
     }
     if (result != vk::Result::eSuccess && result != vk::Result::eSuboptimalKHR) {
-        std::cerr << "Failed to acquireNextImageKHR\n";
+        LOG_ERROR("Failed to acquireNextImageKHR\n");
         return FrameStatus::Failed;
     }
     if (result == vk::Result::eSuboptimalKHR)
@@ -1545,7 +1545,7 @@ Renderer::FrameStatus Renderer::submitAndPresent(vk::CommandBuffer cmd, uint32_t
     if (presentResult == vk::Result::eErrorOutOfDateKHR || presentResult == vk::Result::eSuboptimalKHR)
         m_swapchainDirty = true;
     else if (presentResult != vk::Result::eSuccess)
-        std::cerr << "Failed to present\n";
+        LOG_ERROR("Failed to present\n");
 
     m_currentFrame = (m_currentFrame + 1) % m_framesInFlight;
     return FrameStatus::Rendered;

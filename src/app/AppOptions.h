@@ -14,6 +14,7 @@ struct AppOptions {
     bool showHelp = false;
 };
 
-// Unknown or malformed arguments print a warning to stderr and are ignored.
+// Unknown or malformed arguments log a warning and are ignored.
 AppOptions parseAppOptions(int argc, char** argv);
-void printUsage(const char* executableName);
+// Prints the usage to the console, or shows it in a message box in release builds (they have no console).
+void showUsage(const char* executableName);

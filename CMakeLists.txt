@@ -15,23 +15,16 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 find_package(Vulkan REQUIRED)
 
+# Smaller release binaries: whole-program optimization (dependencies included) and per-variable
+# COMDATs so the linker can drop unreferenced data as well as unreferenced functions.
+set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)
+if (MSVC)
+  add_compile_options("$<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:C,CXX>>:/Gw>")
+endif()
+
 add_subdirectory(external)
 
 add_subdirectory(src)
-
-file(COPY ${CMAKE_SOURCE_DIR}/src/external/IfcConvert.exe
-     DESTINATION ${CMAKE_BINARY_DIR}/src/external)
-
-file(COPY ${CMAKE_SOURCE_DIR}/src/external/IfcConvert.config
-     DESTINATION ${CMAKE_BINARY_DIR}/src/external)
-
-# if .py changed, execute in external
-# .venv/scripts/activate
-# pyinstaller --onefile --clean --collect-all ifcopenshell .\extract_ifc_metadata.py
-# and then regenerate CMake
-
-file(COPY ${CMAKE_SOURCE_DIR}/src/external/dist/extract_ifc_metadata.exe
-    DESTINATION ${CMAKE_BINARY_DIR}/src/external)
 
 file(COPY ${CMAKE_SOURCE_DIR}/src/shaders
      DESTINATION ${CMAKE_BINARY_DIR}/src)

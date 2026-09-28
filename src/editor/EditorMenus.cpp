@@ -7,7 +7,6 @@
 #include "EditorStyle.h"
 #include "FileDialog.h"
 #include "app/SettingsUi.h"
-#include "engine/ModelLoader.h"
 #include "engine/ModelManager.h"
 #include "engine/SceneManager.h"
 
@@ -427,8 +426,7 @@ void Editor::drawFileDialogs()
             const auto rel = makeRelativeIfInside(dialog->GetFilePathName(), kModelsRoot);
             if (rel.has_value()) {
                 const std::string name = std::filesystem::path(rel.value()).stem().string();
-                const bool isIfc = std::filesystem::path(rel.value()).extension() == ".ifc";
-                m_models.loadModelAsync(isIfc ? kIfcDirectPrefix + rel.value() : rel.value(), name);
+                m_models.loadModelAsync(rel.value(), name);
                 setStatus("Importing " + name + "...");
             }
             else setStatus(std::string("Models must be inside the \"") + kModelsRoot + "\" folder", true);

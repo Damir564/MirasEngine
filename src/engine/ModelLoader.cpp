@@ -1,18 +1,12 @@
 #include "ModelLoader.h"
 #include "ModelCache.h"
-#include "IfcConverter.h"
 #include "IfcDirectLoader.h"
-#include "IfcScene.h"
-#include "IfcSceneLoader.h"
 #include <algorithm>
 #include <atomic>
 #include <cctype>
 #include <cstdlib>
-#include <cstring>
 #include <filesystem>
-#include <functional>
 #include <future>
-#include <iostream>
 #include <limits>
 #include <numeric>
 #include <stdexcept>
@@ -28,6 +22,7 @@
 #include <fastgltf/glm_element_traits.hpp>
 #include <fastgltf/tools.hpp>
 #include "stb_image.h"
+#include "Log.h"
 
 namespace {
 
@@ -91,7 +86,7 @@ void decodeTextureParallel(TextureData& tex) {
                     std::string altPath = basePath + tryExt;
                     tex.pixels = stbi_load(altPath.c_str(), &tex.width, &tex.height, &tex.channels, 4);
                     if (tex.pixels) {
-                        std::cout << "  Found texture at: " << altPath << "\n";
+                        LOG_INFO("  Found texture at: " << altPath << "\n");
                         break;
                     }
                 }
@@ -100,7 +95,7 @@ void decodeTextureParallel(TextureData& tex) {
     }
 
     if (!tex.pixels) {
-        std::cerr << "Texture failed to load: " << (tex.path.empty() ? "Embedded" : tex.path) << "\n";
+        LOG_ERROR("Texture failed to load: " << (tex.path.empty() ? "Embedded" : tex.path) << "\n");
         // 1x1 magenta so missing textures are obvious in the viewport.
         tex.width = 1;
         tex.height = 1;
@@ -120,7 +115,7 @@ void decodeAllTextures(std::vector<TextureData>& textures, bool logProgress) {
     if (textures.empty())
         return;
 
-    std::cout << "Decoding " << textures.size() << " textures in parallel...\n";
+    LOG_INFO("Decoding " << textures.size() << " textures in parallel...\n");
 
     std::vector<std::future<void>> futures;
     futures.reserve(textures.size());
@@ -135,7 +130,7 @@ void decodeAllTextures(std::vector<TextureData>& textures, bool logProgress) {
                 return;
             int loaded = ++loadedCount;
             if (loaded % 10 == 0 || loaded == totalTextures) {
-                std::cout << "  Texture progress: " << loaded << "/" << totalTextures << "\n";
+                LOG_INFO("  Texture progress: " << loaded << "/" << totalTextures << "\n");
             }
             }));
     }
@@ -145,7 +140,7 @@ void decodeAllTextures(std::vector<TextureData>& textures, bool logProgress) {
     }
 
     if (logProgress)
-        std::cout << "All textures decoded.\n";
+        LOG_INFO("All textures decoded.\n");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -218,7 +213,7 @@ TextureData prepareObjTextureInfo(const aiMaterial* mat, const std::string& mode
         }
 
         if (!std::filesystem::exists(texture.path)) {
-            std::cerr << "Warning: Texture not found: " << texture.path << "\n";
+            LOG_ERROR("Warning: Texture not found: " << texture.path << "\n");
         }
     }
 
@@ -521,10 +516,10 @@ Mesh loadWithAssimp(const std::string& path) {
         throw std::runtime_error("Failed to load model: " + path + "\nAssimp error: " + importer.GetErrorString());
     }
 
-    std::cout << "Loading with Assimp: " << path << "\n";
-    std::cout << "  Meshes: " << scene->mNumMeshes << "\n";
-    std::cout << "  Materials: " << scene->mNumMaterials << "\n";
-    std::cout << "  Textures (embedded): " << scene->mNumTextures << "\n";
+    LOG_INFO("Loading with Assimp: " << path << "\n");
+    LOG_INFO("  Meshes: " << scene->mNumMeshes << "\n");
+    LOG_INFO("  Materials: " << scene->mNumMaterials << "\n");
+    LOG_INFO("  Textures (embedded): " << scene->mNumTextures << "\n");
 
     Mesh result;
 
@@ -534,7 +529,7 @@ Mesh loadWithAssimp(const std::string& path) {
     result.vertices.reserve(totalVerts);
     result.indices.reserve(totalIndices);
 
-    std::cout << "  Expected vertices: " << totalVerts << ", indices: " << totalIndices << "\n";
+    LOG_INFO("  Expected vertices: " << totalVerts << ", indices: " << totalIndices << "\n");
 
     TextureCache textureCache;
     if (isObjFile) {
@@ -544,9 +539,9 @@ Mesh loadWithAssimp(const std::string& path) {
         processNode(scene->mRootNode, scene, glm::mat4(1.0f), result, textureCache, path);
     }
 
-    std::cout << "  Loaded vertices: " << result.vertices.size() << ", indices: " << result.indices.size() << "\n";
-    std::cout << "  Submeshes: " << result.submeshes.size() << "\n";
-    std::cout << "  Textures to load: " << result.textureData.size() << "\n";
+    LOG_INFO("  Loaded vertices: " << result.vertices.size() << ", indices: " << result.indices.size() << "\n");
+    LOG_INFO("  Submeshes: " << result.submeshes.size() << "\n");
+    LOG_INFO("  Textures to load: " << result.textureData.size() << "\n");
 
     decodeAllTextures(result.textureData, true);
 
@@ -554,7 +549,7 @@ Mesh loadWithAssimp(const std::string& path) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// fastgltf (glTF / GLB, and the GLB produced from IFC)
+// fastgltf (glTF / GLB)
 // ---------------------------------------------------------------------------------------------
 
 // Only records where the encoded image lives; decoding happens later in parallel.
@@ -651,7 +646,7 @@ void readGltfMaterial(const fastgltf::Asset& asset, const fastgltf::Material& ma
         break;
     }
 
-    // Some exporters (IfcConvert included) mark translucent materials as opaque.
+    // Some exporters mark translucent materials as opaque.
     if (outMaterial.alphaMode == AlphaMode::OPAQUE && outMaterial.baseColorFactor.a < 0.99f) {
         outMaterial.alphaMode = AlphaMode::BLEND;
     }
@@ -863,118 +858,13 @@ Mesh loadWithFastGltf(const std::string& path) {
     // Embedded textures point into the asset, so decode before it goes out of scope.
     decodeAllTextures(result.textureData, false);
 
-    std::cout << "Loaded " << result.vertices.size() << " vertices, " << result.textureData.size() << " textures.\n";
-    return result;
-}
-
-// ---------------------------------------------------------------------------------------------
-// IFC
-// ---------------------------------------------------------------------------------------------
-
-// Links IFC elements to submeshes. IfcConvert names each glTF node after its element GUID
-// (--use-element-names), and every primitive of that node becomes one submesh.
-void buildIfcScene(IfcScene& scene, const fastgltf::Asset& asset, const std::vector<size_t>& submeshNodeMap) {
-    for (std::size_t si = 0; si < submeshNodeMap.size(); ++si) {
-        const auto& node = asset.nodes[submeshNodeMap[si]];
-        std::string guid(node.name.begin(), node.name.end());
-
-        auto it = scene.elements.find(guid);
-        if (it != scene.elements.end())
-            it->second.submeshIndices.push_back(si);
-    }
-
-    const std::size_t elementCountBefore = scene.elements.size();
-    std::erase_if(scene.elements, [](const auto& kv) {
-        return kv.second.submeshIndices.empty();
-        });
-    scene.rebuildSubmeshMaps(submeshNodeMap.size());
-
-    for (auto& [sg, sn] : scene.spatial) {
-        std::erase_if(sn.elementGuids, [&](const std::string& guid) {
-            return !scene.elements.contains(guid);
-            });
-    }
-
-    std::cout << "[IFC] " << scene.elements.size() << " elements with geometry, "
-        << (elementCountBefore - scene.elements.size()) << " without geometry removed, "
-        << scene.submeshToGuid.size() << " submeshes matched\n";
-}
-
-// Builds the IfcScene for an already-converted IFC. Only the glTF node tree is parsed (no buffers),
-// which is enough to map submesh indices back to element GUIDs.
-IfcScene beginLoadIfcScene(const std::string& glbPath, const std::string& jsonPath) {
-    // Metadata JSON parsing is independent of the glTF node walk, so overlap them.
-    auto metadataFuture = std::async(std::launch::async, [jsonPath]() {
-        IfcScene scene{};
-        if (!loadIfcScene(jsonPath, scene)) {
-            std::cerr << "[IFC] Warning: failed to load metadata from " << jsonPath << "\n";
-        }
-        return scene;
-        });
-
-    fastgltf::Parser parser;
-    auto gltfFile = fastgltf::MappedGltfFile::FromPath(glbPath);
-    if (!gltfFile)
-        return metadataFuture.get();
-
-    auto assetRet = parser.loadGltf(gltfFile.get(),
-        std::filesystem::path(glbPath).parent_path(), fastgltf::Options::None);
-
-    if (assetRet.error() != fastgltf::Error::None)
-        return metadataFuture.get();
-
-    auto& asset = assetRet.get();
-    std::vector<size_t> submeshNodeMap;
-
-    if (!asset.scenes.empty()) {
-        // Must visit nodes in the same order as processFastGltfNode so indices line up.
-        std::function<void(size_t)> walk = [&](size_t ni) {
-            const auto& n = asset.nodes[ni];
-            if (n.meshIndex.has_value()) {
-                std::size_t primCount = asset.meshes[*n.meshIndex].primitives.size();
-                for (std::size_t p = 0; p < primCount; ++p) {
-                    submeshNodeMap.push_back(ni);
-                }
-            }
-            for (size_t c : n.children) walk(c);
-            };
-        for (size_t ni : asset.scenes[asset.defaultScene.value_or(0)].nodeIndices)
-            walk(ni);
-    }
-
-    IfcScene ifcScene = metadataFuture.get();
-    buildIfcScene(ifcScene, asset, submeshNodeMap);
-
-    return ifcScene;
-}
-
-Mesh loadIfcModel(const std::string& ifcPath) {
-    // IfcConvert (geometry) and the metadata extractor are separate processes; run them concurrently.
-    auto jsonFuture = std::async(std::launch::async, [ifcPath]() { return IfcConverter::toJson(ifcPath); });
-
-    auto glbOpt = IfcConverter::toGlb(ifcPath);
-    if (!glbOpt) {
-        jsonFuture.wait();
-        throw std::runtime_error("IFC conversion failed to GLB: " + ifcPath);
-    }
-    const std::string& glbPath = *glbOpt;
-
-    Mesh result = loadWithFastGltf(glbPath);
-
-    auto jsonOpt = jsonFuture.get();
-    if (!jsonOpt) throw std::runtime_error("IFC conversion failed to JSON: " + ifcPath);
-    result.ifcScene = beginLoadIfcScene(glbPath, *jsonOpt);
-
-    std::cout << "[IFC] " << result.vertices.size() << " verts, "
-        << result.ifcScene->elements.size() << " elements, "
-        << result.ifcScene->spatial.size() << " spatial nodes\n";
-
+    LOG_INFO("Loaded " << result.vertices.size() << " vertices, " << result.textureData.size() << " textures.\n");
     return result;
 }
 
 Mesh loadFromSource(const std::string& path, const std::string& ext) {
     if (ext == ".ifc")
-        return loadIfcModel(path);
+        return loadIfcDirect(path);
     if (ext == ".gltf" || ext == ".glb")
         return loadWithFastGltf(path);
     return loadWithAssimp(path);
@@ -984,14 +874,6 @@ Mesh loadFromSource(const std::string& path, const std::string& ext) {
 
 bool isBuiltinModelPath(const std::string& path) {
     return path.rfind("builtin:", 0) == 0;
-}
-
-bool isIfcDirectPath(const std::string& path) {
-    return path.rfind(kIfcDirectPrefix, 0) == 0;
-}
-
-std::string modelSourceFile(const std::string& path) {
-    return isIfcDirectPath(path) ? path.substr(std::strlen(kIfcDirectPrefix)) : path;
 }
 
 namespace {
@@ -1047,65 +929,28 @@ Mesh generateCube() {
 } // namespace
 
 Mesh loadModelSmart(const std::string& path) {
-    namespace fs = std::filesystem;
-
     if (path == kBuiltinCubePath)
         return generateCube();
     if (isBuiltinModelPath(path))
         throw std::runtime_error("Unknown builtin model: " + path);
-    if (isIfcDirectPath(path)) {
-        const std::string sourcePath = modelSourceFile(path);
-        // Kept apart from the IfcConvert cache of the same file; this one also stores the metadata.
-        const std::string directCachePath = sourcePath + ".direct.cache";
-        if (ModelCache::isValid(sourcePath, directCachePath)) {
-            std::cout << "[CACHE] Found valid cache for: " << path << ". Loading... ";
-            Mesh cached;
-            if (ModelCache::load(directCachePath, cached) && cached.ifcScene) {
-                std::cout << "OK\n";
-                return cached;
-            }
-            std::cout << "Failed (corrupt or outdated), re-importing\n";
-        }
-        Mesh direct = loadIfcDirect(sourcePath);
-        computeAllSubmeshBounds(direct);
-        ModelCache::save(directCachePath, direct, true);
-        return direct;
-    }
 
     const std::string cachePath = path + ".cache";
-    const fs::path fsPath(path);
-    std::string ext = pathToUtf8(fsPath.extension());
+    const std::u8string u8Ext = std::filesystem::path(path).extension().u8string();
+    std::string ext(u8Ext.begin(), u8Ext.end());
     std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
-    const bool isIfc = (ext == ".ifc");
 
-    Mesh result;
     if (ModelCache::isValid(path, cachePath)) {
-        std::cout << "[CACHE] Found valid cache for: " << path << ". Loading... ";
-
-        // The cache holds geometry only; IFC metadata is rebuilt from the converted files alongside it.
-        std::future<IfcScene> ifcFuture;
-        if (isIfc) {
-            fs::path convertedStem = fsPath.parent_path() / "converted" / fsPath.stem();
-            std::string jsonPath = pathToUtf8(convertedStem) + ".json";
-            std::string glbPath = pathToUtf8(convertedStem) + ".glb";
-            ifcFuture = std::async(std::launch::async, [glbPath, jsonPath]() {
-                return beginLoadIfcScene(glbPath, jsonPath);
-                });
+        LOG_INFO("[CACHE] Found valid cache for: " << path << ". Loading... ");
+        Mesh cached;
+        // IFC metadata lives in the cache too; an IFC cache without it predates that and is re-imported.
+        if (ModelCache::load(cachePath, cached) && (ext != ".ifc" || cached.ifcScene)) {
+            LOG_INFO("OK\n");
+            return cached;
         }
-
-        const bool cacheLoaded = ModelCache::load(cachePath, result);
-        if (ifcFuture.valid()) {
-            IfcScene scene = ifcFuture.get();
-            if (cacheLoaded) result.ifcScene = std::move(scene);
-        }
-
-        if (cacheLoaded)
-            return result;
-
-        std::cout << "Failed (Corruption?)\n";
+        LOG_INFO("Failed (corrupt or outdated), re-importing\n");
     }
 
-    result = loadFromSource(path, ext);
+    Mesh result = loadFromSource(path, ext);
     computeAllSubmeshBounds(result);
     ModelCache::save(cachePath, result);
     return result;

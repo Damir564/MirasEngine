@@ -6,7 +6,6 @@
 #include <exception>
 #include <fstream>
 #include <functional>
-#include <iostream>
 #include <mutex>
 #include <stdexcept>
 #include <string_view>
@@ -17,6 +16,7 @@
 #include <SDL3/SDL_thread.h>
 #include <web-ifc/modelmanager/ModelManager.h>
 #include <web-ifc/schema/ifc-schema.h>
+#include "Log.h"
 
 namespace {
 
@@ -33,7 +33,12 @@ std::mutex g_webIfcMutex;
 // SDL reserves (not commits) this, so a generous size is cheap.
 constexpr Sint64 kWebIfcStackSize = 64ll * 1024 * 1024;
 
-constexpr uint8_t kSpdlogLevelError = 4;
+// web-ifc logs through its own spdlog sink, not LOG_*, so silence it where there is no console.
+#ifdef NDEBUG
+constexpr uint8_t kSpdlogLevel = 6; // off
+#else
+constexpr uint8_t kSpdlogLevel = 4; // error
+#endif
 constexpr int kMaxNesting = 8;
 
 // Spatial structure types across IFC2x3, IFC4 and IFC4x3 (infrastructure facilities).
@@ -555,10 +560,10 @@ void runWithLargeStack(const std::function<void()>& job)
 
 Mesh importIfc(std::istream& file, const std::string& ifcPath)
 {
-    std::cout << "[IFC direct] Parsing " << ifcPath << " with web-ifc...\n";
+    LOG_INFO("[IFC direct] Parsing " << ifcPath << " with web-ifc...\n");
 
     webifc::manager::ModelManager manager(false);
-    manager.SetLogLevel(kSpdlogLevelError);
+    manager.SetLogLevel(kSpdlogLevel);
     webifc::manager::LoaderSettings settings;
     const uint32_t modelID = manager.CreateModel(settings);
 
@@ -600,7 +605,7 @@ Mesh importIfc(std::istream& file, const std::string& ifcPath)
         }
         catch (const std::exception& e) {
             ++failed;
-            std::cerr << "[IFC direct] Element #" << id << " failed: " << e.what() << "\n";
+            LOG_ERROR("[IFC direct] Element #" << id << " failed: " << e.what() << "\n");
         }
         // Frees per-element geometry; mapped representations are shared between elements, so they stay.
         processor->Clear(true);
@@ -731,10 +736,10 @@ Mesh importIfc(std::istream& file, const std::string& ifcPath)
 
     scene.rebuildSubmeshMaps(result.submeshes.size());
 
-    std::cout << "[IFC direct] " << scene.schema << ": " << result.vertices.size() << " verts, "
+    LOG_INFO("[IFC direct] " << scene.schema << ": " << result.vertices.size() << " verts, "
         << result.submeshes.size() << " submeshes, " << scene.elements.size() << " elements, "
         << scene.spatial.size() << " spatial nodes"
-        << (failed ? ", " + std::to_string(failed) + " elements failed" : std::string()) << "\n";
+        << (failed ? ", " + std::to_string(failed) + " elements failed" : std::string()) << "\n");
 
     result.ifcScene = std::move(scene);
     return result;

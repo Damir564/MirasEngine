@@ -29,10 +29,10 @@ size_t rgbaSize(const TextureData& tex) {
     return tex.width * tex.height * 4;
 }
 
-// Optional trailer after the textures. Caches written without it (older files, IfcConvert loads)
+// Optional trailer after the textures, only written for IFC models. Caches without it
 // simply end after the textures, so adding it did not require a version bump.
 constexpr uint32_t kIfcSectionMagic = 0x53434649; // "IFCS"
-// Bump when the section layout or the direct IFC loader's output changes, so stale caches re-import.
+// Bump when the section layout or the IFC loader's output changes, so stale caches re-import.
 constexpr uint32_t kIfcSectionVersion = 1;
 
 void writeU32(std::ostream& out, uint32_t v) {
@@ -193,7 +193,7 @@ bool isValid(const std::string& sourcePath, const std::string& cachePath) {
     return fs::last_write_time(cachePath) > fs::last_write_time(sourcePath);
 }
 
-bool save(const std::string& cachePath, const Mesh& mesh, bool includeIfcScene) {
+bool save(const std::string& cachePath, const Mesh& mesh) {
     std::ofstream file(cachePath, std::ios::binary);
     if (!file.is_open()) return false;
 
@@ -230,7 +230,7 @@ bool save(const std::string& cachePath, const Mesh& mesh, bool includeIfcScene) 
         }
     }
 
-    if (includeIfcScene && mesh.ifcScene)
+    if (mesh.ifcScene)
         writeIfcScene(file, *mesh.ifcScene);
 
     return static_cast<bool>(file);

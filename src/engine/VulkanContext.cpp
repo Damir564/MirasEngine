@@ -3,8 +3,8 @@
 #include <volk.h>
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
-#include <iostream>
 #include <vector>
+#include "Log.h"
 
 namespace {
 constexpr uint32_t kApiMajor = 1;
@@ -19,7 +19,7 @@ VulkanContext::~VulkanContext()
 bool VulkanContext::init(SDL_Window* window, bool enableValidation)
 {
     if (volkInitialize() != VK_SUCCESS) {
-        std::cerr << "volkInitialize failed\n";
+        LOG_ERROR("volkInitialize failed\n");
         return false;
     }
     vk::detail::defaultDispatchLoaderDynamic.init(vkGetInstanceProcAddr);
@@ -29,7 +29,7 @@ bool VulkanContext::init(SDL_Window* window, bool enableValidation)
         return false;
     }
 
-    std::cout << "SDL3 + Vulkan instance, device, and VMA initialized successfully!\n";
+    LOG_INFO("SDL3 + Vulkan instance, device, and VMA initialized successfully!\n");
     return true;
 }
 
@@ -38,13 +38,11 @@ bool VulkanContext::createInstance(bool enableValidation)
     Uint32 extensionCount = 0;
     const char* const* sdlExtensions = SDL_Vulkan_GetInstanceExtensions(&extensionCount);
     if (sdlExtensions == nullptr) {
-        std::cerr << "SDL_Vulkan_GetInstanceExtensions failed\n";
+        LOG_ERROR("SDL_Vulkan_GetInstanceExtensions failed\n");
         return false;
     }
 
     std::vector<const char*> extensions(sdlExtensions, sdlExtensions + extensionCount);
-    for (auto ext : extensions)
-        std::cout << ext << "\n";
 
     vkb::InstanceBuilder builder;
     builder
@@ -56,7 +54,7 @@ bool VulkanContext::createInstance(bool enableValidation)
         builder.request_validation_layers(true).use_default_debug_messenger();
     auto instRet = builder.build();
     if (!instRet) {
-        std::cerr << "Failed to create instance: " << instRet.error().message() << "\n";
+        LOG_ERROR("Failed to create instance: " << instRet.error().message() << "\n");
         return false;
     }
 
@@ -71,7 +69,7 @@ bool VulkanContext::createSurface(SDL_Window* window)
 {
     VkSurfaceKHR surface = VK_NULL_HANDLE;
     if (!SDL_Vulkan_CreateSurface(window, m_instance, nullptr, &surface)) {
-        std::cerr << "Failed to create Vulkan surface\n";
+        LOG_ERROR("Failed to create Vulkan surface\n");
         return false;
     }
     m_surface = vk::SurfaceKHR(surface);
@@ -119,22 +117,20 @@ bool VulkanContext::createDevice()
         .set_surface(m_surface)
         .select();
     if (!physRet) {
-        std::cerr << "Failed to select physical device: " << physRet.error().message() << "\n";
+        LOG_ERROR("Failed to select physical device: " << physRet.error().message() << "\n");
         return false;
     }
 
     m_vkbPhysicalDevice = physRet.value();
-    if (!m_vkbPhysicalDevice.are_extension_features_present(shaderObjectFeatures))
-        std::cout << "no" << "\n";
     if (!m_vkbPhysicalDevice.is_extension_present(VK_EXT_SHADER_OBJECT_EXTENSION_NAME)) {
-        std::cerr << "Shader Object not supported\n";
+        LOG_ERROR("Shader Object not supported\n");
         return false;
     }
     m_physicalDevice = vk::PhysicalDevice(m_vkbPhysicalDevice.physical_device);
 
     auto deviceRet = vkb::DeviceBuilder{ m_vkbPhysicalDevice }.build();
     if (!deviceRet) {
-        std::cerr << "Failed to create device: " << deviceRet.error().message() << "\n";
+        LOG_ERROR("Failed to create device: " << deviceRet.error().message() << "\n");
         return false;
     }
 
@@ -147,7 +143,7 @@ bool VulkanContext::createDevice()
     auto presentQueue = m_vkbDevice.get_queue(vkb::QueueType::present);
     auto graphicsFamily = m_vkbDevice.get_queue_index(vkb::QueueType::graphics);
     if (!graphicsQueue || !presentQueue || !graphicsFamily) {
-        std::cerr << "Failed to get device queues\n";
+        LOG_ERROR("Failed to get device queues\n");
         return false;
     }
     m_graphicsQueue = vk::Queue(graphicsQueue.value());
@@ -170,7 +166,7 @@ bool VulkanContext::createAllocator()
     allocatorInfo.vulkanApiVersion = VK_API_VERSION_1_3;
 
     if (vmaCreateAllocator(&allocatorInfo, &m_allocator) != VK_SUCCESS) {
-        std::cerr << "Failed to create VMA allocator\n";
+        LOG_ERROR("Failed to create VMA allocator\n");
         m_allocator = VK_NULL_HANDLE;
         return false;
     }

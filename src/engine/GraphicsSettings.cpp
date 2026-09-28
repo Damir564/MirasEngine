@@ -2,7 +2,7 @@
 #include <nlohmann/json.hpp>
 #include <algorithm>
 #include <fstream>
-#include <iostream>
+#include "Log.h"
 
 namespace {
 
@@ -16,7 +16,7 @@ void readField(const nlohmann::json& json, const char* key, T& out)
         out = it->get<T>();
     }
     catch (const nlohmann::json::exception&) {
-        std::cerr << "[SETTINGS] Ignoring invalid value for '" << key << "'\n";
+        LOG_ERROR("[SETTINGS] Ignoring invalid value for '" << key << "'\n");
     }
 }
 
@@ -49,7 +49,7 @@ GraphicsSettings loadGraphicsSettings(const std::string& path)
 
     const nlohmann::json json = nlohmann::json::parse(file, nullptr, false);
     if (json.is_discarded() || !json.is_object()) {
-        std::cerr << "[SETTINGS] " << path << " is not valid JSON; using defaults\n";
+        LOG_ERROR("[SETTINGS] " << path << " is not valid JSON; using defaults\n");
         return settings;
     }
     readField(json, "vsync", settings.vsync);
@@ -77,7 +77,7 @@ bool saveGraphicsSettings(const GraphicsSettings& settings, const std::string& p
     };
     std::ofstream file(path);
     if (!file) {
-        std::cerr << "[SETTINGS] Failed to write " << path << "\n";
+        LOG_ERROR("[SETTINGS] Failed to write " << path << "\n");
         return false;
     }
     file << json.dump(4) << "\n";

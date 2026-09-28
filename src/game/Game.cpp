@@ -4,7 +4,6 @@
 #include <cfloat>
 #include <cmath>
 #include <filesystem>
-#include <iostream>
 #include <limits>
 #include "imgui.h"
 #include "app/SettingsUi.h"
@@ -12,6 +11,7 @@
 #include "engine/ModelManager.h"
 #include "engine/Renderer.h"
 #include "engine/SceneManager.h"
+#include "engine/Log.h"
 
 namespace {
 constexpr float kButtonWidth = 320.0f;
@@ -77,7 +77,7 @@ void Game::startLoading()
         return;
     }
     for (const std::string& missing : result.missingFiles)
-        std::cerr << "[GAME] Model file not found: " << missing << "\n";
+        LOG_ERROR("[GAME] Model file not found: " << missing << "\n");
     m_loadingStallTime = 0.0f;
     setState(State::Loading);
 }
@@ -104,7 +104,7 @@ void Game::updateLoading(float dt)
 
 void Game::failLoading(const std::string& message)
 {
-    std::cerr << "[GAME] " << message << "\n";
+    LOG_ERROR("[GAME] " << message << "\n");
     m_scenes.clear();
     m_error = message;
     setState(State::MainMenu);

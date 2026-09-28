@@ -1,5 +1,4 @@
 #include "ModelManager.h"
-#include <iostream>
 #include <algorithm>
 #include <filesystem>
 #include <numeric>
@@ -8,6 +7,7 @@
 #include "Shadow.h"
 #include "IfcScene.h"
 #include "ModelLoader.h"
+#include "Log.h"
 
 class TextureImage {
 public:
@@ -324,7 +324,7 @@ void ModelManager::loadModelAsync(const std::string& path, const std::string& na
 size_t ModelManager::loadModelSync(const std::string& path, const std::string& name) {
     std::string modelName = name.empty() ? std::filesystem::path(path).stem().string() : name;
 
-    std::cout << "[ModelManager] Loading model synchronously: " << path << "\n";
+    LOG_INFO("[ModelManager] Loading model synchronously: " << path << "\n");
 
     Mesh mesh = loadModelSmart(path);
     return uploadModelToGPU(mesh, modelName, path);
@@ -401,10 +401,10 @@ size_t ModelManager::uploadModelToGPU(Mesh& mesh, const std::string& name, const
     size_t index = m_models.size();
     m_models.push_back(std::move(gpuModel));
 
-    std::cout << "[ModelManager] Model '" << name << "' loaded: "
+    LOG_INFO("[ModelManager] Model '" << name << "' loaded: "
         << mesh.vertices.size() << " verts, "
         << mesh.indices.size() << " indices, "
-        << m_models.back()->textures.size() << " textures\n";
+        << m_models.back()->textures.size() << " textures\n");
 
     return index;
 }
@@ -493,7 +493,7 @@ void ModelManager::update() {
                 catch (const std::exception& e) {
                     task.state = LoadingState::Failed;
                     task.errorMessage = e.what();
-                    std::cerr << "[ModelManager] Failed: " << e.what() << "\n";
+                    LOG_ERROR("[ModelManager] Failed: " << e.what() << "\n");
                 }
             }
         }

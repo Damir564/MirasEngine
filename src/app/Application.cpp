@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <cstdint>
 #include <exception>
-#include <iostream>
 #include "imgui.h"
 #include "backends/imgui_impl_sdl3.h"
 #include "backends/imgui_impl_vulkan.h"
@@ -13,6 +12,7 @@
 #include "game/Game.h"
 #include "engine/ModelManager.h"
 #include "engine/SceneManager.h"
+#include "engine/Log.h"
 
 namespace {
 constexpr int kInitialWindowWidth = 1600;
@@ -30,6 +30,12 @@ int Application::run(const AppOptions& options)
 {
     if (!init(options)) {
         shutdown();
+#ifdef NDEBUG
+        // Release builds have no console showing the logged reason. Automated runs must not block on a dialog.
+        if (options.exitAfterFrames < 0)
+            SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "MirasEngine",
+                "Failed to start. A GPU and driver with Vulkan 1.3 and VK_EXT_shader_object are required.", nullptr);
+#endif
         return -1;
     }
     const int exitCode = mainLoop(options.exitAfterFrames);
@@ -59,18 +65,16 @@ bool Application::init(const AppOptions& options)
 bool Application::initWindow()
 {
     if (!SDL_Init(SDL_INIT_VIDEO)) {
-        std::cerr << "SDL_Init failed: " << SDL_GetError() << "\n";
+        LOG_ERROR("SDL_Init failed: " << SDL_GetError() << "\n");
         return false;
     }
     m_sdlInitialized = true;
-
-    std::cout << "Hello CMake." << std::endl;
 
     // The active mode sets the real title.
     m_window = SDL_CreateWindow("MirasEngine", kInitialWindowWidth, kInitialWindowHeight,
         SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE);
     if (!m_window) {
-        std::cerr << "SDL_CreateWindow failed: " << SDL_GetError() << "\n";
+        LOG_ERROR("SDL_CreateWindow failed: " << SDL_GetError() << "\n");
         return false;
     }
     return true;
@@ -96,11 +100,11 @@ bool Application::createModelManager()
         m_models = std::make_unique<ModelManager>(
             m_vulkan.allocator(), m_vulkan.device(), m_renderer.commandPool(), m_vulkan.graphicsQueue(),
             m_renderer.descriptorPool(), m_renderer.textureSetLayout(), m_renderer.textureSampler());
-        std::cout << "ModelManager created successfully\n";
+        LOG_INFO("ModelManager created successfully\n");
         return true;
     }
     catch (const std::exception& e) {
-        std::cerr << "Failed to create ModelManager: " << e.what() << "\n";
+        LOG_ERROR("Failed to create ModelManager: " << e.what() << "\n");
         return false;
     }
 }
