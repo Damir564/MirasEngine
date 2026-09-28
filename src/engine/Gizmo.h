@@ -141,24 +141,66 @@ inline bool rayIntersectsAABB(const Ray& ray,
         }
     }
 
-    tOut = tmin > 0.0f ? tmin : tmax;
-    return tOut > 0.0f;
+    if (tmax < 0.0f)
+        return false;
+    // Entry distance; 0 when the ray starts inside, so it never hides closer geometry.
+    tOut = std::max(tmin, 0.0f);
+    return true;
 }
 
-inline bool rayIntersectsTransformedAABB(const Ray& ray,
-    const glm::vec3& localMin, const glm::vec3& localMax,
-    const glm::mat4& transform,
+// Two-sided Moller-Trumbore. t is in units of ray.direction, which need not be normalized.
+inline bool rayIntersectsTriangle(const Ray& ray,
+    const glm::vec3& v0, const glm::vec3& v1, const glm::vec3& v2,
     float& tOut)
 {
-    glm::mat4 invTransform = glm::inverse(transform);
-    glm::vec3 localOrigin = glm::vec3(invTransform * glm::vec4(ray.origin, 1.0f));
-    glm::vec3 localDir = glm::normalize(glm::vec3(invTransform * glm::vec4(ray.direction, 0.0f)));
+    const glm::vec3 e1 = v1 - v0;
+    const glm::vec3 e2 = v2 - v0;
+    const glm::vec3 p = glm::cross(ray.direction, e2);
+    const float det = glm::dot(e1, p);
+    if (std::abs(det) < 1e-12f)
+        return false;
+    const float invDet = 1.0f / det;
+    const glm::vec3 s = ray.origin - v0;
+    const float u = glm::dot(s, p) * invDet;
+    if (u < 0.0f || u > 1.0f)
+        return false;
+    const glm::vec3 q = glm::cross(s, e1);
+    const float v = glm::dot(ray.direction, q) * invDet;
+    if (v < 0.0f || u + v > 1.0f)
+        return false;
+    const float t = glm::dot(e2, q) * invDet;
+    if (t <= 0.0f)
+        return false;
+    tOut = t;
+    return true;
+}
 
-    Ray localRay;
-    localRay.origin = localOrigin;
-    localRay.direction = localDir;
+// Nearest triangle hit of a submesh, or false. Bounds only reject; they are never reported as a hit.
+inline bool rayIntersectsSubmesh(const Ray& ray, const GPUModel& model, const SubmeshInfo& sub, float maxT, float& tOut)
+{
+    const bool validBounds = sub.boundsMin.x <= sub.boundsMax.x;
+    float boxT;
+    if (validBounds && (!rayIntersectsAABB(ray, sub.boundsMin, sub.boundsMax, boxT) || boxT >= maxT))
+        return false;
 
-    return rayIntersectsAABB(localRay, localMin, localMax, tOut);
+    const size_t end = std::min<size_t>(size_t(sub.indexOffset) + sub.indexCount, model.indices.size());
+    bool found = false;
+    float best = maxT;
+    for (size_t i = sub.indexOffset; i + 2 < end; i += 3) {
+        const size_t a = size_t(model.indices[i]) + sub.vertexOffset;
+        const size_t b = size_t(model.indices[i + 1]) + sub.vertexOffset;
+        const size_t c = size_t(model.indices[i + 2]) + sub.vertexOffset;
+        if (a >= model.positions.size() || b >= model.positions.size() || c >= model.positions.size())
+            continue;
+        float t;
+        if (rayIntersectsTriangle(ray, model.positions[a], model.positions[b], model.positions[c], t) && t < best) {
+            best = t;
+            found = true;
+        }
+    }
+    if (found)
+        tOut = best;
+    return found;
 }
 
 struct SubmeshHitResult {
@@ -185,20 +227,16 @@ inline SubmeshHitResult pickSubmesh(
         GPUModel* model = getModel(inst.modelIndex);
         if (!model || !model->isValid()) continue;
 
-        glm::mat4 transform = inst.getTransformMatrix();
-        float modelT;
-        if (!rayIntersectsTransformedAABB(
-            ray, model->boundsMin, model->boundsMax, transform, modelT))
-            continue;
-
-        if (modelT >= best.t) continue;
-
-        glm::mat4 invTransform = glm::inverse(transform);
-
+        // The local direction is deliberately left unnormalized: an affine map keeps the ray parameter,
+        // so local t equals world t and hits from differently scaled instances compare correctly.
+        const glm::mat4 invTransform = glm::inverse(inst.getTransformMatrix());
         Ray localRay;
         localRay.origin = glm::vec3(invTransform * glm::vec4(ray.origin, 1.0f));
-        localRay.direction = glm::normalize(
-            glm::vec3(invTransform * glm::vec4(ray.direction, 0.0f)));
+        localRay.direction = glm::vec3(invTransform * glm::vec4(ray.direction, 0.0f));
+
+        float modelT;
+        if (!rayIntersectsAABB(localRay, model->boundsMin, model->boundsMax, modelT) || modelT >= best.t)
+            continue;
 
         const bool hasIfc = inst.ifcScene.has_value();
 
@@ -210,7 +248,7 @@ inline SubmeshHitResult pickSubmesh(
             const SubmeshInfo& sub = model->submeshes[si];
 
             float subT;
-            if (!rayIntersectsAABB(localRay, sub.boundsMin, sub.boundsMax, subT))
+            if (!rayIntersectsSubmesh(localRay, *model, sub, best.t, subT))
                 continue;
 
             if (subT < best.t) {

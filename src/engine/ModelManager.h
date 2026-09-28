@@ -31,6 +31,9 @@ struct GPUModel {
     std::vector<uint32_t> drawOrder;
     size_t vertexCount = 0;
     size_t indexCount = 0;
+    // CPU copy of the geometry for exact ray picking; indices are relative to each submesh's vertexOffset.
+    std::vector<glm::vec3> positions;
+    std::vector<uint32_t> indices;
 
     glm::vec3 boundsCenter{ 0.0f };
     float boundsRadius{ 1.0f };

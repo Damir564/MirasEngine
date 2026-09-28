@@ -346,6 +346,10 @@ size_t ModelManager::uploadModelToGPU(Mesh& mesh, const std::string& name, const
     gpuModel->vertexCount = mesh.vertices.size();
     gpuModel->indexCount = mesh.indices.size();
     gpuModel->ifcScene = mesh.ifcScene;
+    gpuModel->positions.reserve(mesh.vertices.size());
+    for (const auto& v : mesh.vertices)
+        gpuModel->positions.push_back(v.position);
+    gpuModel->indices = mesh.indices;
 
     const vk::DeviceSize vertexBytes = sizeof(Vertex) * std::max<size_t>(mesh.vertices.size(), 1);
     const vk::DeviceSize indexBytes = sizeof(uint32_t) * std::max<size_t>(mesh.indices.size(), 1);
