@@ -37,7 +37,8 @@ struct IfcElement {
 
     std::unordered_map<std::string, std::string> data;
 
-    std::size_t submeshIndex = std::numeric_limits<std::size_t>::max();
+    // An element can span several submeshes (one per material/colour).
+    std::vector<std::size_t> submeshIndices;
     bool visible = true;
     bool selected = false;
 };
@@ -67,9 +68,27 @@ struct IfcScene {
     std::vector<std::string> roots;
 
     std::unordered_map<std::size_t, std::string> submeshToGuid;
-    std::unordered_map<std::string, std::size_t> guidToSubmesh;
 
     std::vector<bool> submeshVisibilityCache;
+
+    // Rebuilds submeshToGuid and the visibility cache from the elements' submeshIndices.
+    void rebuildSubmeshMaps(std::size_t submeshCount) {
+        submeshToGuid.clear();
+        submeshVisibilityCache.assign(submeshCount, false);
+        for (const auto& [guid, element] : elements) {
+            for (std::size_t si : element.submeshIndices) {
+                if (si >= submeshCount) continue;
+                submeshToGuid[si] = guid;
+                submeshVisibilityCache[si] = element.visible;
+            }
+        }
+    }
+
+    const std::vector<std::size_t>& submeshesOf(const std::string& guid) const {
+        static const std::vector<std::size_t> kNone;
+        auto it = elements.find(guid);
+        return it != elements.end() ? it->second.submeshIndices : kNone;
+    }
 
     bool isSubmeshVisible(std::size_t submeshIdx) const {
         if (submeshIdx < submeshVisibilityCache.size()) {
@@ -87,14 +106,6 @@ struct IfcScene {
                 }
             }
         }
-    }
-
-    static int findSubmeshByGuid(const IfcScene& scene, const std::string& guid) {
-        auto it = scene.guidToSubmesh.find(guid);
-        if (it != scene.guidToSubmesh.end()) {
-            return static_cast<int>(it->second);
-        }
-        return -1;
     }
 
     //bool isSubmeshVisible(std::size_t submeshIdx) const {
@@ -120,9 +131,9 @@ struct IfcScene {
             if (eit != elements.end()) {
                 eit->second.visible = vis;
 
-                if (eit->second.submeshIndex != std::numeric_limits<std::size_t>::max() &&
-                    eit->second.submeshIndex < submeshVisibilityCache.size()) {
-                    submeshVisibilityCache[eit->second.submeshIndex] = vis;
+                for (std::size_t si : eit->second.submeshIndices) {
+                    if (si < submeshVisibilityCache.size())
+                        submeshVisibilityCache[si] = vis;
                 }
             }
         }

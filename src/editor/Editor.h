@@ -139,7 +139,9 @@ private:
     static std::string formatCount(size_t value);
     void fillHighlight(SelectionHighlight& highlight) const;
     static void collectSpatialSubmeshes(const IfcScene& scene, const std::string& spatialGuid, std::vector<uint32_t>& out);
-    static glm::vec3 submeshWorldCenter(const GPUModel* model, size_t submeshIndex, const ModelInstance& instance);
+    // World-space bounding sphere of an IFC element over all of its submeshes. False if it has no bounds.
+    static bool ifcElementWorldBounds(const GPUModel* model, const IfcScene& scene, const std::string& guid,
+        const ModelInstance& instance, glm::vec3& center, float& radius);
     glm::vec3 instanceWorldCenter(int index) const;
     void addCube();
     std::string uniqueInstanceName(const std::string& base) const;
@@ -167,6 +169,7 @@ private:
     void openSceneDialog();
     void saveSceneAsDialog();
     void importModelDialog();
+    void importIfcDirectDialog();
     void drawFileDialogs();
 
     // ---- EditorGizmo.cpp ----

@@ -22,6 +22,7 @@ void Editor::drawHierarchy()
                 ImGui::EndMenu();
             }
             if (ImGui::MenuItem("Import Model...")) importModelDialog();
+            if (ImGui::MenuItem("Import IFC (Direct)...")) importIfcDirectDialog();
             ImGui::EndPopup();
         }
     }
@@ -65,6 +66,8 @@ void Editor::drawModelList()
     if (models.empty() && tasks.empty())
         ImGui::TextDisabled("No models loaded.");
     if (ImGui::Button("Import Model...", ImVec2(-FLT_MIN, 0))) importModelDialog();
+    if (ImGui::Button("Import IFC (Direct)...", ImVec2(-FLT_MIN, 0))) importIfcDirectDialog();
+    ImGui::SetItemTooltip("Load an .ifc in-process with web-ifc (no IfcConvert / metadata extractor)");
     if (deferredUnload >= 0) unloadModel(static_cast<size_t>(deferredUnload));
 }
 

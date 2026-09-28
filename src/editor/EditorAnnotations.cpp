@@ -52,11 +52,9 @@ void Editor::addAnnotationFromPopup()
     annotation.instanceIndex = m_annotationTargetInstance;
     annotation.worldPosition = instance.position;
     GPUModel* model = m_models.getModel(instance.modelIndex);
-    if (model && instance.ifcScene) {
-        const int submeshIndex = IfcScene::findSubmeshByGuid(*instance.ifcScene, m_annotationTargetGuid);
-        if (submeshIndex >= 0)
-            annotation.worldPosition = submeshWorldCenter(model, submeshIndex, instance);
-    }
+    float radius = 0.0f;
+    if (instance.ifcScene)
+        ifcElementWorldBounds(model, *instance.ifcScene, m_annotationTargetGuid, instance, annotation.worldPosition, radius);
     m_annotations.push_back(annotation);
     setStatus("Annotation added");
 }

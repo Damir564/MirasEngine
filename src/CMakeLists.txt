@@ -40,6 +40,8 @@
   engine/IfcScene.cpp
   engine/IfcSceneLoader.h
   engine/IfcSceneLoader.cpp
+  engine/IfcDirectLoader.h
+  engine/IfcDirectLoader.cpp
   app/AppMode.h
   app/AppOptions.h
   app/AppOptions.cpp
@@ -97,6 +99,7 @@ target_link_libraries(engine PRIVATE
     fastgltf::fastgltf
     imgui
     nlohmann_json::nlohmann_json
+    web_ifc
 )
 
 

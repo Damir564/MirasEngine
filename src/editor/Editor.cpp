@@ -381,9 +381,8 @@ void Editor::fillHighlight(SelectionHighlight& highlight) const
     const IfcScene& scene = *instance.ifcScene;
     highlight.wholeInstance = false;
     if (m_ifcSelectionKind == IfcSelectionKind::Element) {
-        const int submeshIndex = IfcScene::findSubmeshByGuid(scene, m_selectedIfcGuid);
-        if (submeshIndex >= 0)
-            highlight.submeshes.push_back(static_cast<uint32_t>(submeshIndex));
+        for (size_t si : scene.submeshesOf(m_selectedIfcGuid))
+            highlight.submeshes.push_back(static_cast<uint32_t>(si));
     }
     else {
         collectSpatialSubmeshes(scene, m_selectedIfcGuid, highlight.submeshes);
@@ -396,9 +395,8 @@ void Editor::collectSpatialSubmeshes(const IfcScene& scene, const std::string& s
     if (it == scene.spatial.end())
         return;
     for (const std::string& elementGuid : it->second.elementGuids) {
-        const int submeshIndex = IfcScene::findSubmeshByGuid(scene, elementGuid);
-        if (submeshIndex >= 0)
-            out.push_back(static_cast<uint32_t>(submeshIndex));
+        for (size_t si : scene.submeshesOf(elementGuid))
+            out.push_back(static_cast<uint32_t>(si));
     }
     for (const std::string& childGuid : it->second.childSpatialGuids)
         collectSpatialSubmeshes(scene, childGuid, out);
@@ -412,6 +410,7 @@ void Editor::handleShortcuts()
     if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_O)) openSceneDialog();
     if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_S)) saveSceneAsDialog();
     if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_S)) saveScene();
+    if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_I)) importIfcDirectDialog();
     if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_I)) importModelDialog();
     if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_D) && selection) duplicateInstance(m_gizmo.selectedInstance);
     if (ImGui::IsKeyChordPressed(ImGuiKey_Delete) && selection) deleteInstance(m_gizmo.selectedInstance);
@@ -454,16 +453,30 @@ std::string Editor::formatCount(size_t value)
     return out;
 }
 
-glm::vec3 Editor::submeshWorldCenter(const GPUModel* model, size_t submeshIndex, const ModelInstance& instance)
+bool Editor::ifcElementWorldBounds(const GPUModel* model, const IfcScene& scene, const std::string& guid,
+    const ModelInstance& instance, glm::vec3& center, float& radius)
 {
-    if (!model || submeshIndex >= model->submeshes.size())
-        return instance.position;
-    const auto& sub = model->submeshes[submeshIndex];
-    // Inverted bounds mean the loader never set them.
-    if (sub.boundsMin.x > sub.boundsMax.x)
-        return instance.position;
-    const glm::vec3 localCenter = (sub.boundsMin + sub.boundsMax) * 0.5f;
-    return glm::vec3(instance.getTransformMatrix() * glm::vec4(localCenter, 1.0f));
+    if (!model)
+        return false;
+    glm::vec3 boundsMin(std::numeric_limits<float>::max());
+    glm::vec3 boundsMax(std::numeric_limits<float>::lowest());
+    for (size_t si : scene.submeshesOf(guid)) {
+        if (si >= model->submeshes.size())
+            continue;
+        const auto& sub = model->submeshes[si];
+        // Inverted bounds mean the loader never set them.
+        if (sub.boundsMin.x > sub.boundsMax.x)
+            continue;
+        boundsMin = glm::min(boundsMin, sub.boundsMin);
+        boundsMax = glm::max(boundsMax, sub.boundsMax);
+    }
+    if (boundsMin.x > boundsMax.x)
+        return false;
+    const glm::vec3 localCenter = (boundsMin + boundsMax) * 0.5f;
+    center = glm::vec3(instance.getTransformMatrix() * glm::vec4(localCenter, 1.0f));
+    const float maxScale = std::max({ instance.scale.x, instance.scale.y, instance.scale.z });
+    radius = glm::length(boundsMax - boundsMin) * 0.5f * maxScale;
+    return true;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -600,16 +613,8 @@ void Editor::focusOnInstance(int index)
     float radius = model->boundsRadius * maxScale;
 
     // Frame the selected IFC element instead of the whole model when there is one.
-    if (m_ifcSelectionInstance == index && m_ifcSelectionKind == IfcSelectionKind::Element && instance.ifcScene) {
-        const int submeshIndex = IfcScene::findSubmeshByGuid(*instance.ifcScene, m_selectedIfcGuid);
-        if (submeshIndex >= 0) {
-            const auto& sub = model->submeshes[submeshIndex];
-            if (sub.boundsMin.x <= sub.boundsMax.x) {
-                center = submeshWorldCenter(model, submeshIndex, instance);
-                radius = glm::length(sub.boundsMax - sub.boundsMin) * 0.5f * maxScale;
-            }
-        }
-    }
+    if (m_ifcSelectionInstance == index && m_ifcSelectionKind == IfcSelectionKind::Element && instance.ifcScene)
+        ifcElementWorldBounds(model, *instance.ifcScene, m_selectedIfcGuid, instance, center, radius);
     // 60 degree vertical FOV: a sphere of radius r fits at distance r / sin(30deg) = 2r.
     m_camera.position = center - getFront(m_camera) * std::max(radius * 2.2f, 1.0f);
 }

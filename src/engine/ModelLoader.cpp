@@ -1,6 +1,7 @@
 #include "ModelLoader.h"
 #include "ModelCache.h"
 #include "IfcConverter.h"
+#include "IfcDirectLoader.h"
 #include "IfcScene.h"
 #include "IfcSceneLoader.h"
 #include <algorithm>
@@ -873,25 +874,20 @@ Mesh loadWithFastGltf(const std::string& path) {
 // Links IFC elements to submeshes. IfcConvert names each glTF node after its element GUID
 // (--use-element-names), and every primitive of that node becomes one submesh.
 void buildIfcScene(IfcScene& scene, const fastgltf::Asset& asset, const std::vector<size_t>& submeshNodeMap) {
-    scene.submeshVisibilityCache.assign(submeshNodeMap.size(), false);
-
     for (std::size_t si = 0; si < submeshNodeMap.size(); ++si) {
         const auto& node = asset.nodes[submeshNodeMap[si]];
         std::string guid(node.name.begin(), node.name.end());
 
         auto it = scene.elements.find(guid);
-        if (it != scene.elements.end()) {
-            it->second.submeshIndex = si;
-            scene.submeshToGuid[si] = guid;
-            scene.guidToSubmesh[guid] = si;
-            scene.submeshVisibilityCache[si] = it->second.visible;
-        }
+        if (it != scene.elements.end())
+            it->second.submeshIndices.push_back(si);
     }
 
     const std::size_t elementCountBefore = scene.elements.size();
     std::erase_if(scene.elements, [](const auto& kv) {
-        return kv.second.submeshIndex == std::numeric_limits<std::size_t>::max();
+        return kv.second.submeshIndices.empty();
         });
+    scene.rebuildSubmeshMaps(submeshNodeMap.size());
 
     for (auto& [sg, sn] : scene.spatial) {
         std::erase_if(sn.elementGuids, [&](const std::string& guid) {
@@ -990,6 +986,14 @@ bool isBuiltinModelPath(const std::string& path) {
     return path.rfind("builtin:", 0) == 0;
 }
 
+bool isIfcDirectPath(const std::string& path) {
+    return path.rfind(kIfcDirectPrefix, 0) == 0;
+}
+
+std::string modelSourceFile(const std::string& path) {
+    return isIfcDirectPath(path) ? path.substr(std::strlen(kIfcDirectPrefix)) : path;
+}
+
 namespace {
 
 // Unit cube centered on the origin: 4 vertices per face so every face has its own normal and UVs.
@@ -1049,6 +1053,24 @@ Mesh loadModelSmart(const std::string& path) {
         return generateCube();
     if (isBuiltinModelPath(path))
         throw std::runtime_error("Unknown builtin model: " + path);
+    if (isIfcDirectPath(path)) {
+        const std::string sourcePath = modelSourceFile(path);
+        // Kept apart from the IfcConvert cache of the same file; this one also stores the metadata.
+        const std::string directCachePath = sourcePath + ".direct.cache";
+        if (ModelCache::isValid(sourcePath, directCachePath)) {
+            std::cout << "[CACHE] Found valid cache for: " << path << ". Loading... ";
+            Mesh cached;
+            if (ModelCache::load(directCachePath, cached) && cached.ifcScene) {
+                std::cout << "OK\n";
+                return cached;
+            }
+            std::cout << "Failed (corrupt or outdated), re-importing\n";
+        }
+        Mesh direct = loadIfcDirect(sourcePath);
+        computeAllSubmeshBounds(direct);
+        ModelCache::save(directCachePath, direct, true);
+        return direct;
+    }
 
     const std::string cachePath = path + ".cache";
     const fs::path fsPath(path);

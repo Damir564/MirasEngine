@@ -18,7 +18,7 @@ SceneManager::OpenResult SceneManager::open(const std::string& path)
 
     clear();
     for (const auto& model : loaded.models) {
-        if (!isBuiltinModelPath(model.path) && !std::filesystem::exists(model.path)) {
+        if (!isBuiltinModelPath(model.path) && !std::filesystem::exists(modelSourceFile(model.path))) {
             result.missingFiles.push_back(model.path);
             continue;
         }
