@@ -15,7 +15,6 @@
 #include "engine/IfcScene.h"
 #include "engine/ModelManager.h"
 #include "engine/Renderer.h"
-#include "engine/Shadow.h"
 
 // The scene editor: viewport interaction (picking, gizmo, camera) plus the docked ImGui panels.
 // The implementation is split by panel across the Editor*.cpp files.
@@ -155,7 +154,7 @@ private:
     void drawToolbar();
     void drawToolButton(const char* label, GizmoMode tool, const char* tooltip);
     void drawSnapPopup();
-    void drawGameObjectMenu();
+    void drawAddMenu();
     void drawStatusBar();
     void drawDockSpace();
     void buildDefaultLayout(ImGuiID dockspaceId);
@@ -233,7 +232,6 @@ private:
 
     // Camera and viewport
     Camera m_camera;
-    DirectionalLight m_sun;
     bool m_flyMode = false; // UI hidden, mouse always looks around
     bool m_rightMouseHeld = false;
     float m_cameraSpeedMultiplier = 1.0f;

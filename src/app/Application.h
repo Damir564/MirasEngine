@@ -45,6 +45,7 @@ private:
     bool m_imguiInitialized = false;
     bool m_quit = false;
 
+    std::string m_settingsPath = kGraphicsSettingsPath;
     GraphicsSettings m_settings;
     GraphicsSettings m_appliedSettings;
 

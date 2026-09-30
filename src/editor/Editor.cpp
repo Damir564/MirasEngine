@@ -17,10 +17,6 @@ Editor::Editor(const EngineContext& engine)
     , m_scenes(engine.scenes)
     , m_settings(engine.settings)
 {
-    m_sun.direction = glm::normalize(glm::vec3(-0.8f, -0.3f, -0.3f));
-    m_sun.color = glm::vec3(1.0f, 0.98f, 0.95f);
-    m_sun.intensity = 1.0f;
-
     int width = 0, height = 0;
     SDL_GetWindowSize(m_window, &width, &height);
     m_sceneView = { 0.0f, 0.0f, static_cast<float>(std::max(width, 1)), static_cast<float>(std::max(height, 1)) };
@@ -354,7 +350,6 @@ void Editor::fillFrame(FrameInput& frame)
     frame.proj = sceneProjection();
     frame.cameraPosition = m_camera.position;
     frame.viewport = m_sceneView;
-    frame.sun = m_sun;
     fillHighlight(frame.highlight);
     frame.showPath = !m_flyMode && m_showCameraPath;
     frame.showGrid = !m_flyMode && m_showGrid;

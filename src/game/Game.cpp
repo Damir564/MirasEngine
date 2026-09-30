@@ -31,9 +31,6 @@ Game::Game(const EngineContext& engine, std::string levelPath)
     , m_settings(engine.settings)
     , m_levelPath(std::move(levelPath))
 {
-    m_sun.direction = glm::normalize(glm::vec3(-0.8f, -0.3f, -0.3f));
-    m_sun.color = glm::vec3(1.0f, 0.98f, 0.95f);
-    m_sun.intensity = 1.0f;
     m_camera.position = glm::vec3(0.0f, 2.0f, 5.0f);
     SDL_SetWindowTitle(m_window, "MirasEngine");
     SDL_SetWindowRelativeMouseMode(m_window, false);
@@ -213,7 +210,6 @@ void Game::fillFrame(FrameInput& frame)
     frame.proj = getProjection(frame.windowWidth, frame.windowHeight, kCameraNearPlane, m_settings.viewDistance);
     frame.cameraPosition = m_camera.position;
     frame.viewport = { 0.0f, 0.0f, frame.windowWidth, frame.windowHeight };
-    frame.sun = m_sun;
     frame.highlight = {};
     frame.showPath = false;
     frame.showGrid = false;
@@ -335,12 +331,13 @@ void Game::drawSettingsScreen()
     // Over the paused scene the settings stay translucent so their effect is visible.
     const float alpha = m_settingsReturn == State::Paused ? 0.75f : 1.0f;
     if (beginScreen("##Settings", alpha)) {
-        const float panelWidth = 460.0f;
-        centerBlock(420.0f);
+        const float panelWidth = 480.0f;
+        const float panelHeight = std::clamp(ImGui::GetWindowHeight() - 260.0f, 150.0f, 460.0f);
+        centerBlock(panelHeight + 120.0f);
         centeredText("Settings", 2.2f, ImVec4(0.95f, 0.95f, 0.97f, 1.0f));
         ImGui::Dummy(ImVec2(0.0f, 20.0f));
         ImGui::SetCursorPosX((ImGui::GetWindowWidth() - panelWidth) * 0.5f);
-        if (ImGui::BeginChild("##settingsPanel", ImVec2(panelWidth, 300.0f), ImGuiChildFlags_Borders))
+        if (ImGui::BeginChild("##settingsPanel", ImVec2(panelWidth, panelHeight), ImGuiChildFlags_Borders))
             drawGraphicsSettings(m_settings, m_renderer.capabilities());
         ImGui::EndChild();
         ImGui::Dummy(ImVec2(0.0f, 16.0f));
