@@ -1,6 +1,6 @@
 ﻿cmake_minimum_required (VERSION 3.21)
 
-project ("MirasEngine")
+project ("MirasEngine" VERSION 0.1.0)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -90,3 +90,32 @@ add_custom_target(Shaders ALL DEPENDS ${SPIRV_FILES})
 add_dependencies(engine Shaders)
 
 
+
+# ==========================================
+# Packaging: cmake --build <dir> --target package  ->  MirasEngine-<version>-<system>-x64.zip
+# ==========================================
+# Every dependency is linked statically, so the package is engine.exe, its SPIR-V shaders, the
+# launchers and (MSVC) the C/C++ runtime DLLs. The Vulkan loader ships with the GPU driver.
+# Everything goes into the "MirasEngine" component so install rules of FetchContent deps
+# (SDL, fastgltf, json, ...) stay out of the package.
+set(PACKAGE_COMPONENT MirasEngine)
+
+install(TARGETS engine RUNTIME DESTINATION . COMPONENT ${PACKAGE_COMPONENT})
+install(FILES ${SPIRV_FILES} DESTINATION shaders COMPONENT ${PACKAGE_COMPONENT})
+if (WIN32)
+  install(FILES packaging/Editor.bat packaging/Game.bat DESTINATION . COMPONENT ${PACKAGE_COMPONENT})
+endif()
+
+set(CMAKE_INSTALL_SYSTEM_RUNTIME_DESTINATION .)
+set(CMAKE_INSTALL_SYSTEM_RUNTIME_COMPONENT ${PACKAGE_COMPONENT})
+set(CMAKE_INSTALL_UCRT_LIBRARIES TRUE)
+include(InstallRequiredSystemLibraries)
+
+set(CPACK_PACKAGE_NAME "MirasEngine")
+set(CPACK_PACKAGE_VENDOR "MirasEngine")
+set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "Game Engine with Vulkan API")
+set(CPACK_GENERATOR ZIP)
+set(CPACK_INCLUDE_TOPLEVEL_DIRECTORY ON)
+set(CPACK_PACKAGE_FILE_NAME "MirasEngine-${PROJECT_VERSION}-${CMAKE_SYSTEM_NAME}-x64")
+set(CPACK_INSTALL_CMAKE_PROJECTS "${CMAKE_BINARY_DIR};MirasEngine;${PACKAGE_COMPONENT};/")
+include(CPack)
