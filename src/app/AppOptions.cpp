@@ -52,6 +52,10 @@ AppOptions parseAppOptions(int argc, char** argv)
             if (const char* value = takeValue(argc, argv, i, arg, "a scene path"))
                 options.scenePath = value;
         }
+        else if (arg == "--settings") {
+            if (const char* value = takeValue(argc, argv, i, arg, "a settings path"))
+                options.settingsPath = value;
+        }
         else if (arg == "--help" || arg == "-h") {
             options.showHelp = true;
         }
@@ -70,6 +74,7 @@ void showUsage(const char* executableName)
         "  --editor                 Start the editor (default)\n"
         "  --game                   Start the game (main menu, plays level1.scn)\n"
         "  --scene <path>           Editor: open this .scn at startup; game: use it as the level\n"
+        "  --settings <path>        Load and save graphics settings here instead of settings.json\n"
         "  --validation             Enable the Vulkan validation layers\n"
         "  --exit-after-frames <N>  Quit after N rendered frames (for automated runs)\n"
         "  --help, -h               Show this help and exit\n";

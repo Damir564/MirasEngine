@@ -20,7 +20,7 @@ void Editor::drawMainMenuBar()
         return;
     drawFileMenu();
     drawEditMenu();
-    drawGameObjectMenu();
+    drawAddMenu();
     drawViewMenu();
     if (ImGui::BeginMenu("Settings")) {
         ImGui::MenuItem("Graphics...", nullptr, &m_showGraphicsSettings);
@@ -75,9 +75,9 @@ void Editor::drawEditMenu()
     ImGui::EndMenu();
 }
 
-void Editor::drawGameObjectMenu()
+void Editor::drawAddMenu()
 {
-    if (!ImGui::BeginMenu("GameObject"))
+    if (!ImGui::BeginMenu("Add"))
         return;
     if (ImGui::MenuItem("Cube")) addCube();
     ImGui::EndMenu();
@@ -137,10 +137,6 @@ void Editor::drawToolbar()
         if (ImGui::Button("Focus")) focusOnInstance(m_gizmo.selectedInstance);
         ImGui::SetItemTooltip("Move the camera to the selection (F)");
         ImGui::EndDisabled();
-
-        ImGui::SameLine(0, 16);
-        if (ImGui::Button("+ Cube")) addCube();
-        ImGui::SetItemTooltip("Add a cube in front of the camera (GameObject > Cube)");
 
         ImGui::SameLine(0, 16);
         if (ImGui::Button("Snap")) ImGui::OpenPopup("SnapSettings");

@@ -5,21 +5,19 @@
 #include "draw_data.glsl"
 
 layout(location = 0) in vec3 inPosition;
-layout(location = 1) in vec3 inNormal;
 layout(location = 2) in vec2 inTexCoord;
-layout(location = 3) in vec4 inTangent;
-
-layout(push_constant) uniform ShadowPush {
-    uint cascade;
-} pc;
 
 layout(location = 0) out vec2 fragTexCoord;
 layout(location = 1) flat out uint fragDrawIndex;
 
+// Same expression and qualifier as triangle.vert: the main pass depth-tests against these exact depths.
+invariant gl_Position;
+
 void main() {
     uint drawIndex = gl_InstanceIndex;
-    mat4 model = transforms[draws[drawIndex].transformIndex].model;
-    gl_Position = ubo.cascadeMatrices[pc.cascade] * (model * vec4(inPosition, 1.0));
+    TransformData t = transforms[draws[drawIndex].transformIndex];
+    vec4 worldPosition = t.model * vec4(inPosition, 1.0);
+    gl_Position = ubo.proj * ubo.view * worldPosition;
     fragTexCoord = inTexCoord;
     fragDrawIndex = drawIndex;
 }

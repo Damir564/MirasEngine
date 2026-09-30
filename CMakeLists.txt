@@ -1,17 +1,28 @@
 ﻿cmake_minimum_required (VERSION 3.21)
 
-# Default debug info is /Zi for every target (third-party libs may add /Zi themselves,
-# so /ZI here would trigger "D9025 overriding '/Zi' with '/ZI'"). Hot Reload (/ZI) is enabled
-# only for the engine target in src/CMakeLists.txt.
-if (POLICY CMP0141)
-  cmake_policy(SET CMP0141 NEW)
-  set(CMAKE_MSVC_DEBUG_INFORMATION_FORMAT "$<$<CONFIG:Debug,RelWithDebInfo>:ProgramDatabase>")
-endif()
-
 project ("MirasEngine")
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+
+if(POLICY CMP0141)
+  cmake_policy(SET CMP0141 NEW)
+  set(CMAKE_MSVC_DEBUG_INFORMATION_FORMAT
+      "$<$<CONFIG:Debug,RelWithDebInfo>:ProgramDatabase>"
+      CACHE STRING "" FORCE)
+endif()
+
+if(MSVC)
+  add_compile_options(
+    $<$<CONFIG:Debug>:/Zi>
+    $<$<CONFIG:RelWithDebInfo>:/Zi>
+    $<$<CONFIG:Release>:/Zi>          # keep PDBs in Release too if you want to debug it
+  )
+  add_link_options(
+    $<$<CONFIG:Debug>:/DEBUG>
+    $<$<CONFIG:RelWithDebInfo>:/DEBUG>
+  )
+endif()
 
 find_package(Vulkan REQUIRED)
 
