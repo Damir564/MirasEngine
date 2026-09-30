@@ -13,9 +13,10 @@ layout(location = 0) out vec3 fragWorldPos;
 layout(location = 1) out vec3 fragNormal;
 layout(location = 2) out vec2 fragTexCoord;
 layout(location = 3) out mat3 TBN;
-layout(location = 6) flat out uint fragDrawIndex;
+layout(location = 6) out vec4 fragPosLightSpace;
+layout(location = 7) flat out uint fragDrawIndex;
 
-// prepass.vert and mask.vert must produce bit-identical positions for their depth comparisons.
+// mask.vert must produce bit-identical positions for its depth comparison.
 invariant gl_Position;
 
 void main() {
@@ -45,5 +46,6 @@ void main() {
     fragNormal = worldNormal;
     fragTexCoord = inTexCoord;
     TBN = mat3(worldTangent, worldBitangent, worldNormal);
+    fragPosLightSpace = ubo.lightSpaceMatrix * worldPosition;
     fragDrawIndex = drawIndex;
 }

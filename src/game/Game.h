@@ -2,6 +2,7 @@
 #include <string>
 #include "app/AppMode.h"
 #include "engine/Camera.h"
+#include "engine/Shadow.h"
 
 class Renderer;
 class ModelManager;
@@ -63,4 +64,5 @@ private:
     bool m_quitRequested = false;
 
     Camera m_camera;
+    DirectionalLight m_sun;
 };

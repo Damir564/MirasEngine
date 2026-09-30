@@ -1,7 +1,5 @@
 #include "Renderer.h"
-#include "Atmosphere.h"
 #include "ModelManager.h"
-#include "RenderUtils.h"
 #include "Vertex.h"
 #include "VulkanContext.h"
 #include <volk.h>
@@ -11,7 +9,6 @@
 #include "backends/imgui_impl_vulkan.h"
 #include <algorithm>
 #include <cmath>
-#include <cstddef>
 #include <cstring>
 #include <execution>
 #include <numeric>
@@ -20,25 +17,13 @@
 namespace {
 
 constexpr uint8_t kVisibleMain = 1;
-// A submesh casts into cascade c when bit (kVisibleShadow << c) is set.
 constexpr uint8_t kVisibleShadow = 2;
 constexpr size_t kCullChunkSize = 1024;
+constexpr float kShadowBias = 0.0015f;
 // Unity's selection orange; occluded parts of the outline are drawn fainter.
 constexpr glm::vec3 kOutlineColor{ 1.0f, 0.4f, 0.0f };
 constexpr float kOutlineOccludedAlpha = 0.4f;
 constexpr float kOutlineWidthPixels = 2.0f;
-
-// Sun irradiance above the atmosphere at intensity 1, in the units exposure 0 is calibrated for.
-constexpr float kSunIrradiance = 3.2f;
-constexpr float kGroundAlbedo = 0.3f;
-// Height fog at fogDensity 1: a few kilometers of visibility near the ground, thinning out with height.
-constexpr float kFogDensity = 0.00015f;
-constexpr float kFogHeightFalloff = 1.0f / 400.0f;
-// Width of a soft shadow's penumbra per meter between caster and receiver: the sun's disk, widened a
-// little for the scattering of the atmosphere.
-constexpr float kPenumbraPerMeter = 2.0f * kSunAngularRadius * 1.5f;
-// SSAO samples for the low / medium / high settings.
-constexpr int kAoSamples[] = { 0, 8, 12, 20 };
 
 const vk::VertexInputBindingDescription2EXT kLineBinding{ 0, sizeof(GizmoVertex), vk::VertexInputRate::eVertex, 1 };
 const std::array<vk::VertexInputAttributeDescription2EXT, 2> kLineAttributes = { {
@@ -46,8 +31,19 @@ const std::array<vk::VertexInputAttributeDescription2EXT, 2> kLineAttributes = {
     { 1, 0, vk::Format::eR32G32B32Sfloat, static_cast<uint32_t>(offsetof(GizmoVertex, color)) },
 } };
 
-// FNV-1a, used to detect frames where a shadow cascade or the sky would come out identical.
-class Hasher {
+template <typename T>
+bool takeResult(vk::ResultValue<T>&& created, T& out, const char* what)
+{
+    if (created.result != vk::Result::eSuccess) {
+        LOG_ERROR("Failed to create " << what << ": " << vk::to_string(created.result) << "\n");
+        return false;
+    }
+    out = std::move(created.value);
+    return true;
+}
+
+// FNV-1a, used to detect frames where the shadow map would come out identical.
+class ShadowHasher {
 public:
     void bytes(const void* data, size_t size) {
         const uint8_t* p = static_cast<const uint8_t*>(data);
@@ -63,6 +59,31 @@ public:
 private:
     uint64_t m_hash = 1469598103934665603ull;
 };
+
+vk::ImageMemoryBarrier2 imageBarrier(vk::Image image, vk::ImageAspectFlags aspect,
+    vk::PipelineStageFlags2 srcStage, vk::AccessFlags2 srcAccess,
+    vk::PipelineStageFlags2 dstStage, vk::AccessFlags2 dstAccess,
+    vk::ImageLayout oldLayout, vk::ImageLayout newLayout)
+{
+    vk::ImageMemoryBarrier2 barrier{};
+    barrier.setSrcStageMask(srcStage)
+        .setSrcAccessMask(srcAccess)
+        .setDstStageMask(dstStage)
+        .setDstAccessMask(dstAccess)
+        .setOldLayout(oldLayout)
+        .setNewLayout(newLayout)
+        .setImage(image)
+        .setSubresourceRange({ aspect, 0, 1, 0, 1 });
+    return barrier;
+}
+
+void pipelineBarriers(vk::CommandBuffer cmd, std::span<const vk::ImageMemoryBarrier2> barriers)
+{
+    vk::DependencyInfo info{};
+    info.setImageMemoryBarrierCount(static_cast<uint32_t>(barriers.size()))
+        .setPImageMemoryBarriers(barriers.data());
+    cmd.pipelineBarrier2(info);
+}
 
 vk::SampleCountFlagBits toSampleCount(int samples)
 {
@@ -104,7 +125,6 @@ bool Renderer::init(VulkanContext& context, SDL_Window* window, const GraphicsSe
     m_meshBinding = Vertex::getBindingDescription(0);
     m_meshAttributes = Vertex::getVertexOnlyAttributes(0);
     m_settings = sanitizeGraphicsSettings(settings);
-    updateSun();
     queryCapabilities();
 
     try {
@@ -117,7 +137,7 @@ bool Renderer::init(VulkanContext& context, SDL_Window* window, const GraphicsSe
         // Fixed at startup; later swapchain rebuilds may change the image count but not this.
         m_framesInFlight = m_swapchain.imageCount();
 
-        if (!createRenderTargets() || !createSkyResources() || !createFrameResources() || !createDescriptors() ||
+        if (!createRenderTargets() || !createFrameResources() || !createDescriptors() ||
             !createShaders() || !initImGuiBackend()) {
             shutdown();
             return false;
@@ -149,15 +169,14 @@ vk::SampleCountFlagBits Renderer::effectiveSampleCount() const
 }
 
 bool Renderer::createRenderImage(vk::Format format, vk::ImageUsageFlags usage, vk::SampleCountFlagBits samples,
-    vk::ImageAspectFlags aspect, RenderImage& out, vk::Extent2D extent, uint32_t mipLevels)
+    vk::ImageAspectFlags aspect, RenderImage& out)
 {
-    if (extent.width == 0 || extent.height == 0)
-        extent = m_swapchain.extent();
+    const vk::Extent2D extent = m_swapchain.extent();
 
     vk::ImageCreateInfo imageInfo{};
     imageInfo.imageType = vk::ImageType::e2D;
     imageInfo.extent = vk::Extent3D{ extent.width, extent.height, 1 };
-    imageInfo.mipLevels = mipLevels;
+    imageInfo.mipLevels = 1;
     imageInfo.arrayLayers = 1;
     imageInfo.format = format;
     imageInfo.tiling = vk::ImageTiling::eOptimal;
@@ -182,22 +201,12 @@ bool Renderer::createRenderImage(vk::Format format, vk::ImageUsageFlags usage, v
     viewInfo.image = vk::Image(out.image);
     viewInfo.viewType = vk::ImageViewType::e2D;
     viewInfo.format = format;
-    viewInfo.subresourceRange = { aspect, 0, mipLevels, 0, 1 };
+    viewInfo.subresourceRange = { aspect, 0, 1, 0, 1 };
     if (!takeResult(m_device.createImageView(viewInfo), out.view, "render target view")) {
         destroyRenderImage(out);
         return false;
     }
     return true;
-}
-
-bool Renderer::createMipView(const RenderImage& image, vk::Format format, uint32_t mip, vk::ImageView& out)
-{
-    vk::ImageViewCreateInfo viewInfo{};
-    viewInfo.image = vk::Image(image.image);
-    viewInfo.viewType = vk::ImageViewType::e2D;
-    viewInfo.format = format;
-    viewInfo.subresourceRange = { vk::ImageAspectFlagBits::eColor, mip, 1, 0, 1 };
-    return takeResult(m_device.createImageView(viewInfo), out, "mip view");
 }
 
 void Renderer::destroyRenderImage(RenderImage& image)
@@ -210,89 +219,56 @@ void Renderer::destroyRenderImage(RenderImage& image)
 bool Renderer::createRenderTargets()
 {
     m_samples = effectiveSampleCount();
-    const vk::Extent2D extent = m_swapchain.extent();
-    m_halfExtent.setWidth((extent.width + 1) / 2);
-    m_halfExtent.setHeight((extent.height + 1) / 2);
     const auto depthAspect = vk::ImageAspectFlagBits::eDepth;
     const auto colorAspect = vk::ImageAspectFlagBits::eColor;
-    const auto target = vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled;
-    const auto single = vk::SampleCountFlagBits::e1;
 
     if (!createRenderImage(kDepthFormat,
             vk::ImageUsageFlagBits::eDepthStencilAttachment | vk::ImageUsageFlagBits::eSampled,
-            single, depthAspect, m_sceneDepth) ||
-        !createRenderImage(kSelectionMaskFormat, target, single, colorAspect, m_selectionMask) ||
-        !createRenderImage(kHdrFormat, target, single, colorAspect, m_hdrColor) ||
-        !createRenderImage(kLdrFormat, target, single, colorAspect, m_ldrColor) ||
-        !createRenderImage(kAoDepthFormat, target, single, colorAspect, m_aoDepth, m_halfExtent) ||
-        !createRenderImage(kAoFormat, target, single, colorAspect, m_aoRaw, m_halfExtent) ||
-        !createRenderImage(kAoFormat, target, single, colorAspect, m_aoTemp, m_halfExtent))
+            vk::SampleCountFlagBits::e1, depthAspect, m_sceneDepth) ||
+        !createRenderImage(kSelectionMaskFormat,
+            vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled,
+            vk::SampleCountFlagBits::e1, colorAspect, m_selectionMask))
         return false;
 
-    // Bloom mips down to roughly 8 texels on the short side.
-    m_bloomMips = 1;
-    while (m_bloomMips < kMaxBloomMips && (std::min(m_halfExtent.width, m_halfExtent.height) >> m_bloomMips) >= 8)
-        ++m_bloomMips;
-    if (!createRenderImage(kHdrFormat, target, single, colorAspect, m_bloom, m_halfExtent, m_bloomMips))
-        return false;
-    for (uint32_t mip = 0; mip < m_bloomMips; ++mip)
-        if (!createMipView(m_bloom, kHdrFormat, mip, m_bloomMipViews[mip]))
-            return false;
-
-    if (m_samples != single) {
-        // The depth is not transient: the depth prepass result is loaded again by the scene pass.
-        if (!createRenderImage(kHdrFormat,
-                vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eTransientAttachment,
+    if (m_samples != vk::SampleCountFlagBits::e1) {
+        const auto transient = vk::ImageUsageFlagBits::eTransientAttachment;
+        if (!createRenderImage(m_swapchain.format(), vk::ImageUsageFlagBits::eColorAttachment | transient,
                 m_samples, colorAspect, m_msaaColor) ||
-            !createRenderImage(kDepthFormat, vk::ImageUsageFlagBits::eDepthStencilAttachment,
+            !createRenderImage(kDepthFormat, vk::ImageUsageFlagBits::eDepthStencilAttachment | transient,
                 m_samples, depthAspect, m_msaaDepth))
             return false;
     }
 
-    writeImageDescriptors();
+    // The sets exist once createDescriptors() ran; on later rebuilds point them at the new images.
+    if (m_sceneDepthSet && m_selectionMaskSet) {
+        const vk::DescriptorImageInfo depthInfo{ m_nearestSampler, m_sceneDepth.view, vk::ImageLayout::eShaderReadOnlyOptimal };
+        const vk::DescriptorImageInfo maskInfo{ m_nearestSampler, m_selectionMask.view, vk::ImageLayout::eShaderReadOnlyOptimal };
+        const vk::WriteDescriptorSet writes[2] = {
+            { m_sceneDepthSet, 0, 0, 1, vk::DescriptorType::eCombinedImageSampler, &depthInfo },
+            { m_selectionMaskSet, 0, 0, 1, vk::DescriptorType::eCombinedImageSampler, &maskInfo },
+        };
+        m_device.updateDescriptorSets(2, writes, 0, nullptr);
+    }
     return true;
 }
 
 void Renderer::destroyRenderTargets()
 {
-    for (vk::ImageView& view : m_bloomMipViews) {
-        if (view) m_device.destroyImageView(view);
-        view = nullptr;
-    }
-    m_bloomMips = 0;
-    for (RenderImage* image : { &m_sceneDepth, &m_selectionMask, &m_msaaColor, &m_msaaDepth, &m_hdrColor,
-             &m_ldrColor, &m_aoDepth, &m_aoRaw, &m_aoTemp, &m_bloom })
-        destroyRenderImage(*image);
-}
-
-bool Renderer::createSkyResources()
-{
-    const auto colorAspect = vk::ImageAspectFlagBits::eColor;
-    // Mips come from blits and give rough reflections their blur.
-    const auto lutUsage = vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled |
-        vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst;
-    m_skyValid = false;
-    return createRenderImage(kHdrFormat, lutUsage, vk::SampleCountFlagBits::e1, colorAspect, m_skyLut,
-               kSkyLutExtent, kSkyLutMips) &&
-        createMipView(m_skyLut, kHdrFormat, 0, m_skyLutTargetView) &&
-        createRenderImage(kHdrFormat, vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled,
-            vk::SampleCountFlagBits::e1, colorAspect, m_skyIrradiance, kSkyIrradianceExtent);
-}
-
-void Renderer::destroySkyResources()
-{
-    if (m_skyLutTargetView) m_device.destroyImageView(m_skyLutTargetView);
-    m_skyLutTargetView = nullptr;
-    destroyRenderImage(m_skyLut);
-    destroyRenderImage(m_skyIrradiance);
+    destroyRenderImage(m_sceneDepth);
+    destroyRenderImage(m_selectionMask);
+    destroyRenderImage(m_msaaColor);
+    destroyRenderImage(m_msaaDepth);
 }
 
 bool Renderer::createShadowMapResources()
 {
-    m_shadowMap = createShadowMap(m_allocator, m_device, static_cast<uint32_t>(m_settings.shadowMapSize),
-        static_cast<uint32_t>(m_settings.shadowCascades));
+    m_shadowMap = createShadowMap(m_allocator, m_device, static_cast<uint32_t>(m_settings.shadowMapSize));
     m_shadowMapValid = false;
-    writeImageDescriptors();
+    if (m_shadowMapSet) {
+        const vk::DescriptorImageInfo shadowImageInfo{ m_shadowMap.sampler, m_shadowMap.view, vk::ImageLayout::eDepthStencilReadOnlyOptimal };
+        const vk::WriteDescriptorSet shadowWrite{ m_shadowMapSet, 0, 0, 1, vk::DescriptorType::eCombinedImageSampler, &shadowImageInfo };
+        m_device.updateDescriptorSets(1, &shadowWrite, 0, nullptr);
+    }
     return true;
 }
 
@@ -372,19 +348,6 @@ bool Renderer::createDescriptors()
     if (!takeResult(m_device.createSampler(nearestInfo), m_nearestSampler, "nearest sampler"))
         return false;
 
-    vk::SamplerCreateInfo linearInfo = nearestInfo;
-    linearInfo.magFilter = vk::Filter::eLinear;
-    linearInfo.minFilter = vk::Filter::eLinear;
-    if (!takeResult(m_device.createSampler(linearInfo), m_linearClampSampler, "linear sampler"))
-        return false;
-
-    vk::SamplerCreateInfo skyInfo = linearInfo;
-    skyInfo.mipmapMode = vk::SamplerMipmapMode::eLinear;
-    skyInfo.addressModeU = vk::SamplerAddressMode::eRepeat;
-    skyInfo.maxLod = VK_LOD_CLAMP_NONE;
-    if (!takeResult(m_device.createSampler(skyInfo), m_skySampler, "sky sampler"))
-        return false;
-
     const vk::DescriptorSetLayoutBinding textureBinding{ 0, vk::DescriptorType::eCombinedImageSampler, 1, vk::ShaderStageFlagBits::eFragment };
     if (!takeResult(m_device.createDescriptorSetLayout({ {}, 1, &textureBinding }), m_textureSetLayout, "texture set layout"))
         return false;
@@ -398,48 +361,37 @@ bool Renderer::createDescriptors()
     if (!takeResult(m_device.createDescriptorSetLayout({ {}, 3, frameBindings }), m_frameSetLayout, "frame set layout"))
         return false;
 
-    // Set 4 of triangle.frag: shadow map (comparison and raw depth), AO, AO depth, sky LUT, sky irradiance.
-    std::array<vk::DescriptorSetLayoutBinding, 6> lightingBindings;
-    for (uint32_t i = 0; i < lightingBindings.size(); ++i)
-        lightingBindings[i] = { i, vk::DescriptorType::eCombinedImageSampler, 1, vk::ShaderStageFlagBits::eFragment };
-    vk::DescriptorSetLayoutCreateInfo lightingInfo{};
-    lightingInfo.setBindings(lightingBindings);
-    if (!takeResult(m_device.createDescriptorSetLayout(lightingInfo), m_lightingSetLayout, "lighting set layout"))
-        return false;
-
     // Shared with ModelManager, which allocates one set per texture from it.
     const vk::DescriptorPoolSize poolSizes[] = {
-        { vk::DescriptorType::eCombinedImageSampler, 1100 },
+        { vk::DescriptorType::eCombinedImageSampler, 1000 },
         { vk::DescriptorType::eUniformBuffer, m_framesInFlight + 10 },
         { vk::DescriptorType::eStorageBuffer, 2 * m_framesInFlight + 10 },
     };
     vk::DescriptorPoolCreateInfo poolInfo{};
     poolInfo.flags = vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet;
-    poolInfo.maxSets = 1164;
+    poolInfo.maxSets = 1100;
     poolInfo.setPoolSizes(poolSizes);
     if (!takeResult(m_device.createDescriptorPool(poolInfo), m_descriptorPool, "descriptor pool"))
         return false;
 
-    std::vector<vk::DescriptorSet> lightingSets;
-    if (!takeResult(m_device.allocateDescriptorSets({ m_descriptorPool, 1, &m_lightingSetLayout }), lightingSets, "lighting set"))
+    const vk::DescriptorSetLayout imageLayouts[3] = { m_textureSetLayout, m_textureSetLayout, m_textureSetLayout };
+    std::vector<vk::DescriptorSet> imageSets;
+    if (!takeResult(m_device.allocateDescriptorSets({ m_descriptorPool, 3, imageLayouts }), imageSets, "image descriptor sets"))
         return false;
-    m_lightingSet = lightingSets[0];
+    m_shadowMapSet = imageSets[0];
+    m_sceneDepthSet = imageSets[1];
+    m_selectionMaskSet = imageSets[2];
 
-    vk::DescriptorSet* imageSets[] = { &m_sceneDepthSet, &m_selectionMaskSet, &m_hdrSet, &m_ldrSet, &m_aoDepthSet,
-        &m_aoRawSet, &m_aoTempSet, &m_skyLutSet };
-    const uint32_t imageSetCount = static_cast<uint32_t>(std::size(imageSets)) + kMaxBloomMips;
-    const std::vector<vk::DescriptorSetLayout> imageLayouts(imageSetCount, m_textureSetLayout);
-    std::vector<vk::DescriptorSet> allocated;
-    if (!takeResult(m_device.allocateDescriptorSets({ m_descriptorPool, imageLayouts }), allocated, "image descriptor sets"))
-        return false;
-    for (size_t i = 0; i < std::size(imageSets); ++i)
-        *imageSets[i] = allocated[i];
-    for (uint32_t i = 0; i < kMaxBloomMips; ++i)
-        m_bloomSets[i] = allocated[std::size(imageSets) + i];
-
-    // Also writes every image descriptor now that the sets exist.
+    // Writes the shadow map set; the render target sets are written by rebuilding the targets' views.
     if (!createShadowMapResources())
         return false;
+    const vk::DescriptorImageInfo depthInfo{ m_nearestSampler, m_sceneDepth.view, vk::ImageLayout::eShaderReadOnlyOptimal };
+    const vk::DescriptorImageInfo maskInfo{ m_nearestSampler, m_selectionMask.view, vk::ImageLayout::eShaderReadOnlyOptimal };
+    const vk::WriteDescriptorSet targetWrites[2] = {
+        { m_sceneDepthSet, 0, 0, 1, vk::DescriptorType::eCombinedImageSampler, &depthInfo },
+        { m_selectionMaskSet, 0, 0, 1, vk::DescriptorType::eCombinedImageSampler, &maskInfo },
+    };
+    m_device.updateDescriptorSets(2, targetWrites, 0, nullptr);
 
     const std::vector<vk::DescriptorSetLayout> frameLayouts(m_framesInFlight, m_frameSetLayout);
     vk::DescriptorSetAllocateInfo frameAllocInfo{ m_descriptorPool, frameLayouts };
@@ -475,84 +427,33 @@ void Renderer::writeDrawDescriptors(uint32_t frame)
     m_device.updateDescriptorSets(2, writes, 0, nullptr);
 }
 
-void Renderer::writeImageDescriptors()
-{
-    // Before createDescriptors() ran there is nothing to write; it calls this itself once the sets exist.
-    if (!m_lightingSet || !m_shadowMap.view)
-        return;
-
-    constexpr size_t kMaxWrites = 16 + kMaxBloomMips;
-    std::array<vk::DescriptorImageInfo, kMaxWrites> infos;
-    std::array<vk::WriteDescriptorSet, kMaxWrites> writes;
-    uint32_t count = 0;
-    auto add = [&](vk::DescriptorSet set, uint32_t binding, vk::Sampler sampler, vk::ImageView view, vk::ImageLayout layout) {
-        infos[count] = { sampler, view, layout };
-        writes[count] = { set, binding, 0, 1, vk::DescriptorType::eCombinedImageSampler, &infos[count] };
-        ++count;
-    };
-    const auto sampled = vk::ImageLayout::eShaderReadOnlyOptimal;
-    const auto shadowLayout = vk::ImageLayout::eDepthStencilReadOnlyOptimal;
-    add(m_lightingSet, 0, m_shadowMap.sampler, m_shadowMap.view, shadowLayout);
-    add(m_lightingSet, 1, m_shadowMap.depthSampler, m_shadowMap.view, shadowLayout);
-    add(m_lightingSet, 2, m_nearestSampler, m_aoRaw.view, sampled);
-    add(m_lightingSet, 3, m_nearestSampler, m_aoDepth.view, sampled);
-    add(m_lightingSet, 4, m_skySampler, m_skyLut.view, sampled);
-    add(m_lightingSet, 5, m_skySampler, m_skyIrradiance.view, sampled);
-    add(m_sceneDepthSet, 0, m_nearestSampler, m_sceneDepth.view, vk::ImageLayout::eDepthReadOnlyOptimal);
-    add(m_selectionMaskSet, 0, m_nearestSampler, m_selectionMask.view, sampled);
-    add(m_hdrSet, 0, m_linearClampSampler, m_hdrColor.view, sampled);
-    add(m_ldrSet, 0, m_linearClampSampler, m_ldrColor.view, sampled);
-    add(m_aoDepthSet, 0, m_nearestSampler, m_aoDepth.view, sampled);
-    add(m_aoRawSet, 0, m_nearestSampler, m_aoRaw.view, sampled);
-    add(m_aoTempSet, 0, m_nearestSampler, m_aoTemp.view, sampled);
-    add(m_skyLutSet, 0, m_skySampler, m_skyLut.view, sampled);
-    // Sets past the current chain length are never used; they just need a valid view.
-    for (uint32_t i = 0; i < kMaxBloomMips; ++i)
-        add(m_bloomSets[i], 0, m_linearClampSampler, m_bloomMipViews[std::min(i, m_bloomMips - 1)], sampled);
-    m_device.updateDescriptorSets(count, writes.data(), 0, nullptr);
-}
-
 bool Renderer::createShaders()
 {
-    // Main: set 0 = frame data, sets 1-3 = base color / normal / metallic-roughness, set 4 = lighting.
+    // Main: set 0 = frame data, sets 1-3 = base color / normal / metallic-roughness, set 4 = shadow map.
     const vk::DescriptorSetLayout meshLayouts[] = {
-        m_frameSetLayout, m_textureSetLayout, m_textureSetLayout, m_textureSetLayout, m_lightingSetLayout,
+        m_frameSetLayout, m_textureSetLayout, m_textureSetLayout, m_textureSetLayout, m_textureSetLayout,
     };
-    // Depth-only (shadow, prepass): set 0 = frame data, set 1 = base color for alpha testing.
-    const vk::DescriptorSetLayout depthLayouts[] = { m_frameSetLayout, m_textureSetLayout };
+    // Shadow: set 0 = frame data (lightSpaceMatrix), set 1 = base color for alpha testing.
+    const vk::DescriptorSetLayout shadowLayouts[] = { m_frameSetLayout, m_textureSetLayout };
     const vk::DescriptorSetLayout frameOnlyLayouts[] = { m_frameSetLayout };
-    const vk::DescriptorSetLayout fxLayouts[] = { m_frameSetLayout, m_textureSetLayout, m_textureSetLayout, m_textureSetLayout };
+    const vk::DescriptorSetLayout fxLayouts[] = { m_frameSetLayout, m_textureSetLayout };
 
-    const vk::PushConstantRange shadowPushRange{ vk::ShaderStageFlagBits::eVertex, 0, sizeof(ShadowPushConstants) };
     const vk::PushConstantRange gizmoPushRange{ vk::ShaderStageFlagBits::eVertex, 0, sizeof(glm::mat4) };
-    const vk::PushConstantRange fxPushRange{ vk::ShaderStageFlagBits::eFragment, 0, kFxPushConstantSize };
+    const vk::PushConstantRange fxPushRange{ vk::ShaderStageFlagBits::eFragment, 0, sizeof(OutlinePushConstants) };
 
     try {
         m_meshShaders = createShaderPair(m_device, "shaders/triangle.vert.spv", "shaders/triangle.frag.spv", meshLayouts);
-        m_prepassShaders = createShaderPair(m_device, "shaders/prepass.vert.spv", "shaders/alpha_test.frag.spv", depthLayouts);
-        m_shadowShaders = createShaderPair(m_device, "shaders/shadow.vert.spv", "shaders/alpha_test.frag.spv",
-            depthLayouts, { &shadowPushRange, 1 });
+        m_shadowShaders = createShaderPair(m_device, "shaders/shadow.vert.spv", "shaders/shadow.frag.spv", shadowLayouts);
         m_gizmoShaders = createShaderPair(m_device, "shaders/gizmo.vert.spv", "shaders/gizmo.frag.spv",
             frameOnlyLayouts, { &gizmoPushRange, 1 });
+        m_skyShaders = createShaderPair(m_device, "shaders/fullscreen.vert.spv", "shaders/sky.frag.spv",
+            fxLayouts, { &fxPushRange, 1 });
+        m_gridShaders = createShaderPair(m_device, "shaders/fullscreen.vert.spv", "shaders/grid.frag.spv",
+            fxLayouts, { &fxPushRange, 1 });
         m_maskShaders = createShaderPair(m_device, "shaders/mask.vert.spv", "shaders/mask.frag.spv",
             fxLayouts, { &fxPushRange, 1 });
-
-        const std::pair<ShaderPair*, const char*> fullscreen[] = {
-            { &m_skyShaders, "shaders/sky.frag.spv" },
-            { &m_gridShaders, "shaders/grid.frag.spv" },
-            { &m_outlineShaders, "shaders/outline.frag.spv" },
-            { &m_aoDepthShaders, "shaders/ao_depth.frag.spv" },
-            { &m_aoShaders, "shaders/ao.frag.spv" },
-            { &m_aoBlurShaders, "shaders/ao_blur.frag.spv" },
-            { &m_bloomDownShaders, "shaders/bloom_down.frag.spv" },
-            { &m_bloomUpShaders, "shaders/bloom_up.frag.spv" },
-            { &m_compositeShaders, "shaders/composite.frag.spv" },
-            { &m_fxaaShaders, "shaders/fxaa.frag.spv" },
-            { &m_skyLutShaders, "shaders/sky_lut.frag.spv" },
-            { &m_skyIrradianceShaders, "shaders/sky_irradiance.frag.spv" },
-        };
-        for (const auto& [pair, fragment] : fullscreen)
-            *pair = createShaderPair(m_device, "shaders/fullscreen.vert.spv", fragment, fxLayouts, { &fxPushRange, 1 });
+        m_outlineShaders = createShaderPair(m_device, "shaders/fullscreen.vert.spv", "shaders/outline.frag.spv",
+            fxLayouts, { &fxPushRange, 1 });
     }
     catch (const std::exception& e) {
         LOG_ERROR("Failed to load shaders: " << e.what() << "\n");
@@ -561,17 +462,14 @@ bool Renderer::createShaders()
 
     vk::PipelineLayoutCreateInfo meshLayoutInfo{};
     meshLayoutInfo.setSetLayouts(meshLayouts);
-    vk::PipelineLayoutCreateInfo prepassLayoutInfo{};
-    prepassLayoutInfo.setSetLayouts(depthLayouts);
     vk::PipelineLayoutCreateInfo shadowLayoutInfo{};
-    shadowLayoutInfo.setSetLayouts(depthLayouts).setPushConstantRanges(shadowPushRange);
+    shadowLayoutInfo.setSetLayouts(shadowLayouts);
     vk::PipelineLayoutCreateInfo gizmoLayoutInfo{};
     gizmoLayoutInfo.setSetLayouts(frameOnlyLayouts).setPushConstantRanges(gizmoPushRange);
     vk::PipelineLayoutCreateInfo fxLayoutInfo{};
     fxLayoutInfo.setSetLayouts(fxLayouts).setPushConstantRanges(fxPushRange);
 
     return takeResult(m_device.createPipelineLayout(meshLayoutInfo), m_meshLayout, "mesh pipeline layout") &&
-        takeResult(m_device.createPipelineLayout(prepassLayoutInfo), m_prepassLayout, "prepass pipeline layout") &&
         takeResult(m_device.createPipelineLayout(shadowLayoutInfo), m_shadowLayout, "shadow pipeline layout") &&
         takeResult(m_device.createPipelineLayout(gizmoLayoutInfo), m_gizmoLayout, "gizmo pipeline layout") &&
         takeResult(m_device.createPipelineLayout(fxLayoutInfo), m_fxLayout, "effects pipeline layout");
@@ -620,7 +518,7 @@ bool Renderer::initImGuiBackend()
     if (!takeResult(m_device.createDescriptorPool(imguiPoolInfo), m_imguiDescriptorPool, "ImGui descriptor pool"))
         return false;
 
-    // ImGui draws in the single-sample final pass, which has only the swapchain color attachment.
+    // ImGui draws in the single-sample overlay pass, which has only the swapchain color attachment.
     const VkFormat colorFormat = static_cast<VkFormat>(m_swapchain.format());
     VkPipelineRenderingCreateInfoKHR renderingInfo{ VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO_KHR };
     renderingInfo.colorAttachmentCount = 1;
@@ -676,12 +574,10 @@ void Renderer::shutdown()
 
     destroyLineBuffer(m_pathLines);
 
-    for (ShaderPair* pair : { &m_meshShaders, &m_prepassShaders, &m_shadowShaders, &m_gizmoShaders, &m_skyShaders,
-             &m_gridShaders, &m_maskShaders, &m_outlineShaders, &m_aoDepthShaders, &m_aoShaders, &m_aoBlurShaders,
-             &m_bloomDownShaders, &m_bloomUpShaders, &m_compositeShaders, &m_fxaaShaders, &m_skyLutShaders,
-             &m_skyIrradianceShaders })
+    for (ShaderPair* pair : { &m_meshShaders, &m_shadowShaders, &m_gizmoShaders, &m_skyShaders,
+             &m_gridShaders, &m_maskShaders, &m_outlineShaders })
         destroyShaderPair(m_device, *pair);
-    for (vk::PipelineLayout* layout : { &m_meshLayout, &m_prepassLayout, &m_shadowLayout, &m_gizmoLayout, &m_fxLayout }) {
+    for (vk::PipelineLayout* layout : { &m_meshLayout, &m_shadowLayout, &m_gizmoLayout, &m_fxLayout }) {
         if (*layout) m_device.destroyPipelineLayout(*layout);
         *layout = nullptr;
     }
@@ -705,25 +601,23 @@ void Renderer::shutdown()
     if (m_descriptorPool) m_device.destroyDescriptorPool(m_descriptorPool);
     m_descriptorPool = nullptr;
     m_frameSets.clear();
-    for (vk::DescriptorSet* set : { &m_lightingSet, &m_sceneDepthSet, &m_selectionMaskSet, &m_hdrSet, &m_ldrSet,
-             &m_aoDepthSet, &m_aoRawSet, &m_aoTempSet, &m_skyLutSet })
-        *set = nullptr;
-    m_bloomSets = {};
-    for (vk::DescriptorSetLayout* layout : { &m_frameSetLayout, &m_textureSetLayout, &m_lightingSetLayout }) {
-        if (*layout) m_device.destroyDescriptorSetLayout(*layout);
-        *layout = nullptr;
-    }
-    for (vk::Sampler* sampler : { &m_textureSampler, &m_nearestSampler, &m_linearClampSampler, &m_skySampler }) {
-        if (*sampler) m_device.destroySampler(*sampler);
-        *sampler = nullptr;
-    }
+    m_shadowMapSet = nullptr;
+    m_sceneDepthSet = nullptr;
+    m_selectionMaskSet = nullptr;
+    if (m_frameSetLayout) m_device.destroyDescriptorSetLayout(m_frameSetLayout);
+    if (m_textureSetLayout) m_device.destroyDescriptorSetLayout(m_textureSetLayout);
+    if (m_textureSampler) m_device.destroySampler(m_textureSampler);
+    if (m_nearestSampler) m_device.destroySampler(m_nearestSampler);
+    m_frameSetLayout = nullptr;
+    m_textureSetLayout = nullptr;
+    m_textureSampler = nullptr;
+    m_nearestSampler = nullptr;
 
     if (m_commandPool) m_device.destroyCommandPool(m_commandPool);
     m_commandPool = nullptr;
     m_commandBuffers.clear();
 
     destroyRenderTargets();
-    destroySkyResources();
     destroyShadowMap(m_shadowMap, m_allocator, m_device);
     m_swapchain.destroy();
 
@@ -744,7 +638,6 @@ void Renderer::applySettings(const GraphicsSettings& requested)
         return;
     const GraphicsSettings old = m_settings;
     m_settings = settings;
-    updateSun();
 
     if (old.vsync != settings.vsync)
         m_swapchainDirty = true;
@@ -756,7 +649,7 @@ void Renderer::applySettings(const GraphicsSettings& requested)
             LOG_ERROR("Failed to recreate render targets for MSAA " << settings.msaaSamples << "x\n");
     }
 
-    if (old.shadowMapSize != settings.shadowMapSize || old.shadowCascades != settings.shadowCascades) {
+    if (old.shadowMapSize != settings.shadowMapSize) {
         (void)m_device.waitIdle();
         destroyShadowMap(m_shadowMap, m_allocator, m_device);
         try {
@@ -768,43 +661,8 @@ void Renderer::applySettings(const GraphicsSettings& requested)
             createShadowMapResources();
         }
     }
-    // Sun direction, shadow distance and caster changes are caught by the per-cascade hashes.
-    if (old.shadows != settings.shadows)
+    if (old.shadows != settings.shadows || old.shadowDistance != settings.shadowDistance)
         m_shadowMapValid = false;
-}
-
-void Renderer::updateSun()
-{
-    m_sun.direction = sunDirectionFromAngles(m_settings.sunAzimuth, m_settings.sunElevation);
-    m_sun.topIrradiance = srgbToLinear(m_settings.sunColor) * (m_settings.sunIntensity * kSunIrradiance);
-    m_sun.groundIrradiance = m_settings.sun
-        ? m_sun.topIrradiance * sunTransmittance(-m_sun.direction, m_settings.haze)
-        : glm::vec3(0.0f);
-}
-
-bool Renderer::shadowsActive() const
-{
-    // Nothing to shadow once the sun is off, set or has no intensity.
-    return m_settings.shadows && glm::dot(m_sun.groundIrradiance, glm::vec3(1.0f)) > 1e-4f;
-}
-
-bool Renderer::contactShadowsActive() const
-{
-    return m_settings.contactShadows && glm::dot(m_sun.groundIrradiance, glm::vec3(1.0f)) > 1e-4f;
-}
-
-bool Renderer::depthPrepassEnabled() const
-{
-    return m_settings.ambientOcclusion > 0 || contactShadowsActive();
-}
-
-uint64_t Renderer::skyHash() const
-{
-    Hasher hash;
-    const float values[] = { m_sun.direction.x, m_sun.direction.y, m_sun.direction.z, m_sun.topIrradiance.r,
-        m_sun.topIrradiance.g, m_sun.topIrradiance.b, m_settings.haze, kGroundAlbedo };
-    hash.bytes(values, sizeof(values));
-    return hash.value();
 }
 
 bool Renderer::prepareSwapchain()
@@ -877,55 +735,34 @@ Renderer::FrameStatus Renderer::renderFrame(const FrameInput& input)
     // Reset only once we know this frame will be submitted; otherwise the next wait would hang.
     (void)m_device.resetFences(fence);
 
-    const glm::vec2 depthRange = projectionDepthRange(input.proj);
-    computeShadowCascades(input.view, input.proj, depthRange.x, m_settings.shadowDistance, m_sun.direction,
-        m_shadowMap.size, std::span(m_cascades.data(), m_shadowMap.layers));
-
     const FrameUBO frameData = buildFrameUBO(input);
     memcpy(m_frameUBOs[m_currentFrame].mapped, &frameData, sizeof(FrameUBO));
 
     FrameBatches batches;
-    std::array<uint64_t, kMaxShadowCascades> shadowHashes{};
-    cullAndBatch(input, frameData.proj * frameData.view, batches, shadowHashes);
-    // A cascade whose casters and matrix did not change keeps last frame's contents.
-    for (uint32_t c = 0; c < m_shadowMap.layers; ++c) {
-        m_renderCascade[c] = !m_shadowMapValid || shadowHashes[c] != m_cascadeHashes[c];
-        m_cascadeHashes[c] = shadowHashes[c];
-    }
+    const uint64_t shadowHash = cullAndBatch(input, frameData.proj * frameData.view, frameData.lightSpaceMatrix, batches);
+    const bool renderShadowMap = !m_shadowMapValid || shadowHash != m_lastShadowHash;
+    m_lastShadowHash = shadowHash;
     m_shadowMapValid = true;
 
-    const uint64_t sky = skyHash();
-    const bool renderSky = !m_skyValid || sky != m_skyHash;
-    m_skyHash = sky;
-    m_skyValid = true;
-
-    buildDrawStreams(input, batches);
+    buildDrawStreams(input, batches, renderShadowMap);
     uploadDrawStreams();
 
     const vk::CommandBuffer cmd = m_commandBuffers[m_currentFrame];
     (void)cmd.reset();
     (void)cmd.begin({ vk::CommandBufferUsageFlagBits::eOneTimeSubmit });
 
-    if (renderSky)
-        recordSkyPasses(cmd);
-    recordShadowPasses(cmd, *input.models);
+    // When skipped, the map keeps its previous contents in DepthStencilReadOnlyOptimal. With shadows
+    // off it is still cleared once so the (unused) binding refers to an initialized image.
+    if (renderShadowMap)
+        recordShadowPass(cmd, *input.models);
 
-    const bool depthPrepass = depthPrepassEnabled();
-    transitionFrameTargets(cmd, depthPrepass);
-    if (depthPrepass) {
-        recordDepthPrepass(cmd, input);
-        recordAoPasses(cmd, input);
-    }
-    recordScenePass(cmd, input, depthPrepass);
+    recordScenePass(cmd, imageIndex, input);
     const bool drawOutline = !m_highlightRuns.empty();
     if (drawOutline)
         recordSelectionMask(cmd, input);
-    if (m_settings.bloom)
-        recordBloom(cmd, input);
-    recordFinalPass(cmd, imageIndex, input, drawOutline);
+    recordOverlayPass(cmd, imageIndex, input, drawOutline);
 
     (void)cmd.end();
-    ++m_frameIndex;
     return submitAndPresent(cmd, imageIndex);
 }
 
@@ -936,52 +773,39 @@ FrameUBO Renderer::buildFrameUBO(const FrameInput& input) const
     frameData.proj = input.proj;
     frameData.invViewProj = glm::inverse(input.proj * input.view);
 
-    for (uint32_t c = 0; c < kMaxShadowCascades; ++c) {
-        const ShadowCascade& cascade = m_cascades[c];
-        frameData.cascadeMatrices[c] = cascade.matrix;
-        frameData.cascadeSplits[c] = cascade.splitEnd;
-        frameData.cascadeParams[c] = glm::vec4(cascade.texelWorld, cascade.depthRange,
-            1.0f / (2.0f * std::max(cascade.radius, 1e-3f)), 0.0f);
-    }
+    // Fit the shadow map to a sphere in front of the camera, so it covers what is actually on screen
+    // up to the shadow distance instead of the whole scene.
+    const glm::mat4 invView = glm::inverse(input.view);
+    const glm::vec3 forward = -glm::normalize(glm::vec3(invView[2]));
+    const float radius = m_settings.shadowDistance * 0.5f;
+    const glm::vec3 center = input.cameraPosition + forward * radius;
+    frameData.lightSpaceMatrix = calculateLightSpaceMatrix(input.sun, center, radius, m_shadowMap.size);
 
     frameData.cameraPos = glm::vec4(input.cameraPosition, 1.0f);
-    frameData.lightDir = glm::vec4(m_sun.direction, kSunAngularRadius);
-    frameData.sunColor = glm::vec4(m_sun.groundIrradiance, 0.0f);
-    frameData.sunTopColor = glm::vec4(m_sun.topIrradiance, 0.0f);
-    const bool realistic = m_settings.background == BackgroundMode::Realistic;
-    frameData.backgroundColor = glm::vec4(srgbToLinear(m_settings.backgroundColor), realistic ? 1.0f : 0.0f);
-    frameData.atmosphereParams = glm::vec4(m_settings.haze, kGroundAlbedo, 0.0f, 0.0f);
+    frameData.lightDir = glm::vec4(glm::normalize(input.sun.direction), 0.0f);
+    // Zero radiance removes the sun disk, its haze and direct lighting (and the flare it causes) in one go.
+    frameData.sunColor = m_settings.sun ? glm::vec4(input.sun.color, input.sun.intensity * 3.0f) : glm::vec4(0.0f);
+    frameData.skyZenith = glm::vec4(0.16f, 0.34f, 0.72f, 0.0f);
+    frameData.skyHorizon = glm::vec4(0.62f, 0.74f, 0.88f, 0.0f);
+    frameData.groundColor = glm::vec4(0.28f, 0.26f, 0.23f, 0.0f);
 
     const glm::vec2 depthRange = projectionDepthRange(input.proj);
-    frameData.fogParams = glm::vec4(m_settings.fog ? 1.0f : 0.0f, kFogDensity * m_settings.fogDensity,
-        kFogHeightFalloff, depthRange.y * 0.8f);
-    frameData.shadowParams = glm::vec4(shadowsActive() ? 1.0f : 0.0f, static_cast<float>(m_shadowMap.layers),
-        m_settings.shadowDistance, m_settings.softShadows ? 1.0f : 0.0f);
-    frameData.shadowParams2 = glm::vec4(1.0f / static_cast<float>(std::max(m_shadowMap.size, 1u)),
-        kPenumbraPerMeter, 0.0f, 0.0f);
-    frameData.aoParams = glm::vec4(m_settings.ambientOcclusion > 0 ? 1.0f : 0.0f, m_settings.aoRadius,
-        m_settings.aoIntensity, static_cast<float>(kAoSamples[m_settings.ambientOcclusion]));
-    frameData.aoParams2 = glm::vec4(contactShadowsActive() ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f);
-    frameData.projParams = glm::vec4(1.0f / input.proj[0][0], 1.0f / input.proj[1][1], 0.0f, 0.0f);
-
-    const vk::Rect2D rect = sceneRect(input);
-    frameData.viewport = glm::vec4(rect.offset.x, rect.offset.y, rect.extent.width, rect.extent.height);
-    const vk::Extent2D extent = m_swapchain.extent();
-    frameData.renderSize = glm::vec4(extent.width, extent.height, 1.0f / extent.width, 1.0f / extent.height);
-
+    frameData.fogParams = glm::vec4(m_settings.fog ? 1.0f : 0.0f, depthRange.y * 0.6f, 0.0f, 0.0f);
+    frameData.shadowParams = glm::vec4(kShadowBias, m_settings.shadows && m_settings.sun ? 1.0f : 0.0f, m_settings.shadowDistance,
+        1.0f / static_cast<float>(std::max(m_shadowMap.size, 1u)));
     frameData.time = input.time;
     frameData.nearPlane = depthRange.x;
     frameData.farPlane = depthRange.y;
-    frameData.frameIndex = m_frameIndex;
     return frameData;
 }
 
-void Renderer::cullAndBatch(const FrameInput& input, const glm::mat4& viewProj, FrameBatches& batches,
-    std::array<uint64_t, kMaxShadowCascades>& shadowHashes)
+uint64_t Renderer::cullAndBatch(const FrameInput& input, const glm::mat4& viewProj, const glm::mat4& lightSpaceMatrix,
+    FrameBatches& batches)
 {
     ModelManager& models = *input.models;
-    const bool shadows = shadowsActive();
-    const uint32_t cascadeCount = shadows ? m_shadowMap.layers : 0;
+    const glm::vec3 cameraPos = input.cameraPosition;
+    const bool shadows = m_settings.shadows && m_settings.sun;
+    const float shadowDistance = m_settings.shadowDistance;
     const auto& instances = models.getInstances();
     m_cullResults.resize(instances.size());
     m_cullIndices.resize(instances.size());
@@ -996,7 +820,7 @@ void Renderer::cullAndBatch(const FrameInput& input, const glm::mat4& viewProj, 
         res.modelIndex = inst.modelIndex;
         res.gpuModel = nullptr;
         res.visibleMain = false;
-        res.shadowMask = 0;
+        res.visibleShadow = false;
 
         if (!inst.visible) return;
 
@@ -1005,18 +829,17 @@ void Renderer::cullAndBatch(const FrameInput& input, const glm::mat4& viewProj, 
 
         res.gpuModel = gpuModel;
         res.transform = inst.getTransformMatrix();
-        res.maxScale = std::max({ std::abs(inst.scale.x), std::abs(inst.scale.y), std::abs(inst.scale.z) });
 
         res.mainPlanes = extractFrustumPlanes(viewProj * res.transform);
         res.visibleMain = isAABBInFrustum(res.mainPlanes, gpuModel->boundsMin, gpuModel->boundsMax);
 
-        for (uint32_t c = 0; c < cascadeCount; ++c) {
-            FrustumPlanes planes = extractFrustumPlanes(m_cascades[c].matrix * res.transform);
-            // Casters between the sun and the cascade still throw shadows into it (depth clamp flattens them).
-            planes.planes[4] = glm::vec4(0.0f, 0.0f, 0.0f, 1.0f);
-            if (isAABBInFrustum(planes, gpuModel->boundsMin, gpuModel->boundsMax)) {
-                res.shadowPlanes[c] = planes;
-                res.shadowMask |= static_cast<uint8_t>(1u << c);
+        if (shadows) {
+            glm::vec3 worldCenter = glm::vec3(res.transform * glm::vec4(gpuModel->boundsCenter, 1.0f));
+            float maxScale = std::max({ inst.scale.x, inst.scale.y, inst.scale.z });
+            float distToCamera = glm::distance(worldCenter, cameraPos) - (gpuModel->boundsRadius * maxScale);
+            if (distToCamera < shadowDistance) {
+                res.shadowPlanes = extractFrustumPlanes(lightSpaceMatrix * res.transform);
+                res.visibleShadow = isAABBInFrustum(res.shadowPlanes, gpuModel->boundsMin, gpuModel->boundsMax);
             }
         }
 
@@ -1027,7 +850,7 @@ void Renderer::cullAndBatch(const FrameInput& input, const glm::mat4& viewProj, 
     m_cullChunks.clear();
     for (size_t i = 0; i < m_cullResults.size(); ++i) {
         const auto& res = m_cullResults[i];
-        if (!res.gpuModel || !(res.visibleMain || res.shadowMask)) continue;
+        if (!res.gpuModel || !(res.visibleMain || res.visibleShadow)) continue;
         const size_t n = res.gpuModel->submeshes.size();
         for (size_t b = 0; b < n; b += kCullChunkSize)
             m_cullChunks.push_back({ i, b, std::min(b + kCullChunkSize, n) });
@@ -1047,34 +870,23 @@ void Renderer::cullAndBatch(const FrameInput& input, const glm::mat4& viewProj, 
             if (res.visibleMain &&
                 (!validBounds || isAABBInFrustum(res.mainPlanes, sub.boundsMin, sub.boundsMax)))
                 flags |= kVisibleMain;
-            if (res.shadowMask && sub.material.alphaMode != AlphaMode::BLEND) {
-                const float radius = validBounds
-                    ? 0.5f * glm::length(sub.boundsMax - sub.boundsMin) * res.maxScale
-                    : std::numeric_limits<float>::max();
-                for (uint32_t c = 0; c < cascadeCount; ++c) {
-                    // Casters smaller than a texel would only add aliasing noise to a cascade.
-                    if (!(res.shadowMask & (1u << c)) || radius < m_cascades[c].texelWorld)
-                        continue;
-                    if (!validBounds || isAABBInFrustum(res.shadowPlanes[c], sub.boundsMin, sub.boundsMax))
-                        flags |= static_cast<uint8_t>(kVisibleShadow << c);
-                }
-            }
+            if (res.visibleShadow && sub.material.alphaMode != AlphaMode::BLEND &&
+                (!validBounds || isAABBInFrustum(res.shadowPlanes, sub.boundsMin, sub.boundsMax)))
+                flags |= kVisibleShadow;
             res.submeshFlags[s] = flags;
         }
     });
 
-    // 3. Sequential aggregation, hashing everything that affects each cascade on the way.
-    std::array<Hasher, kMaxShadowCascades> hashers;
-    for (uint32_t c = 0; c < m_shadowMap.layers; ++c) {
-        hashers[c].byte(static_cast<uint8_t>(shadows ? 1 : 0));
-        hashers[c].bytes(&m_shadowMap.size, sizeof(m_shadowMap.size));
-        if (shadows)
-            hashers[c].bytes(&m_cascades[c].matrix, sizeof(glm::mat4));
-    }
+    // 3. Sequential aggregation, hashing everything that affects the shadow map on the way.
+    ShadowHasher shadowHash;
+    shadowHash.byte(static_cast<uint8_t>(shadows ? 1 : 0));
+    shadowHash.bytes(&m_shadowMap.size, sizeof(m_shadowMap.size));
+    if (shadows)
+        shadowHash.bytes(&lightSpaceMatrix, sizeof(glm::mat4));
 
     m_frameTransforms.clear();
     for (const auto& res : m_cullResults) {
-        if (!res.gpuModel || !(res.visibleMain || res.shadowMask)) continue;
+        if (!res.gpuModel || !(res.visibleMain || res.visibleShadow)) continue;
 
         const uint32_t transformIndex = pushTransform(res.transform);
         InstanceRenderData renderData{ res.instance, res.transform, res.submeshFlags.data(), transformIndex };
@@ -1085,24 +897,18 @@ void Renderer::cullAndBatch(const FrameInput& input, const glm::mat4& viewProj, 
             batch.instances.push_back(renderData);
         }
 
-        if (res.shadowMask) {
+        if (res.visibleShadow) {
             auto& batch = batches.shadow[res.modelIndex];
             batch.model = res.gpuModel;
             batch.instances.push_back(renderData);
 
-            for (uint32_t c = 0; c < cascadeCount; ++c) {
-                if (!(res.shadowMask & (1u << c))) continue;
-                Hasher& hash = hashers[c];
-                hash.bytes(&res.gpuModel, sizeof(res.gpuModel));
-                hash.bytes(&res.transform, sizeof(glm::mat4));
-                const uint8_t bit = static_cast<uint8_t>(kVisibleShadow << c);
-                for (uint8_t f : res.submeshFlags)
-                    hash.byte(f & bit);
-            }
+            shadowHash.bytes(&res.gpuModel, sizeof(res.gpuModel));
+            shadowHash.bytes(&res.transform, sizeof(glm::mat4));
+            for (uint8_t f : res.submeshFlags)
+                shadowHash.byte(f & kVisibleShadow);
         }
     }
-    for (uint32_t c = 0; c < m_shadowMap.layers; ++c)
-        shadowHashes[c] = hashers[c].value();
+    return shadowHash.value();
 }
 
 void Renderer::materialSets(const ModelManager& models, const GPUModel* model, const Material& material,
@@ -1162,22 +968,18 @@ void Renderer::appendDraw(std::vector<DrawRun>& runs, GPUModel* model, const vk:
 
 // Every visible (instance, submesh) pair becomes one GpuDrawData entry plus one indirect command whose
 // firstInstance points at that entry; compatible neighbours are merged into DrawRuns.
-void Renderer::buildDrawStreams(const FrameInput& input, FrameBatches& batches)
+void Renderer::buildDrawStreams(const FrameInput& input, FrameBatches& batches, bool renderShadowMap)
 {
     ModelManager& models = *input.models;
     const glm::vec3 cameraPos = input.cameraPosition;
 
     m_frameDraws.clear();
     m_frameCommands.clear();
-    for (auto& runs : m_shadowRuns)
-        runs.clear();
+    m_shadowRuns.clear();
     m_opaqueRuns.clear();
     m_blendRuns.clear();
 
-    // Only cascades that are re-rendered this frame need draws.
-    for (uint32_t c = 0; c < m_shadowMap.layers; ++c) {
-        if (!m_renderCascade[c]) continue;
-        const uint8_t bit = static_cast<uint8_t>(kVisibleShadow << c);
+    if (renderShadowMap) {
         for (auto& [modelIdx, batch] : batches.shadow) {
             GPUModel* model = batch.model;
             for (uint32_t si : model->drawOrder) {
@@ -1190,8 +992,8 @@ void Renderer::buildDrawStreams(const FrameInput& input, FrameBatches& batches)
                     sets[0] = all[0];
                 }
                 for (const auto& rd : batch.instances)
-                    if (rd.submeshFlags[si] & bit)
-                        appendDraw(m_shadowRuns[c], model, sets, false, sub, rd.transformIndex, glm::vec3(1.0f));
+                    if (rd.submeshFlags[si] & kVisibleShadow)
+                        appendDraw(m_shadowRuns, model, sets, false, sub, rd.transformIndex, glm::vec3(1.0f));
             }
         }
     }
@@ -1305,7 +1107,6 @@ void Renderer::setDefaultDrawState(vk::CommandBuffer cmd, vk::SampleCountFlagBit
     cmd.setDepthWriteEnable(VK_FALSE);
     cmd.setDepthCompareOp(vk::CompareOp::eLessOrEqual);
     cmd.setDepthBiasEnable(VK_FALSE);
-    cmd.setDepthClampEnableEXT(VK_FALSE);
     cmd.setStencilTestEnable(VK_FALSE);
     cmd.setPolygonModeEXT(vk::PolygonMode::eFill);
     cmd.setRasterizationSamplesEXT(samples);
@@ -1327,19 +1128,6 @@ void Renderer::setAlphaBlending(vk::CommandBuffer cmd, bool enabled) const
     blendEquation.colorBlendOp = vk::BlendOp::eAdd;
     blendEquation.srcAlphaBlendFactor = vk::BlendFactor::eOne;
     blendEquation.dstAlphaBlendFactor = vk::BlendFactor::eOneMinusSrcAlpha;
-    blendEquation.alphaBlendOp = vk::BlendOp::eAdd;
-    cmd.setColorBlendEquationEXT(0, 1, &blendEquation);
-}
-
-void Renderer::setAdditiveBlending(vk::CommandBuffer cmd) const
-{
-    cmd.setColorBlendEnableEXT(0, VK_TRUE);
-    vk::ColorBlendEquationEXT blendEquation{};
-    blendEquation.srcColorBlendFactor = vk::BlendFactor::eOne;
-    blendEquation.dstColorBlendFactor = vk::BlendFactor::eOne;
-    blendEquation.colorBlendOp = vk::BlendOp::eAdd;
-    blendEquation.srcAlphaBlendFactor = vk::BlendFactor::eOne;
-    blendEquation.dstAlphaBlendFactor = vk::BlendFactor::eOne;
     blendEquation.alphaBlendOp = vk::BlendOp::eAdd;
     cmd.setColorBlendEquationEXT(0, 1, &blendEquation);
 }
@@ -1381,270 +1169,177 @@ void Renderer::recordRun(vk::CommandBuffer cmd, const DrawRun& run) const
     }
 }
 
-// Depth-only runs: only the base color texture (set 1, for alpha testing) is bound.
-void Renderer::recordDepthRuns(vk::CommandBuffer cmd, vk::PipelineLayout layout, const std::vector<DrawRun>& runs,
-    const ModelManager& models) const
-{
-    cmd.setVertexInputEXT(1, &m_meshBinding, static_cast<uint32_t>(m_meshAttributes.size()), m_meshAttributes.data());
-    cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, layout, 0, 1, &m_frameSets[m_currentFrame], 0, nullptr);
-    // alpha_test.frag statically uses set 1, so it must be bound even when nothing is alpha-masked.
-    vk::DescriptorSet boundSet = models.getDefaultBaseColorSet();
-    cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, layout, 1, 1, &boundSet, 0, nullptr);
-
-    const GPUModel* boundModel = nullptr;
-    for (const DrawRun& run : runs) {
-        if (run.model != boundModel) {
-            bindModelBuffers(cmd, run.model);
-            boundModel = run.model;
-        }
-        if (run.sets[0] && run.sets[0] != boundSet) {
-            boundSet = run.sets[0];
-            cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, layout, 1, 1, &boundSet, 0, nullptr);
-        }
-        recordRun(cmd, run);
-    }
-}
-
-void Renderer::recordShadowPasses(vk::CommandBuffer cmd, const ModelManager& models)
+void Renderer::recordShadowPass(vk::CommandBuffer cmd, const ModelManager& models)
 {
     const uint32_t size = m_shadowMap.size;
     const vk::Image shadowImage(m_shadowMap.image);
     const auto depthAspect = vk::ImageAspectFlagBits::eDepth;
-    const auto depthStages = vk::PipelineStageFlagBits2::eEarlyFragmentTests | vk::PipelineStageFlagBits2::eLateFragmentTests;
-    const vk::Rect2D area{ { 0, 0 }, { size, size } };
 
-    for (uint32_t c = 0; c < m_shadowMap.layers; ++c) {
-        if (!m_renderCascade[c])
-            continue;
-        // Unchanged cascades keep their contents; this one is redrawn from scratch.
-        const vk::ImageMemoryBarrier2 toAttachment = imageBarrier(shadowImage, depthAspect,
-            vk::PipelineStageFlagBits2::eFragmentShader, vk::AccessFlagBits2::eNone,
-            depthStages, vk::AccessFlagBits2::eDepthStencilAttachmentRead | vk::AccessFlagBits2::eDepthStencilAttachmentWrite,
-            vk::ImageLayout::eUndefined, vk::ImageLayout::eDepthAttachmentOptimal, 0, 1, c, 1);
-        pipelineBarriers(cmd, { &toAttachment, 1 });
+    const vk::ImageMemoryBarrier2 toAttachment = imageBarrier(shadowImage, depthAspect,
+        vk::PipelineStageFlagBits2::eFragmentShader, vk::AccessFlagBits2::eNone,
+        vk::PipelineStageFlagBits2::eEarlyFragmentTests | vk::PipelineStageFlagBits2::eLateFragmentTests,
+        vk::AccessFlagBits2::eDepthStencilAttachmentRead | vk::AccessFlagBits2::eDepthStencilAttachmentWrite,
+        vk::ImageLayout::eUndefined, vk::ImageLayout::eDepthAttachmentOptimal);
+    pipelineBarriers(cmd, { &toAttachment, 1 });
 
-        vk::RenderingAttachmentInfo depthAttachment{};
-        depthAttachment.setImageView(m_shadowMap.layerViews[c])
-            .setImageLayout(vk::ImageLayout::eDepthAttachmentOptimal)
-            .setLoadOp(vk::AttachmentLoadOp::eClear)
-            .setStoreOp(vk::AttachmentStoreOp::eStore)
-            .setClearValue(vk::ClearValue(vk::ClearDepthStencilValue{ 1.0f, 0 }));
-        vk::RenderingInfo renderInfo{};
-        renderInfo.setRenderArea(area).setLayerCount(1).setPDepthAttachment(&depthAttachment);
-
-        cmd.beginRendering(renderInfo);
-        if (!m_shadowRuns[c].empty()) {
-            bindShaderPair(cmd, m_shadowShaders);
-            setDefaultDrawState(cmd, vk::SampleCountFlagBits::e1, viewportFor(area), area);
-            // Both faces cast: single-sided geometry facing the sun must still block it. The normal offset
-            // and slope bias keep lit faces from shadowing themselves.
-            cmd.setDepthTestEnable(VK_TRUE);
-            cmd.setDepthWriteEnable(VK_TRUE);
-            cmd.setDepthBiasEnable(VK_TRUE);
-            cmd.setDepthBias(1.25f, 0.0f, 1.75f);
-            cmd.setDepthClampEnableEXT(VK_TRUE);
-            const ShadowPushConstants push{ c, {} };
-            cmd.pushConstants(m_shadowLayout, vk::ShaderStageFlagBits::eVertex, 0, sizeof(push), &push);
-            recordDepthRuns(cmd, m_shadowLayout, m_shadowRuns[c], models);
-        }
-        cmd.endRendering();
-
-        const vk::ImageMemoryBarrier2 toSampled = imageBarrier(shadowImage, depthAspect,
-            vk::PipelineStageFlagBits2::eLateFragmentTests, vk::AccessFlagBits2::eDepthStencilAttachmentWrite,
-            vk::PipelineStageFlagBits2::eFragmentShader, vk::AccessFlagBits2::eShaderSampledRead,
-            vk::ImageLayout::eDepthAttachmentOptimal, vk::ImageLayout::eDepthStencilReadOnlyOptimal, 0, 1, c, 1);
-        pipelineBarriers(cmd, { &toSampled, 1 });
-    }
-}
-
-void Renderer::transitionFrameTargets(vk::CommandBuffer cmd, bool depthPrepass)
-{
-    using Stage = vk::PipelineStageFlagBits2;
-    using Access = vk::AccessFlagBits2;
-    const auto colorAspect = vk::ImageAspectFlagBits::eColor;
-    const auto depthAspect = vk::ImageAspectFlagBits::eDepth;
-    const auto depthStages = Stage::eEarlyFragmentTests | Stage::eLateFragmentTests;
-    const auto depthAccess = Access::eDepthStencilAttachmentRead | Access::eDepthStencilAttachmentWrite;
-    // Earlier frames rendered to these images or sampled them; their contents are discarded.
-    const auto previousStages = Stage::eFragmentShader | Stage::eColorAttachmentOutput | depthStages;
-    const auto previousWrites = Access::eColorAttachmentWrite | Access::eDepthStencilAttachmentWrite;
-
-    std::vector<vk::ImageMemoryBarrier2> barriers;
-    auto toColorTarget = [&](const RenderImage& image, uint32_t mips) {
-        barriers.push_back(imageBarrier(vk::Image(image.image), colorAspect, previousStages, previousWrites,
-            Stage::eColorAttachmentOutput, Access::eColorAttachmentRead | Access::eColorAttachmentWrite,
-            vk::ImageLayout::eUndefined, vk::ImageLayout::eColorAttachmentOptimal, 0, mips));
-    };
-    // Inputs of passes skipped this frame must still be in the layout their descriptors promise.
-    auto toUnusedInput = [&](const RenderImage& image) {
-        barriers.push_back(imageBarrier(vk::Image(image.image), colorAspect, previousStages, previousWrites,
-            Stage::eFragmentShader, Access::eShaderSampledRead,
-            vk::ImageLayout::eUndefined, vk::ImageLayout::eShaderReadOnlyOptimal));
-    };
-
-    // Depth resolves write in the color output stage with color attachment access.
-    barriers.push_back(imageBarrier(vk::Image(m_sceneDepth.image), depthAspect, previousStages, previousWrites,
-        depthStages | Stage::eColorAttachmentOutput, depthAccess | Access::eColorAttachmentWrite,
-        vk::ImageLayout::eUndefined, vk::ImageLayout::eDepthAttachmentOptimal));
-    toColorTarget(m_hdrColor, 1);
-    if (m_samples != vk::SampleCountFlagBits::e1) {
-        toColorTarget(m_msaaColor, 1);
-        barriers.push_back(imageBarrier(vk::Image(m_msaaDepth.image), depthAspect, previousStages, previousWrites,
-            depthStages, depthAccess, vk::ImageLayout::eUndefined, vk::ImageLayout::eDepthAttachmentOptimal));
-    }
-    if (depthPrepass) {
-        toColorTarget(m_aoDepth, 1);
-        toColorTarget(m_aoRaw, 1);
-        toColorTarget(m_aoTemp, 1);
-    }
-    else {
-        toUnusedInput(m_aoDepth);
-        toUnusedInput(m_aoRaw);
-    }
-    if (m_settings.bloom)
-        toColorTarget(m_bloom, m_bloomMips);
-    else
-        toUnusedInput(m_bloom);
-    if (m_settings.fxaa)
-        toColorTarget(m_ldrColor, 1);
-    pipelineBarriers(cmd, barriers);
-}
-
-// Depth of the opaque scene before shading: the AO passes read it, and the scene pass then shades each
-// pixel once (depth test against these exact depths, no writes).
-void Renderer::recordDepthPrepass(vk::CommandBuffer cmd, const FrameInput& input)
-{
-    const bool msaa = m_samples != vk::SampleCountFlagBits::e1;
-    const vk::Rect2D rect = sceneRect(input);
-
-    vk::RenderingAttachmentInfo depthAttachment{};
-    depthAttachment.setImageLayout(vk::ImageLayout::eDepthAttachmentOptimal)
+    vk::RenderingAttachmentInfo shadowDepthAttachment{};
+    shadowDepthAttachment.setImageView(m_shadowMap.view)
+        .setImageLayout(vk::ImageLayout::eDepthAttachmentOptimal)
         .setLoadOp(vk::AttachmentLoadOp::eClear)
         .setStoreOp(vk::AttachmentStoreOp::eStore)
         .setClearValue(vk::ClearValue(vk::ClearDepthStencilValue{ 1.0f, 0 }));
+
+    vk::RenderingInfo shadowRenderInfo{};
+    shadowRenderInfo.setRenderArea({ {0, 0}, {size, size} })
+        .setLayerCount(1)
+        .setColorAttachmentCount(0)
+        .setPDepthAttachment(&shadowDepthAttachment);
+
+    cmd.beginRendering(shadowRenderInfo);
+    if (!m_shadowRuns.empty()) {
+        bindShaderPair(cmd, m_shadowShaders);
+        const vk::Viewport shadowViewport{ 0, 0, float(size), float(size), 0.f, 1.f };
+        const vk::Rect2D shadowRect{ {0, 0}, {size, size} };
+        setDefaultDrawState(cmd, vk::SampleCountFlagBits::e1, shadowViewport, shadowRect);
+        cmd.setCullMode(vk::CullModeFlagBits::eFront);
+        cmd.setDepthTestEnable(VK_TRUE);
+        cmd.setDepthWriteEnable(VK_TRUE);
+        cmd.setDepthBiasEnable(VK_TRUE);
+        cmd.setDepthBias(1.25f, 0.0f, 1.75f);
+        cmd.setVertexInputEXT(1, &m_meshBinding, static_cast<uint32_t>(m_meshAttributes.size()), m_meshAttributes.data());
+
+        cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, m_shadowLayout, 0, 1, &m_frameSets[m_currentFrame], 0, nullptr);
+        // The shadow fragment shader statically uses set 1, so it must be bound even
+        // when no submesh is alpha-masked.
+        vk::DescriptorSet boundShadowSet = models.getDefaultBaseColorSet();
+        cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, m_shadowLayout, 1, 1, &boundShadowSet, 0, nullptr);
+
+        const GPUModel* boundModel = nullptr;
+        for (const DrawRun& run : m_shadowRuns) {
+            if (run.model != boundModel) {
+                bindModelBuffers(cmd, run.model);
+                boundModel = run.model;
+            }
+            if (run.sets[0] && run.sets[0] != boundShadowSet) {
+                boundShadowSet = run.sets[0];
+                cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, m_shadowLayout, 1, 1, &boundShadowSet, 0, nullptr);
+            }
+            recordRun(cmd, run);
+        }
+        cmd.setDepthBiasEnable(VK_FALSE);
+    }
+    cmd.endRendering();
+
+    const vk::ImageMemoryBarrier2 toSampled = imageBarrier(shadowImage, depthAspect,
+        vk::PipelineStageFlagBits2::eLateFragmentTests, vk::AccessFlagBits2::eDepthStencilAttachmentWrite,
+        vk::PipelineStageFlagBits2::eFragmentShader, vk::AccessFlagBits2::eShaderSampledRead,
+        vk::ImageLayout::eDepthAttachmentOptimal, vk::ImageLayout::eDepthStencilReadOnlyOptimal);
+    pipelineBarriers(cmd, { &toSampled, 1 });
+}
+
+void Renderer::recordScenePass(vk::CommandBuffer cmd, uint32_t imageIndex, const FrameInput& input)
+{
+    const vk::Extent2D extent = m_swapchain.extent();
+    const bool msaa = m_samples != vk::SampleCountFlagBits::e1;
+    const vk::Image swapImage(m_swapchain.images()[imageIndex]);
+    const auto colorAspect = vk::ImageAspectFlagBits::eColor;
+    const auto depthAspect = vk::ImageAspectFlagBits::eDepth;
+    const auto depthStages = vk::PipelineStageFlagBits2::eEarlyFragmentTests | vk::PipelineStageFlagBits2::eLateFragmentTests;
+    const auto depthAccess = vk::AccessFlagBits2::eDepthStencilAttachmentRead | vk::AccessFlagBits2::eDepthStencilAttachmentWrite;
+
+    // Previous contents are discarded. The scene depth was last sampled by the selection mask pass
+    // of an earlier frame, hence the fragment shader source stage.
+    std::vector<vk::ImageMemoryBarrier2> barriers = {
+        imageBarrier(swapImage, colorAspect,
+            vk::PipelineStageFlagBits2::eColorAttachmentOutput, vk::AccessFlagBits2::eNone,
+            vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+            vk::AccessFlagBits2::eColorAttachmentRead | vk::AccessFlagBits2::eColorAttachmentWrite,
+            vk::ImageLayout::eUndefined, vk::ImageLayout::eColorAttachmentOptimal),
+        imageBarrier(vk::Image(m_sceneDepth.image), depthAspect,
+            vk::PipelineStageFlagBits2::eFragmentShader | depthStages | vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+            vk::AccessFlagBits2::eDepthStencilAttachmentWrite,
+            // Depth resolves write in the color output stage with color attachment access.
+            depthStages | vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+            depthAccess | vk::AccessFlagBits2::eColorAttachmentWrite,
+            vk::ImageLayout::eUndefined, vk::ImageLayout::eDepthAttachmentOptimal),
+    };
     if (msaa) {
+        barriers.push_back(imageBarrier(vk::Image(m_msaaColor.image), colorAspect,
+            vk::PipelineStageFlagBits2::eColorAttachmentOutput, vk::AccessFlagBits2::eColorAttachmentWrite,
+            vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+            vk::AccessFlagBits2::eColorAttachmentRead | vk::AccessFlagBits2::eColorAttachmentWrite,
+            vk::ImageLayout::eUndefined, vk::ImageLayout::eColorAttachmentOptimal));
+        barriers.push_back(imageBarrier(vk::Image(m_msaaDepth.image), depthAspect,
+            depthStages, vk::AccessFlagBits2::eDepthStencilAttachmentWrite, depthStages, depthAccess,
+            vk::ImageLayout::eUndefined, vk::ImageLayout::eDepthAttachmentOptimal));
+    }
+    pipelineBarriers(cmd, barriers);
+
+    // Outside the scene viewport the UI covers everything, so a plain clear is enough there.
+    vk::RenderingAttachmentInfo colorAttachment{};
+    colorAttachment.setImageLayout(vk::ImageLayout::eColorAttachmentOptimal)
+        .setLoadOp(vk::AttachmentLoadOp::eClear)
+        .setClearValue(vk::ClearValue(vk::ClearColorValue(std::array<float, 4>{ 0.1f, 0.1f, 0.1f, 1.0f })));
+    vk::RenderingAttachmentInfo depthAttachment{};
+    depthAttachment.setImageLayout(vk::ImageLayout::eDepthAttachmentOptimal)
+        .setLoadOp(vk::AttachmentLoadOp::eClear)
+        .setClearValue(vk::ClearValue(vk::ClearDepthStencilValue{ 1.0f, 0 }));
+    if (msaa) {
+        colorAttachment.setImageView(m_msaaColor.view)
+            .setStoreOp(vk::AttachmentStoreOp::eDontCare)
+            .setResolveMode(vk::ResolveModeFlagBits::eAverage)
+            .setResolveImageView(m_swapchain.imageViews()[imageIndex])
+            .setResolveImageLayout(vk::ImageLayout::eColorAttachmentOptimal);
         depthAttachment.setImageView(m_msaaDepth.view)
+            .setStoreOp(vk::AttachmentStoreOp::eDontCare)
             .setResolveMode(vk::ResolveModeFlagBits::eSampleZero)
             .setResolveImageView(m_sceneDepth.view)
             .setResolveImageLayout(vk::ImageLayout::eDepthAttachmentOptimal);
     }
     else {
-        depthAttachment.setImageView(m_sceneDepth.view);
-    }
-    vk::RenderingInfo renderInfo{};
-    renderInfo.setRenderArea(rect).setLayerCount(1).setPDepthAttachment(&depthAttachment);
-
-    cmd.beginRendering(renderInfo);
-    if (!m_opaqueRuns.empty()) {
-        bindShaderPair(cmd, m_prepassShaders);
-        setDefaultDrawState(cmd, m_samples, viewportFor(rect), rect);
-        cmd.setDepthTestEnable(VK_TRUE);
-        cmd.setDepthWriteEnable(VK_TRUE);
-        cmd.setDepthCompareOp(vk::CompareOp::eLess);
-        recordDepthRuns(cmd, m_prepassLayout, m_opaqueRuns, *input.models);
-    }
-    cmd.endRendering();
-
-    using Stage = vk::PipelineStageFlagBits2;
-    using Access = vk::AccessFlagBits2;
-    const auto depthAspect = vk::ImageAspectFlagBits::eDepth;
-    const auto depthStages = Stage::eEarlyFragmentTests | Stage::eLateFragmentTests;
-    // Read-only from here on: sampled by the AO passes and the selection mask, depth-tested by the scene pass.
-    std::vector<vk::ImageMemoryBarrier2> barriers = {
-        imageBarrier(vk::Image(m_sceneDepth.image), depthAspect,
-            depthStages | Stage::eColorAttachmentOutput,
-            Access::eDepthStencilAttachmentWrite | Access::eColorAttachmentWrite,
-            Stage::eFragmentShader | depthStages, Access::eShaderSampledRead | Access::eDepthStencilAttachmentRead,
-            vk::ImageLayout::eDepthAttachmentOptimal, vk::ImageLayout::eDepthReadOnlyOptimal),
-    };
-    if (msaa) {
-        barriers.push_back(imageBarrier(vk::Image(m_msaaDepth.image), depthAspect,
-            depthStages | Stage::eColorAttachmentOutput, Access::eDepthStencilAttachmentWrite,
-            depthStages, Access::eDepthStencilAttachmentRead | Access::eDepthStencilAttachmentWrite,
-            vk::ImageLayout::eDepthAttachmentOptimal, vk::ImageLayout::eDepthAttachmentOptimal));
-    }
-    pipelineBarriers(cmd, barriers);
-}
-
-void Renderer::recordScenePass(vk::CommandBuffer cmd, const FrameInput& input, bool depthPrepass)
-{
-    const bool msaa = m_samples != vk::SampleCountFlagBits::e1;
-    const vk::Rect2D rect = sceneRect(input);
-
-    // Cleared to zero coverage: in the solid-background mode, composite.frag fills uncovered pixels.
-    vk::RenderingAttachmentInfo colorAttachment{};
-    colorAttachment.setImageLayout(vk::ImageLayout::eColorAttachmentOptimal)
-        .setLoadOp(vk::AttachmentLoadOp::eClear)
-        .setClearValue(vk::ClearValue(vk::ClearColorValue(std::array<float, 4>{ 0.0f, 0.0f, 0.0f, 0.0f })));
-    if (msaa) {
-        colorAttachment.setImageView(m_msaaColor.view)
-            .setStoreOp(vk::AttachmentStoreOp::eDontCare)
-            .setResolveMode(vk::ResolveModeFlagBits::eAverage)
-            .setResolveImageView(m_hdrColor.view)
-            .setResolveImageLayout(vk::ImageLayout::eColorAttachmentOptimal);
-    }
-    else {
-        colorAttachment.setImageView(m_hdrColor.view).setStoreOp(vk::AttachmentStoreOp::eStore);
-    }
-
-    vk::RenderingAttachmentInfo depthAttachment{};
-    if (depthPrepass) {
-        // Depth is final already; this pass only tests against it.
-        depthAttachment.setLoadOp(vk::AttachmentLoadOp::eLoad).setStoreOp(vk::AttachmentStoreOp::eNone);
-        if (msaa)
-            depthAttachment.setImageView(m_msaaDepth.view).setImageLayout(vk::ImageLayout::eDepthAttachmentOptimal);
-        else
-            depthAttachment.setImageView(m_sceneDepth.view).setImageLayout(vk::ImageLayout::eDepthReadOnlyOptimal);
-    }
-    else {
-        depthAttachment.setImageLayout(vk::ImageLayout::eDepthAttachmentOptimal)
-            .setLoadOp(vk::AttachmentLoadOp::eClear)
-            .setClearValue(vk::ClearValue(vk::ClearDepthStencilValue{ 1.0f, 0 }));
-        if (msaa) {
-            depthAttachment.setImageView(m_msaaDepth.view)
-                .setStoreOp(vk::AttachmentStoreOp::eDontCare)
-                .setResolveMode(vk::ResolveModeFlagBits::eSampleZero)
-                .setResolveImageView(m_sceneDepth.view)
-                .setResolveImageLayout(vk::ImageLayout::eDepthAttachmentOptimal);
-        }
-        else {
-            depthAttachment.setImageView(m_sceneDepth.view).setStoreOp(vk::AttachmentStoreOp::eStore);
-        }
+        colorAttachment.setImageView(m_swapchain.imageViews()[imageIndex])
+            .setStoreOp(vk::AttachmentStoreOp::eStore);
+        depthAttachment.setImageView(m_sceneDepth.view)
+            .setStoreOp(vk::AttachmentStoreOp::eStore);
     }
 
     vk::RenderingInfo renderInfo{};
-    renderInfo.setRenderArea(rect)
+    renderInfo.setRenderArea({ {0, 0}, extent })
         .setLayerCount(1)
         .setColorAttachments(colorAttachment)
         .setPDepthAttachment(&depthAttachment);
     cmd.beginRendering(renderInfo);
 
-    setDefaultDrawState(cmd, m_samples, viewportFor(rect), rect);
+    const vk::Rect2D rect = sceneRect(input);
+    const vk::Viewport viewport{ float(rect.offset.x), float(rect.offset.y),
+        float(rect.extent.width), float(rect.extent.height), 0.f, 1.f };
+    setDefaultDrawState(cmd, m_samples, viewport, rect);
+
+    // Sky first, behind everything (no depth).
+    recordFullscreen(cmd, m_skyShaders);
+
     cmd.setDepthTestEnable(VK_TRUE);
-    cmd.setDepthWriteEnable(depthPrepass ? VK_FALSE : VK_TRUE);
-    cmd.setDepthCompareOp(depthPrepass ? vk::CompareOp::eLessOrEqual : vk::CompareOp::eLess);
+    cmd.setDepthWriteEnable(VK_TRUE);
+    cmd.setDepthCompareOp(vk::CompareOp::eLess);
     bindShaderPair(cmd, m_meshShaders);
     cmd.setVertexInputEXT(1, &m_meshBinding, static_cast<uint32_t>(m_meshAttributes.size()), m_meshAttributes.data());
     cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, m_meshLayout, 0, 1, &m_frameSets[m_currentFrame], 0, nullptr);
-    cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, m_meshLayout, 4, 1, &m_lightingSet, 0, nullptr);
+    cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, m_meshLayout, 4, 1, &m_shadowMapSet, 0, nullptr);
     recordMeshRuns(cmd, m_opaqueRuns);
 
-    // Sky after the opaque geometry, so it is only shaded where nothing covers it.
+    // Transparent-ish layers: depth-tested against the opaque scene, no depth writes.
     cmd.setDepthWriteEnable(VK_FALSE);
     cmd.setDepthCompareOp(vk::CompareOp::eLessOrEqual);
-    if (m_settings.background == BackgroundMode::Realistic)
-        drawFx(cmd, m_skyShaders, { m_skyLutSet });
-
-    // Transparent-ish layers: depth-tested against the opaque scene, no depth writes.
     setAlphaBlending(cmd, true);
+
     if (input.showGrid)
-        drawFx(cmd, m_gridShaders, {});
+        recordFullscreen(cmd, m_gridShaders);
 
     if (!m_blendRuns.empty()) {
         bindShaderPair(cmd, m_meshShaders);
         cmd.setVertexInputEXT(1, &m_meshBinding, static_cast<uint32_t>(m_meshAttributes.size()), m_meshAttributes.data());
         cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, m_meshLayout, 0, 1, &m_frameSets[m_currentFrame], 0, nullptr);
-        cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, m_meshLayout, 4, 1, &m_lightingSet, 0, nullptr);
+        cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, m_meshLayout, 4, 1, &m_shadowMapSet, 0, nullptr);
         recordMeshRuns(cmd, m_blendRuns);
     }
 
@@ -1652,24 +1347,21 @@ void Renderer::recordScenePass(vk::CommandBuffer cmd, const FrameInput& input, b
     recordPathLines(cmd, input);
     cmd.endRendering();
 
-    // The HDR image feeds bloom and the composite; without a prepass the depth was only written just now
-    // and the selection mask samples it next. Resolves count as color attachment writes.
-    using Stage = vk::PipelineStageFlagBits2;
-    using Access = vk::AccessFlagBits2;
-    std::vector<vk::ImageMemoryBarrier2> barriers = {
-        imageBarrier(vk::Image(m_hdrColor.image), vk::ImageAspectFlagBits::eColor,
-            Stage::eColorAttachmentOutput, Access::eColorAttachmentWrite,
-            Stage::eFragmentShader, Access::eShaderSampledRead,
-            vk::ImageLayout::eColorAttachmentOptimal, vk::ImageLayout::eShaderReadOnlyOptimal),
+    // The resolved depth is sampled by the selection mask; the swapchain image is drawn on again
+    // by the overlay pass. Resolves count as attachment writes in the color output stage.
+    const vk::ImageMemoryBarrier2 after[2] = {
+        imageBarrier(vk::Image(m_sceneDepth.image), depthAspect,
+            vk::PipelineStageFlagBits2::eLateFragmentTests | vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+            vk::AccessFlagBits2::eDepthStencilAttachmentWrite | vk::AccessFlagBits2::eColorAttachmentWrite,
+            vk::PipelineStageFlagBits2::eFragmentShader, vk::AccessFlagBits2::eShaderSampledRead,
+            vk::ImageLayout::eDepthAttachmentOptimal, vk::ImageLayout::eShaderReadOnlyOptimal),
+        imageBarrier(swapImage, colorAspect,
+            vk::PipelineStageFlagBits2::eColorAttachmentOutput, vk::AccessFlagBits2::eColorAttachmentWrite,
+            vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+            vk::AccessFlagBits2::eColorAttachmentRead | vk::AccessFlagBits2::eColorAttachmentWrite,
+            vk::ImageLayout::eColorAttachmentOptimal, vk::ImageLayout::eColorAttachmentOptimal),
     };
-    if (!depthPrepass) {
-        barriers.push_back(imageBarrier(vk::Image(m_sceneDepth.image), vk::ImageAspectFlagBits::eDepth,
-            Stage::eLateFragmentTests | Stage::eColorAttachmentOutput,
-            Access::eDepthStencilAttachmentWrite | Access::eColorAttachmentWrite,
-            Stage::eFragmentShader, Access::eShaderSampledRead,
-            vk::ImageLayout::eDepthAttachmentOptimal, vk::ImageLayout::eDepthReadOnlyOptimal));
-    }
-    pipelineBarriers(cmd, barriers);
+    pipelineBarriers(cmd, after);
 }
 
 void Renderer::recordMeshRuns(vk::CommandBuffer cmd, const std::vector<DrawRun>& runs)
@@ -1687,6 +1379,14 @@ void Renderer::recordMeshRuns(vk::CommandBuffer cmd, const std::vector<DrawRun>&
         }
         recordRun(cmd, run);
     }
+}
+
+void Renderer::recordFullscreen(vk::CommandBuffer cmd, const ShaderPair& shaders)
+{
+    bindShaderPair(cmd, shaders);
+    cmd.setVertexInputEXT(0, nullptr, 0, nullptr);
+    cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, m_fxLayout, 0, 1, &m_frameSets[m_currentFrame], 0, nullptr);
+    cmd.draw(3, 1, 0, 0);
 }
 
 void Renderer::recordPathLines(vk::CommandBuffer cmd, const FrameInput& input)
@@ -1739,7 +1439,9 @@ void Renderer::recordSelectionMask(vk::CommandBuffer cmd, const FrameInput& inpu
     cmd.beginRendering(renderInfo);
 
     const vk::Rect2D rect = sceneRect(input);
-    setDefaultDrawState(cmd, vk::SampleCountFlagBits::e1, viewportFor(rect), rect);
+    const vk::Viewport viewport{ float(rect.offset.x), float(rect.offset.y),
+        float(rect.extent.width), float(rect.extent.height), 0.f, 1.f };
+    setDefaultDrawState(cmd, vk::SampleCountFlagBits::e1, viewport, rect);
     cmd.setColorWriteMaskEXT(0, vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG);
     cmd.setColorBlendEnableEXT(0, VK_TRUE);
     vk::ColorBlendEquationEXT maxEquation{};
@@ -1755,8 +1457,6 @@ void Renderer::recordSelectionMask(vk::CommandBuffer cmd, const FrameInput& inpu
     cmd.setVertexInputEXT(1, &m_meshBinding, static_cast<uint32_t>(m_meshAttributes.size()), m_meshAttributes.data());
     cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, m_fxLayout, 0, 1, &m_frameSets[m_currentFrame], 0, nullptr);
     cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, m_fxLayout, 1, 1, &m_sceneDepthSet, 0, nullptr);
-    const std::array<std::byte, kFxPushConstantSize> noPush{};
-    cmd.pushConstants(m_fxLayout, vk::ShaderStageFlagBits::eFragment, 0, kFxPushConstantSize, noPush.data());
 
     const GPUModel* boundModel = nullptr;
     for (const DrawRun& run : m_highlightRuns) {
@@ -1775,61 +1475,37 @@ void Renderer::recordSelectionMask(vk::CommandBuffer cmd, const FrameInput& inpu
     pipelineBarriers(cmd, { &toSampled, 1 });
 }
 
-// Single-sample pass on the swapchain image: the tone-mapped scene (or its FXAA'd copy), the selection
-// outline, then ImGui.
-void Renderer::recordFinalPass(vk::CommandBuffer cmd, uint32_t imageIndex, const FrameInput& input, bool drawOutline)
+// Single-sample pass straight on the swapchain image: selection outline, then ImGui.
+void Renderer::recordOverlayPass(vk::CommandBuffer cmd, uint32_t imageIndex, const FrameInput& input, bool drawOutline)
 {
-    const vk::Rect2D rect = sceneRect(input);
-    const vk::Extent2D extent = m_swapchain.extent();
-    const CompositePushConstants composite = compositeConstants();
-    if (m_settings.fxaa) {
-        beginFxPass(cmd, m_ldrColor.view, rect, vk::AttachmentLoadOp::eDontCare);
-        drawFx(cmd, m_compositeShaders, { m_hdrSet, m_bloomSets[0] }, &composite, sizeof(composite));
-        cmd.endRendering();
-        colorTargetToSampled(cmd, m_ldrColor);
-    }
-
-    const vk::Image swapImage(m_swapchain.images()[imageIndex]);
-    const vk::ImageMemoryBarrier2 toAttachment = imageBarrier(swapImage, vk::ImageAspectFlagBits::eColor,
-        vk::PipelineStageFlagBits2::eColorAttachmentOutput, vk::AccessFlagBits2::eNone,
-        vk::PipelineStageFlagBits2::eColorAttachmentOutput,
-        vk::AccessFlagBits2::eColorAttachmentRead | vk::AccessFlagBits2::eColorAttachmentWrite,
-        vk::ImageLayout::eUndefined, vk::ImageLayout::eColorAttachmentOptimal);
-    pipelineBarriers(cmd, { &toAttachment, 1 });
-
-    // Outside the scene viewport the UI covers everything, so a plain clear is enough there.
     vk::RenderingAttachmentInfo colorAttachment{};
     colorAttachment.setImageView(m_swapchain.imageViews()[imageIndex])
         .setImageLayout(vk::ImageLayout::eColorAttachmentOptimal)
-        .setLoadOp(vk::AttachmentLoadOp::eClear)
-        .setStoreOp(vk::AttachmentStoreOp::eStore)
-        .setClearValue(vk::ClearValue(vk::ClearColorValue(std::array<float, 4>{ 0.1f, 0.1f, 0.1f, 1.0f })));
+        .setLoadOp(vk::AttachmentLoadOp::eLoad)
+        .setStoreOp(vk::AttachmentStoreOp::eStore);
     vk::RenderingInfo renderInfo{};
-    renderInfo.setRenderArea({ {0, 0}, extent })
+    renderInfo.setRenderArea({ {0, 0}, m_swapchain.extent() })
         .setLayerCount(1)
         .setColorAttachments(colorAttachment);
     cmd.beginRendering(renderInfo);
-    setDefaultDrawState(cmd, vk::SampleCountFlagBits::e1, viewportFor(rect), rect);
 
-    if (m_settings.fxaa) {
-        FxaaPushConstants push{};
-        push.texel = glm::vec4(1.0f / extent.width, 1.0f / extent.height, 0.0f, 0.0f);
-        push.uvClamp = glm::vec4((rect.offset.x + 0.5f) / extent.width, (rect.offset.y + 0.5f) / extent.height,
-            (rect.offset.x + rect.extent.width - 0.5f) / extent.width,
-            (rect.offset.y + rect.extent.height - 0.5f) / extent.height);
-        drawFx(cmd, m_fxaaShaders, { m_ldrSet }, &push, sizeof(push));
-    }
-    else {
-        drawFx(cmd, m_compositeShaders, { m_hdrSet, m_bloomSets[0] }, &composite, sizeof(composite));
-    }
+    const vk::Rect2D rect = sceneRect(input);
+    const vk::Viewport viewport{ float(rect.offset.x), float(rect.offset.y),
+        float(rect.extent.width), float(rect.extent.height), 0.f, 1.f };
+    setDefaultDrawState(cmd, vk::SampleCountFlagBits::e1, viewport, rect);
 
     if (drawOutline) {
         setAlphaBlending(cmd, true);
+        bindShaderPair(cmd, m_outlineShaders);
+        cmd.setVertexInputEXT(0, nullptr, 0, nullptr);
+        cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, m_fxLayout, 0, 1, &m_frameSets[m_currentFrame], 0, nullptr);
+        cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, m_fxLayout, 1, 1, &m_selectionMaskSet, 0, nullptr);
         OutlinePushConstants push{};
         push.color = glm::vec4(kOutlineColor, 1.0f);
         push.occludedAlpha = kOutlineOccludedAlpha;
         push.widthPixels = kOutlineWidthPixels;
-        drawFx(cmd, m_outlineShaders, { m_selectionMaskSet }, &push, sizeof(push));
+        cmd.pushConstants(m_fxLayout, vk::ShaderStageFlagBits::eFragment, 0, sizeof(push), &push);
+        cmd.draw(3, 1, 0, 0);
         setAlphaBlending(cmd, false);
     }
 
@@ -1837,7 +1513,8 @@ void Renderer::recordFinalPass(vk::CommandBuffer cmd, uint32_t imageIndex, const
         ImGui_ImplVulkan_RenderDrawData(input.imgui, cmd);
     cmd.endRendering();
 
-    const vk::ImageMemoryBarrier2 toPresent = imageBarrier(swapImage, vk::ImageAspectFlagBits::eColor,
+    const vk::ImageMemoryBarrier2 toPresent = imageBarrier(vk::Image(m_swapchain.images()[imageIndex]),
+        vk::ImageAspectFlagBits::eColor,
         vk::PipelineStageFlagBits2::eColorAttachmentOutput, vk::AccessFlagBits2::eColorAttachmentWrite,
         vk::PipelineStageFlagBits2::eBottomOfPipe, vk::AccessFlagBits2::eNone,
         vk::ImageLayout::eColorAttachmentOptimal, vk::ImageLayout::ePresentSrcKHR);

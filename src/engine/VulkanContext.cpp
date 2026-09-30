@@ -96,7 +96,6 @@ bool VulkanContext::createDevice()
     features12.bufferDeviceAddress = VK_TRUE;
     features12.scalarBlockLayout = VK_TRUE;
     features12.storageBuffer8BitAccess = VK_TRUE;
-    features12.separateDepthStencilLayouts = VK_TRUE;
 
     VkPhysicalDeviceFeatures coreFeatures{};
     coreFeatures.fragmentStoresAndAtomics = VK_TRUE;
@@ -106,8 +105,6 @@ bool VulkanContext::createDevice()
     coreFeatures.multiDrawIndirect = VK_TRUE;
     coreFeatures.drawIndirectFirstInstance = VK_TRUE;
     coreFeatures.samplerAnisotropy = VK_TRUE;
-    // Shadow casters in front of a cascade are flattened onto its near plane instead of being clipped.
-    coreFeatures.depthClamp = VK_TRUE;
 
     vkb::PhysicalDeviceSelector selector{ m_vkbInstance };
     auto physRet = selector

@@ -11,7 +11,6 @@ struct AppOptions {
     bool validation = false;
     int exitAfterFrames = -1; // -1 = run until the window is closed
     std::string scenePath;
-    std::string settingsPath; // empty = settings.json next to the executable
     bool showHelp = false;
 };
 

@@ -14,7 +14,7 @@
       "project": "CMakeLists.txt",
       "projectTarget": "engine.exe (src\\engine.exe)",
       "name": "Engine (Game)",
-      "args": [ "--game --scene C:\\Projects\\MirasEngine\\out\\build\\x64-release\\src\\parking1.scn" ]
+      "args": [ "--game" ]
     }
   ]
 }

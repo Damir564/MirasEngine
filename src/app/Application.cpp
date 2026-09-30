@@ -51,9 +51,7 @@ bool Application::init(const AppOptions& options)
         return false;
     // The renderer initializes the ImGui Vulkan backend, so the ImGui context must exist first.
     initImGui();
-    if (!options.settingsPath.empty())
-        m_settingsPath = options.settingsPath;
-    m_settings = loadGraphicsSettings(m_settingsPath);
+    m_settings = loadGraphicsSettings();
     if (!m_renderer.init(m_vulkan, m_window, m_settings))
         return false;
     m_appliedSettings = m_settings;
@@ -205,7 +203,7 @@ void Application::applyChangedSettings()
         return;
     m_settings = sanitizeGraphicsSettings(m_settings);
     m_renderer.applySettings(m_settings);
-    saveGraphicsSettings(m_settings, m_settingsPath);
+    saveGraphicsSettings(m_settings);
     m_appliedSettings = m_settings;
 }
 

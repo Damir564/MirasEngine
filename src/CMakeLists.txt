@@ -16,10 +16,6 @@
   engine/ShaderUtils.cpp
   engine/Renderer.h
   engine/Renderer.cpp
-  engine/RendererEffects.cpp
-  engine/RenderUtils.h
-  engine/Atmosphere.h
-  engine/Atmosphere.cpp
   engine/Buffers.h
   engine/Log.h
   engine/Vertex.h
