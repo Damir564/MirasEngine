@@ -26,6 +26,11 @@ endif()
 
 find_package(Vulkan REQUIRED)
 
+# Ships a Vulkan loader, the Khronos emulation layers and a CPU driver in vulkan/ next to engine.exe, so the
+# engine also runs on GPUs without Vulkan 1.3 / VK_EXT_shader_object and on PCs without a Vulkan driver.
+# The x64-release preset turns it on.
+option(MIRAS_BUNDLE_VULKAN_RUNTIME "Download and ship the fallback Vulkan runtime" OFF)
+
 # Smaller release binaries: whole-program optimization (dependencies included) and per-variable
 # COMDATs so the linker can drop unreferenced data as well as unreferenced functions.
 set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)
@@ -88,5 +93,7 @@ add_custom_target(Shaders ALL DEPENDS ${SPIRV_FILES})
 
 # 5️⃣ Example: Link shaders to your executable target
 add_dependencies(engine Shaders)
+
+include(cmake/Packaging.cmake)
 
 

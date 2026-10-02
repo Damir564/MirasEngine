@@ -34,7 +34,8 @@ int Application::run(const AppOptions& options)
         // Release builds have no console showing the logged reason. Automated runs must not block on a dialog.
         if (options.exitAfterFrames < 0)
             SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "MirasEngine",
-                "Failed to start. A GPU and driver with Vulkan 1.3 and VK_EXT_shader_object are required.", nullptr);
+                "Failed to start: neither the graphics driver nor the bundled software renderer could initialize Vulkan.\n"
+                "Make sure the \"vulkan\" folder next to engine.exe is complete, or update the graphics driver.", nullptr);
 #endif
         return -1;
     }
@@ -47,7 +48,7 @@ bool Application::init(const AppOptions& options)
 {
     if (!initWindow())
         return false;
-    if (!m_vulkan.init(m_window, options.validation))
+    if (!m_vulkan.init(m_window, options.validation, options.firstVulkanBackend))
         return false;
     // The renderer initializes the ImGui Vulkan backend, so the ImGui context must exist first.
     initImGui();
@@ -71,6 +72,9 @@ bool Application::initWindow()
         return false;
     }
     m_sdlInitialized = true;
+    // Before the window: SDL uses whichever Vulkan loader is already loaded instead of loading its own.
+    if (!m_vulkan.loadLibrary())
+        return false;
 
     // The active mode sets the real title.
     m_window = SDL_CreateWindow("MirasEngine", kInitialWindowWidth, kInitialWindowHeight,

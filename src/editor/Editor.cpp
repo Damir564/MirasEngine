@@ -12,6 +12,7 @@
 
 Editor::Editor(const EngineContext& engine)
     : m_window(engine.window)
+    , m_vulkan(engine.vulkan)
     , m_renderer(engine.renderer)
     , m_models(engine.models)
     , m_scenes(engine.scenes)

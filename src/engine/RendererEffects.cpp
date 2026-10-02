@@ -58,7 +58,7 @@ void Renderer::beginFxPass(vk::CommandBuffer cmd, vk::ImageView target, const vk
         .setStoreOp(vk::AttachmentStoreOp::eStore);
     vk::RenderingInfo renderInfo{};
     renderInfo.setRenderArea(area).setLayerCount(1).setColorAttachments(attachment);
-    cmd.beginRendering(renderInfo);
+    beginRendering(cmd, renderInfo);
     setDefaultDrawState(cmd, vk::SampleCountFlagBits::e1, viewportFor(area), area);
 }
 
@@ -123,19 +123,13 @@ void Renderer::recordSkyPasses(vk::CommandBuffer cmd)
     for (uint32_t mip = 1; mip < kSkyLutMips; ++mip) {
         const vk::Extent2D src = mipExtent(kSkyLutExtent, mip - 1);
         const vk::Extent2D dst = mipExtent(kSkyLutExtent, mip);
-        vk::ImageBlit2 blit{};
-        blit.srcSubresource = { color, mip - 1, 0, 1 };
+        // vkCmdBlitImage rather than vkCmdBlitImage2, which would need VK_KHR_copy_commands2 on 1.2 devices.
+        vk::ImageBlit blit{};
+        blit.srcSubresource = vk::ImageSubresourceLayers{ color, mip - 1, 0, 1 };
         blit.srcOffsets[1] = vk::Offset3D(static_cast<int32_t>(src.width), static_cast<int32_t>(src.height), 1);
-        blit.dstSubresource = { color, mip, 0, 1 };
+        blit.dstSubresource = vk::ImageSubresourceLayers{ color, mip, 0, 1 };
         blit.dstOffsets[1] = vk::Offset3D(static_cast<int32_t>(dst.width), static_cast<int32_t>(dst.height), 1);
-        vk::BlitImageInfo2 blitInfo{};
-        blitInfo.setSrcImage(lut)
-            .setSrcImageLayout(Layout::eTransferSrcOptimal)
-            .setDstImage(lut)
-            .setDstImageLayout(Layout::eTransferDstOptimal)
-            .setRegions(blit)
-            .setFilter(vk::Filter::eLinear);
-        cmd.blitImage2(blitInfo);
+        cmd.blitImage(lut, Layout::eTransferSrcOptimal, lut, Layout::eTransferDstOptimal, blit, vk::Filter::eLinear);
 
         const vk::ImageMemoryBarrier2 toSource = imageBarrier(lut, color,
             Stage::eBlit, Access::eTransferWrite, Stage::eBlit, Access::eTransferRead,

@@ -112,6 +112,30 @@ FetchContent_Declare(webifc_spdlog GIT_REPOSITORY https://github.com/gabime/spdl
 FetchContent_Declare(webifc_stduuid GIT_REPOSITORY https://github.com/mariusbancila/stduuid GIT_TAG 3afe7193facd5d674de709fccc44d5055e144d7a SOURCE_SUBDIR none)
 FetchContent_Declare(webifc_unordered_dense GIT_REPOSITORY https://github.com/martinus/unordered_dense GIT_TAG 1c8636e810d7e4a485d17bb9cbd6dccb5fe4e284 SOURCE_SUBDIR none)
 
+# Prebuilt Vulkan runtime shipped next to engine.exe (see cmake/Packaging.cmake): the loader, for PCs
+# without a Vulkan driver, and Mesa's lavapipe, a Vulkan 1.4 driver that renders on the CPU. Only
+# downloaded and extracted; SOURCE_SUBDIR none keeps FetchContent from looking for a CMake project.
+if (MIRAS_BUNDLE_VULKAN_RUNTIME)
+    FetchContent_Declare(vulkan_runtime
+        URL https://sdk.lunarg.com/sdk/download/1.4.335.0/windows/VulkanRT-X64-1.4.335.0-Components.zip
+        URL_HASH SHA256=4f856da356ffb1c16fbfc792cae70f6e6873680e6b62bc132b9d7131cbc97fe2
+        DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+        SOURCE_SUBDIR none)
+    # Not 26.2.x: its lavapipe corrupts the heap in vkDestroySwapchainKHR on Windows (even vkcube crashes).
+    FetchContent_Declare(mesa_dist
+        URL https://github.com/pal1000/mesa-dist-win/releases/download/26.1.8/mesa3d-26.1.8-release-msvc.7z
+        URL_HASH SHA256=4c6d32e653e0ff9ad07796e40c0bcfabf2764d849e3ce4f3b1590112c87e42f9
+        DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+        SOURCE_SUBDIR none)
+    # The binary release has no license file; this is the MIT license that covers lavapipe.
+    FetchContent_Declare(mesa_license
+        URL https://gitlab.freedesktop.org/mesa/mesa/-/raw/mesa-26.1.8/licenses/MIT
+        URL_HASH SHA256=323c587d0ccf10e376f8bf9a7f31fb4ca6078105194b42e0b1e0ee2bc9bde71f
+        DOWNLOAD_NO_EXTRACT TRUE
+        SOURCE_SUBDIR none)
+    FetchContent_MakeAvailable(vulkan_runtime mesa_dist mesa_license)
+endif()
+
 set(FASTGLTF_COMPILE_AS_CPP20 ON CACHE BOOL "" FORCE)
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 

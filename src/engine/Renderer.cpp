@@ -139,8 +139,9 @@ void Renderer::queryCapabilities()
     for (int samples : { 2, 4, 8 })
         if (counts & toSampleCount(samples))
             m_capabilities.maxMsaaSamples = samples;
-    m_capabilities.maxAnisotropy = limits.maxSamplerAnisotropy;
-    m_maxDrawIndirectCount = limits.maxDrawIndirectCount;
+    const OptionalDeviceFeatures& features = m_context->features();
+    m_capabilities.maxAnisotropy = features.samplerAnisotropy ? limits.maxSamplerAnisotropy : 1.0f;
+    m_maxDrawIndirectCount = features.multiDrawIndirect ? limits.maxDrawIndirectCount : 1;
 }
 
 vk::SampleCountFlagBits Renderer::effectiveSampleCount() const
@@ -352,7 +353,7 @@ bool Renderer::createDescriptors()
     samplerInfo.addressModeU = vk::SamplerAddressMode::eRepeat;
     samplerInfo.addressModeV = vk::SamplerAddressMode::eRepeat;
     samplerInfo.addressModeW = vk::SamplerAddressMode::eRepeat;
-    samplerInfo.anisotropyEnable = VK_TRUE;
+    samplerInfo.anisotropyEnable = m_capabilities.maxAnisotropy > 1.0f ? VK_TRUE : VK_FALSE;
     samplerInfo.maxAnisotropy = std::min(16.0f, m_capabilities.maxAnisotropy);
     samplerInfo.borderColor = vk::BorderColor::eIntOpaqueBlack;
     samplerInfo.unnormalizedCoordinates = VK_FALSE;
@@ -628,7 +629,7 @@ bool Renderer::initImGuiBackend()
 
     const VkInstance instance = m_context->instance();
     ImGui_ImplVulkan_InitInfo initInfo = {};
-    initInfo.ApiVersion = VK_API_VERSION_1_3;
+    initInfo.ApiVersion = m_context->apiVersion();
     initInfo.Instance = instance;
     initInfo.PhysicalDevice = m_context->physicalDevice();
     initInfo.Device = m_device;
@@ -644,9 +645,14 @@ bool Renderer::initImGuiBackend()
     initInfo.PipelineInfoMain.PipelineRenderingCreateInfo = renderingInfo;
 
     // Built with IMGUI_IMPL_VULKAN_NO_PROTOTYPES, so the backend loads its entry points through volk's loader.
-    const bool loaded = ImGui_ImplVulkan_LoadFunctions(VK_API_VERSION_1_3, [](const char* functionName, void* userData) {
-        return vkGetInstanceProcAddr(static_cast<VkInstance>(userData), functionName);
-    }, instance);
+    // ImGui tries the core dynamic rendering commands before the KHR ones. On a 1.2 device the instance-level
+    // vkCmdBeginRendering exists but leads nowhere; the device-level lookup fails instead, so ImGui falls back.
+    const bool loaded = ImGui_ImplVulkan_LoadFunctions(m_context->apiVersion(), [](const char* functionName, void* userData) {
+        const auto* context = static_cast<const VulkanContext*>(userData);
+        if (std::strcmp(functionName, "vkCmdBeginRendering") == 0 || std::strcmp(functionName, "vkCmdEndRendering") == 0)
+            return vkGetDeviceProcAddr(context->device(), functionName);
+        return vkGetInstanceProcAddr(context->instance(), functionName);
+    }, m_context);
     if (!loaded || !ImGui_ImplVulkan_Init(&initInfo)) {
         LOG_ERROR("Failed to initialize the ImGui Vulkan backend\n");
         return false;
@@ -1432,7 +1438,7 @@ void Renderer::recordShadowPasses(vk::CommandBuffer cmd, const ModelManager& mod
         vk::RenderingInfo renderInfo{};
         renderInfo.setRenderArea(area).setLayerCount(1).setPDepthAttachment(&depthAttachment);
 
-        cmd.beginRendering(renderInfo);
+        beginRendering(cmd, renderInfo);
         if (!m_shadowRuns[c].empty()) {
             bindShaderPair(cmd, m_shadowShaders);
             setDefaultDrawState(cmd, vk::SampleCountFlagBits::e1, viewportFor(area), area);
@@ -1442,7 +1448,8 @@ void Renderer::recordShadowPasses(vk::CommandBuffer cmd, const ModelManager& mod
             cmd.setDepthWriteEnable(VK_TRUE);
             cmd.setDepthBiasEnable(VK_TRUE);
             cmd.setDepthBias(1.25f, 0.0f, 1.75f);
-            cmd.setDepthClampEnableEXT(VK_TRUE);
+            // Casters in front of the cascade are flattened onto its near plane instead of being clipped.
+            cmd.setDepthClampEnableEXT(m_context->features().depthClamp ? VK_TRUE : VK_FALSE);
             const ShadowPushConstants push{ c, {} };
             cmd.pushConstants(m_shadowLayout, vk::ShaderStageFlagBits::eVertex, 0, sizeof(push), &push);
             recordDepthRuns(cmd, m_shadowLayout, m_shadowRuns[c], models);
@@ -1534,7 +1541,7 @@ void Renderer::recordDepthPrepass(vk::CommandBuffer cmd, const FrameInput& input
     vk::RenderingInfo renderInfo{};
     renderInfo.setRenderArea(rect).setLayerCount(1).setPDepthAttachment(&depthAttachment);
 
-    cmd.beginRendering(renderInfo);
+    beginRendering(cmd, renderInfo);
     if (!m_opaqueRuns.empty()) {
         bindShaderPair(cmd, m_prepassShaders);
         setDefaultDrawState(cmd, m_samples, viewportFor(rect), rect);
@@ -1617,7 +1624,7 @@ void Renderer::recordScenePass(vk::CommandBuffer cmd, const FrameInput& input, b
         .setLayerCount(1)
         .setColorAttachments(colorAttachment)
         .setPDepthAttachment(&depthAttachment);
-    cmd.beginRendering(renderInfo);
+    beginRendering(cmd, renderInfo);
 
     setDefaultDrawState(cmd, m_samples, viewportFor(rect), rect);
     cmd.setDepthTestEnable(VK_TRUE);
@@ -1696,7 +1703,7 @@ void Renderer::recordPathLines(vk::CommandBuffer cmd, const FrameInput& input)
 
     bindShaderPair(cmd, m_gizmoShaders);
     cmd.setPrimitiveTopology(vk::PrimitiveTopology::eLineList);
-    cmd.setLineWidth(2.0f);
+    cmd.setLineWidth(m_context->features().wideLines ? 2.0f : 1.0f);
     cmd.setDepthTestEnable(VK_TRUE); // the path is hidden behind objects
     cmd.setDepthWriteEnable(VK_FALSE);
     cmd.setVertexInputEXT(1, &kLineBinding, static_cast<uint32_t>(kLineAttributes.size()), kLineAttributes.data());
@@ -1736,7 +1743,7 @@ void Renderer::recordSelectionMask(vk::CommandBuffer cmd, const FrameInput& inpu
     renderInfo.setRenderArea({ {0, 0}, m_swapchain.extent() })
         .setLayerCount(1)
         .setColorAttachments(maskAttachment);
-    cmd.beginRendering(renderInfo);
+    beginRendering(cmd, renderInfo);
 
     const vk::Rect2D rect = sceneRect(input);
     setDefaultDrawState(cmd, vk::SampleCountFlagBits::e1, viewportFor(rect), rect);
@@ -1808,7 +1815,7 @@ void Renderer::recordFinalPass(vk::CommandBuffer cmd, uint32_t imageIndex, const
     renderInfo.setRenderArea({ {0, 0}, extent })
         .setLayerCount(1)
         .setColorAttachments(colorAttachment);
-    cmd.beginRendering(renderInfo);
+    beginRendering(cmd, renderInfo);
     setDefaultDrawState(cmd, vk::SampleCountFlagBits::e1, viewportFor(rect), rect);
 
     if (m_settings.fxaa) {

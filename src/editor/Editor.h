@@ -225,6 +225,7 @@ private:
     void drawStatisticsPanel();
 
     SDL_Window* m_window;
+    const VulkanContext& m_vulkan;
     Renderer& m_renderer;
     ModelManager& m_models;
     SceneManager& m_scenes;

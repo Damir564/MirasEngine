@@ -28,6 +28,18 @@ void parseFrameCount(std::string_view value, AppOptions& options)
         options.exitAfterFrames = frames;
 }
 
+void parseVulkanBackend(std::string_view value, AppOptions& options)
+{
+    if (value == "auto")
+        options.firstVulkanBackend = VulkanBackend::Native;
+    else if (value == "emulated")
+        options.firstVulkanBackend = VulkanBackend::Emulated;
+    else if (value == "software")
+        options.firstVulkanBackend = VulkanBackend::Software;
+    else
+        LOG_ERROR("Warning: invalid --vulkan value '" << value << "', ignoring\n");
+}
+
 } // namespace
 
 AppOptions parseAppOptions(int argc, char** argv)
@@ -43,6 +55,10 @@ AppOptions parseAppOptions(int argc, char** argv)
         }
         else if (arg == "--validation") {
             options.validation = true;
+        }
+        else if (arg == "--vulkan") {
+            if (const char* value = takeValue(argc, argv, i, arg, "auto, emulated or software"))
+                parseVulkanBackend(value, options);
         }
         else if (arg == "--exit-after-frames") {
             if (const char* value = takeValue(argc, argv, i, arg, "a frame count"))
@@ -76,6 +92,8 @@ void showUsage(const char* executableName)
         "  --scene <path>           Editor: open this .scn at startup; game: use it as the level\n"
         "  --settings <path>        Load and save graphics settings here instead of settings.json\n"
         "  --validation             Enable the Vulkan validation layers\n"
+        "  --vulkan <mode>          auto (default): the GPU driver, then emulation layers, then the CPU\n"
+        "                           emulated: force the emulation layers; software: render on the CPU\n"
         "  --exit-after-frames <N>  Quit after N rendered frames (for automated runs)\n"
         "  --help, -h               Show this help and exit\n";
 #ifdef NDEBUG

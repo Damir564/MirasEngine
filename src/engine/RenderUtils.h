@@ -46,6 +46,18 @@ inline void pipelineBarriers(vk::CommandBuffer cmd, std::span<const vk::ImageMem
     cmd.pipelineBarrier2(info);
 }
 
+// Passes without a depth or stencil attachment still name one, with a null view: the shader object emulation
+// layer only updates the attachment formats it builds pipelines for from the attachments a pass names.
+inline void beginRendering(vk::CommandBuffer cmd, vk::RenderingInfo info)
+{
+    static const vk::RenderingAttachmentInfo kNoAttachment{};
+    if (!info.pDepthAttachment)
+        info.pDepthAttachment = &kNoAttachment;
+    if (!info.pStencilAttachment)
+        info.pStencilAttachment = &kNoAttachment;
+    cmd.beginRendering(info);
+}
+
 inline vk::Viewport viewportFor(const vk::Rect2D& rect)
 {
     return { float(rect.offset.x), float(rect.offset.y), float(rect.extent.width), float(rect.extent.height), 0.f, 1.f };
