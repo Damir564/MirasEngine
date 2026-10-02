@@ -1,7 +1,6 @@
 #pragma once
 
 #include <string>
-#include <string_view>
 #include <vector>
 #include <fstream>
 #include <glm/glm.hpp>
@@ -186,11 +185,6 @@ public:
 
             scene.models[i].name.resize(entry.nameLength);
             file.read(scene.models[i].name.data(), entry.nameLength);
-
-            // Older scenes marked web-ifc imports with this prefix; web-ifc is now the only IFC importer.
-            constexpr std::string_view kLegacyIfcPrefix = "ifcdirect:";
-            if (scene.models[i].path.starts_with(kLegacyIfcPrefix))
-                scene.models[i].path.erase(0, kLegacyIfcPrefix.size());
         }
 
         // Read instances

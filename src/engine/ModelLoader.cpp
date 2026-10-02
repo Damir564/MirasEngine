@@ -1,6 +1,5 @@
 #include "ModelLoader.h"
 #include "ModelCache.h"
-#include "IfcDirectLoader.h"
 #include <algorithm>
 #include <atomic>
 #include <cctype>
@@ -454,14 +453,6 @@ Mesh loadWithFastGltf(const std::string& path) {
     return result;
 }
 
-Mesh loadFromSource(const std::string& path, const std::string& ext) {
-    if (ext == ".ifc")
-        return loadIfcDirect(path);
-    if (ext == ".gltf" || ext == ".glb")
-        return loadWithFastGltf(path);
-    throw std::runtime_error("Unsupported model format: " + path);
-}
-
 } // namespace
 
 bool isBuiltinModelPath(const std::string& path) {
@@ -530,19 +521,21 @@ Mesh loadModelSmart(const std::string& path) {
     const std::u8string u8Ext = std::filesystem::path(path).extension().u8string();
     std::string ext(u8Ext.begin(), u8Ext.end());
     std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+    // Checked before the cache so a leftover cache of a no longer supported format isn't loaded.
+    if (ext != ".gltf" && ext != ".glb")
+        throw std::runtime_error("Unsupported model format: " + path);
 
     if (ModelCache::isValid(path, cachePath)) {
         LOG_INFO("[CACHE] Found valid cache for: " << path << ". Loading... ");
         Mesh cached;
-        // IFC metadata lives in the cache too; an IFC cache without it predates that and is re-imported.
-        if (ModelCache::load(cachePath, cached) && (ext != ".ifc" || cached.ifcScene)) {
+        if (ModelCache::load(cachePath, cached)) {
             LOG_INFO("OK\n");
             return cached;
         }
         LOG_INFO("Failed (corrupt or outdated), re-importing\n");
     }
 
-    Mesh result = loadFromSource(path, ext);
+    Mesh result = loadWithFastGltf(path);
     computeAllSubmeshBounds(result);
     ModelCache::save(cachePath, result);
     return result;

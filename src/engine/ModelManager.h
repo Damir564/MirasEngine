@@ -12,7 +12,6 @@
 #include <glm/ext/matrix_transform.hpp>
 #include "ModelTypes.h"
 #include "Buffers.h"
-#include "IfcScene.h"
 
 class TextureImage;
 
@@ -40,8 +39,6 @@ struct GPUModel {
     glm::vec3 boundsMin{ 0.0f };
     glm::vec3 boundsMax{ 0.0f };
 
-    std::optional<IfcScene> ifcScene;
-
     bool isValid() const { return vertexBuffer != nullptr && indexBuffer != nullptr; }
 };
 
@@ -51,7 +48,6 @@ struct ModelInstance {
     glm::vec3 position{ 0.0f };
     glm::vec3 rotation{ 0.0f };
     glm::vec3 scale{ 1.0f };
-    std::optional<IfcScene> ifcScene;
     bool visible = true;
     // Multiplied into every submesh's base color.
     glm::vec3 color{ 1.0f };

@@ -58,7 +58,6 @@ foreach(scene IN LISTS MIRAS_SCENES)
         math(EXPR offset "${offset} + ${pathLength} + ${nameLength}")
         math(EXPR index "${index} + 1")
 
-        string(REGEX REPLACE "^ifcdirect:" "" path "${path}")
         if (path MATCHES "^builtin:" OR path IN_LIST installedModels)
             continue()
         endif()

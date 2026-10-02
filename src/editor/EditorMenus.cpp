@@ -66,7 +66,6 @@ void Editor::drawEditMenu()
     if (ImGui::MenuItem("Deselect", "Esc", false, selection)) deselectAll();
     ImGui::Separator();
     if (ImGui::MenuItem("Focus Selected", "F", false, selection)) focusOnInstance(m_gizmo.selectedInstance);
-    if (ImGui::MenuItem("Add Annotation...", "M", false, m_ifcSelectionKind == IfcSelectionKind::Element)) requestAnnotation();
     ImGui::Separator();
     if (ImGui::MenuItem("Select Tool", "Q", m_tool == GizmoMode::None)) m_tool = GizmoMode::None;
     if (ImGui::MenuItem("Move Tool", "1", m_tool == GizmoMode::Translate)) m_tool = GizmoMode::Translate;
@@ -90,10 +89,8 @@ void Editor::drawViewMenu()
     ImGui::MenuItem("Hierarchy", nullptr, &m_showHierarchy);
     ImGui::MenuItem("Inspector", nullptr, &m_showInspector);
     ImGui::MenuItem("Camera Animation", nullptr, &m_showAnimationPanel);
-    ImGui::MenuItem("Annotations", nullptr, &m_showAnnotationsPanel);
     ImGui::MenuItem("Statistics", nullptr, &m_showStatisticsPanel);
     ImGui::Separator();
-    ImGui::MenuItem("Show Annotations in Viewport", nullptr, &m_showAnnotations);
     ImGui::MenuItem("Show Camera Path", nullptr, &m_showCameraPath);
     ImGui::MenuItem("Grid", nullptr, &m_showGrid);
     ImGui::Separator();
@@ -156,8 +153,6 @@ void Editor::drawToolbar()
         ImGui::SetItemTooltip("Show the ground grid (View > Grid)");
 
         ImGui::SameLine(0, 16);
-        ImGui::Checkbox("Annotations", &m_showAnnotations);
-        ImGui::SameLine();
         ImGui::Checkbox("Camera path", &m_showCameraPath);
 
         const float flyWidth = ImGui::CalcTextSize("Fly Mode").x + ImGui::GetStyle().FramePadding.x * 2;
@@ -243,10 +238,9 @@ void Editor::buildDefaultLayout(ImGuiID dockspaceId)
     ImGui::DockBuilderDockWindow("Hierarchy", left);
     ImGui::DockBuilderDockWindow("Inspector", right);
     ImGui::DockBuilderDockWindow("Camera Animation", bottom);
-    ImGui::DockBuilderDockWindow("Annotations", bottom);
     ImGui::DockBuilderDockWindow("Statistics", bottom);
     ImGui::DockBuilderFinish(dockspaceId);
-    m_showHierarchy = m_showInspector = m_showAnimationPanel = m_showAnnotationsPanel = m_showStatisticsPanel = true;
+    m_showHierarchy = m_showInspector = m_showAnimationPanel = m_showStatisticsPanel = true;
 }
 
 void Editor::drawDockSpace()
@@ -311,7 +305,7 @@ void Editor::drawControlsPopup()
         ImGui::TableSetupColumn("Input", ImGuiTableColumnFlags_WidthFixed, 170.0f);
         ImGui::TableSetupColumn("Action", ImGuiTableColumnFlags_WidthFixed, 300.0f);
         static constexpr const char* kRows[][2] = {
-            { "Left click", "Select object / IFC element" },
+            { "Left click", "Select object" },
             { "Right mouse + drag", "Look around" },
             { "W A S D", "Move camera" },
             { "Shift (hold)", "Move 4x faster" },
@@ -320,7 +314,6 @@ void Editor::drawControlsPopup()
             { "Ctrl (while dragging)", "Snap move to grid / rotate and scale to steps" },
             { "Click view gizmo axis", "Look along that axis (top-right of viewport)" },
             { "F2", "Rename selected object" },
-            { "M", "Annotate selected IFC element" },
             { "Ctrl+D", "Duplicate selected object" },
             { "Delete", "Delete selected object" },
             { "Esc", "Deselect / leave fly mode" },
@@ -350,7 +343,7 @@ void Editor::drawAboutPopup()
     if (!ImGui::BeginPopupModal("About MirasEngine", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
         return;
     ImGui::Text("MirasEngine");
-    ImGui::TextDisabled("Vulkan 1.3 renderer and IFC/BIM viewer");
+    ImGui::TextDisabled("Vulkan 1.3 renderer and glTF viewer");
     ImGui::Separator();
     ImGui::Text("Dear ImGui %s", ImGui::GetVersion());
     ImGui::Spacing();
@@ -390,7 +383,7 @@ void Editor::saveSceneAsDialog()
 void Editor::importModelDialog()
 {
     openFileDialog("BrowseModelDlg", "Import 3D Model",
-        "3D Models{.gltf,.glb,.ifc},.gltf,.glb,.ifc", kModelsRoot, nullptr, false);
+        "3D Models{.gltf,.glb},.gltf,.glb", kModelsRoot, nullptr, false);
 }
 
 void Editor::drawFileDialogs()

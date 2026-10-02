@@ -58,9 +58,6 @@ void Editor::handleKeyDown(const SDL_KeyboardEvent& key)
     }
 
     dropStaleGizmoSelection();
-
-    if (!m_flyMode && key.scancode == SDL_SCANCODE_M && !m_selectedIfcGuid.empty())
-        requestAnnotation();
 }
 
 void Editor::dropStaleGizmoSelection()
@@ -112,7 +109,6 @@ void Editor::handleViewportClick(float mouseX, float mouseY)
         selectPickedSubmesh(hit);
     }
     else {
-        clearIfcSelection();
         m_gizmo.deselect();
     }
 }
@@ -178,40 +174,9 @@ bool Editor::tryBeginGizmoDrag(float mouseX, float mouseY, const glm::mat4& view
 
 void Editor::selectPickedSubmesh(const SubmeshHitResult& hit)
 {
-    clearIfcSelection();
     m_gizmo.select(hit.instanceIndex);
-
-    auto& instance = m_models.getInstances()[hit.instanceIndex];
-    if (!instance.ifcScene.has_value()) {
-        LOG_INFO("[PICK] Instance " << hit.instanceIndex << " | Submesh " << hit.submeshIndex
-            << " | t: " << hit.t << "\n");
-        return;
-    }
-
-    IfcScene& scene = instance.ifcScene.value();
-    for (auto& [guid, element] : scene.elements) element.selected = false;
-    for (auto& [guid, node] : scene.spatial) node.selected = false;
-
-    if (hit.ifcGuid.empty()) {
-        LOG_INFO("[PICK] IFC model hit but no GUID for submesh " << hit.submeshIndex << "\n");
-        return;
-    }
-    auto it = scene.elements.find(hit.ifcGuid);
-    if (it == scene.elements.end())
-        return;
-
-    it->second.selected = true;
-    m_selectedIfcGuid = hit.ifcGuid;
-    m_ifcSelectionKind = IfcSelectionKind::Element;
-    m_ifcSelectionInstance = hit.instanceIndex;
-    m_selectionChangedFromViewport = true;
-    LOG_INFO("[PICK] IFC Hit"
-        << " | Type: " << it->second.type
-        << " | Name: " << it->second.name
-        << " | GUID: " << hit.ifcGuid
-        << " | Submesh: " << hit.submeshIndex
-        << " | t: " << hit.t
-        << "\n");
+    LOG_INFO("[PICK] Instance " << hit.instanceIndex << " | Submesh " << hit.submeshIndex
+        << " | t: " << hit.t << "\n");
 }
 
 void Editor::dragGizmo(float mouseX, float mouseY)
@@ -334,9 +299,6 @@ void Editor::drawUi()
     drawOrientationGizmo();
     if (m_showHierarchy) drawHierarchy();
     if (m_showInspector) drawInspector();
-    drawAnnotationPopup();
-    if (m_showAnnotations && !m_annotations.empty()) drawViewportAnnotations();
-    if (m_showAnnotationsPanel) drawAnnotationsPanel();
     if (m_showStatisticsPanel) drawStatisticsPanel();
     if (m_showAnimationPanel) drawAnimationPanel();
     if (m_showGraphicsSettings) drawGraphicsSettingsWindow();
@@ -361,41 +323,12 @@ glm::mat4 Editor::sceneProjection() const
     return getProjection(m_sceneView.width, m_sceneView.height, kCameraNearPlane, m_settings.viewDistance);
 }
 
-// IFC element -> its submesh; IFC spatial node -> every element below it; anything else -> the whole instance.
 void Editor::fillHighlight(SelectionHighlight& highlight) const
 {
     highlight = {};
     if (m_flyMode || !hasSelection())
         return;
     highlight.instance = m_gizmo.selectedInstance;
-
-    const ModelInstance& instance = m_models.getInstances()[m_gizmo.selectedInstance];
-    if (m_ifcSelectionKind == IfcSelectionKind::None || m_ifcSelectionInstance != m_gizmo.selectedInstance ||
-        !instance.ifcScene)
-        return;
-
-    const IfcScene& scene = *instance.ifcScene;
-    highlight.wholeInstance = false;
-    if (m_ifcSelectionKind == IfcSelectionKind::Element) {
-        for (size_t si : scene.submeshesOf(m_selectedIfcGuid))
-            highlight.submeshes.push_back(static_cast<uint32_t>(si));
-    }
-    else {
-        collectSpatialSubmeshes(scene, m_selectedIfcGuid, highlight.submeshes);
-    }
-}
-
-void Editor::collectSpatialSubmeshes(const IfcScene& scene, const std::string& spatialGuid, std::vector<uint32_t>& out)
-{
-    const auto it = scene.spatial.find(spatialGuid);
-    if (it == scene.spatial.end())
-        return;
-    for (const std::string& elementGuid : it->second.elementGuids) {
-        for (size_t si : scene.submeshesOf(elementGuid))
-            out.push_back(static_cast<uint32_t>(si));
-    }
-    for (const std::string& childGuid : it->second.childSpatialGuids)
-        collectSpatialSubmeshes(scene, childGuid, out);
 }
 
 void Editor::handleShortcuts()
@@ -451,32 +384,6 @@ std::string Editor::formatCount(size_t value)
     return out;
 }
 
-bool Editor::ifcElementWorldBounds(const GPUModel* model, const IfcScene& scene, const std::string& guid,
-    const ModelInstance& instance, glm::vec3& center, float& radius)
-{
-    if (!model)
-        return false;
-    glm::vec3 boundsMin(std::numeric_limits<float>::max());
-    glm::vec3 boundsMax(std::numeric_limits<float>::lowest());
-    for (size_t si : scene.submeshesOf(guid)) {
-        if (si >= model->submeshes.size())
-            continue;
-        const auto& sub = model->submeshes[si];
-        // Inverted bounds mean the loader never set them.
-        if (sub.boundsMin.x > sub.boundsMax.x)
-            continue;
-        boundsMin = glm::min(boundsMin, sub.boundsMin);
-        boundsMax = glm::max(boundsMax, sub.boundsMax);
-    }
-    if (boundsMin.x > boundsMax.x)
-        return false;
-    const glm::vec3 localCenter = (boundsMin + boundsMax) * 0.5f;
-    center = glm::vec3(instance.getTransformMatrix() * glm::vec4(localCenter, 1.0f));
-    const float maxScale = std::max({ instance.scale.x, instance.scale.y, instance.scale.z });
-    radius = glm::length(boundsMax - boundsMin) * 0.5f * maxScale;
-    return true;
-}
-
 // ---------------------------------------------------------------------------------------------
 // Selection
 // ---------------------------------------------------------------------------------------------
@@ -490,108 +397,16 @@ void Editor::validateSelection()
 {
     if (!validInstance(m_gizmo.selectedInstance) && m_gizmo.selectedInstance != -1)
         m_gizmo.deselect();
-    if (m_ifcSelectionInstance != -1 &&
-        (!validInstance(m_ifcSelectionInstance) || !m_models.getInstances()[m_ifcSelectionInstance].ifcScene)) {
-        m_ifcSelectionInstance = -1;
-        m_ifcSelectionKind = IfcSelectionKind::None;
-        m_selectedIfcGuid.clear();
-    }
-}
-
-// Drops the current IFC element/spatial selection (flag, inspector target and outline).
-void Editor::clearIfcSelection()
-{
-    auto& instances = m_models.getInstances();
-    if (validInstance(m_ifcSelectionInstance) && instances[m_ifcSelectionInstance].ifcScene) {
-        IfcScene& scene = *instances[m_ifcSelectionInstance].ifcScene;
-        if (m_ifcSelectionKind == IfcSelectionKind::Element) {
-            auto it = scene.elements.find(m_selectedIfcGuid);
-            if (it != scene.elements.end()) it->second.selected = false;
-        }
-        else if (m_ifcSelectionKind == IfcSelectionKind::Spatial) {
-            auto it = scene.spatial.find(m_selectedIfcGuid);
-            if (it != scene.spatial.end()) it->second.selected = false;
-        }
-    }
-    m_ifcSelectionKind = IfcSelectionKind::None;
-    m_selectedIfcGuid.clear();
-    m_ifcSelectionInstance = -1;
 }
 
 void Editor::selectInstance(int index)
 {
-    clearIfcSelection();
     m_gizmo.select(index);
 }
 
 void Editor::deselectAll()
 {
-    clearIfcSelection();
     m_gizmo.deselect();
-}
-
-void Editor::selectIfcElement(int instanceIndex, IfcScene& scene, const std::string& guid)
-{
-    clearIfcSelection();
-    auto it = scene.elements.find(guid);
-    if (it == scene.elements.end())
-        return;
-    it->second.selected = true;
-    m_gizmo.select(instanceIndex);
-    m_selectedIfcGuid = guid;
-    m_ifcSelectionKind = IfcSelectionKind::Element;
-    m_ifcSelectionInstance = instanceIndex;
-}
-
-void Editor::selectIfcSpatial(int instanceIndex, IfcScene& scene, const std::string& guid)
-{
-    clearIfcSelection();
-    auto it = scene.spatial.find(guid);
-    if (it == scene.spatial.end())
-        return;
-    it->second.selected = true;
-    m_gizmo.select(instanceIndex);
-    m_selectedIfcGuid = guid;
-    m_ifcSelectionKind = IfcSelectionKind::Spatial;
-    m_ifcSelectionInstance = instanceIndex;
-}
-
-void Editor::showAllIfc(IfcScene& scene)
-{
-    for (auto& [guid, element] : scene.elements) element.visible = true;
-    for (auto& [guid, node] : scene.spatial) node.visible = true;
-    scene.syncVisibilityCache();
-}
-
-void Editor::hideAllIfc(IfcScene& scene)
-{
-    for (auto& [guid, element] : scene.elements) element.visible = false;
-    for (auto& [guid, node] : scene.spatial) node.visible = false;
-    scene.syncVisibilityCache();
-}
-
-void Editor::isolateIfcElement(IfcScene& scene, const std::string& guid)
-{
-    for (auto& [g, element] : scene.elements) element.visible = (g == guid);
-    for (auto& [g, node] : scene.spatial) node.visible = false;
-    auto it = scene.elements.find(guid);
-    if (it != scene.elements.end()) {
-        std::string parent = it->second.parentSpatialGuid;
-        while (!parent.empty()) {
-            auto sit = scene.spatial.find(parent);
-            if (sit == scene.spatial.end()) break;
-            sit->second.visible = true;
-            parent = sit->second.parentGuid;
-        }
-    }
-    scene.syncVisibilityCache();
-}
-
-void Editor::showOnlyIfcBranch(IfcScene& scene, const std::string& spatialGuid)
-{
-    hideAllIfc(scene);
-    scene.setVisibilityRecursive(spatialGuid, true);
-    scene.syncVisibilityCache();
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -608,11 +423,7 @@ void Editor::focusOnInstance(int index)
         return;
     const float maxScale = std::max({ instance.scale.x, instance.scale.y, instance.scale.z });
     glm::vec3 center = glm::vec3(instance.getTransformMatrix() * glm::vec4(model->boundsCenter, 1.0f));
-    float radius = model->boundsRadius * maxScale;
-
-    // Frame the selected IFC element instead of the whole model when there is one.
-    if (m_ifcSelectionInstance == index && m_ifcSelectionKind == IfcSelectionKind::Element && instance.ifcScene)
-        ifcElementWorldBounds(model, *instance.ifcScene, m_selectedIfcGuid, instance, center, radius);
+    const float radius = model->boundsRadius * maxScale;
     // 60 degree vertical FOV: a sphere of radius r fits at distance r / sin(30deg) = 2r.
     m_camera.position = center - getFront(m_camera) * std::max(radius * 2.2f, 1.0f);
 }
@@ -635,10 +446,6 @@ void Editor::deleteInstance(int index)
     if (!validInstance(index))
         return;
     const std::string name = m_models.getInstances()[index].name;
-    // Annotations reference instances by index.
-    std::erase_if(m_annotations, [&](const Annotation& a) { return a.instanceIndex == index; });
-    for (auto& annotation : m_annotations)
-        if (annotation.instanceIndex > index) --annotation.instanceIndex;
     deselectAll();
     m_models.removeInstance(static_cast<size_t>(index));
     setStatus("Deleted " + name);
@@ -724,17 +531,6 @@ void Editor::unloadModel(size_t modelIndex)
     if (!model)
         return;
     const std::string name = model->name;
-    // Instances of this model disappear and the rest shift down; remap annotation indices.
-    const auto& instances = m_models.getInstances();
-    std::vector<int> remap(instances.size(), -1);
-    int next = 0;
-    for (size_t k = 0; k < instances.size(); ++k)
-        remap[k] = instances[k].modelIndex == modelIndex ? -1 : next++;
-    std::erase_if(m_annotations, [&](const Annotation& a) {
-        return !validInstance(a.instanceIndex) || remap[a.instanceIndex] < 0;
-    });
-    for (auto& annotation : m_annotations)
-        annotation.instanceIndex = remap[annotation.instanceIndex];
     deselectAll();
     m_models.unloadModel(modelIndex);
     setStatus("Unloaded " + name);
@@ -748,7 +544,6 @@ void Editor::newScene()
 {
     deselectAll();
     m_scenes.clear();
-    m_annotations.clear();
     m_scenes.setCurrentPath({});
     setStatus("New scene");
 }
@@ -760,9 +555,8 @@ void Editor::openScene(const std::string& path)
         setStatus("Failed to open scene: " + path, true);
         return;
     }
-    // The previous scene is gone, so selection and annotations would point at stale instances.
+    // The previous scene is gone, so the selection would point at a stale instance.
     deselectAll();
-    m_annotations.clear();
     for (const auto& missing : opened.missingFiles)
         setStatus("Model file not found: " + missing, true);
     setStatus("Opening " + path + " (" + std::to_string(opened.queuedModels) + " models)...");
@@ -782,14 +576,4 @@ void Editor::saveScene()
         saveSceneAsDialog();
     else
         saveSceneTo(m_scenes.currentPath());
-}
-
-void Editor::requestAnnotation()
-{
-    if (m_ifcSelectionKind != IfcSelectionKind::Element || !validInstance(m_ifcSelectionInstance))
-        return;
-    m_annotationTargetGuid = m_selectedIfcGuid;
-    m_annotationTargetInstance = m_ifcSelectionInstance;
-    m_annotationText[0] = '\0';
-    m_openAnnotationPopup = true;
 }

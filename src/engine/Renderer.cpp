@@ -1042,11 +1042,8 @@ void Renderer::cullAndBatch(const FrameInput& input, const glm::mat4& viewProj, 
     std::for_each(std::execution::par, m_cullChunks.begin(), m_cullChunks.end(), [&](const CullChunk& chunk) {
         auto& res = m_cullResults[chunk.instanceIdx];
         const auto& submeshes = res.gpuModel->submeshes;
-        const IfcScene* ifc = res.instance->ifcScene ? &*res.instance->ifcScene : nullptr;
 
         for (size_t s = chunk.begin; s < chunk.end; ++s) {
-            if (ifc && !ifc->isSubmeshVisible(s)) continue;
-
             const SubmeshInfo& sub = submeshes[s];
             const bool validBounds = sub.boundsMin.x <= sub.boundsMax.x;
             uint8_t flags = 0;
@@ -1242,8 +1239,8 @@ void Renderer::buildDrawStreams(const FrameInput& input, FrameBatches& batches)
     buildHighlightStream(input);
 }
 
-// The selection mask draws the highlighted submeshes whether or not they passed culling, so the
-// outline of partly off-screen objects stays correct.
+// The selection mask draws the highlighted instance whether or not its submeshes passed culling, so
+// the outline of partly off-screen objects stays correct.
 void Renderer::buildHighlightStream(const FrameInput& input)
 {
     m_highlightRuns.clear();
@@ -1256,25 +1253,11 @@ void Renderer::buildHighlightStream(const FrameInput& input)
     GPUModel* model = models.getModel(inst.modelIndex);
     if (!inst.visible || !model || !model->isValid())
         return;
-    if (!highlight.wholeInstance && highlight.submeshes.empty())
-        return;
 
-    const IfcScene* ifc = inst.ifcScene ? &*inst.ifcScene : nullptr;
     const uint32_t transformIndex = pushTransform(inst.getTransformMatrix());
     const vk::DescriptorSet noSets[3] = {};
-    auto add = [&](size_t si) {
-        if (si >= model->submeshes.size() || (ifc && !ifc->isSubmeshVisible(si)))
-            return;
-        appendDraw(m_highlightRuns, model, noSets, false, model->submeshes[si], transformIndex, glm::vec3(1.0f));
-    };
-    if (highlight.wholeInstance) {
-        for (size_t si = 0; si < model->submeshes.size(); ++si)
-            add(si);
-    }
-    else {
-        for (uint32_t si : highlight.submeshes)
-            add(si);
-    }
+    for (const SubmeshInfo& sub : model->submeshes)
+        appendDraw(m_highlightRuns, model, noSets, false, sub, transformIndex, glm::vec3(1.0f));
 }
 
 void Renderer::uploadDrawStreams()

@@ -39,9 +39,6 @@
   engine/SceneManager.cpp
   engine/CameraAnimation.h
   engine/CameraAnimation.cpp
-  engine/IfcScene.h
-  engine/IfcDirectLoader.h
-  engine/IfcDirectLoader.cpp
   app/AppMode.h
   app/AppOptions.h
   app/AppOptions.cpp
@@ -54,7 +51,6 @@
   editor/EditorMenus.cpp
   editor/EditorHierarchy.cpp
   editor/EditorInspector.cpp
-  editor/EditorAnnotations.cpp
   editor/EditorAnimation.cpp
   editor/EditorStatistics.cpp
   editor/EditorGizmo.cpp
@@ -105,7 +101,6 @@ target_link_libraries(engine PRIVATE
     fastgltf::fastgltf
     imgui
     nlohmann_json::nlohmann_json
-    web_ifc
 )
 
 

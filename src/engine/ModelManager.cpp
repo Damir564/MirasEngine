@@ -5,7 +5,6 @@
 #include <tuple>
 #include "stb_image.h"
 #include "Shadow.h"
-#include "IfcScene.h"
 #include "ModelLoader.h"
 #include "Log.h"
 
@@ -345,7 +344,6 @@ size_t ModelManager::uploadModelToGPU(Mesh& mesh, const std::string& name, const
         });
     gpuModel->vertexCount = mesh.vertices.size();
     gpuModel->indexCount = mesh.indices.size();
-    gpuModel->ifcScene = mesh.ifcScene;
     gpuModel->positions.reserve(mesh.vertices.size());
     for (const auto& v : mesh.vertices)
         gpuModel->positions.push_back(v.position);
@@ -446,7 +444,6 @@ size_t ModelManager::createInstance(size_t modelIndex, const glm::vec3& position
     inst.rotation = rotation;
     inst.scale = scale;
     inst.name = m_models[modelIndex]->name + "_" + std::to_string(m_nextInstanceId++);
-    inst.ifcScene = m_models[modelIndex]->ifcScene;
 
     m_instances.push_back(inst);
     return m_instances.size() - 1;

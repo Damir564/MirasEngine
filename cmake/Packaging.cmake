@@ -82,8 +82,7 @@ install(CODE "
 install(SCRIPT ${CMAKE_CURRENT_LIST_DIR}/PackageScenes.cmake COMPONENT ${MIRAS_COMPONENT})
 
 # --- Third-party licenses -----------------------------------------------------------------------------
-foreach(dep vulkanhpp volk vma vk_bootstrap sdl3 glm stb fastgltf imgui nlohmann_json web_ifc webifc_fastfloat
-        webifc_tinynurbs webifc_earcut webifc_cdt webifc_spdlog webifc_stduuid webifc_unordered_dense)
+foreach(dep vulkanhpp volk vma vk_bootstrap sdl3 glm stb fastgltf imgui nlohmann_json)
     FetchContent_GetProperties(${dep})
     if (NOT ${dep}_SOURCE_DIR)
         continue()
@@ -106,7 +105,7 @@ if (licenseBegin GREATER_EQUAL 0 AND licenseEnd GREATER licenseBegin)
 endif()
 
 # --- Zip ----------------------------------------------------------------------------------------------
-# Not CPack: its ZIP writer stores names in CP437 and fails on the Cyrillic names of IFC models. Windows'
+# Not CPack: its ZIP writer stores names in CP437 and fails on non-ASCII (e.g. Cyrillic) model names. Windows'
 # own tar (bsdtar) writes them as UTF-8, which Explorer and Expand-Archive read.
 find_program(MIRAS_TAR tar.exe PATHS "$ENV{SystemRoot}/System32" NO_DEFAULT_PATH)
 set(MIRAS_PACKAGE_NAME MirasEngine-win64)

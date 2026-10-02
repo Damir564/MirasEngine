@@ -35,12 +35,9 @@ struct ViewRect {
     float height = 0.0f;
 };
 
-// Geometry drawn with the selection outline.
+// Instance drawn with the selection outline.
 struct SelectionHighlight {
     int instance = -1;
-    bool wholeInstance = true;
-    // Submesh indices of `instance`; used only when wholeInstance is false.
-    std::vector<uint32_t> submeshes;
 };
 
 struct FrameInput {

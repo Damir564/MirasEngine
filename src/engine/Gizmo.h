@@ -207,7 +207,6 @@ struct SubmeshHitResult {
     int   instanceIndex = -1;
     size_t submeshIndex = std::numeric_limits<size_t>::max();
     float t = std::numeric_limits<float>::max();
-    std::string ifcGuid;                  
 
     bool hit() const { return instanceIndex >= 0; }
 };
@@ -238,30 +237,15 @@ inline SubmeshHitResult pickSubmesh(
         if (!rayIntersectsAABB(localRay, model->boundsMin, model->boundsMax, modelT) || modelT >= best.t)
             continue;
 
-        const bool hasIfc = inst.ifcScene.has_value();
-
         for (size_t si = 0; si < model->submeshes.size(); ++si) {
-
-            if (hasIfc && !inst.ifcScene->isSubmeshVisible(si))
-                continue;
-
-            const SubmeshInfo& sub = model->submeshes[si];
-
             float subT;
-            if (!rayIntersectsSubmesh(localRay, *model, sub, best.t, subT))
+            if (!rayIntersectsSubmesh(localRay, *model, model->submeshes[si], best.t, subT))
                 continue;
 
             if (subT < best.t) {
                 best.t = subT;
                 best.instanceIndex = static_cast<int>(i);
                 best.submeshIndex = si;
-
-                best.ifcGuid.clear();
-                if (hasIfc) {
-                    auto it = inst.ifcScene->submeshToGuid.find(si);
-                    if (it != inst.ifcScene->submeshToGuid.end())
-                        best.ifcGuid = it->second;
-                }
             }
         }
     }
