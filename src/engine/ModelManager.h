@@ -68,6 +68,8 @@ struct GPUModel {
 };
 
 struct ModelInstance {
+    // Unique for the session and kept while the index shifts; 0 = never created by ModelManager.
+    uint64_t id = 0;
     size_t modelIndex = 0;
     std::string name;
     glm::vec3 position{ 0.0f };
@@ -177,6 +179,7 @@ private:
 
     std::mutex m_mutex;
     size_t m_nextInstanceId = 0;
+    uint64_t m_nextInstanceUid = 1;
     uint32_t m_nextLevelModelId = 1;
 
     bool m_canGenerateMipsSrgb = false;

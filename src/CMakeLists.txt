@@ -63,6 +63,7 @@
   editor/EditorGizmo.cpp
   editor/EditorLevel.cpp
   editor/EditorPrefab.cpp
+  editor/EditorHistory.cpp
   editor/EditorStyle.h
   editor/FileDialog.h
   game/Game.h

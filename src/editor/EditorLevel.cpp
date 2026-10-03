@@ -12,7 +12,6 @@
 namespace {
 constexpr const char* kTexturesRoot = "textures";
 constexpr size_t kMaxPolyMaterials = 255; // below kNoPolyMaterial and the scene reader's cap
-constexpr size_t kMaxUndoSteps = 100;
 constexpr ImU32 kFaceOutline = IM_COL32(255, 160, 40, 255);
 constexpr ImU32 kFaceEdges = IM_COL32(255, 255, 255, 70);
 constexpr ImU32 kVertexDot = IM_COL32(255, 255, 255, 200);
@@ -388,96 +387,6 @@ void Editor::rebuildSelectedLevelModel(const char* action)
     }
 }
 
-void Editor::updateLevelHistory()
-{
-    if (m_vertexDrag.moved) {
-        m_vertexDrag.moved = false;
-        if (selectedLevelMesh())
-            rebuildSelectedLevelModel("move vertex");
-    }
-    if (m_levelEditPending) {
-        if (ImGui::IsAnyItemActive() || m_vertexDrag.active)
-            return;
-        const auto found = m_models.findModelByPath(m_levelBaselinePath);
-        const GPUModel* model = found ? m_models.getModel(*found) : nullptr;
-        if (model && model->polyMesh) {
-            m_undoStack.push_back({ m_levelBaselinePath, m_levelEditAction, std::move(m_levelBaseline), *model->polyMesh });
-            if (m_undoStack.size() > kMaxUndoSteps)
-                m_undoStack.erase(m_undoStack.begin());
-            m_redoStack.clear();
-        }
-        m_levelEditPending = false;
-        m_levelBaselinePath.clear(); // re-snapshot below
-    }
-
-    const PolyMesh* mesh = selectedLevelMesh();
-    const std::string path = mesh
-        ? m_models.getModel(m_models.getInstances()[m_gizmo.selectedInstance].modelIndex)->sourcePath
-        : std::string();
-    if (path != m_levelBaselinePath) {
-        m_levelBaselinePath = path;
-        m_levelBaseline = mesh ? *mesh : PolyMesh{};
-    }
-}
-
-bool Editor::applyLevelEdit(const LevelEdit& edit, bool undo)
-{
-    const auto found = m_models.findModelByPath(edit.modelPath);
-    GPUModel* model = found ? m_models.getModel(*found) : nullptr;
-    if (!model || !model->polyMesh) {
-        setStatus("Cannot " + std::string(undo ? "undo " : "redo ") + edit.action + ": the object was deleted", true);
-        return false;
-    }
-    *model->polyMesh = undo ? edit.before : edit.after;
-    if (edit.modelPath == m_levelBaselinePath)
-        m_levelBaseline = *model->polyMesh;
-    try {
-        m_models.rebuildPolyMesh(*found);
-    }
-    catch (const std::exception& e) {
-        setStatus("Failed to rebuild " + model->name + ": " + e.what(), true);
-    }
-    setStatus((undo ? "Undo " : "Redo ") + edit.action);
-    return true;
-}
-
-void Editor::undoLevelEdit()
-{
-    // Mid-drag the edit has no history entry yet.
-    if (m_levelEditPending || m_vertexDrag.active)
-        return;
-    if (m_undoStack.empty()) {
-        setStatus("Nothing to undo");
-        return;
-    }
-    LevelEdit edit = std::move(m_undoStack.back());
-    m_undoStack.pop_back();
-    if (applyLevelEdit(edit, true))
-        m_redoStack.push_back(std::move(edit));
-}
-
-void Editor::redoLevelEdit()
-{
-    if (m_levelEditPending || m_vertexDrag.active)
-        return;
-    if (m_redoStack.empty()) {
-        setStatus("Nothing to redo");
-        return;
-    }
-    LevelEdit edit = std::move(m_redoStack.back());
-    m_redoStack.pop_back();
-    if (applyLevelEdit(edit, false))
-        m_undoStack.push_back(std::move(edit));
-}
-
-void Editor::clearLevelHistory()
-{
-    m_undoStack.clear();
-    m_redoStack.clear();
-    m_levelEditPending = false;
-    m_levelBaselinePath.clear();
-}
-
 void Editor::drawFaceProperties(PolyMesh& mesh, PolyFace& face)
 {
     bool changed = false;
@@ -810,6 +719,7 @@ void Editor::applyLevelClip(ClipKeep keep)
     const size_t newIndex = m_models.createInstance(*modelIndex, source.position, source.rotation, source.scale);
     m_models.getInstances()[newIndex].name = name;
     m_models.getInstances()[newIndex].color = source.color;
+    markSceneChanged();
     setStatus("Split " + source.name + "; the front part is " + name);
 }
 
@@ -895,6 +805,7 @@ void Editor::applyLevelMirror(MirrorAction action)
         const size_t newIndex = m_models.createInstance(*modelIndex, source.position, source.rotation, source.scale);
         m_models.getInstances()[newIndex].name = name;
         m_models.getInstances()[newIndex].color = source.color;
+        markSceneChanged();
         selectInstance(static_cast<int>(newIndex));
         setStatus("Added mirrored copy " + name);
         return;
@@ -1016,6 +927,7 @@ void Editor::applyLevelSubtract()
     if (m_deleteCutter) {
         m_models.removeInstance(static_cast<size_t>(cutter));
         releaseUnusedLevelModels();
+        markSceneChanged();
         selectInstance(cutter < target ? target - 1 : target);
         m_levelCutterName.clear();
     }
@@ -1088,6 +1000,7 @@ void Editor::addLevelShape(PolyShape shape)
         return;
     const size_t newIndex = m_models.createInstance(*modelIndex, placementPoint());
     m_models.getInstances()[newIndex].name = name;
+    markSceneChanged();
     selectInstance(static_cast<int>(newIndex));
     setStatus("Added " + name);
 }

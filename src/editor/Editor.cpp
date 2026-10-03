@@ -100,6 +100,8 @@ void Editor::onResume()
     io.AddMouseButtonEvent(ImGuiMouseButton_Left, false);
     io.AddMouseButtonEvent(ImGuiMouseButton_Right, false);
     io.ClearInputKeys();
+    // Whatever the game session did to the scene is not an editor action.
+    resetObjectBaseline();
     setStatus("Play stopped");
 }
 
@@ -249,6 +251,7 @@ void Editor::dragGizmo(float mouseX, float mouseY)
     const glm::vec3 axisDir = gizmoAxisDirection(m_gizmo.activeAxis);
     const bool snap = (SDL_GetModState() & SDL_KMOD_CTRL) != 0;
     const auto snapTo = [](float value, float step) { return step > 0.0f ? std::round(value / step) * step : value; };
+    markSceneChanged(); // recorded when the drag ends
 
     switch (m_gizmo.mode) {
     case GizmoMode::Translate:
@@ -365,6 +368,7 @@ void Editor::drawUi()
     if (m_showAnimationPanel) drawAnimationPanel();
     if (m_showGraphicsSettings) drawGraphicsSettingsWindow();
     updateLevelHistory();
+    updateObjectHistory();
     drawFileDialogs();
     drawHelpPopups();
 }
@@ -403,9 +407,9 @@ void Editor::handleShortcuts()
     if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_S)) saveSceneAsDialog();
     if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_S)) saveScene();
     if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_I)) importModelDialog();
-    if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_Z)) undoLevelEdit();
+    if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_Z)) undo();
     if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_Y) ||
-        ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_Z)) redoLevelEdit();
+        ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_Z)) redo();
     if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_D) && selection) duplicateInstance(m_gizmo.selectedInstance);
     if (ImGui::IsKeyChordPressed(ImGuiKey_Delete) && selection && !deleteLevelSelection()) deleteInstance(m_gizmo.selectedInstance);
     if (ImGui::IsKeyChordPressed(ImGuiKey_F) && selection) focusOnInstance(m_gizmo.selectedInstance);
@@ -503,6 +507,7 @@ void Editor::addModelToScene(size_t modelIndex, bool atOrigin)
     if (!atOrigin)
         position = m_camera.position + getFront(m_camera) * std::max(model->boundsRadius * 2.2f, 2.0f) - model->boundsCenter;
     const size_t newIndex = m_models.createInstance(modelIndex, position);
+    markSceneChanged();
     selectInstance(static_cast<int>(newIndex));
     setStatus("Added " + model->name + " to the scene");
 }
@@ -515,6 +520,7 @@ void Editor::deleteInstance(int index)
     deselectAll();
     m_models.removeInstance(static_cast<size_t>(index));
     releaseUnusedLevelModels();
+    markSceneChanged();
     setStatus("Deleted " + name);
 }
 
@@ -537,6 +543,7 @@ void Editor::duplicateInstance(int index)
         source.rotation, source.scale);
     m_models.getInstances()[newIndex].color = source.color;
     m_models.getInstances()[newIndex].locked = source.locked;
+    markSceneChanged();
     selectInstance(static_cast<int>(newIndex));
     setStatus("Duplicated " + source.name);
 }
@@ -585,6 +592,7 @@ void Editor::addCube()
     const size_t newIndex = m_models.createInstance(modelIndex, position);
     const std::string name = uniqueInstanceName("Cube");
     m_models.getInstances()[newIndex].name = name;
+    markSceneChanged();
     selectInstance(static_cast<int>(newIndex));
     setStatus("Added " + name);
 }
@@ -609,6 +617,8 @@ void Editor::unloadModel(size_t modelIndex)
     const std::string name = model->name;
     deselectAll();
     m_models.unloadModel(modelIndex);
+    // Its instances can't be brought back without the model, so their removal is not an undo step.
+    resetObjectBaseline();
     setStatus("Unloaded " + name);
 }
 
@@ -620,7 +630,7 @@ void Editor::newScene()
 {
     deselectAll();
     m_scenes.clear();
-    clearLevelHistory();
+    clearHistory();
     m_scenes.setCurrentPath({});
     setStatus("New scene");
 }
@@ -634,7 +644,7 @@ void Editor::openScene(const std::string& path)
     }
     // The previous scene is gone, so the selection would point at a stale instance.
     deselectAll();
-    clearLevelHistory();
+    clearHistory();
     for (const auto& missing : opened.missingFiles)
         setStatus("Model file not found: " + missing, true);
     setStatus("Opening " + path + " (" + std::to_string(opened.queuedModels) + " models)...");

@@ -96,6 +96,7 @@ void Editor::saveAsPrefab(int instanceIndex, const std::string& path)
     }
     instances[instanceIndex].locked = true;
     releaseUnusedLevelModels();
+    markSceneChanged();
     setStatus("Saved prefab " + path);
 }
 
@@ -128,6 +129,7 @@ void Editor::addPrefab(const std::string& path)
     ModelInstance& instance = m_models.getInstances()[newIndex];
     instance.name = name;
     instance.locked = true;
+    markSceneChanged();
     selectInstance(static_cast<int>(newIndex));
     setStatus("Added prefab " + name);
 }
@@ -194,6 +196,7 @@ void Editor::setInstanceLocked(int instanceIndex, bool locked)
         return;
     ModelInstance& instance = m_models.getInstances()[instanceIndex];
     instance.locked = locked;
+    markSceneChanged();
     if (locked) {
         setStatus("Locked " + instance.name);
         return;
@@ -216,6 +219,7 @@ void Editor::unlinkPrefab(int instanceIndex)
     instance.locked = false;
     const std::string name = instance.name;
     releaseUnusedLevelModels();
+    markSceneChanged();
     setStatus("Unlinked " + name + " from its prefab");
 }
 

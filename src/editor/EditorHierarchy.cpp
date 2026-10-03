@@ -104,7 +104,8 @@ void Editor::drawInstanceNode(int instanceIndex, HierarchyActions& actions)
         return;
 
     ImGui::PushID(instanceIndex);
-    ImGui::Checkbox("##visible", &instance.visible);
+    if (ImGui::Checkbox("##visible", &instance.visible))
+        markSceneChanged();
     ImGui::SetItemTooltip(instance.visible ? "Hide object" : "Show object");
     ImGui::SameLine();
 
@@ -158,6 +159,7 @@ bool Editor::drawRenameField(int instanceIndex)
         name = first == std::string::npos ? std::string() : name.substr(first, last - first + 1);
         if (!name.empty() && validInstance(instanceIndex)) {
             m_models.getInstances()[instanceIndex].name = name;
+            markSceneChanged();
             setStatus("Renamed to " + name);
         }
     }

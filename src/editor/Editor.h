@@ -1,8 +1,10 @@
 #pragma once
 #include <array>
 #include <cstddef>
+#include <memory>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 #include <glm/glm.hpp>
 #include "imgui.h"
@@ -234,20 +236,6 @@ private:
     // Del deletes the object instead.
     bool deleteLevelSelection();
 
-    // Undo history of level geometry edits. Entries name their model by source path, which stays
-    // valid while other models are added or removed.
-    struct LevelEdit {
-        std::string modelPath;
-        std::string action;
-        PolyMesh before;
-        PolyMesh after;
-    };
-    // Turns finished edits into history entries; runs once per frame after the panels.
-    void updateLevelHistory();
-    bool applyLevelEdit(const LevelEdit& edit, bool undo);
-    void undoLevelEdit();
-    void redoLevelEdit();
-    void clearLevelHistory();
     // Level models belong to their instances, so they are unloaded once no instance uses them.
     void releaseUnusedLevelModels();
     glm::vec3 placementPoint() const;
@@ -272,6 +260,58 @@ private:
     void unlinkPrefab(int instanceIndex);
     // Overwrites the prefab file with the current shared geometry.
     void writePrefabFile(int instanceIndex);
+
+    // ---- EditorHistory.cpp ----
+    // Undo history. Models are named by source path, which stays valid while other models are added
+    // or removed, and objects by ModelInstance::id, which stays valid while indices shift.
+    // An object as one side of a change.
+    struct ObjectRecord {
+        ModelInstance instance; // modelIndex is resolved from modelPath on restore
+        size_t index = 0;       // position in the scene list
+        std::string modelPath;
+        // Level models: rebuilds the model when it was released together with its last instance.
+        std::string modelName;
+        std::string prefabPath;
+        std::shared_ptr<const PolyMesh> mesh;
+    };
+    struct ObjectChange {
+        std::optional<ObjectRecord> before; // empty: the object was created
+        std::optional<ObjectRecord> after;  // empty: the object was deleted
+    };
+    // One step: a level geometry edit, object changes (transform, color, visibility, name, lock, model,
+    // existence), or both when one action did both (e.g. subtract deleting the cutter).
+    struct HistoryEntry {
+        std::string action;
+        std::string modelPath; // empty when no geometry changed
+        PolyMesh before;
+        PolyMesh after;
+        std::vector<ObjectChange> objects;
+    };
+    // Turns finished geometry edits into history entries; runs once per frame after the panels.
+    void updateLevelHistory();
+    // Actions that add, delete or change objects call this; only then is the scene compared with the
+    // snapshot, once the action (e.g. a drag) has finished.
+    void markSceneChanged() { m_sceneChanged = true; }
+    // Turns a marked change into a history entry; runs right after updateLevelHistory().
+    void updateObjectHistory();
+    // Retakes the snapshot without recording, e.g. after a scene load, an undo, or unloading a model.
+    void resetObjectBaseline();
+    ObjectRecord makeObjectRecord(size_t index,
+        std::unordered_map<std::string, std::shared_ptr<const PolyMesh>>& meshCopies) const;
+    bool objectChangedSinceBaseline();
+    // A gizmo, vertex or widget drag is still going; it becomes one entry when it ends.
+    bool editInProgress() const;
+    static bool sameObjectState(const ObjectRecord& a, const ObjectRecord& b);
+    static std::string describeObjectChanges(const std::vector<ObjectChange>& changes);
+    // Model index for a record, rebuilding a released level model under its old path if needed.
+    std::optional<size_t> resolveRecordModel(const ObjectRecord& record);
+    bool applyObjectChanges(const std::vector<ObjectChange>& changes, bool undo);
+    bool applyLevelEdit(const HistoryEntry& entry, bool undo);
+    bool applyHistoryEntry(const HistoryEntry& entry, bool undo);
+    void pushHistory(HistoryEntry entry);
+    void undo();
+    void redo();
+    void clearHistory();
 
     SDL_Window* m_window;
     const VulkanContext& m_vulkan;
@@ -392,12 +432,20 @@ private:
     // Instance the open "Save as Prefab" dialog is for; the name catches index shifts from deletes.
     int m_prefabSaveInstance = -1;
     std::string m_prefabSaveName;
-    std::vector<LevelEdit> m_undoStack;
-    std::vector<LevelEdit> m_redoStack;
+
+    // Undo history
+    std::vector<HistoryEntry> m_undoStack;
+    std::vector<HistoryEntry> m_redoStack;
     // The selected shape's mesh as of the last history entry; a finished edit is stored against it.
     std::string m_levelBaselinePath;
     PolyMesh m_levelBaseline;
     // Set by edits and kept while a widget is still being dragged, so one drag is one entry.
     bool m_levelEditPending = false;
     std::string m_levelEditAction;
+    // A geometry entry was pushed this frame; object changes of the same frame join it.
+    bool m_levelEntryPushed = false;
+    // Every object as of the last history entry, in scene order.
+    std::vector<ObjectRecord> m_objectBaseline;
+    bool m_objectBaselineValid = false;
+    bool m_sceneChanged = false;
 };

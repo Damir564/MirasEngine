@@ -662,6 +662,7 @@ size_t ModelManager::createInstance(size_t modelIndex, const glm::vec3& position
     }
 
     ModelInstance inst;
+    inst.id = m_nextInstanceUid++;
     inst.modelIndex = modelIndex;
     inst.position = position;
     inst.rotation = rotation;
