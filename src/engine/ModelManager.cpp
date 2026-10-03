@@ -456,6 +456,7 @@ bool ModelManager::rebuildPolyMesh(size_t modelIndex) {
     (void)m_device.waitIdle();
     GPUModel& rebuilt = *m_models[uploaded];
     rebuilt.polyMesh = std::move(old.polyMesh);
+    rebuilt.prefabPath = std::move(old.prefabPath);
     rebuilt.texturePaths = std::move(texturePaths);
     if (keepTextures) {
         rebuilt.textures = std::move(old.textures);

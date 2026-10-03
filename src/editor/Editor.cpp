@@ -35,7 +35,8 @@ Editor::Editor(const EngineContext& engine)
 
 void Editor::onEvent(const SDL_Event& event)
 {
-    if (m_flyMode || !ImGui::GetIO().WantCaptureKeyboard) {
+    // WantTextInput, not WantCaptureKeyboard: with keyboard nav enabled the latter stays true after clicking any button.
+    if (m_flyMode || !ImGui::GetIO().WantTextInput) {
         if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat)
             handleKeyDown(event.key);
         if (event.type == SDL_EVENT_KEY_UP && !event.key.repeat && !(event.key.mod & SDL_KMOD_SHIFT))
@@ -291,7 +292,7 @@ void Editor::handleCameraLook(const SDL_Event& event)
 
 void Editor::moveCamera(float dt)
 {
-    if ((!m_flyMode && ImGui::GetIO().WantCaptureKeyboard) || m_cameraAnimator.isPlaying())
+    if ((!m_flyMode && ImGui::GetIO().WantTextInput) || m_cameraAnimator.isPlaying())
         return;
     const bool* keys = SDL_GetKeyboardState(nullptr);
     const glm::vec3 front = getFront(m_camera);
@@ -524,9 +525,9 @@ void Editor::duplicateInstance(int index)
     const ModelInstance source = m_models.getInstances()[index];
     GPUModel* model = m_models.getModel(source.modelIndex);
     const float offset = model ? model->boundsRadius * std::max({ source.scale.x, source.scale.y, source.scale.z }) : 1.0f;
-    // Level geometry is copied so the duplicate can be edited on its own.
+    // Level geometry is copied so the duplicate can be edited on its own; prefab instances keep sharing it.
     size_t modelIndex = source.modelIndex;
-    if (model && model->polyMesh) {
+    if (model && model->polyMesh && model->prefabPath.empty()) {
         const auto copy = createLevelModel(*model->polyMesh, model->name);
         if (!copy)
             return;
@@ -535,6 +536,7 @@ void Editor::duplicateInstance(int index)
     const size_t newIndex = m_models.createInstance(modelIndex, source.position + glm::vec3(offset, 0.0f, 0.0f),
         source.rotation, source.scale);
     m_models.getInstances()[newIndex].color = source.color;
+    m_models.getInstances()[newIndex].locked = source.locked;
     selectInstance(static_cast<int>(newIndex));
     setStatus("Duplicated " + source.name);
 }

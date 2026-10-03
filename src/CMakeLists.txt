@@ -36,6 +36,8 @@
   engine/PolyMesh.h
   engine/PolyMesh.cpp
   engine/PolyMeshCsg.cpp
+  engine/Prefab.h
+  engine/Prefab.cpp
   engine/Physics.h
   engine/Physics.cpp
   engine/Gizmo.h
@@ -60,6 +62,7 @@
   editor/EditorStatistics.cpp
   editor/EditorGizmo.cpp
   editor/EditorLevel.cpp
+  editor/EditorPrefab.cpp
   editor/EditorStyle.h
   editor/FileDialog.h
   game/Game.h

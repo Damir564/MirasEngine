@@ -48,7 +48,10 @@ PolyMesh* Editor::selectedLevelMesh()
 {
     if (!hasSelection())
         return nullptr;
-    GPUModel* model = m_models.getModel(m_models.getInstances()[m_gizmo.selectedInstance].modelIndex);
+    const ModelInstance& instance = m_models.getInstances()[m_gizmo.selectedInstance];
+    if (instance.locked)
+        return nullptr;
+    GPUModel* model = m_models.getModel(instance.modelIndex);
     return model ? model->polyMesh.get() : nullptr;
 }
 
@@ -80,7 +83,7 @@ int Editor::pickLevelFace(float mouseX, float mouseY) const
         return -1;
     const ModelInstance& instance = m_models.getInstances()[m_gizmo.selectedInstance];
     const GPUModel* model = m_models.getModel(instance.modelIndex);
-    if (!model || !model->polyMesh || !instance.visible)
+    if (!model || !model->polyMesh || !instance.visible || instance.locked)
         return -1;
     const PolyMesh& mesh = *model->polyMesh;
 
@@ -117,7 +120,7 @@ int Editor::pickLevelVertex(float mouseX, float mouseY) const
         return -1;
     const ModelInstance& instance = m_models.getInstances()[m_gizmo.selectedInstance];
     const GPUModel* model = m_models.getModel(instance.modelIndex);
-    if (!model || !model->polyMesh || !instance.visible)
+    if (!model || !model->polyMesh || !instance.visible || instance.locked)
         return -1;
     const PolyMesh& mesh = *model->polyMesh;
 
@@ -1247,6 +1250,7 @@ void Editor::drawLevelPanel()
             addLevelShape(m_newShape.shape);
 
         ImGui::SeparatorText("Selected");
+        drawPrefabSection();
         if (PolyMesh* mesh = selectedLevelMesh()) {
             ImGui::Text("%zu vertices, %zu faces", mesh->positions.size(), mesh->faces.size());
             // Rebuilding replaces any manual edits, so it only happens on request.
@@ -1360,7 +1364,7 @@ void Editor::drawLevelPanel()
             if (ImGui::CollapsingHeader("Subtract"))
                 drawLevelSubtract();
         }
-        else {
+        else if (!hasSelection() || !m_models.getInstances()[m_gizmo.selectedInstance].locked) {
             ImGui::TextDisabled("Select a level shape to edit it.");
         }
     }

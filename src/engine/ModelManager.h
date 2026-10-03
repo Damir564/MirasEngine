@@ -59,6 +59,8 @@ struct GPUModel {
 
     // Editable source geometry of level models (null for models loaded from files).
     std::unique_ptr<PolyMesh> polyMesh;
+    // The .prefab file this level model was loaded from or saved as; empty when it is not a prefab.
+    std::string prefabPath;
     // Where each of textures came from, so a rebuild can keep them when only geometry or UVs changed.
     std::vector<std::string> texturePaths;
 
@@ -74,6 +76,8 @@ struct ModelInstance {
     bool visible = true;
     // Multiplied into every submesh's base color.
     glm::vec3 color{ 1.0f };
+    // Prefab instances start locked: their shared geometry can't be edited until unlocked.
+    bool locked = false;
 
     glm::mat4 getTransformMatrix() const {
         glm::mat4 T = glm::translate(glm::mat4(1.0f), position);

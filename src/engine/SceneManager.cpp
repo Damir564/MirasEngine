@@ -22,7 +22,9 @@ SceneManager::OpenResult SceneManager::open(const std::string& path)
             // Level geometry is rebuilt right away under a fresh path; the pending scene maps to it by path.
             try {
                 const size_t index = m_models.addPolyMesh(std::move(*model.polyMesh), model.name);
-                model.path = m_models.getModel(index)->sourcePath;
+                GPUModel* built = m_models.getModel(index);
+                built->prefabPath = std::move(model.prefabPath);
+                model.path = built->sourcePath;
                 ++result.queuedModels;
             }
             catch (const std::exception& e) {
@@ -101,6 +103,7 @@ void SceneManager::instantiatePendingScene()
         newInst.scale = inst.scale;
         newInst.visible = inst.visible;
         newInst.color = inst.color;
+        newInst.locked = inst.locked;
     }
 
     m_pendingLoad = false;

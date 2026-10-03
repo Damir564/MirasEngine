@@ -20,6 +20,8 @@ void Editor::drawHierarchy()
                 if (ImGui::MenuItem("Cube")) addCube();
                 ImGui::SeparatorText("Level shapes");
                 drawShapeMenuItems();
+                ImGui::SeparatorText("Prefabs");
+                drawPrefabMenuItems();
                 ImGui::EndMenu();
             }
             if (ImGui::MenuItem("Import Model...")) importModelDialog();
@@ -116,7 +118,8 @@ void Editor::drawInstanceNode(int instanceIndex, HierarchyActions& actions)
         ImGuiTreeNodeFlags_SpanAvailWidth;
     if (m_gizmo.selectedInstance == instanceIndex)
         flags |= ImGuiTreeNodeFlags_Selected;
-    ImGui::TreeNodeEx("##instance", flags, "%s", instance.name.c_str());
+    const char* prefabTag = !prefabModel(instanceIndex) ? "" : instance.locked ? "  [prefab, locked]" : "  [prefab]";
+    ImGui::TreeNodeEx("##instance", flags, "%s%s", instance.name.c_str(), prefabTag);
     if (ImGui::IsItemClicked(ImGuiMouseButton_Left))
         selectInstance(instanceIndex);
     if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
@@ -174,6 +177,18 @@ void Editor::drawInstanceContextMenu(int instanceIndex, HierarchyActions& action
     }
     if (ImGui::MenuItem("Duplicate", "Ctrl+D")) actions.duplicateIndex = instanceIndex;
     if (ImGui::MenuItem("Delete", "Del")) actions.deleteIndex = instanceIndex;
+    ImGui::Separator();
+    const GPUModel* model = m_models.getModel(m_models.getInstances()[instanceIndex].modelIndex);
+    if (ImGui::MenuItem("Save as Prefab...", nullptr, false, model && model->polyMesh))
+        savePrefabDialog(instanceIndex);
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip("%s", model && model->polyMesh ? "Save the shape's geometry and materials (not its transform)"
+                                                         : "Only level shapes can be saved as prefabs");
+    if (prefabModel(instanceIndex)) {
+        const bool locked = m_models.getInstances()[instanceIndex].locked;
+        if (ImGui::MenuItem(locked ? "Unlock Prefab" : "Lock Prefab"))
+            setInstanceLocked(instanceIndex, !locked);
+    }
     ImGui::Separator();
     if (ImGui::BeginMenu("Create")) {
         if (ImGui::MenuItem("Cube")) actions.createCube = true;

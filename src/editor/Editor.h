@@ -49,6 +49,7 @@ private:
     static constexpr const char* kScenesRoot = ".";
     static constexpr const char* kModelsRoot = "models";
     static constexpr const char* kCameraPathsRoot = ".";
+    static constexpr const char* kPrefabsRoot = "prefabs";
     static constexpr ImVec2 kDialogSize{ 760.0f, 480.0f };
     static constexpr float kGizmoPickRadius = 12.0f;
 
@@ -183,7 +184,7 @@ private:
     void addLevelShape(PolyShape shape);
     // Uploads the mesh as a new model and returns its index, or nothing on failure.
     std::optional<size_t> createLevelModel(PolyMesh mesh, const std::string& name);
-    // Editable geometry of the selected instance's model, or null when it is not a level model.
+    // Editable geometry of the selected instance's model, or null when it is not a level model or is locked.
     PolyMesh* selectedLevelMesh();
     // The selected face, or null when face editing is off or the face belongs to another instance.
     PolyFace* selectedLevelFace();
@@ -250,6 +251,27 @@ private:
     // Level models belong to their instances, so they are unloaded once no instance uses them.
     void releaseUnusedLevelModels();
     glm::vec3 placementPoint() const;
+
+    // ---- EditorPrefab.cpp ----
+    // The instance's model when it is a level model linked to a prefab file, else null.
+    GPUModel* prefabModel(int instanceIndex);
+    size_t prefabInstanceCount(size_t modelIndex) const;
+    void savePrefabDialog(int instanceIndex);
+    void loadPrefabDialog();
+    void drawPrefabDialogs();
+    // Writes the instance's level geometry to a prefab file and links the instance to it, locked.
+    void saveAsPrefab(int instanceIndex, const std::string& path);
+    // Adds a locked instance of the prefab; it shares the model of instances already in the scene.
+    void addPrefab(const std::string& path);
+    // Prefab files in kPrefabsRoot plus a Browse item.
+    void drawPrefabMenuItems();
+    // Level panel: link, lock and file actions of the selected prefab instance.
+    void drawPrefabSection();
+    void setInstanceLocked(int instanceIndex, bool locked);
+    // Gives the instance its own copy of the geometry, no longer tied to the prefab.
+    void unlinkPrefab(int instanceIndex);
+    // Overwrites the prefab file with the current shared geometry.
+    void writePrefabFile(int instanceIndex);
 
     SDL_Window* m_window;
     const VulkanContext& m_vulkan;
@@ -367,6 +389,9 @@ private:
     // Kept by name: instance indices shift when objects are deleted.
     std::string m_levelCutterName;
     bool m_deleteCutter = false;
+    // Instance the open "Save as Prefab" dialog is for; the name catches index shifts from deletes.
+    int m_prefabSaveInstance = -1;
+    std::string m_prefabSaveName;
     std::vector<LevelEdit> m_undoStack;
     std::vector<LevelEdit> m_redoStack;
     // The selected shape's mesh as of the last history entry; a finished edit is stored against it.

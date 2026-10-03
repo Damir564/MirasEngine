@@ -22,7 +22,8 @@ struct SceneModelEntry {
     uint32_t pathLength = 0;
     uint32_t nameLength = 0;
     // followed by: char path[pathLength], char name[nameLength]; then (version 3+) uint8_t hasPolyMesh
-    // and, when set, the mesh in writePolyMesh() form
+    // and, when set, the mesh in writePolyMesh() form; then (version 5+) uint32_t prefabPathLength and
+    // char prefabPath[prefabPathLength]
 };
 
 struct SceneInstanceEntry {
@@ -32,12 +33,13 @@ struct SceneInstanceEntry {
     float rotX, rotY, rotZ;
     float scaleX, scaleY, scaleZ;
     bool visible = true;
-    // followed by (version 2+): float color[3]; then: char name[nameLength]
+    // followed by (version 2+): float color[3]; then (version 5+): uint8_t locked; then: char name[nameLength]
 };
 
 // Version 1 files have no per-instance color, version 2 files no level geometry, version 3 files no
-// level materials.
-inline constexpr uint32_t kSceneFileVersion = 4;
+// level materials, version 4 files no prefabs.
+inline constexpr uint32_t kSceneFileVersion = 5;
+inline constexpr uint32_t kMaxScenePrefabPathLength = 4096;
 
 class SceneSerializer {
 public:
@@ -56,6 +58,7 @@ public:
             std::string path;
             std::string name;
             const PolyMesh* polyMesh = nullptr;
+            std::string prefabPath;
         };
         std::vector<ModelEntry> uniqueModels;
         // Map from modelManager model index -> file model index
@@ -74,7 +77,8 @@ public:
             }
             if (!found) {
                 modelIndexMap[i] = static_cast<uint32_t>(uniqueModels.size());
-                uniqueModels.push_back({ models[i]->sourcePath, models[i]->name, models[i]->polyMesh.get() });
+                uniqueModels.push_back({ models[i]->sourcePath, models[i]->name, models[i]->polyMesh.get(),
+                    models[i]->prefabPath });
             }
         }
 
@@ -105,6 +109,9 @@ public:
             file.write(reinterpret_cast<const char*>(&hasPolyMesh), sizeof(hasPolyMesh));
             if (model.polyMesh)
                 writePolyMesh(file, *model.polyMesh);
+            const uint32_t prefabPathLength = static_cast<uint32_t>(model.prefabPath.size());
+            file.write(reinterpret_cast<const char*>(&prefabPathLength), sizeof(prefabPathLength));
+            file.write(model.prefabPath.data(), prefabPathLength);
         }
 
         // Write instances
@@ -130,6 +137,8 @@ public:
             file.write(reinterpret_cast<const char*>(&entry), sizeof(entry));
             const float color[3] = { inst.color.r, inst.color.g, inst.color.b };
             file.write(reinterpret_cast<const char*>(color), sizeof(color));
+            const uint8_t locked = inst.locked ? 1 : 0;
+            file.write(reinterpret_cast<const char*>(&locked), sizeof(locked));
             file.write(inst.name.data(), entry.nameLength);
         }
 
@@ -144,6 +153,7 @@ public:
             std::string path;
             std::string name;
             std::optional<PolyMesh> polyMesh; // level geometry stored in the file
+            std::string prefabPath;
         };
         struct LoadedInstance {
             uint32_t fileModelIndex; // index into loadedModels
@@ -153,6 +163,7 @@ public:
             glm::vec3 scale;
             bool visible;
             glm::vec3 color{ 1.0f };
+            bool locked = false;
         };
 
         std::vector<LoadedModel> models;
@@ -204,6 +215,16 @@ public:
                 LOG_ERROR("[SCENE] Corrupt level geometry for '" << scene.models[i].name << "' in " << filepath << "\n");
                 return scene;
             }
+            if (header.version >= 5) {
+                uint32_t prefabPathLength = 0;
+                file.read(reinterpret_cast<char*>(&prefabPathLength), sizeof(prefabPathLength));
+                if (!file || prefabPathLength > kMaxScenePrefabPathLength) {
+                    LOG_ERROR("[SCENE] Corrupt prefab path for '" << scene.models[i].name << "' in " << filepath << "\n");
+                    return scene;
+                }
+                scene.models[i].prefabPath.resize(prefabPathLength);
+                file.read(scene.models[i].prefabPath.data(), prefabPathLength);
+            }
         }
 
         // Read instances
@@ -221,6 +242,11 @@ public:
                 float color[3] = { 1.0f, 1.0f, 1.0f };
                 file.read(reinterpret_cast<char*>(color), sizeof(color));
                 scene.instances[i].color = glm::vec3(color[0], color[1], color[2]);
+            }
+            if (header.version >= 5) {
+                uint8_t locked = 0;
+                file.read(reinterpret_cast<char*>(&locked), sizeof(locked));
+                scene.instances[i].locked = locked != 0;
             }
 
             scene.instances[i].name.resize(entry.nameLength);

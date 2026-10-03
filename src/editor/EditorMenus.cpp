@@ -86,6 +86,8 @@ void Editor::drawAddMenu()
     if (ImGui::MenuItem("Cube")) addCube();
     ImGui::SeparatorText("Level shapes");
     drawShapeMenuItems();
+    ImGui::SeparatorText("Prefabs");
+    drawPrefabMenuItems();
     ImGui::EndMenu();
 }
 
@@ -434,6 +436,7 @@ void Editor::drawFileDialogs()
         }
         dialog->Close();
     }
+    drawPrefabDialogs();
 }
 
 // ---------------------------------------------------------------------------------------------
