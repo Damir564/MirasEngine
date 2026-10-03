@@ -12,6 +12,7 @@
 #include <glm/ext/matrix_transform.hpp>
 #include "ModelTypes.h"
 #include "Buffers.h"
+#include "PolyMesh.h"
 
 class TextureImage;
 
@@ -55,6 +56,11 @@ struct GPUModel {
 
     // Model-space triangle soup (3 positions per triangle) kept on the CPU for physics collision.
     std::vector<glm::vec3> collisionTriangles;
+
+    // Editable source geometry of level models (null for models loaded from files).
+    std::unique_ptr<PolyMesh> polyMesh;
+    // Where each of textures came from, so a rebuild can keep them when only geometry or UVs changed.
+    std::vector<std::string> texturePaths;
 
     bool isValid() const { return vertexBuffer != nullptr && indexBuffer != nullptr; }
 };
@@ -110,6 +116,12 @@ public:
     void loadModelAsync(const std::string& path, const std::string& name = "");
     size_t loadModelSync(const std::string& path, const std::string& name = "");
     void unloadModel(size_t modelIndex);
+    // Uploads a level mesh as a new model with a fresh "level:#<n>" source path and keeps the mesh on it.
+    // Throws like loadModelSync() when the upload fails.
+    size_t addPolyMesh(PolyMesh mesh, const std::string& name);
+    // Re-uploads a level model after its polyMesh changed (waits for the GPU to go idle); its index,
+    // name, path and instances are kept.
+    bool rebuildPolyMesh(size_t modelIndex);
 
     size_t createInstance(size_t modelIndex, const glm::vec3& position = glm::vec3(0.0f), const glm::vec3& rotation = glm::vec3(0.0f), const glm::vec3& scale = glm::vec3(1.0f));
     void removeInstance(size_t instanceIndex);
@@ -137,6 +149,8 @@ private:
     static void buildDrawOrder(GPUModel& model);
     void createDefaultTextures();
     vk::DescriptorSet allocateTextureDescriptorSet(vk::ImageView view);
+    // Returns a model's sets to the shared pool; the GPU must be done with them.
+    void freeTextureDescriptorSets(GPUModel& model);
 
     VmaAllocator m_allocator;
     vk::Device m_device;
@@ -159,6 +173,7 @@ private:
 
     std::mutex m_mutex;
     size_t m_nextInstanceId = 0;
+    uint32_t m_nextLevelModelId = 1;
 
     bool m_canGenerateMipsSrgb = false;
     bool m_canGenerateMipsUnorm = false;

@@ -91,6 +91,8 @@ void Editor::onResume()
     // The game changed the title and mouse mode, and ImGui got no events while it ran.
     m_windowTitle.clear();
     m_rightMouseHeld = false;
+    m_vertexDrag.active = false;
+    m_vertexMarquee.active = false;
     m_cameraSpeedMultiplier = 1.0f;
     SDL_SetWindowRelativeMouseMode(m_window, m_flyMode);
     ImGuiIO& io = ImGui::GetIO();
@@ -123,10 +125,17 @@ void Editor::handleViewportMouse(const SDL_Event& event)
     if (event.type == SDL_EVENT_MOUSE_BUTTON_UP && event.button.button == SDL_BUTTON_LEFT) {
         m_gizmo.isDragging = false;
         m_gizmo.activeAxis = GizmoAxis::None;
+        m_vertexDrag.active = false;
+        if (m_vertexMarquee.active)
+            finishVertexMarquee(event.button.x - m_sceneView.x, event.button.y - m_sceneView.y);
     }
 
     if (event.type == SDL_EVENT_MOUSE_MOTION && m_gizmo.isDragging && validInstance(m_gizmo.selectedInstance))
         dragGizmo(event.motion.x - m_sceneView.x, event.motion.y - m_sceneView.y);
+    if (event.type == SDL_EVENT_MOUSE_MOTION && m_vertexDrag.active)
+        dragLevelVertex(event.motion.x - m_sceneView.x, event.motion.y - m_sceneView.y);
+    if (event.type == SDL_EVENT_MOUSE_MOTION && m_vertexMarquee.active)
+        m_vertexMarquee.end = glm::vec2(event.motion.x - m_sceneView.x, event.motion.y - m_sceneView.y);
 }
 
 void Editor::handleViewportClick(float mouseX, float mouseY)
@@ -142,6 +151,16 @@ void Editor::handleViewportClick(float mouseX, float mouseY)
     if (tryBeginGizmoDrag(mouseX, mouseY, view, proj))
         return;
 
+    // In face/vertex mode the selected level shape keeps the selection; clicks elsewhere pick objects as usual.
+    if (m_levelMode != LevelEditMode::Object && handleLevelClick(mouseX, mouseY))
+        return;
+    pickObject(mouseX, mouseY);
+}
+
+void Editor::pickObject(float mouseX, float mouseY)
+{
+    const glm::mat4 view = getView(m_camera);
+    const glm::mat4 proj = sceneProjection();
     const Ray ray = screenToWorldRay(mouseX, mouseY, m_sceneView.width, m_sceneView.height, view, proj);
     const SubmeshHitResult hit = pickSubmesh(ray, m_models.getInstances(),
         [&](size_t index) { return m_models.getModel(index); });
@@ -335,13 +354,16 @@ void Editor::drawUi()
     drawStatusBar();
     drawDockSpace();
     drawViewportOverlay();
+    drawLevelFaceOverlay();
     drawTransformGizmo();
     drawOrientationGizmo();
     if (m_showHierarchy) drawHierarchy();
     if (m_showInspector) drawInspector();
     if (m_showStatisticsPanel) drawStatisticsPanel();
+    if (m_showLevelPanel) drawLevelPanel();
     if (m_showAnimationPanel) drawAnimationPanel();
     if (m_showGraphicsSettings) drawGraphicsSettingsWindow();
+    updateLevelHistory();
     drawFileDialogs();
     drawHelpPopups();
 }
@@ -380,8 +402,11 @@ void Editor::handleShortcuts()
     if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_S)) saveSceneAsDialog();
     if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_S)) saveScene();
     if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_I)) importModelDialog();
+    if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_Z)) undoLevelEdit();
+    if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_Y) ||
+        ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_Z)) redoLevelEdit();
     if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_D) && selection) duplicateInstance(m_gizmo.selectedInstance);
-    if (ImGui::IsKeyChordPressed(ImGuiKey_Delete) && selection) deleteInstance(m_gizmo.selectedInstance);
+    if (ImGui::IsKeyChordPressed(ImGuiKey_Delete) && selection && !deleteLevelSelection()) deleteInstance(m_gizmo.selectedInstance);
     if (ImGui::IsKeyChordPressed(ImGuiKey_F) && selection) focusOnInstance(m_gizmo.selectedInstance);
     if (ImGui::IsKeyChordPressed(ImGuiKey_Escape) && !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId)) deselectAll();
     if (ImGui::IsKeyChordPressed(ImGuiKey_Q)) m_tool = GizmoMode::None;
@@ -488,6 +513,7 @@ void Editor::deleteInstance(int index)
     const std::string name = m_models.getInstances()[index].name;
     deselectAll();
     m_models.removeInstance(static_cast<size_t>(index));
+    releaseUnusedLevelModels();
     setStatus("Deleted " + name);
 }
 
@@ -498,7 +524,15 @@ void Editor::duplicateInstance(int index)
     const ModelInstance source = m_models.getInstances()[index];
     GPUModel* model = m_models.getModel(source.modelIndex);
     const float offset = model ? model->boundsRadius * std::max({ source.scale.x, source.scale.y, source.scale.z }) : 1.0f;
-    const size_t newIndex = m_models.createInstance(source.modelIndex, source.position + glm::vec3(offset, 0.0f, 0.0f),
+    // Level geometry is copied so the duplicate can be edited on its own.
+    size_t modelIndex = source.modelIndex;
+    if (model && model->polyMesh) {
+        const auto copy = createLevelModel(*model->polyMesh, model->name);
+        if (!copy)
+            return;
+        modelIndex = *copy;
+    }
+    const size_t newIndex = m_models.createInstance(modelIndex, source.position + glm::vec3(offset, 0.0f, 0.0f),
         source.rotation, source.scale);
     m_models.getInstances()[newIndex].color = source.color;
     selectInstance(static_cast<int>(newIndex));
@@ -584,6 +618,7 @@ void Editor::newScene()
 {
     deselectAll();
     m_scenes.clear();
+    clearLevelHistory();
     m_scenes.setCurrentPath({});
     setStatus("New scene");
 }
@@ -597,6 +632,7 @@ void Editor::openScene(const std::string& path)
     }
     // The previous scene is gone, so the selection would point at a stale instance.
     deselectAll();
+    clearLevelHistory();
     for (const auto& missing : opened.missingFiles)
         setStatus("Model file not found: " + missing, true);
     setStatus("Opening " + path + " (" + std::to_string(opened.queuedModels) + " models)...");

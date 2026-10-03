@@ -7,7 +7,7 @@
       "project": "CMakeLists.txt",
       "projectTarget": "engine.exe (src\\engine.exe)",
       "name": "Engine (Editor)",
-      "args": [ "--editor" ]
+      "args": [ "--editor --validation" ]
     },
     {
       "type": "default",

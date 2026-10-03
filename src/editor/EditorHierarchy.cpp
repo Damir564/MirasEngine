@@ -18,6 +18,8 @@ void Editor::drawHierarchy()
                 ImGuiPopupFlags_MouseButtonRight | ImGuiPopupFlags_NoOpenOverItems)) {
             if (ImGui::BeginMenu("Create")) {
                 if (ImGui::MenuItem("Cube")) addCube();
+                ImGui::SeparatorText("Level shapes");
+                drawShapeMenuItems();
                 ImGui::EndMenu();
             }
             if (ImGui::MenuItem("Import Model...")) importModelDialog();

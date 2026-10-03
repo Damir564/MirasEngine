@@ -60,6 +60,11 @@ void Editor::drawEditMenu()
     if (!ImGui::BeginMenu("Edit"))
         return;
     const bool selection = hasSelection();
+    const std::string undoLabel = m_undoStack.empty() ? "Undo" : "Undo " + m_undoStack.back().action;
+    const std::string redoLabel = m_redoStack.empty() ? "Redo" : "Redo " + m_redoStack.back().action;
+    if (ImGui::MenuItem(undoLabel.c_str(), "Ctrl+Z", false, !m_undoStack.empty())) undoLevelEdit();
+    if (ImGui::MenuItem(redoLabel.c_str(), "Ctrl+Y", false, !m_redoStack.empty())) redoLevelEdit();
+    ImGui::Separator();
     if (ImGui::MenuItem("Rename", "F2", false, selection)) beginRename(m_gizmo.selectedInstance);
     if (ImGui::MenuItem("Duplicate", "Ctrl+D", false, selection)) duplicateInstance(m_gizmo.selectedInstance);
     if (ImGui::MenuItem("Delete", "Del", false, selection)) deleteInstance(m_gizmo.selectedInstance);
@@ -79,6 +84,8 @@ void Editor::drawAddMenu()
     if (!ImGui::BeginMenu("Add"))
         return;
     if (ImGui::MenuItem("Cube")) addCube();
+    ImGui::SeparatorText("Level shapes");
+    drawShapeMenuItems();
     ImGui::EndMenu();
 }
 
@@ -90,6 +97,7 @@ void Editor::drawViewMenu()
     ImGui::MenuItem("Inspector", nullptr, &m_showInspector);
     ImGui::MenuItem("Camera Animation", nullptr, &m_showAnimationPanel);
     ImGui::MenuItem("Statistics", nullptr, &m_showStatisticsPanel);
+    ImGui::MenuItem("Level", nullptr, &m_showLevelPanel);
     ImGui::Separator();
     ImGui::MenuItem("Show Camera Path", nullptr, &m_showCameraPath);
     ImGui::MenuItem("Grid", nullptr, &m_showGrid);
@@ -248,10 +256,11 @@ void Editor::buildDefaultLayout(ImGuiID dockspaceId)
     const ImGuiID bottom = ImGui::DockBuilderSplitNode(center, ImGuiDir_Down, 0.30f, nullptr, &center);
     ImGui::DockBuilderDockWindow("Hierarchy", left);
     ImGui::DockBuilderDockWindow("Inspector", right);
+    ImGui::DockBuilderDockWindow("Level", right);
     ImGui::DockBuilderDockWindow("Camera Animation", bottom);
     ImGui::DockBuilderDockWindow("Statistics", bottom);
     ImGui::DockBuilderFinish(dockspaceId);
-    m_showHierarchy = m_showInspector = m_showAnimationPanel = m_showStatisticsPanel = true;
+    m_showHierarchy = m_showInspector = m_showAnimationPanel = m_showStatisticsPanel = m_showLevelPanel = true;
 }
 
 void Editor::drawDockSpace()
@@ -326,6 +335,7 @@ void Editor::drawControlsPopup()
             { "Click view gizmo axis", "Look along that axis (top-right of viewport)" },
             { "F2", "Rename selected object" },
             { "Ctrl+D", "Duplicate selected object" },
+            { "Ctrl+Z / Ctrl+Y", "Undo / redo level shape edits" },
             { "Delete", "Delete selected object" },
             { "Esc", "Deselect / leave fly mode" },
             { "Shift+`", "Toggle fly mode (hide UI)" },

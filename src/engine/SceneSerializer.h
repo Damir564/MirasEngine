@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 #include <fstream>
@@ -19,7 +21,8 @@ struct SceneFileHeader {
 struct SceneModelEntry {
     uint32_t pathLength = 0;
     uint32_t nameLength = 0;
-    // followed by: char path[pathLength], char name[nameLength]
+    // followed by: char path[pathLength], char name[nameLength]; then (version 3+) uint8_t hasPolyMesh
+    // and, when set, the mesh in writePolyMesh() form
 };
 
 struct SceneInstanceEntry {
@@ -32,8 +35,9 @@ struct SceneInstanceEntry {
     // followed by (version 2+): float color[3]; then: char name[nameLength]
 };
 
-// Version 1 files have no per-instance color.
-inline constexpr uint32_t kSceneFileVersion = 2;
+// Version 1 files have no per-instance color, version 2 files no level geometry, version 3 files no
+// level materials.
+inline constexpr uint32_t kSceneFileVersion = 4;
 
 class SceneSerializer {
 public:
@@ -51,6 +55,7 @@ public:
         struct ModelEntry {
             std::string path;
             std::string name;
+            const PolyMesh* polyMesh = nullptr;
         };
         std::vector<ModelEntry> uniqueModels;
         // Map from modelManager model index -> file model index
@@ -69,7 +74,7 @@ public:
             }
             if (!found) {
                 modelIndexMap[i] = static_cast<uint32_t>(uniqueModels.size());
-                uniqueModels.push_back({ models[i]->sourcePath, models[i]->name });
+                uniqueModels.push_back({ models[i]->sourcePath, models[i]->name, models[i]->polyMesh.get() });
             }
         }
 
@@ -83,6 +88,7 @@ public:
 
         // Write header
         SceneFileHeader header;
+        header.version = kSceneFileVersion;
         header.modelCount = static_cast<uint32_t>(uniqueModels.size());
         header.instanceCount = validInstanceCount;
         file.write(reinterpret_cast<const char*>(&header), sizeof(header));
@@ -95,6 +101,10 @@ public:
             file.write(reinterpret_cast<const char*>(&entry), sizeof(entry));
             file.write(model.path.data(), entry.pathLength);
             file.write(model.name.data(), entry.nameLength);
+            const uint8_t hasPolyMesh = model.polyMesh ? 1 : 0;
+            file.write(reinterpret_cast<const char*>(&hasPolyMesh), sizeof(hasPolyMesh));
+            if (model.polyMesh)
+                writePolyMesh(file, *model.polyMesh);
         }
 
         // Write instances
@@ -133,6 +143,7 @@ public:
         struct LoadedModel {
             std::string path;
             std::string name;
+            std::optional<PolyMesh> polyMesh; // level geometry stored in the file
         };
         struct LoadedInstance {
             uint32_t fileModelIndex; // index into loadedModels
@@ -185,6 +196,14 @@ public:
 
             scene.models[i].name.resize(entry.nameLength);
             file.read(scene.models[i].name.data(), entry.nameLength);
+
+            uint8_t hasPolyMesh = 0;
+            if (header.version >= 3)
+                file.read(reinterpret_cast<char*>(&hasPolyMesh), sizeof(hasPolyMesh));
+            if (hasPolyMesh && !readPolyMesh(file, scene.models[i].polyMesh.emplace(), header.version >= 4)) {
+                LOG_ERROR("[SCENE] Corrupt level geometry for '" << scene.models[i].name << "' in " << filepath << "\n");
+                return scene;
+            }
         }
 
         // Read instances

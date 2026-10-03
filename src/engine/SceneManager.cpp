@@ -17,7 +17,21 @@ SceneManager::OpenResult SceneManager::open(const std::string& path)
         return result;
 
     clear();
-    for (const auto& model : loaded.models) {
+    for (auto& model : loaded.models) {
+        if (model.polyMesh) {
+            // Level geometry is rebuilt right away under a fresh path; the pending scene maps to it by path.
+            try {
+                const size_t index = m_models.addPolyMesh(std::move(*model.polyMesh), model.name);
+                model.path = m_models.getModel(index)->sourcePath;
+                ++result.queuedModels;
+            }
+            catch (const std::exception& e) {
+                LOG_ERROR("[SCENE] Failed to build level geometry '" << model.name << "': " << e.what() << "\n");
+                model.path.clear(); // the file's path may now name a different level model
+            }
+            model.polyMesh.reset();
+            continue;
+        }
         if (!isBuiltinModelPath(model.path) && !std::filesystem::exists(model.path)) {
             result.missingFiles.push_back(model.path);
             continue;

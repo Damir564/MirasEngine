@@ -1,6 +1,7 @@
 #pragma once
 #include <array>
 #include <cstddef>
+#include <optional>
 #include <string>
 #include <vector>
 #include <glm/glm.hpp>
@@ -11,6 +12,7 @@
 #include "engine/Gizmo.h"
 #include "engine/GraphicsSettings.h"
 #include "engine/ModelManager.h"
+#include "engine/PolyMesh.h"
 #include "engine/Renderer.h"
 
 // The scene editor: viewport interaction (picking, gizmo, camera) plus the docked ImGui panels.
@@ -76,6 +78,8 @@ private:
     void dropStaleGizmoSelection();
     void handleViewportMouse(const SDL_Event& event);
     void handleViewportClick(float mouseX, float mouseY);
+    // Selects the object under the mouse, or deselects when there is none.
+    void pickObject(float mouseX, float mouseY);
     bool tryBeginGizmoDrag(float mouseX, float mouseY, const glm::mat4& view, const glm::mat4& proj);
     void selectPickedSubmesh(const SubmeshHitResult& hit);
     void dragGizmo(float mouseX, float mouseY);
@@ -173,6 +177,80 @@ private:
     // ---- EditorStatistics.cpp ----
     void drawStatisticsPanel();
 
+    // ---- EditorLevel.cpp ----
+    void drawLevelPanel();
+    void drawShapeMenuItems();
+    void addLevelShape(PolyShape shape);
+    // Uploads the mesh as a new model and returns its index, or nothing on failure.
+    std::optional<size_t> createLevelModel(PolyMesh mesh, const std::string& name);
+    // Editable geometry of the selected instance's model, or null when it is not a level model.
+    PolyMesh* selectedLevelMesh();
+    // The selected face, or null when face editing is off or the face belongs to another instance.
+    PolyFace* selectedLevelFace();
+    // Same for vertex editing; drops indices the mesh no longer has. Empty when there is none.
+    const std::vector<uint32_t>& selectedLevelVertices();
+    // Face of the selected level instance under the mouse (scene-view pixels), or -1.
+    int pickLevelFace(float mouseX, float mouseY) const;
+    // Vertex of the selected level instance drawn closest to the mouse, within a few pixels, or -1.
+    int pickLevelVertex(float mouseX, float mouseY) const;
+    // Face/vertex picking for a viewport click; false when nothing was hit and objects should be picked.
+    bool handleLevelClick(float mouseX, float mouseY);
+    void dragLevelVertex(float mouseX, float mouseY);
+    // Selects the vertices inside the box, or picks an object when the mouse barely moved.
+    void finishVertexMarquee(float mouseX, float mouseY);
+    void drawLevelFaceOverlay();
+    void drawFaceProperties(PolyMesh& mesh, PolyFace& face);
+    void drawVertexProperties(PolyMesh& mesh);
+    // Push/pull and extrude; by index, because extruding adds faces and moves the face storage.
+    void drawFaceGeometry(PolyMesh& mesh, uint32_t faceIndex);
+    void drawLevelMaterials(PolyMesh& mesh);
+    void drawLevelTextureDialog();
+    // Uploads the selected shape after an edit and marks the edit for the undo history.
+    void rebuildSelectedLevelModel(const char* action);
+    // Replaces the selected shape with an edited copy, unless the edit removed every face.
+    bool commitLevelTopology(PolyMesh&& edited, const char* action);
+    void deleteLevelFace();
+    void deleteLevelVertices();
+    void mergeLevelVertices();
+    // Both act on exactly two selected vertices: split the edge between them, or cut a face along them.
+    void splitLevelEdge();
+    void connectLevelVertices();
+    enum class ClipKeep { Back, Front, Both };
+    void drawLevelClip(PolyMesh& mesh);
+    // Two selected vertices: plane through them along the view direction. Three or more: through the first three.
+    void setLevelClipFromVertices();
+    void applyLevelClip(ClipKeep keep);
+    enum class MirrorAction { InPlace, Copy, SymmetrizePositive, SymmetrizeNegative };
+    void drawLevelMirror();
+    float levelMirrorPivot(const PolyMesh& mesh) const;
+    void applyLevelMirror(MirrorAction action);
+    void drawLevelHollow();
+    // Subtract cuts another level object (the cutter) out of the selected one.
+    void drawLevelSubtract();
+    int levelCutterInstance() const; // -1 if the chosen cutter is gone or is the selection
+    void applyLevelSubtract();
+    // Del in face or vertex mode deletes the selected face or vertices. False in object mode, where
+    // Del deletes the object instead.
+    bool deleteLevelSelection();
+
+    // Undo history of level geometry edits. Entries name their model by source path, which stays
+    // valid while other models are added or removed.
+    struct LevelEdit {
+        std::string modelPath;
+        std::string action;
+        PolyMesh before;
+        PolyMesh after;
+    };
+    // Turns finished edits into history entries; runs once per frame after the panels.
+    void updateLevelHistory();
+    bool applyLevelEdit(const LevelEdit& edit, bool undo);
+    void undoLevelEdit();
+    void redoLevelEdit();
+    void clearLevelHistory();
+    // Level models belong to their instances, so they are unloaded once no instance uses them.
+    void releaseUnusedLevelModels();
+    glm::vec3 placementPoint() const;
+
     SDL_Window* m_window;
     const VulkanContext& m_vulkan;
     Renderer& m_renderer;
@@ -210,6 +288,7 @@ private:
     bool m_showInspector = true;
     bool m_showAnimationPanel = true;
     bool m_showStatisticsPanel = true;
+    bool m_showLevelPanel = true;
     bool m_showGraphicsSettings = false;
     bool m_resetLayout = false;
     bool m_openControlsPopup = false;
@@ -239,4 +318,61 @@ private:
     // Statistics panel
     float m_frameTimes[240] = {};
     int m_frameTimeOffset = 0;
+
+    // Level tool
+    PolyShapeParams m_newShape;
+    // Face and vertex modes: clicks on the selected level shape pick its parts instead of objects.
+    enum class LevelEditMode { Object, Face, Vertex };
+    LevelEditMode m_levelMode = LevelEditMode::Object;
+    int m_selectedFace = -1;
+    std::vector<uint32_t> m_selectedVertices;
+    int m_levelSelectionInstance = -1; // face and vertex indices are only meaningful for this instance
+    // The clicked vertex is dragged in the plane facing the camera through its start position; the
+    // rest of the selection follows by the same world offset.
+    struct VertexDrag {
+        bool active = false;
+        bool moved = false; // positions changed since the last rebuild
+        glm::vec3 planePoint{ 0.0f }; // world start of the clicked vertex
+        glm::vec3 grabOffset{ 0.0f }; // vertex minus the plane point under the mouse, so it does not jump
+        std::vector<glm::vec3> startPositions; // object space, parallel to m_selectedVertices
+    };
+    VertexDrag m_vertexDrag;
+    // Box selection started on empty space in vertex mode; scene-view pixels.
+    struct VertexMarquee {
+        bool active = false;
+        bool additive = false; // Shift: add to the selection instead of replacing it
+        glm::vec2 start{ 0.0f };
+        glm::vec2 end{ 0.0f };
+    };
+    VertexMarquee m_vertexMarquee;
+    int m_textureDialogMaterial = -1; // material of the selected shape the open texture dialog is for
+    float m_faceOpDistance = 1.0f;
+    // Plane dot(normal, p) == offset in the selected shape's object space. "Front" is the side the
+    // normal points to.
+    struct LevelClip {
+        glm::vec3 normal{ 0.0f, 1.0f, 0.0f };
+        float offset = 1.0f;
+        bool preview = false; // the Clip section was open last frame
+    };
+    LevelClip m_levelClip;
+    // Mirror plane: coordinate `axis` of the selected shape's object space equals the pivot.
+    enum class MirrorPivot { Origin, Center, Min, Max };
+    struct LevelMirror {
+        int axis = 0;
+        MirrorPivot pivot = MirrorPivot::Center;
+        bool preview = false; // the Mirror section was open last frame
+    };
+    LevelMirror m_levelMirror;
+    float m_hollowThickness = 0.25f;
+    // Kept by name: instance indices shift when objects are deleted.
+    std::string m_levelCutterName;
+    bool m_deleteCutter = false;
+    std::vector<LevelEdit> m_undoStack;
+    std::vector<LevelEdit> m_redoStack;
+    // The selected shape's mesh as of the last history entry; a finished edit is stored against it.
+    std::string m_levelBaselinePath;
+    PolyMesh m_levelBaseline;
+    // Set by edits and kept while a widget is still being dragged, so one drag is one entry.
+    bool m_levelEditPending = false;
+    std::string m_levelEditAction;
 };

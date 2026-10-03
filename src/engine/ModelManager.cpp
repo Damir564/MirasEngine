@@ -256,6 +256,58 @@ bool supportsLinearBlit(vk::PhysicalDevice physicalDevice, vk::Format format) {
         (features & vk::FormatFeatureFlagBits::eSampledImageFilterLinear);
 }
 
+std::vector<std::string> levelTexturePaths(const Mesh& mesh) {
+    std::vector<std::string> paths;
+    for (const TextureData& tex : mesh.textureData)
+        paths.push_back(tex.path);
+    return paths;
+}
+
+// Fills a malloc'd RGBA image; fromCache makes TextureData::free() release it with ::free.
+void allocatePixels(TextureData& tex, int width, int height) {
+    tex.width = width;
+    tex.height = height;
+    tex.channels = 4;
+    tex.fromCache = true;
+    tex.pixels = static_cast<unsigned char*>(malloc(size_t(width) * height * 4));
+    if (!tex.pixels)
+        throw std::runtime_error("Out of memory for texture " + tex.path);
+}
+
+// Level textures are few and small next to glTF scenes, so they are decoded serially.
+void decodeLevelTextures(Mesh& mesh) {
+    for (TextureData& tex : mesh.textureData) {
+        if (tex.path == kCheckerTexturePath) {
+            constexpr int kSize = 64, kCell = 8;
+            allocatePixels(tex, kSize, kSize);
+            for (int y = 0; y < kSize; ++y) {
+                for (int x = 0; x < kSize; ++x) {
+                    unsigned char* p = tex.pixels + (size_t(y) * kSize + x) * 4;
+                    const bool light = ((x / kCell) + (y / kCell)) % 2 == 0;
+                    // A red corner cell shows which way the UVs are rotated.
+                    const bool marker = x < kCell && y < kCell;
+                    p[0] = marker ? 220 : light ? 200 : 70;
+                    p[1] = marker ? 40 : light ? 200 : 70;
+                    p[2] = marker ? 40 : light ? 200 : 70;
+                    p[3] = 255;
+                }
+            }
+            continue;
+        }
+        tex.pixels = stbi_load(tex.path.c_str(), &tex.width, &tex.height, &tex.channels, 4);
+        tex.fromCache = false;
+        if (!tex.pixels) {
+            LOG_ERROR("[ModelManager] Texture failed to load: " << tex.path << "\n");
+            // 1x1 magenta, as for glTF models, so the missing texture is obvious.
+            allocatePixels(tex, 1, 1);
+            tex.pixels[0] = 255;
+            tex.pixels[1] = 0;
+            tex.pixels[2] = 255;
+            tex.pixels[3] = 255;
+        }
+    }
+}
+
 } // namespace
 
 void TextureData::free() {
@@ -322,7 +374,10 @@ vk::DescriptorSet ModelManager::allocateTextureDescriptorSet(vk::ImageView view)
     allocInfo.descriptorSetCount = 1;
     allocInfo.pSetLayouts = &m_textureSetLayout;
 
-    vk::DescriptorSet set = m_device.allocateDescriptorSets(allocInfo).value[0];
+    auto allocated = m_device.allocateDescriptorSets(allocInfo);
+    if (allocated.result != vk::Result::eSuccess)
+        throw std::runtime_error("Failed to allocate texture descriptor set: " + vk::to_string(allocated.result));
+    vk::DescriptorSet set = allocated.value[0];
 
     vk::DescriptorImageInfo imageInfo{};
     imageInfo.imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal;
@@ -339,6 +394,12 @@ vk::DescriptorSet ModelManager::allocateTextureDescriptorSet(vk::ImageView view)
     m_device.updateDescriptorSets(1, &write, 0, nullptr);
 
     return set;
+}
+
+void ModelManager::freeTextureDescriptorSets(GPUModel& model) {
+    if (!model.textureDescriptorSets.empty())
+        (void)m_device.freeDescriptorSets(m_descriptorPool, model.textureDescriptorSets);
+    model.textureDescriptorSets.clear();
 }
 
 void ModelManager::loadModelAsync(const std::string& path, const std::string& name) {
@@ -364,6 +425,48 @@ size_t ModelManager::loadModelSync(const std::string& path, const std::string& n
 
     Mesh mesh = loadModelSmart(path);
     return uploadModelToGPU(mesh, modelName, path);
+}
+
+size_t ModelManager::addPolyMesh(PolyMesh polyMesh, const std::string& name) {
+    Mesh mesh = polyMeshToMesh(polyMesh);
+    std::vector<std::string> texturePaths = levelTexturePaths(mesh);
+    decodeLevelTextures(mesh);
+    const size_t index = uploadModelToGPU(mesh, name, kLevelModelPathPrefix + std::to_string(m_nextLevelModelId++));
+    m_models[index]->polyMesh = std::make_unique<PolyMesh>(std::move(polyMesh));
+    m_models[index]->texturePaths = std::move(texturePaths);
+    return index;
+}
+
+bool ModelManager::rebuildPolyMesh(size_t modelIndex) {
+    if (modelIndex >= m_models.size() || !m_models[modelIndex] || !m_models[modelIndex]->polyMesh)
+        return false;
+    GPUModel& old = *m_models[modelIndex];
+    Mesh mesh = polyMeshToMesh(*old.polyMesh);
+    std::vector<std::string> texturePaths = levelTexturePaths(mesh);
+    // Same textures in the same order: the old images are moved over instead of decoded and uploaded again.
+    const bool keepTextures = texturePaths == old.texturePaths;
+    if (keepTextures)
+        mesh.textureData.clear();
+    else
+        decodeLevelTextures(mesh);
+    const size_t uploaded = uploadModelToGPU(mesh, old.name, old.sourcePath);
+
+    std::lock_guard<std::mutex> lock(m_mutex);
+    // The old buffers may still be read by frames in flight.
+    (void)m_device.waitIdle();
+    GPUModel& rebuilt = *m_models[uploaded];
+    rebuilt.polyMesh = std::move(old.polyMesh);
+    rebuilt.texturePaths = std::move(texturePaths);
+    if (keepTextures) {
+        rebuilt.textures = std::move(old.textures);
+        rebuilt.textureDescriptorSets = std::move(old.textureDescriptorSets);
+    }
+    else {
+        freeTextureDescriptorSets(old);
+    }
+    m_models[modelIndex] = std::move(m_models[uploaded]);
+    m_models.erase(m_models.begin() + uploaded);
+    return true;
 }
 
 size_t ModelManager::uploadModelToGPU(Mesh& mesh, const std::string& name, const std::string& path) {
@@ -430,8 +533,17 @@ size_t ModelManager::uploadModelToGPU(Mesh& mesh, const std::string& name, const
         batch.submitAndWait();
     }
 
-    for (auto& tex : gpuModel->textures)
-        gpuModel->textureDescriptorSets.push_back(allocateTextureDescriptorSet(tex->getView()));
+    try {
+        for (auto& tex : gpuModel->textures)
+            gpuModel->textureDescriptorSets.push_back(allocateTextureDescriptorSet(tex->getView()));
+    }
+    catch (...) {
+        // The model is dropped, so the sets allocated so far would never be returned.
+        freeTextureDescriptorSets(*gpuModel);
+        for (auto& texData : mesh.textureData)
+            texData.free();
+        throw;
+    }
     for (auto& texData : mesh.textureData)
         texData.free();
 
@@ -536,6 +648,8 @@ void ModelManager::unloadModel(size_t modelIndex) {
     }
 
     (void)m_device.waitIdle();
+    if (m_models[modelIndex])
+        freeTextureDescriptorSets(*m_models[modelIndex]);
     m_models.erase(m_models.begin() + modelIndex);
 }
 
