@@ -3,7 +3,6 @@
 #include "app/AppMode.h"
 #include "engine/Camera.h"
 #include "engine/Physics.h"
-#include "engine/Shadow.h"
 
 class Renderer;
 class ModelManager;
@@ -78,5 +77,4 @@ private:
     // Falling below this (off the edge of the level) respawns the player.
     float m_killHeight = -100.0f;
     bool m_jumpRequested = false;
-    DirectionalLight m_sun;
 };

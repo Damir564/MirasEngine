@@ -49,6 +49,13 @@ FetchContent_Declare(
   GIT_SHALLOW TRUE
 )
 
+# Only windowing, events and Vulkan surfaces are used; drop the other subsystems and renderers.
+foreach(SDL_UNUSED_OPTION
+    SDL_AUDIO SDL_GPU SDL_RENDER SDL_CAMERA SDL_JOYSTICK SDL_HAPTIC SDL_HIDAPI SDL_POWER SDL_SENSOR
+    SDL_DIALOG SDL_TRAY SDL_OPENGL SDL_OPENGLES SDL_TEST_LIBRARY)
+  set(${SDL_UNUSED_OPTION} OFF CACHE BOOL "" FORCE)
+endforeach()
+
 FetchContent_Declare(
   glm
   GIT_REPOSITORY https://github.com/g-truc/glm.git
@@ -56,21 +63,8 @@ FetchContent_Declare(
   GIT_SHALLOW TRUE
 )
 
-FetchContent_Declare(
-  assimp
-  GIT_REPOSITORY https://github.com/assimp/assimp.git
-  GIT_TAG v6.0.2
-  GIT_SHALLOW TRUE
-)
-
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
-set(ASSIMP_BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 
-set(ASSIMP_BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
-set(ASSIMP_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-set(ASSIMP_BUILD_SAMPLES OFF CACHE BOOL "" FORCE)
-set(ASSIMP_BUILD_DOCS OFF CACHE BOOL "" FORCE)
-set(ASSIMP_BUILD_ASSIMP_TOOLS OFF CACHE BOOL "" FORCE)
 
 FetchContent_Declare(
     stb
@@ -115,6 +109,29 @@ set(TARGET_HELLO_WORLD OFF CACHE BOOL "" FORCE)
 set(TARGET_PERFORMANCE_TEST OFF CACHE BOOL "" FORCE)
 set(TARGET_SAMPLES OFF CACHE BOOL "" FORCE)
 set(TARGET_VIEWER OFF CACHE BOOL "" FORCE)
+# Prebuilt Vulkan runtime shipped next to engine.exe (see cmake/Packaging.cmake): the loader, for PCs
+# without a Vulkan driver, and Mesa's lavapipe, a Vulkan 1.4 driver that renders on the CPU. Only
+# downloaded and extracted; SOURCE_SUBDIR none keeps FetchContent from looking for a CMake project.
+if (MIRAS_BUNDLE_VULKAN_RUNTIME)
+    FetchContent_Declare(vulkan_runtime
+        URL https://sdk.lunarg.com/sdk/download/1.4.335.0/windows/VulkanRT-X64-1.4.335.0-Components.zip
+        URL_HASH SHA256=4f856da356ffb1c16fbfc792cae70f6e6873680e6b62bc132b9d7131cbc97fe2
+        DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+        SOURCE_SUBDIR none)
+    # Not 26.2.x: its lavapipe corrupts the heap in vkDestroySwapchainKHR on Windows (even vkcube crashes).
+    FetchContent_Declare(mesa_dist
+        URL https://github.com/pal1000/mesa-dist-win/releases/download/26.1.8/mesa3d-26.1.8-release-msvc.7z
+        URL_HASH SHA256=4c6d32e653e0ff9ad07796e40c0bcfabf2764d849e3ce4f3b1590112c87e42f9
+        DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+        SOURCE_SUBDIR none)
+    # The binary release has no license file; this is the MIT license that covers lavapipe.
+    FetchContent_Declare(mesa_license
+        URL https://gitlab.freedesktop.org/mesa/mesa/-/raw/mesa-26.1.8/licenses/MIT
+        URL_HASH SHA256=323c587d0ccf10e376f8bf9a7f31fb4ca6078105194b42e0b1e0ee2bc9bde71f
+        DOWNLOAD_NO_EXTRACT TRUE
+        SOURCE_SUBDIR none)
+    FetchContent_MakeAvailable(vulkan_runtime mesa_dist mesa_license)
+endif()
 
 set(FASTGLTF_COMPILE_AS_CPP20 ON CACHE BOOL "" FORCE)
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
@@ -129,7 +146,6 @@ FetchContent_MakeAvailable(
   vk_bootstrap
   SDL3
   glm
-  assimp
   stb
   fastgltf
   imgui
@@ -137,9 +153,11 @@ FetchContent_MakeAvailable(
   JoltPhysics
 )
 
+# SDL forces /GL- on SDL_mslibc.c, which conflicts with LTCG (D9025/C4652), so SDL is left out of it.
+set_target_properties(SDL3-static PROPERTIES INTERPROCEDURAL_OPTIMIZATION_RELEASE OFF)
+
 add_library(imgui STATIC
     ${imgui_SOURCE_DIR}/imgui.cpp
-    ${imgui_SOURCE_DIR}/imgui_demo.cpp
     ${imgui_SOURCE_DIR}/imgui_draw.cpp
     ${imgui_SOURCE_DIR}/imgui_tables.cpp
     ${imgui_SOURCE_DIR}/imgui_widgets.cpp

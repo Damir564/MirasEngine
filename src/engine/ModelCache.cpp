@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <string>
 #include <vector>
 
 namespace {
@@ -75,7 +76,7 @@ bool save(const std::string& cachePath, const Mesh& mesh) {
         }
     }
 
-    return true;
+    return static_cast<bool>(file);
 }
 
 bool load(const std::string& cachePath, Mesh& outMesh) {
@@ -114,8 +115,7 @@ bool load(const std::string& cachePath, Mesh& outMesh) {
         tex.fromCache = true;
         file.read(reinterpret_cast<char*>(tex.pixels), dataSize);
     }
-
-    return true;
+    return static_cast<bool>(file);
 }
 
 } // namespace ModelCache

@@ -1,5 +1,4 @@
 #include "ModelManager.h"
-#include <iostream>
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -8,8 +7,8 @@
 #include <tuple>
 #include "stb_image.h"
 #include "Shadow.h"
-#include "IfcScene.h"
 #include "ModelLoader.h"
+#include "Log.h"
 
 class TextureImage {
 public:
@@ -361,7 +360,7 @@ void ModelManager::loadModelAsync(const std::string& path, const std::string& na
 size_t ModelManager::loadModelSync(const std::string& path, const std::string& name) {
     std::string modelName = name.empty() ? std::filesystem::path(path).stem().string() : name;
 
-    std::cout << "[ModelManager] Loading model synchronously: " << path << "\n";
+    LOG_INFO("[ModelManager] Loading model synchronously: " << path << "\n");
 
     Mesh mesh = loadModelSmart(path);
     return uploadModelToGPU(mesh, modelName, path);
@@ -382,7 +381,10 @@ size_t ModelManager::uploadModelToGPU(Mesh& mesh, const std::string& name, const
     buildDrawOrder(*gpuModel);
     gpuModel->vertexCount = mesh.vertices.size();
     gpuModel->indexCount = mesh.indices.size();
-    gpuModel->ifcScene = mesh.ifcScene;
+    gpuModel->positions.reserve(mesh.vertices.size());
+    for (const auto& v : mesh.vertices)
+        gpuModel->positions.push_back(v.position);
+    gpuModel->indices = mesh.indices;
 
     const vk::DeviceSize vertexBytes = sizeof(Vertex) * std::max<size_t>(mesh.vertices.size(), 1);
     const vk::DeviceSize indexBytes = sizeof(uint32_t) * std::max<size_t>(gpuIndexCount, 1);
@@ -462,10 +464,10 @@ size_t ModelManager::uploadModelToGPU(Mesh& mesh, const std::string& name, const
     size_t index = m_models.size();
     m_models.push_back(std::move(gpuModel));
 
-    std::cout << "[ModelManager] Model '" << name << "' loaded: "
+    LOG_INFO("[ModelManager] Model '" << name << "' loaded: "
         << mesh.vertices.size() << " verts, "
         << mesh.indices.size() << " indices, "
-        << m_models.back()->textures.size() << " textures\n";
+        << m_models.back()->textures.size() << " textures\n");
 
     return index;
 }
@@ -550,7 +552,6 @@ size_t ModelManager::createInstance(size_t modelIndex, const glm::vec3& position
     inst.rotation = rotation;
     inst.scale = scale;
     inst.name = m_models[modelIndex]->name + "_" + std::to_string(m_nextInstanceId++);
-    inst.ifcScene = m_models[modelIndex]->ifcScene;
 
     m_instances.push_back(inst);
     return m_instances.size() - 1;
@@ -601,7 +602,7 @@ void ModelManager::update() {
                 catch (const std::exception& e) {
                     task.state = LoadingState::Failed;
                     task.errorMessage = e.what();
-                    std::cerr << "[ModelManager] Failed: " << e.what() << "\n";
+                    LOG_ERROR("[ModelManager] Failed: " << e.what() << "\n");
                 }
             }
         }

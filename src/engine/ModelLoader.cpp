@@ -1,17 +1,11 @@
 #include "ModelLoader.h"
 #include "ModelCache.h"
-#include "IfcConverter.h"
-#include "IfcScene.h"
-#include "IfcSceneLoader.h"
 #include <algorithm>
 #include <atomic>
 #include <cctype>
 #include <cstdlib>
-#include <cstring>
 #include <filesystem>
-#include <functional>
 #include <future>
-#include <iostream>
 #include <limits>
 #include <numeric>
 #include <stdexcept>
@@ -20,13 +14,11 @@
 #include <glm/glm.hpp>
 #include <glm/ext/matrix_transform.hpp>
 #include <glm/gtc/quaternion.hpp>
-#include <assimp/Importer.hpp>
-#include <assimp/scene.h>
-#include <assimp/postprocess.h>
 #include <fastgltf/core.hpp>
 #include <fastgltf/glm_element_traits.hpp>
 #include <fastgltf/tools.hpp>
 #include "stb_image.h"
+#include "Log.h"
 
 namespace {
 
@@ -90,7 +82,7 @@ void decodeTextureParallel(TextureData& tex) {
                     std::string altPath = basePath + tryExt;
                     tex.pixels = stbi_load(altPath.c_str(), &tex.width, &tex.height, &tex.channels, 4);
                     if (tex.pixels) {
-                        std::cout << "  Found texture at: " << altPath << "\n";
+                        LOG_INFO("  Found texture at: " << altPath << "\n");
                         break;
                     }
                 }
@@ -99,7 +91,7 @@ void decodeTextureParallel(TextureData& tex) {
     }
 
     if (!tex.pixels) {
-        std::cerr << "Texture failed to load: " << (tex.path.empty() ? "Embedded" : tex.path) << "\n";
+        LOG_ERROR("Texture failed to load: " << (tex.path.empty() ? "Embedded" : tex.path) << "\n");
         // 1x1 magenta so missing textures are obvious in the viewport.
         tex.width = 1;
         tex.height = 1;
@@ -119,7 +111,7 @@ void decodeAllTextures(std::vector<TextureData>& textures, bool logProgress) {
     if (textures.empty())
         return;
 
-    std::cout << "Decoding " << textures.size() << " textures in parallel...\n";
+    LOG_INFO("Decoding " << textures.size() << " textures in parallel...\n");
 
     std::vector<std::future<void>> futures;
     futures.reserve(textures.size());
@@ -134,7 +126,7 @@ void decodeAllTextures(std::vector<TextureData>& textures, bool logProgress) {
                 return;
             int loaded = ++loadedCount;
             if (loaded % 10 == 0 || loaded == totalTextures) {
-                std::cout << "  Texture progress: " << loaded << "/" << totalTextures << "\n";
+                LOG_INFO("  Texture progress: " << loaded << "/" << totalTextures << "\n");
             }
             }));
     }
@@ -144,416 +136,11 @@ void decodeAllTextures(std::vector<TextureData>& textures, bool logProgress) {
     }
 
     if (logProgress)
-        std::cout << "All textures decoded.\n";
+        LOG_INFO("All textures decoded.\n");
 }
 
 // ---------------------------------------------------------------------------------------------
-// assimp (FBX, OBJ, ...)
-// ---------------------------------------------------------------------------------------------
-
-TextureData prepareAssimpTextureInfo(const aiScene* scene, const aiMaterial* mat, const std::string& modelPath, aiTextureType type) {
-    TextureData texture{};
-    aiString path;
-
-    if (mat->GetTexture(type, 0, &path) == AI_SUCCESS) {
-        const aiTexture* embeddedTex = scene->GetEmbeddedTexture(path.C_Str());
-        if (embeddedTex) {
-            texture.encodedData = reinterpret_cast<const unsigned char*>(embeddedTex->pcData);
-
-            if (embeddedTex->mHeight == 0) {
-                // Compressed (png/jpg) blob; mWidth is its byte size.
-                texture.encodedSize = embeddedTex->mWidth;
-            }
-            else {
-                // Raw ARGB texels; stbi expects a file header, so these may fail to decode.
-                texture.encodedSize = embeddedTex->mWidth * embeddedTex->mHeight * 4;
-            }
-        }
-        else {
-            std::filesystem::path mPath(modelPath);
-            std::filesystem::path tPath(path.C_Str());
-
-            if (!tPath.is_absolute()) {
-                texture.path = (mPath.parent_path() / tPath).string();
-            }
-            else {
-                texture.path = path.C_Str();
-            }
-        }
-    }
-    return texture;
-}
-
-// OBJ/MTL textures are always external files, and MTL paths are frequently stale.
-TextureData prepareObjTextureInfo(const aiMaterial* mat, const std::string& modelPath, aiTextureType type) {
-    TextureData texture{};
-    aiString texPath;
-
-    if (mat->GetTexture(type, 0, &texPath) == AI_SUCCESS) {
-        std::filesystem::path modelDir = std::filesystem::path(modelPath).parent_path();
-        std::filesystem::path texturePath(texPath.C_Str());
-
-        if (texturePath.is_absolute()) {
-            texture.path = texturePath.string();
-        }
-        else {
-            std::filesystem::path fullPath = modelDir / texturePath;
-
-            if (!std::filesystem::exists(fullPath)) {
-                fullPath = modelDir / texturePath.filename();
-            }
-
-            if (!std::filesystem::exists(fullPath)) {
-                for (const auto& subdir : { "textures", "Textures", "tex", "maps", "Materials" }) {
-                    auto tryPath = modelDir / subdir / texturePath.filename();
-                    if (std::filesystem::exists(tryPath)) {
-                        fullPath = tryPath;
-                        break;
-                    }
-                }
-            }
-
-            texture.path = fullPath.string();
-        }
-
-        if (!std::filesystem::exists(texture.path)) {
-            std::cerr << "Warning: Texture not found: " << texture.path << "\n";
-        }
-    }
-
-    return texture;
-}
-
-glm::mat4 aiMatrix4x4ToGlm(const aiMatrix4x4& from) {
-    glm::mat4 to;
-    to[0][0] = from.a1; to[1][0] = from.a2; to[2][0] = from.a3; to[3][0] = from.a4;
-    to[0][1] = from.b1; to[1][1] = from.b2; to[2][1] = from.b3; to[3][1] = from.b4;
-    to[0][2] = from.c1; to[1][2] = from.c2; to[2][2] = from.c3; to[3][2] = from.c4;
-    to[0][3] = from.d1; to[1][3] = from.d2; to[2][3] = from.d3; to[3][3] = from.d4;
-    return to;
-}
-
-void processNode(const aiNode* node, const aiScene* scene, const glm::mat4& parentTransform, Mesh& result,
-    TextureCache& textureCache, const std::string& path) {
-
-    glm::mat4 globalTransform = parentTransform * aiMatrix4x4ToGlm(node->mTransformation);
-    glm::mat3 normalMatrix = glm::transpose(glm::inverse(glm::mat3(globalTransform)));
-
-    uint32_t vertexOffset = static_cast<uint32_t>(result.vertices.size());
-    uint32_t indexOffset = static_cast<uint32_t>(result.indices.size());
-
-    for (unsigned int m = 0; m < node->mNumMeshes; ++m) {
-        const aiMesh* mesh = scene->mMeshes[node->mMeshes[m]];
-
-        SubmeshInfo info{};
-        info.vertexOffset = vertexOffset;
-        info.indexOffset = indexOffset;
-        info.indexCount = mesh->mNumFaces * 3;
-
-        for (unsigned int i = 0; i < mesh->mNumVertices; ++i) {
-            Vertex vertex{};
-            glm::vec4 pos = globalTransform * glm::vec4(mesh->mVertices[i].x, mesh->mVertices[i].y, mesh->mVertices[i].z, 1.0f);
-            vertex.position = glm::vec3(pos);
-            vertex.normal = mesh->HasNormals() ? glm::normalize(normalMatrix * glm::vec3(mesh->mNormals[i].x, mesh->mNormals[i].y, mesh->mNormals[i].z)) : glm::vec3(0.0f);
-            vertex.texCoord = mesh->HasTextureCoords(0) ? glm::vec2(mesh->mTextureCoords[0][i].x, mesh->mTextureCoords[0][i].y) : glm::vec2(0.0f);
-            if (mesh->HasTangentsAndBitangents()) {
-                glm::vec3 T = glm::normalize(normalMatrix * glm::vec3(mesh->mTangents[i].x, mesh->mTangents[i].y, mesh->mTangents[i].z));
-                glm::vec3 B = glm::normalize(normalMatrix * glm::vec3(mesh->mBitangents[i].x, mesh->mBitangents[i].y, mesh->mBitangents[i].z));
-                glm::vec3 N = vertex.normal;
-                float handedness = (glm::dot(glm::cross(N, T), B) < 0.0f) ? -1.0f : 1.0f;
-                vertex.tangent = glm::vec4(T, handedness);
-            }
-            else {
-                vertex.tangent = glm::vec4(0.0f);
-            }
-            result.vertices.push_back(vertex);
-        }
-
-        for (unsigned int i = 0; i < mesh->mNumFaces; ++i) {
-            const aiFace& face = mesh->mFaces[i];
-            if (face.mNumIndices != 3) continue;
-            result.indices.push_back(face.mIndices[0]);
-            result.indices.push_back(face.mIndices[1]);
-            result.indices.push_back(face.mIndices[2]);
-        }
-
-        vertexOffset += mesh->mNumVertices;
-        indexOffset += mesh->mNumFaces * 3;
-
-        aiMaterial* material = scene->mMaterials[mesh->mMaterialIndex];
-
-        aiColor4D color;
-        if (AI_SUCCESS == aiGetMaterialColor(material, AI_MATKEY_BASE_COLOR, &color)) {
-            info.material.baseColorFactor = glm::vec4(color.r, color.g, color.b, color.a);
-        }
-        else if (AI_SUCCESS == aiGetMaterialColor(material, AI_MATKEY_COLOR_DIFFUSE, &color)) {
-            info.material.baseColorFactor = glm::vec4(color.r, color.g, color.b, color.a);
-        }
-
-        float opacity = 1.0f;
-        aiGetMaterialFloat(material, AI_MATKEY_OPACITY, &opacity);
-        info.material.baseColorFactor.a *= opacity;
-
-        aiColor4D transparentColor;
-        if (AI_SUCCESS == aiGetMaterialColor(material, AI_MATKEY_COLOR_TRANSPARENT, &transparentColor)) {
-            float avgTransparency = (transparentColor.r + transparentColor.g + transparentColor.b) / 3.0f;
-            if (avgTransparency > 0.01f) {
-                info.material.baseColorFactor.a *= (1.0f - avgTransparency);
-            }
-        }
-
-        info.material.alphaMode = info.material.baseColorFactor.a < 0.99f ? AlphaMode::BLEND : AlphaMode::OPAQUE;
-
-        // FBX rarely carries PBR factors; default to a non-metal.
-        float metallic = 0.0f;
-        float roughness = 0.5f;
-        aiGetMaterialFloat(material, AI_MATKEY_METALLIC_FACTOR, &metallic);
-        aiGetMaterialFloat(material, AI_MATKEY_ROUGHNESS_FACTOR, &roughness);
-        info.material.metallicFactor = metallic;
-        info.material.roughnessFactor = roughness;
-
-        aiString texPath;
-
-        aiTextureType baseType = aiTextureType_BASE_COLOR;
-        if (material->GetTextureCount(baseType) == 0) baseType = aiTextureType_DIFFUSE;
-
-        if (material->GetTexture(baseType, 0, &texPath) == AI_SUCCESS) {
-            info.material.baseColorTextureIndex = findOrAddTexture(result, textureCache, texPath.C_Str(), false,
-                [&] { return prepareAssimpTextureInfo(scene, material, path, baseType); });
-        }
-
-        if (material->GetTexture(aiTextureType_NORMALS, 0, &texPath) == AI_SUCCESS) {
-            info.material.normalTextureIndex = findOrAddTexture(result, textureCache, texPath.C_Str(), true,
-                [&] { return prepareAssimpTextureInfo(scene, material, path, aiTextureType_NORMALS); });
-        }
-
-        if (material->GetTexture(aiTextureType_UNKNOWN, 0, &texPath) == AI_SUCCESS) {
-            info.material.metallicRoughnessTextureIndex = findOrAddTexture(result, textureCache, texPath.C_Str(), true,
-                [&] { return prepareAssimpTextureInfo(scene, material, path, aiTextureType_UNKNOWN); });
-        }
-
-        result.submeshes.push_back(info);
-    }
-
-    for (unsigned int i = 0; i < node->mNumChildren; ++i) {
-        processNode(node->mChildren[i], scene, globalTransform, result, textureCache, path);
-    }
-}
-
-void readObjMaterial(const aiMaterial* material, const std::string& path, Mesh& result,
-    TextureCache& textureCache, Material& outMaterial) {
-
-    aiColor4D diffuseColor(1.0f, 1.0f, 1.0f, 1.0f);
-    if (AI_SUCCESS == aiGetMaterialColor(material, AI_MATKEY_COLOR_DIFFUSE, &diffuseColor)) {
-        // Alpha comes from the opacity keys below, not the diffuse color.
-        outMaterial.baseColorFactor = glm::vec4(diffuseColor.r, diffuseColor.g, diffuseColor.b, 1.0f);
-    }
-
-    float shininess = 0.0f;
-    if (AI_SUCCESS == aiGetMaterialFloat(material, AI_MATKEY_SHININESS, &shininess)) {
-        outMaterial.roughnessFactor = 1.0f - glm::clamp(shininess / 1000.0f, 0.0f, 1.0f);
-    }
-    else {
-        outMaterial.roughnessFactor = 0.5f;
-    }
-
-    outMaterial.metallicFactor = 0.0f;
-
-    aiString texPath;
-    if (material->GetTexture(aiTextureType_DIFFUSE, 0, &texPath) == AI_SUCCESS) {
-        outMaterial.baseColorTextureIndex = findOrAddTexture(result, textureCache,
-            std::string("diffuse:") + texPath.C_Str(), false,
-            [&] { return prepareObjTextureInfo(material, path, aiTextureType_DIFFUSE); });
-    }
-
-    float finalOpacity = 1.0f;
-
-    float opacity = 1.0f;
-    if (AI_SUCCESS == aiGetMaterialFloat(material, AI_MATKEY_OPACITY, &opacity)) {
-        finalOpacity = opacity;
-    }
-
-    // Many exporters write Tr=1.0 meaning "opaque", so only fractional Tr values count as transparency.
-    float transparency = 0.0f;
-    if (AI_SUCCESS == aiGetMaterialFloat(material, AI_MATKEY_TRANSPARENCYFACTOR, &transparency)) {
-        if (transparency > 0.001f && transparency < 0.999f) {
-            finalOpacity = 1.0f - transparency;
-        }
-    }
-
-    aiColor4D transparentColor;
-    if (AI_SUCCESS == aiGetMaterialColor(material, AI_MATKEY_COLOR_TRANSPARENT, &transparentColor)) {
-        float avgTransparency = (transparentColor.r + transparentColor.g + transparentColor.b) / 3.0f;
-        if (avgTransparency > 0.01f && avgTransparency < 0.99f) {
-            finalOpacity *= (1.0f - avgTransparency);
-        }
-    }
-
-    outMaterial.baseColorFactor.a = finalOpacity;
-    outMaterial.alphaMode = finalOpacity < 0.99f ? AlphaMode::BLEND : AlphaMode::OPAQUE;
-
-    // MTL bump maps (map_Bump) come through as HEIGHT when no NORMALS slot is present.
-    aiTextureType normalType = aiTextureType_NORMALS;
-    if (material->GetTextureCount(aiTextureType_NORMALS) == 0) {
-        normalType = aiTextureType_HEIGHT;
-    }
-    if (material->GetTexture(normalType, 0, &texPath) == AI_SUCCESS) {
-        outMaterial.normalTextureIndex = findOrAddTexture(result, textureCache,
-            std::string("normal:") + texPath.C_Str(), true,
-            [&] { return prepareObjTextureInfo(material, path, normalType); });
-    }
-
-    // Specular map stands in for metallic-roughness, which OBJ has no notion of.
-    if (material->GetTexture(aiTextureType_SPECULAR, 0, &texPath) == AI_SUCCESS) {
-        outMaterial.metallicRoughnessTextureIndex = findOrAddTexture(result, textureCache,
-            std::string("specular:") + texPath.C_Str(), true,
-            [&] { return prepareObjTextureInfo(material, path, aiTextureType_SPECULAR); });
-    }
-}
-
-void processNodeForObj(const aiNode* node, const aiScene* scene, const glm::mat4& parentTransform, Mesh& result,
-    TextureCache& textureCache, const std::string& path) {
-
-    glm::mat4 globalTransform = parentTransform * aiMatrix4x4ToGlm(node->mTransformation);
-    glm::mat3 normalMatrix = glm::transpose(glm::inverse(glm::mat3(globalTransform)));
-
-    for (unsigned int m = 0; m < node->mNumMeshes; ++m) {
-        const aiMesh* mesh = scene->mMeshes[node->mMeshes[m]];
-
-        SubmeshInfo info{};
-        info.vertexOffset = static_cast<uint32_t>(result.vertices.size());
-        info.indexOffset = static_cast<uint32_t>(result.indices.size());
-        info.indexCount = mesh->mNumFaces * 3;
-
-        for (unsigned int i = 0; i < mesh->mNumVertices; ++i) {
-            Vertex vertex{};
-            glm::vec4 pos = globalTransform * glm::vec4(mesh->mVertices[i].x, mesh->mVertices[i].y, mesh->mVertices[i].z, 1.0f);
-            vertex.position = glm::vec3(pos);
-
-            if (mesh->HasNormals()) {
-                vertex.normal = glm::normalize(normalMatrix * glm::vec3(mesh->mNormals[i].x, mesh->mNormals[i].y, mesh->mNormals[i].z));
-            }
-            else {
-                vertex.normal = glm::vec3(0.0f, 1.0f, 0.0f);
-            }
-
-            if (mesh->HasTextureCoords(0)) {
-                vertex.texCoord = glm::vec2(mesh->mTextureCoords[0][i].x, mesh->mTextureCoords[0][i].y);
-            }
-            else {
-                vertex.texCoord = glm::vec2(0.0f);
-            }
-
-            if (mesh->HasTangentsAndBitangents()) {
-                glm::vec3 T = glm::normalize(normalMatrix * glm::vec3(mesh->mTangents[i].x, mesh->mTangents[i].y, mesh->mTangents[i].z));
-                glm::vec3 B = glm::normalize(normalMatrix * glm::vec3(mesh->mBitangents[i].x, mesh->mBitangents[i].y, mesh->mBitangents[i].z));
-                glm::vec3 N = vertex.normal;
-                float handedness = (glm::dot(glm::cross(N, T), B) < 0.0f) ? -1.0f : 1.0f;
-                vertex.tangent = glm::vec4(T, handedness);
-            }
-            else {
-                vertex.tangent = glm::vec4(1.0f, 0.0f, 0.0f, 1.0f);
-            }
-
-            result.vertices.push_back(vertex);
-        }
-
-        for (unsigned int i = 0; i < mesh->mNumFaces; ++i) {
-            const aiFace& face = mesh->mFaces[i];
-            if (face.mNumIndices != 3) continue;
-            result.indices.push_back(face.mIndices[0]);
-            result.indices.push_back(face.mIndices[1]);
-            result.indices.push_back(face.mIndices[2]);
-        }
-
-        if (mesh->mMaterialIndex < scene->mNumMaterials) {
-            readObjMaterial(scene->mMaterials[mesh->mMaterialIndex], path, result, textureCache, info.material);
-        }
-
-        result.submeshes.push_back(info);
-    }
-
-    for (unsigned int i = 0; i < node->mNumChildren; ++i) {
-        processNodeForObj(node->mChildren[i], scene, globalTransform, result, textureCache, path);
-    }
-}
-
-void calculateTotalAssimpVertices(const aiNode* node, const aiScene* scene, size_t& totalVerts, size_t& totalIndices) {
-    for (unsigned int i = 0; i < node->mNumMeshes; ++i) {
-        const aiMesh* mesh = scene->mMeshes[node->mMeshes[i]];
-        totalVerts += mesh->mNumVertices;
-        // aiProcess_Triangulate guarantees 3 indices per face.
-        totalIndices += mesh->mNumFaces * 3;
-    }
-
-    for (unsigned int i = 0; i < node->mNumChildren; ++i) {
-        calculateTotalAssimpVertices(node->mChildren[i], scene, totalVerts, totalIndices);
-    }
-}
-
-Mesh loadWithAssimp(const std::string& path) {
-    Assimp::Importer importer;
-
-    std::string ext = std::filesystem::path(path).extension().string();
-    std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
-    const bool isObjFile = (ext == ".obj");
-
-    unsigned int importFlags =
-        aiProcess_Triangulate |
-        aiProcess_CalcTangentSpace |
-        aiProcess_GenSmoothNormals |
-        aiProcess_JoinIdenticalVertices;
-
-    if (isObjFile) {
-        // OBJ UVs already have the orientation we want; large OBJ exports benefit from merging.
-        importFlags |= aiProcess_OptimizeMeshes;
-        importFlags |= aiProcess_OptimizeGraph;
-    }
-    else {
-        importFlags |= aiProcess_FlipUVs;
-        importFlags |= aiProcess_GlobalScale;
-    }
-
-    const aiScene* scene = importer.ReadFile(path, importFlags);
-
-    if (!scene || !scene->HasMeshes()) {
-        throw std::runtime_error("Failed to load model: " + path + "\nAssimp error: " + importer.GetErrorString());
-    }
-
-    std::cout << "Loading with Assimp: " << path << "\n";
-    std::cout << "  Meshes: " << scene->mNumMeshes << "\n";
-    std::cout << "  Materials: " << scene->mNumMaterials << "\n";
-    std::cout << "  Textures (embedded): " << scene->mNumTextures << "\n";
-
-    Mesh result;
-
-    size_t totalVerts = 0;
-    size_t totalIndices = 0;
-    calculateTotalAssimpVertices(scene->mRootNode, scene, totalVerts, totalIndices);
-    result.vertices.reserve(totalVerts);
-    result.indices.reserve(totalIndices);
-
-    std::cout << "  Expected vertices: " << totalVerts << ", indices: " << totalIndices << "\n";
-
-    TextureCache textureCache;
-    if (isObjFile) {
-        processNodeForObj(scene->mRootNode, scene, glm::mat4(1.0f), result, textureCache, path);
-    }
-    else {
-        processNode(scene->mRootNode, scene, glm::mat4(1.0f), result, textureCache, path);
-    }
-
-    std::cout << "  Loaded vertices: " << result.vertices.size() << ", indices: " << result.indices.size() << "\n";
-    std::cout << "  Submeshes: " << result.submeshes.size() << "\n";
-    std::cout << "  Textures to load: " << result.textureData.size() << "\n";
-
-    decodeAllTextures(result.textureData, true);
-
-    return result;
-}
-
-// ---------------------------------------------------------------------------------------------
-// fastgltf (glTF / GLB, and the GLB produced from IFC)
+// fastgltf (glTF / GLB)
 // ---------------------------------------------------------------------------------------------
 
 // Only records where the encoded image lives; decoding happens later in parallel.
@@ -650,7 +237,7 @@ void readGltfMaterial(const fastgltf::Asset& asset, const fastgltf::Material& ma
         break;
     }
 
-    // Some exporters (IfcConvert included) mark translucent materials as opaque.
+    // Some exporters mark translucent materials as opaque.
     if (outMaterial.alphaMode == AlphaMode::OPAQUE && outMaterial.baseColorFactor.a < 0.99f) {
         outMaterial.alphaMode = AlphaMode::BLEND;
     }
@@ -862,126 +449,8 @@ Mesh loadWithFastGltf(const std::string& path) {
     // Embedded textures point into the asset, so decode before it goes out of scope.
     decodeAllTextures(result.textureData, false);
 
-    std::cout << "Loaded " << result.vertices.size() << " vertices, " << result.textureData.size() << " textures.\n";
+    LOG_INFO("Loaded " << result.vertices.size() << " vertices, " << result.textureData.size() << " textures.\n");
     return result;
-}
-
-// ---------------------------------------------------------------------------------------------
-// IFC
-// ---------------------------------------------------------------------------------------------
-
-// Links IFC elements to submeshes. IfcConvert names each glTF node after its element GUID
-// (--use-element-names), and every primitive of that node becomes one submesh.
-void buildIfcScene(IfcScene& scene, const fastgltf::Asset& asset, const std::vector<size_t>& submeshNodeMap) {
-    scene.submeshVisibilityCache.assign(submeshNodeMap.size(), false);
-
-    for (std::size_t si = 0; si < submeshNodeMap.size(); ++si) {
-        const auto& node = asset.nodes[submeshNodeMap[si]];
-        std::string guid(node.name.begin(), node.name.end());
-
-        auto it = scene.elements.find(guid);
-        if (it != scene.elements.end()) {
-            it->second.submeshIndex = si;
-            scene.submeshToGuid[si] = guid;
-            scene.guidToSubmesh[guid] = si;
-            scene.submeshVisibilityCache[si] = it->second.visible;
-        }
-    }
-
-    const std::size_t elementCountBefore = scene.elements.size();
-    std::erase_if(scene.elements, [](const auto& kv) {
-        return kv.second.submeshIndex == std::numeric_limits<std::size_t>::max();
-        });
-
-    for (auto& [sg, sn] : scene.spatial) {
-        std::erase_if(sn.elementGuids, [&](const std::string& guid) {
-            return !scene.elements.contains(guid);
-            });
-    }
-
-    std::cout << "[IFC] " << scene.elements.size() << " elements with geometry, "
-        << (elementCountBefore - scene.elements.size()) << " without geometry removed, "
-        << scene.submeshToGuid.size() << " submeshes matched\n";
-}
-
-// Builds the IfcScene for an already-converted IFC. Only the glTF node tree is parsed (no buffers),
-// which is enough to map submesh indices back to element GUIDs.
-IfcScene beginLoadIfcScene(const std::string& glbPath, const std::string& jsonPath) {
-    // Metadata JSON parsing is independent of the glTF node walk, so overlap them.
-    auto metadataFuture = std::async(std::launch::async, [jsonPath]() {
-        IfcScene scene{};
-        if (!loadIfcScene(jsonPath, scene)) {
-            std::cerr << "[IFC] Warning: failed to load metadata from " << jsonPath << "\n";
-        }
-        return scene;
-        });
-
-    fastgltf::Parser parser;
-    auto gltfFile = fastgltf::MappedGltfFile::FromPath(glbPath);
-    if (!gltfFile)
-        return metadataFuture.get();
-
-    auto assetRet = parser.loadGltf(gltfFile.get(),
-        std::filesystem::path(glbPath).parent_path(), fastgltf::Options::None);
-
-    if (assetRet.error() != fastgltf::Error::None)
-        return metadataFuture.get();
-
-    auto& asset = assetRet.get();
-    std::vector<size_t> submeshNodeMap;
-
-    if (!asset.scenes.empty()) {
-        // Must visit nodes in the same order as processFastGltfNode so indices line up.
-        std::function<void(size_t)> walk = [&](size_t ni) {
-            const auto& n = asset.nodes[ni];
-            if (n.meshIndex.has_value()) {
-                std::size_t primCount = asset.meshes[*n.meshIndex].primitives.size();
-                for (std::size_t p = 0; p < primCount; ++p) {
-                    submeshNodeMap.push_back(ni);
-                }
-            }
-            for (size_t c : n.children) walk(c);
-            };
-        for (size_t ni : asset.scenes[asset.defaultScene.value_or(0)].nodeIndices)
-            walk(ni);
-    }
-
-    IfcScene ifcScene = metadataFuture.get();
-    buildIfcScene(ifcScene, asset, submeshNodeMap);
-
-    return ifcScene;
-}
-
-Mesh loadIfcModel(const std::string& ifcPath) {
-    // IfcConvert (geometry) and the metadata extractor are separate processes; run them concurrently.
-    auto jsonFuture = std::async(std::launch::async, [ifcPath]() { return IfcConverter::toJson(ifcPath); });
-
-    auto glbOpt = IfcConverter::toGlb(ifcPath);
-    if (!glbOpt) {
-        jsonFuture.wait();
-        throw std::runtime_error("IFC conversion failed to GLB: " + ifcPath);
-    }
-    const std::string& glbPath = *glbOpt;
-
-    Mesh result = loadWithFastGltf(glbPath);
-
-    auto jsonOpt = jsonFuture.get();
-    if (!jsonOpt) throw std::runtime_error("IFC conversion failed to JSON: " + ifcPath);
-    result.ifcScene = beginLoadIfcScene(glbPath, *jsonOpt);
-
-    std::cout << "[IFC] " << result.vertices.size() << " verts, "
-        << result.ifcScene->elements.size() << " elements, "
-        << result.ifcScene->spatial.size() << " spatial nodes\n";
-
-    return result;
-}
-
-Mesh loadFromSource(const std::string& path, const std::string& ext) {
-    if (ext == ".ifc")
-        return loadIfcModel(path);
-    if (ext == ".gltf" || ext == ".glb")
-        return loadWithFastGltf(path);
-    return loadWithAssimp(path);
 }
 
 } // namespace
@@ -1043,47 +512,30 @@ Mesh generateCube() {
 } // namespace
 
 Mesh loadModelSmart(const std::string& path) {
-    namespace fs = std::filesystem;
-
     if (path == kBuiltinCubePath)
         return generateCube();
     if (isBuiltinModelPath(path))
         throw std::runtime_error("Unknown builtin model: " + path);
 
     const std::string cachePath = path + ".cache";
-    const fs::path fsPath(path);
-    std::string ext = pathToUtf8(fsPath.extension());
+    const std::u8string u8Ext = std::filesystem::path(path).extension().u8string();
+    std::string ext(u8Ext.begin(), u8Ext.end());
     std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
-    const bool isIfc = (ext == ".ifc");
+    // Checked before the cache so a leftover cache of a no longer supported format isn't loaded.
+    if (ext != ".gltf" && ext != ".glb")
+        throw std::runtime_error("Unsupported model format: " + path);
 
-    Mesh result;
     if (ModelCache::isValid(path, cachePath)) {
-        std::cout << "[CACHE] Found valid cache for: " << path << ". Loading... ";
-
-        // The cache holds geometry only; IFC metadata is rebuilt from the converted files alongside it.
-        std::future<IfcScene> ifcFuture;
-        if (isIfc) {
-            fs::path convertedStem = fsPath.parent_path() / "converted" / fsPath.stem();
-            std::string jsonPath = pathToUtf8(convertedStem) + ".json";
-            std::string glbPath = pathToUtf8(convertedStem) + ".glb";
-            ifcFuture = std::async(std::launch::async, [glbPath, jsonPath]() {
-                return beginLoadIfcScene(glbPath, jsonPath);
-                });
+        LOG_INFO("[CACHE] Found valid cache for: " << path << ". Loading... ");
+        Mesh cached;
+        if (ModelCache::load(cachePath, cached)) {
+            LOG_INFO("OK\n");
+            return cached;
         }
-
-        const bool cacheLoaded = ModelCache::load(cachePath, result);
-        if (ifcFuture.valid()) {
-            IfcScene scene = ifcFuture.get();
-            if (cacheLoaded) result.ifcScene = std::move(scene);
-        }
-
-        if (cacheLoaded)
-            return result;
-
-        std::cout << "Failed (Corruption?)\n";
+        LOG_INFO("Failed (corrupt or outdated), re-importing\n");
     }
 
-    result = loadFromSource(path, ext);
+    Mesh result = loadWithFastGltf(path);
     computeAllSubmeshBounds(result);
     ModelCache::save(cachePath, result);
     return result;

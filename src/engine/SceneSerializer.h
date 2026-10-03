@@ -3,11 +3,11 @@
 #include <string>
 #include <vector>
 #include <fstream>
-#include <iostream>
 #include <glm/glm.hpp>
 
 // Forward declarations - adjust these includes to match your project
 #include "ModelManager.h" // For ModelManager, ModelInstance, GPUModel
+#include "Log.h"
 
 struct SceneFileHeader {
     char magic[4] = { 'S', 'C', 'N', 'E' };
@@ -40,7 +40,7 @@ public:
     static bool Save(const std::string& filepath, ModelManager& modelManager) {
         std::ofstream file(filepath, std::ios::binary);
         if (!file.is_open()) {
-            std::cerr << "[SCENE] Failed to open file for writing: " << filepath << "\n";
+            LOG_ERROR("[SCENE] Failed to open file for writing: " << filepath << "\n");
             return false;
         }
 
@@ -124,8 +124,8 @@ public:
         }
 
         file.close();
-        std::cout << "[SCENE] Saved: " << uniqueModels.size() << " models, "
-            << validInstanceCount << " instances to " << filepath << "\n";
+        LOG_INFO("[SCENE] Saved: " << uniqueModels.size() << " models, "
+            << validInstanceCount << " instances to " << filepath << "\n");
         return true;
     }
 
@@ -155,7 +155,7 @@ public:
 
         std::ifstream file(filepath, std::ios::binary);
         if (!file.is_open()) {
-            std::cerr << "[SCENE] Failed to open file for reading: " << filepath << "\n";
+            LOG_ERROR("[SCENE] Failed to open file for reading: " << filepath << "\n");
             return scene;
         }
 
@@ -165,12 +165,12 @@ public:
 
         if (header.magic[0] != 'S' || header.magic[1] != 'C' ||
             header.magic[2] != 'N' || header.magic[3] != 'E') {
-            std::cerr << "[SCENE] Invalid scene file magic\n";
+            LOG_ERROR("[SCENE] Invalid scene file magic\n");
             return scene;
         }
 
         if (header.version < 1 || header.version > kSceneFileVersion) {
-            std::cerr << "[SCENE] Unsupported scene version: " << header.version << "\n";
+            LOG_ERROR("[SCENE] Unsupported scene version: " << header.version << "\n");
             return scene;
         }
 
@@ -209,12 +209,12 @@ public:
         }
 
         if (!file) {
-            std::cerr << "[SCENE] Scene file is truncated: " << filepath << "\n";
+            LOG_ERROR("[SCENE] Scene file is truncated: " << filepath << "\n");
             return scene;
         }
         scene.valid = true;
-        std::cout << "[SCENE] Loaded: " << scene.models.size() << " models, "
-            << scene.instances.size() << " instances from " << filepath << "\n";
+        LOG_INFO("[SCENE] Loaded: " << scene.models.size() << " models, "
+            << scene.instances.size() << " instances from " << filepath << "\n");
         return scene;
     }
 };

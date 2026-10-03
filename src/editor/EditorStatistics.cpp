@@ -4,6 +4,7 @@
 #include <cstdio>
 #include "EditorStyle.h"
 #include "engine/ModelManager.h"
+#include "engine/VulkanContext.h"
 
 void Editor::drawStatisticsPanel()
 {
@@ -45,6 +46,10 @@ void Editor::drawStatisticsPanel()
             EditorStyle::keyValueRow("Window", buf);
             snprintf(buf, sizeof(buf), "%.0f x %.0f", m_sceneView.width, m_sceneView.height);
             EditorStyle::keyValueRow("Viewport", buf);
+            snprintf(buf, sizeof(buf), "%s (Vulkan %u.%u, %s)", m_vulkan.vkbPhysicalDevice().properties.deviceName,
+                VK_API_VERSION_MAJOR(m_vulkan.apiVersion()), VK_API_VERSION_MINOR(m_vulkan.apiVersion()),
+                vulkanBackendName(m_vulkan.backend()));
+            EditorStyle::keyValueRow("GPU", buf);
             ImGui::EndTable();
         }
     }

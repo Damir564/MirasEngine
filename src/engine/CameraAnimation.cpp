@@ -2,8 +2,8 @@
 #include <algorithm>
 #include <cmath>
 #include <fstream>
-#include <iostream>
 #include <glm/gtc/constants.hpp>
+#include "Log.h"
 
 // ============================================================
 // Catmull-Rom Spline
@@ -274,7 +274,7 @@ CameraKeyframe CameraAnimator::makeKeyframe(const glm::vec3& pos, float yaw, flo
 void CameraAnimator::savePath(const std::string& filepath) const {
     std::ofstream file(filepath, std::ios::binary);
     if (!file.is_open()) {
-        std::cerr << "[CameraAnim] Failed to save: " << filepath << "\n";
+        LOG_ERROR("[CameraAnim] Failed to save: " << filepath << "\n");
         return;
     }
 
@@ -304,20 +304,20 @@ void CameraAnimator::savePath(const std::string& filepath) const {
         file.write(reinterpret_cast<const char*>(&kf.useCurve), sizeof(bool));
     }
 
-    std::cout << "[CameraAnim] Saved " << count << " keyframes to " << filepath << "\n";
+    LOG_INFO("[CameraAnim] Saved " << count << " keyframes to " << filepath << "\n");
 }
 
 bool CameraAnimator::loadPath(const std::string& filepath) {
     std::ifstream file(filepath, std::ios::binary);
     if (!file.is_open()) {
-        std::cerr << "[CameraAnim] Failed to load: " << filepath << "\n";
+        LOG_ERROR("[CameraAnim] Failed to load: " << filepath << "\n");
         return false;
     }
 
     char magic[4];
     file.read(magic, 4);
     if (std::string(magic, 4) != "CMAP") {
-        std::cerr << "[CameraAnim] Invalid file format\n";
+        LOG_ERROR("[CameraAnim] Invalid file format\n");
         return false;
     }
 
@@ -348,6 +348,6 @@ bool CameraAnimator::loadPath(const std::string& filepath) {
     m_path = newPath;
     stop();
 
-    std::cout << "[CameraAnim] Loaded " << count << " keyframes from " << filepath << "\n";
+    LOG_INFO("[CameraAnim] Loaded " << count << " keyframes from " << filepath << "\n");
     return true;
 }

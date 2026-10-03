@@ -25,7 +25,7 @@ inline glm::mat4 getView(const Camera& cam) {
 
 inline constexpr float kCameraNearPlane = 0.1f;
 
-// Every consumer (rendering, picking, gizmos, annotations) must use this so the math agrees.
+// Every consumer (rendering, picking, gizmos) must use this so the math agrees.
 // Depth maps to [0, 1] as Vulkan expects.
 inline glm::mat4 getProjection(float width, float height, float nearPlane, float farPlane) {
     glm::mat4 proj = glm::perspectiveRH_ZO(glm::radians(60.0f), width / height, nearPlane, farPlane);

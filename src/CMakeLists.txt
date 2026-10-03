@@ -2,7 +2,6 @@
   vma.cpp
   main.cpp
   vk_globals.cpp
-  external/portable-file-dialogs.h
   external/ImGuiFileDialog.h
   external/ImGuiFileDialogConfig.h
   external/ImGuiFileDialog.cpp
@@ -17,7 +16,12 @@
   engine/ShaderUtils.cpp
   engine/Renderer.h
   engine/Renderer.cpp
+  engine/RendererEffects.cpp
+  engine/RenderUtils.h
+  engine/Atmosphere.h
+  engine/Atmosphere.cpp
   engine/Buffers.h
+  engine/Log.h
   engine/Vertex.h
   engine/Camera.h
   engine/Shadow.h
@@ -37,11 +41,6 @@
   engine/SceneManager.cpp
   engine/CameraAnimation.h
   engine/CameraAnimation.cpp
-  engine/IfcConverter.h
-  engine/IfcScene.h
-  engine/IfcScene.cpp
-  engine/IfcSceneLoader.h
-  engine/IfcSceneLoader.cpp
   app/AppMode.h
   app/AppOptions.h
   app/AppOptions.cpp
@@ -54,7 +53,6 @@
   editor/EditorMenus.cpp
   editor/EditorHierarchy.cpp
   editor/EditorInspector.cpp
-  editor/EditorAnnotations.cpp
   editor/EditorAnimation.cpp
   editor/EditorStatistics.cpp
   editor/EditorGizmo.cpp
@@ -69,6 +67,13 @@ if (CMAKE_VERSION VERSION_GREATER 3.12)
 endif()
 
 target_sources(engine PRIVATE vma.cpp)
+
+# Non-debug builds are GUI apps without a console window; keep main() as the entry point
+# instead of WinMain. Their logging is compiled out as well (engine/Log.h).
+set_property(TARGET engine PROPERTY WIN32_EXECUTABLE "$<NOT:$<CONFIG:Debug>>")
+if (MSVC)
+  target_link_options(engine PRIVATE "$<$<NOT:$<CONFIG:Debug>>:/ENTRY:mainCRTStartup>")
+endif()
 
 # Sources include each other as "engine/...", "app/...", "editor/...".
 target_include_directories(engine PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
@@ -94,7 +99,6 @@ target_link_libraries(engine PRIVATE
     vk-bootstrap::vk-bootstrap
     SDL3::SDL3
     glm::glm-header-only
-    assimp
     stb_image
     fastgltf::fastgltf
     imgui

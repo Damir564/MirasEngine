@@ -25,3 +25,13 @@ inline std::optional<std::string> makeRelativeIfInside(
     std::replace(rel.begin(), rel.end(), '\\', '/');
     return rel;
 }
+
+// Paths under the working directory stay relative so scenes remain portable; anything else is kept absolute.
+inline std::string toStoredPath(const std::string& filePath)
+{
+    namespace fs = std::filesystem;
+    fs::path absFile = fs::weakly_canonical(fs::absolute(filePath));
+    std::string path = makeRelativeIfInside(absFile.string(), fs::current_path().string()).value_or(absFile.string());
+    std::replace(path.begin(), path.end(), '\\', '/');
+    return path;
+}

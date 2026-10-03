@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <cstdint>
 #include <exception>
-#include <iostream>
 #include "imgui.h"
 #include "backends/imgui_impl_sdl3.h"
 #include "backends/imgui_impl_vulkan.h"
@@ -13,6 +12,7 @@
 #include "game/Game.h"
 #include "engine/ModelManager.h"
 #include "engine/SceneManager.h"
+#include "engine/Log.h"
 
 namespace {
 constexpr int kInitialWindowWidth = 1600;
@@ -30,6 +30,13 @@ int Application::run(const AppOptions& options)
 {
     if (!init(options)) {
         shutdown();
+#ifdef NDEBUG
+        // Release builds have no console showing the logged reason. Automated runs must not block on a dialog.
+        if (options.exitAfterFrames < 0)
+            SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "MirasEngine",
+                "Failed to start: neither the graphics driver nor the bundled software renderer could initialize Vulkan.\n"
+                "Make sure the \"vulkan\" folder next to engine.exe is complete, or update the graphics driver.", nullptr);
+#endif
         return -1;
     }
     const int exitCode = mainLoop(options.exitAfterFrames);
@@ -41,11 +48,13 @@ bool Application::init(const AppOptions& options)
 {
     if (!initWindow())
         return false;
-    if (!m_vulkan.init(m_window, options.validation))
+    if (!m_vulkan.init(m_window, options.validation, options.firstVulkanBackend))
         return false;
     // The renderer initializes the ImGui Vulkan backend, so the ImGui context must exist first.
     initImGui();
-    m_settings = loadGraphicsSettings();
+    if (!options.settingsPath.empty())
+        m_settingsPath = options.settingsPath;
+    m_settings = loadGraphicsSettings(m_settingsPath);
     if (!m_renderer.init(m_vulkan, m_window, m_settings))
         return false;
     m_appliedSettings = m_settings;
@@ -59,18 +68,19 @@ bool Application::init(const AppOptions& options)
 bool Application::initWindow()
 {
     if (!SDL_Init(SDL_INIT_VIDEO)) {
-        std::cerr << "SDL_Init failed: " << SDL_GetError() << "\n";
+        LOG_ERROR("SDL_Init failed: " << SDL_GetError() << "\n");
         return false;
     }
     m_sdlInitialized = true;
-
-    std::cout << "Hello CMake." << std::endl;
+    // Before the window: SDL uses whichever Vulkan loader is already loaded instead of loading its own.
+    if (!m_vulkan.loadLibrary())
+        return false;
 
     // The active mode sets the real title.
     m_window = SDL_CreateWindow("MirasEngine", kInitialWindowWidth, kInitialWindowHeight,
         SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE);
     if (!m_window) {
-        std::cerr << "SDL_CreateWindow failed: " << SDL_GetError() << "\n";
+        LOG_ERROR("SDL_CreateWindow failed: " << SDL_GetError() << "\n");
         return false;
     }
     return true;
@@ -96,11 +106,11 @@ bool Application::createModelManager()
         m_models = std::make_unique<ModelManager>(
             m_vulkan.allocator(), m_vulkan.device(), m_renderer.commandPool(), m_vulkan.graphicsQueue(),
             m_renderer.descriptorPool(), m_renderer.textureSetLayout(), m_renderer.textureSampler());
-        std::cout << "ModelManager created successfully\n";
+        LOG_INFO("ModelManager created successfully\n");
         return true;
     }
     catch (const std::exception& e) {
-        std::cerr << "Failed to create ModelManager: " << e.what() << "\n";
+        LOG_ERROR("Failed to create ModelManager: " << e.what() << "\n");
         return false;
     }
 }
@@ -228,7 +238,7 @@ void Application::applyChangedSettings()
         return;
     m_settings = sanitizeGraphicsSettings(m_settings);
     m_renderer.applySettings(m_settings);
-    saveGraphicsSettings(m_settings);
+    saveGraphicsSettings(m_settings, m_settingsPath);
     m_appliedSettings = m_settings;
 }
 

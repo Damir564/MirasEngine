@@ -1,37 +1,46 @@
 ﻿cmake_minimum_required (VERSION 3.21)
 
-# Default debug info is /Zi for every target (third-party libs like assimp add /Zi themselves,
-# so /ZI here would trigger "D9025 overriding '/Zi' with '/ZI'"). Hot Reload (/ZI) is enabled
-# only for the engine target in src/CMakeLists.txt.
-if (POLICY CMP0141)
-  cmake_policy(SET CMP0141 NEW)
-  set(CMAKE_MSVC_DEBUG_INFORMATION_FORMAT "$<$<CONFIG:Debug,RelWithDebInfo>:ProgramDatabase>")
-endif()
-
 project ("MirasEngine")
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+if(POLICY CMP0141)
+  cmake_policy(SET CMP0141 NEW)
+  set(CMAKE_MSVC_DEBUG_INFORMATION_FORMAT
+      "$<$<CONFIG:Debug,RelWithDebInfo>:ProgramDatabase>"
+      CACHE STRING "" FORCE)
+endif()
+
+if(MSVC)
+  add_compile_options(
+    $<$<CONFIG:Debug>:/Zi>
+    $<$<CONFIG:RelWithDebInfo>:/Zi>
+    $<$<CONFIG:Release>:/Zi>          # keep PDBs in Release too if you want to debug it
+  )
+  add_link_options(
+    $<$<CONFIG:Debug>:/DEBUG>
+    $<$<CONFIG:RelWithDebInfo>:/DEBUG>
+  )
+endif()
+
 find_package(Vulkan REQUIRED)
+
+# Ships a Vulkan loader, the Khronos emulation layers and a CPU driver in vulkan/ next to engine.exe, so the
+# engine also runs on GPUs without Vulkan 1.3 / VK_EXT_shader_object and on PCs without a Vulkan driver.
+# The x64-release preset turns it on.
+option(MIRAS_BUNDLE_VULKAN_RUNTIME "Download and ship the fallback Vulkan runtime" OFF)
+
+# Smaller release binaries: whole-program optimization (dependencies included) and per-variable
+# COMDATs so the linker can drop unreferenced data as well as unreferenced functions.
+set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)
+if (MSVC)
+  add_compile_options("$<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:C,CXX>>:/Gw>")
+endif()
 
 add_subdirectory(external)
 
 add_subdirectory(src)
-
-file(COPY ${CMAKE_SOURCE_DIR}/src/external/IfcConvert.exe
-     DESTINATION ${CMAKE_BINARY_DIR}/src/external)
-
-file(COPY ${CMAKE_SOURCE_DIR}/src/external/IfcConvert.config
-     DESTINATION ${CMAKE_BINARY_DIR}/src/external)
-
-# if .py changed, execute in external
-# .venv/scripts/activate
-# pyinstaller --onefile --clean --collect-all ifcopenshell .\extract_ifc_metadata.py
-# and then regenerate CMake
-
-file(COPY ${CMAKE_SOURCE_DIR}/src/external/dist/extract_ifc_metadata.exe
-    DESTINATION ${CMAKE_BINARY_DIR}/src/external)
 
 file(COPY ${CMAKE_SOURCE_DIR}/src/shaders
      DESTINATION ${CMAKE_BINARY_DIR}/src)
@@ -84,5 +93,7 @@ add_custom_target(Shaders ALL DEPENDS ${SPIRV_FILES})
 
 # 5️⃣ Example: Link shaders to your executable target
 add_dependencies(engine Shaders)
+
+include(cmake/Packaging.cmake)
 
 

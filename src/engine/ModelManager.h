@@ -12,7 +12,6 @@
 #include <glm/ext/matrix_transform.hpp>
 #include "ModelTypes.h"
 #include "Buffers.h"
-#include "IfcScene.h"
 
 class TextureImage;
 
@@ -45,13 +44,14 @@ struct GPUModel {
     std::vector<DrawGroup> shadowGroups;
     size_t vertexCount = 0;
     size_t indexCount = 0;
+    // CPU copy of the geometry for exact ray picking; indices are relative to each submesh's vertexOffset.
+    std::vector<glm::vec3> positions;
+    std::vector<uint32_t> indices;
 
     glm::vec3 boundsCenter{ 0.0f };
     float boundsRadius{ 1.0f };
     glm::vec3 boundsMin{ 0.0f };
     glm::vec3 boundsMax{ 0.0f };
-
-    std::optional<IfcScene> ifcScene;
 
     // Model-space triangle soup (3 positions per triangle) kept on the CPU for physics collision.
     std::vector<glm::vec3> collisionTriangles;
@@ -65,7 +65,6 @@ struct ModelInstance {
     glm::vec3 position{ 0.0f };
     glm::vec3 rotation{ 0.0f };
     glm::vec3 scale{ 1.0f };
-    std::optional<IfcScene> ifcScene;
     bool visible = true;
     // Multiplied into every submesh's base color.
     glm::vec3 color{ 1.0f };

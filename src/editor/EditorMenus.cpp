@@ -20,7 +20,7 @@ void Editor::drawMainMenuBar()
         return;
     drawFileMenu();
     drawEditMenu();
-    drawGameObjectMenu();
+    drawAddMenu();
     drawViewMenu();
     if (ImGui::BeginMenu("Settings")) {
         ImGui::MenuItem("Graphics...", nullptr, &m_showGraphicsSettings);
@@ -66,7 +66,6 @@ void Editor::drawEditMenu()
     if (ImGui::MenuItem("Deselect", "Esc", false, selection)) deselectAll();
     ImGui::Separator();
     if (ImGui::MenuItem("Focus Selected", "F", false, selection)) focusOnInstance(m_gizmo.selectedInstance);
-    if (ImGui::MenuItem("Add Annotation...", "M", false, m_ifcSelectionKind == IfcSelectionKind::Element)) requestAnnotation();
     ImGui::Separator();
     if (ImGui::MenuItem("Select Tool", "Q", m_tool == GizmoMode::None)) m_tool = GizmoMode::None;
     if (ImGui::MenuItem("Move Tool", "1", m_tool == GizmoMode::Translate)) m_tool = GizmoMode::Translate;
@@ -75,9 +74,9 @@ void Editor::drawEditMenu()
     ImGui::EndMenu();
 }
 
-void Editor::drawGameObjectMenu()
+void Editor::drawAddMenu()
 {
-    if (!ImGui::BeginMenu("GameObject"))
+    if (!ImGui::BeginMenu("Add"))
         return;
     if (ImGui::MenuItem("Cube")) addCube();
     ImGui::EndMenu();
@@ -90,10 +89,8 @@ void Editor::drawViewMenu()
     ImGui::MenuItem("Hierarchy", nullptr, &m_showHierarchy);
     ImGui::MenuItem("Inspector", nullptr, &m_showInspector);
     ImGui::MenuItem("Camera Animation", nullptr, &m_showAnimationPanel);
-    ImGui::MenuItem("Annotations", nullptr, &m_showAnnotationsPanel);
     ImGui::MenuItem("Statistics", nullptr, &m_showStatisticsPanel);
     ImGui::Separator();
-    ImGui::MenuItem("Show Annotations in Viewport", nullptr, &m_showAnnotations);
     ImGui::MenuItem("Show Camera Path", nullptr, &m_showCameraPath);
     ImGui::MenuItem("Grid", nullptr, &m_showGrid);
     ImGui::Separator();
@@ -139,10 +136,6 @@ void Editor::drawToolbar()
         ImGui::EndDisabled();
 
         ImGui::SameLine(0, 16);
-        if (ImGui::Button("+ Cube")) addCube();
-        ImGui::SetItemTooltip("Add a cube in front of the camera (GameObject > Cube)");
-
-        ImGui::SameLine(0, 16);
         if (ImGui::Button("Snap")) ImGui::OpenPopup("SnapSettings");
         ImGui::SetItemTooltip("Snap increments used while holding Ctrl during a gizmo drag");
         drawSnapPopup();
@@ -160,8 +153,6 @@ void Editor::drawToolbar()
         ImGui::SetItemTooltip("Show the ground grid (View > Grid)");
 
         ImGui::SameLine(0, 16);
-        ImGui::Checkbox("Annotations", &m_showAnnotations);
-        ImGui::SameLine();
         ImGui::Checkbox("Camera path", &m_showCameraPath);
 
         const ImGuiStyle& style = ImGui::GetStyle();
@@ -258,10 +249,9 @@ void Editor::buildDefaultLayout(ImGuiID dockspaceId)
     ImGui::DockBuilderDockWindow("Hierarchy", left);
     ImGui::DockBuilderDockWindow("Inspector", right);
     ImGui::DockBuilderDockWindow("Camera Animation", bottom);
-    ImGui::DockBuilderDockWindow("Annotations", bottom);
     ImGui::DockBuilderDockWindow("Statistics", bottom);
     ImGui::DockBuilderFinish(dockspaceId);
-    m_showHierarchy = m_showInspector = m_showAnimationPanel = m_showAnnotationsPanel = m_showStatisticsPanel = true;
+    m_showHierarchy = m_showInspector = m_showAnimationPanel = m_showStatisticsPanel = true;
 }
 
 void Editor::drawDockSpace()
@@ -326,7 +316,7 @@ void Editor::drawControlsPopup()
         ImGui::TableSetupColumn("Input", ImGuiTableColumnFlags_WidthFixed, 170.0f);
         ImGui::TableSetupColumn("Action", ImGuiTableColumnFlags_WidthFixed, 300.0f);
         static constexpr const char* kRows[][2] = {
-            { "Left click", "Select object / IFC element" },
+            { "Left click", "Select object" },
             { "Right mouse + drag", "Look around" },
             { "W A S D", "Move camera" },
             { "Shift (hold)", "Move 4x faster" },
@@ -335,7 +325,6 @@ void Editor::drawControlsPopup()
             { "Ctrl (while dragging)", "Snap move to grid / rotate and scale to steps" },
             { "Click view gizmo axis", "Look along that axis (top-right of viewport)" },
             { "F2", "Rename selected object" },
-            { "M", "Annotate selected IFC element" },
             { "Ctrl+D", "Duplicate selected object" },
             { "Delete", "Delete selected object" },
             { "Esc", "Deselect / leave fly mode" },
@@ -365,7 +354,7 @@ void Editor::drawAboutPopup()
     if (!ImGui::BeginPopupModal("About MirasEngine", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
         return;
     ImGui::Text("MirasEngine");
-    ImGui::TextDisabled("Vulkan 1.3 renderer and IFC/BIM viewer");
+    ImGui::TextDisabled("Vulkan 1.3 renderer and glTF viewer");
     ImGui::Separator();
     ImGui::Text("Dear ImGui %s", ImGui::GetVersion());
     ImGui::Spacing();
@@ -405,7 +394,7 @@ void Editor::saveSceneAsDialog()
 void Editor::importModelDialog()
 {
     openFileDialog("BrowseModelDlg", "Import 3D Model",
-        "3D Models{.gltf,.glb,.obj,.fbx,.ifc},.gltf,.glb,.obj,.fbx,.ifc", kModelsRoot, nullptr, false);
+        "3D Models{.gltf,.glb},.gltf,.glb", kModelsRoot, nullptr, false);
 }
 
 void Editor::drawFileDialogs()
@@ -413,9 +402,7 @@ void Editor::drawFileDialogs()
     ImGuiFileDialog* dialog = ImGuiFileDialog::Instance();
     if (dialog->Display("BrowseSceneDlg", ImGuiWindowFlags_NoCollapse, kDialogSize)) {
         if (dialog->IsOk()) {
-            const auto rel = makeRelativeIfInside(dialog->GetFilePathName(), kScenesRoot);
-            if (rel.has_value()) openScene(rel.value());
-            else setStatus("Scenes must be inside the application folder", true);
+            openScene(toStoredPath(dialog->GetFilePathName()));
         }
         dialog->Close();
     }
@@ -423,24 +410,17 @@ void Editor::drawFileDialogs()
         if (dialog->IsOk()) {
             std::filesystem::path path(dialog->GetFilePathName());
             if (!path.has_extension() || path.extension() != ".scn") path.replace_extension(".scn");
-            const auto rel = makeRelativeIfInside(path.string(), kScenesRoot);
-            if (rel.has_value()) {
-                m_scenes.setCurrentPath(rel.value());
-                saveSceneTo(m_scenes.currentPath());
-            }
-            else setStatus("Scenes must be saved inside the application folder", true);
+            m_scenes.setCurrentPath(toStoredPath(path.string()));
+            saveSceneTo(m_scenes.currentPath());
         }
         dialog->Close();
     }
     if (dialog->Display("BrowseModelDlg", ImGuiWindowFlags_NoCollapse, kDialogSize)) {
         if (dialog->IsOk()) {
-            const auto rel = makeRelativeIfInside(dialog->GetFilePathName(), kModelsRoot);
-            if (rel.has_value()) {
-                const std::string name = std::filesystem::path(rel.value()).stem().string();
-                m_models.loadModelAsync(rel.value(), name);
-                setStatus("Importing " + name + "...");
-            }
-            else setStatus(std::string("Models must be inside the \"") + kModelsRoot + "\" folder", true);
+            const std::string path = toStoredPath(dialog->GetFilePathName());
+            const std::string name = std::filesystem::path(path).stem().string();
+            m_models.loadModelAsync(path, name);
+            setStatus("Importing " + name + "...");
         }
         dialog->Close();
     }

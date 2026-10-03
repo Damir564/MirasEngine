@@ -14,7 +14,7 @@ int main(int argc, char** argv)
 
     const AppOptions options = parseAppOptions(argc, argv);
     if (options.showHelp) {
-        printUsage(argc > 0 ? argv[0] : "engine");
+        showUsage(argc > 0 ? argv[0] : "engine");
         return 0;
     }
     Application app;

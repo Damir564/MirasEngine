@@ -34,8 +34,22 @@
       "displayName": "x64 Release",
       "inherits": "x64-debug",
       "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Release"
+        "CMAKE_BUILD_TYPE": "Release",
+        "MIRAS_BUNDLE_VULKAN_RUNTIME": "ON"
       }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "x64-release",
+      "displayName": "x64 Release",
+      "configurePreset": "x64-release"
+    },
+    {
+      "name": "x64-release-package",
+      "displayName": "x64 Release package (zip)",
+      "configurePreset": "x64-release",
+      "targets": [ "dist" ]
     }
   ]
 }
