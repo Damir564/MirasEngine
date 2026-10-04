@@ -69,12 +69,26 @@ constexpr ImGuiSliderFlags kLogClamp = ImGuiSliderFlags_Logarithmic | ImGuiSlide
 
 bool drawDisplay(GraphicsSettings& settings, const RenderCapabilities& caps)
 {
-    bool changed = ImGui::Checkbox("VSync", &settings.vsync);
+    bool changed = false;
+    {
+        static const char* const names[] = { "Standard", "Classic" };
+        changed |= comboEnum("Render pipeline", settings.pipeline, names, IM_ARRAYSIZE(names));
+        ImGui::SetItemTooltip("Standard: physically based lighting, shadows, AO and bloom.\n"
+            "Classic: one cheap forward pass with per-vertex lighting and fog, for low-end hardware.");
+    }
+    const bool classic = settings.pipeline == RenderPipeline::Classic;
+    ImGui::BeginDisabled(!classic);
+    changed |= ImGui::SliderFloat("Render scale", &settings.renderScale, 0.25f, 1.0f, "%.2f", kClamp);
+    ImGui::SetItemTooltip("Internal resolution relative to the window (Classic only).");
+    ImGui::EndDisabled();
+
+    changed |= ImGui::Checkbox("VSync", &settings.vsync);
     {
         static const int values[] = { 0, 30, 60, 120, 144, 165, 240 };
         static const char* const names[] = { "Unlimited", "30", "60", "120", "144", "165", "240" };
         changed |= comboInt("Max FPS", settings.maxFps, values, names, IM_ARRAYSIZE(values), 1 << 30);
     }
+    ImGui::BeginDisabled(classic);
     {
         static const int values[] = { 1, 2, 4, 8 };
         static const char* const names[] = { "Off", "MSAA 2x", "MSAA 4x", "MSAA 8x" };
@@ -83,6 +97,7 @@ bool drawDisplay(GraphicsSettings& settings, const RenderCapabilities& caps)
     changed |= ImGui::Checkbox("FXAA", &settings.fxaa);
     ImGui::SetItemTooltip("Post-process anti-aliasing. Cheap, also smooths edges MSAA misses (alpha-tested\n"
         "foliage, shading), but slightly softens the image.");
+    ImGui::EndDisabled();
     return changed;
 }
 
@@ -190,10 +205,13 @@ bool drawGraphicsSettings(GraphicsSettings& settings, const RenderCapabilities& 
 
     if (ImGui::CollapsingHeader("Display", ImGuiTreeNodeFlags_DefaultOpen))
         changed |= drawDisplay(settings, caps);
+    // The Classic pipeline has no shadows or post-processing.
+    ImGui::BeginDisabled(settings.pipeline == RenderPipeline::Classic);
     if (ImGui::CollapsingHeader("Shadows", ImGuiTreeNodeFlags_DefaultOpen))
         changed |= drawShadows(settings);
     if (ImGui::CollapsingHeader("Lighting and effects", ImGuiTreeNodeFlags_DefaultOpen))
         changed |= drawLighting(settings);
+    ImGui::EndDisabled();
     if (ImGui::CollapsingHeader("Environment", ImGuiTreeNodeFlags_DefaultOpen))
         changed |= drawEnvironment(settings);
 

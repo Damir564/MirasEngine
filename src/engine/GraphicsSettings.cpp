@@ -11,6 +11,11 @@ NLOHMANN_JSON_SERIALIZE_ENUM(BackgroundMode, {
     { BackgroundMode::SolidColor, "solid" },
 })
 
+NLOHMANN_JSON_SERIALIZE_ENUM(RenderPipeline, {
+    { RenderPipeline::Standard, "standard" },
+    { RenderPipeline::Classic, "classic" },
+})
+
 NLOHMANN_JSON_SERIALIZE_ENUM(Tonemapper, {
     { Tonemapper::Aces, "aces" },
     { Tonemapper::AgX, "agx" },
@@ -71,6 +76,7 @@ glm::vec3 clampColor(const glm::vec3& color)
 GraphicsSettings sanitizeGraphicsSettings(GraphicsSettings s)
 {
     const GraphicsSettings defaults;
+    s.renderScale = clampFinite(s.renderScale, 0.25f, 1.0f, defaults.renderScale);
     s.maxFps = std::clamp(s.maxFps, 0, 1000);
     s.msaaSamples = snapToPowerOfTwo(s.msaaSamples, 1, 8);
     s.shadowMapSize = snapToPowerOfTwo(s.shadowMapSize, 1024, 4096);
@@ -108,6 +114,8 @@ GraphicsSettings loadGraphicsSettings(const std::string& path)
         LOG_ERROR("[SETTINGS] " << path << " is not valid JSON; using defaults\n");
         return settings;
     }
+    readField(json, "pipeline", settings.pipeline);
+    readField(json, "renderScale", settings.renderScale);
     readField(json, "vsync", settings.vsync);
     readField(json, "maxFps", settings.maxFps);
     readField(json, "msaaSamples", settings.msaaSamples);
@@ -145,6 +153,8 @@ GraphicsSettings loadGraphicsSettings(const std::string& path)
 bool saveGraphicsSettings(const GraphicsSettings& settings, const std::string& path)
 {
     const nlohmann::json json = {
+        { "pipeline", settings.pipeline },
+        { "renderScale", settings.renderScale },
         { "vsync", settings.vsync },
         { "maxFps", settings.maxFps },
         { "msaaSamples", settings.msaaSamples },

@@ -146,6 +146,8 @@ void Renderer::queryCapabilities()
 
 vk::SampleCountFlagBits Renderer::effectiveSampleCount() const
 {
+    if (classic())
+        return vk::SampleCountFlagBits::e1;
     return toSampleCount(std::min(m_settings.msaaSamples, m_capabilities.maxMsaaSamples));
 }
 
@@ -530,6 +532,8 @@ bool Renderer::createShaders()
 
     try {
         m_meshShaders = createShaderPair(m_device, "shaders/triangle.vert.spv", "shaders/triangle.frag.spv", meshLayouts);
+        // Same layout as the main mesh shaders, so the scene pass binds descriptor sets the same way.
+        m_classicShaders = createShaderPair(m_device, "shaders/classic.vert.spv", "shaders/classic.frag.spv", meshLayouts);
         m_prepassShaders = createShaderPair(m_device, "shaders/prepass.vert.spv", "shaders/alpha_test.frag.spv", depthLayouts);
         m_shadowShaders = createShaderPair(m_device, "shaders/shadow.vert.spv", "shaders/alpha_test.frag.spv",
             depthLayouts, { &shadowPushRange, 1 });
@@ -553,6 +557,8 @@ bool Renderer::createShaders()
             { &m_fxaaShaders, "shaders/fxaa.frag.spv" },
             { &m_skyLutShaders, "shaders/sky_lut.frag.spv" },
             { &m_skyIrradianceShaders, "shaders/sky_irradiance.frag.spv" },
+            { &m_classicSkyShaders, "shaders/classic_sky.frag.spv" },
+            { &m_classicPresentShaders, "shaders/classic_present.frag.spv" },
         };
         for (const auto& [pair, fragment] : fullscreen)
             *pair = createShaderPair(m_device, "shaders/fullscreen.vert.spv", fragment, fxLayouts, { &fxPushRange, 1 });
@@ -687,7 +693,7 @@ void Renderer::shutdown()
     for (ShaderPair* pair : { &m_meshShaders, &m_prepassShaders, &m_shadowShaders, &m_gizmoShaders, &m_skyShaders,
              &m_gridShaders, &m_maskShaders, &m_levelGridShaders, &m_outlineShaders, &m_aoDepthShaders, &m_aoShaders, &m_aoBlurShaders,
              &m_bloomDownShaders, &m_bloomUpShaders, &m_compositeShaders, &m_fxaaShaders, &m_skyLutShaders,
-             &m_skyIrradianceShaders })
+             &m_skyIrradianceShaders, &m_classicShaders, &m_classicSkyShaders, &m_classicPresentShaders })
         destroyShaderPair(m_device, *pair);
     for (vk::PipelineLayout* layout : { &m_meshLayout, &m_prepassLayout, &m_shadowLayout, &m_gizmoLayout, &m_fxLayout }) {
         if (*layout) m_device.destroyPipelineLayout(*layout);
@@ -793,17 +799,17 @@ void Renderer::updateSun()
 bool Renderer::shadowsActive() const
 {
     // Nothing to shadow once the sun is off, set or has no intensity.
-    return m_settings.shadows && glm::dot(m_sun.groundIrradiance, glm::vec3(1.0f)) > 1e-4f;
+    return m_settings.shadows && !classic() && glm::dot(m_sun.groundIrradiance, glm::vec3(1.0f)) > 1e-4f;
 }
 
 bool Renderer::contactShadowsActive() const
 {
-    return m_settings.contactShadows && glm::dot(m_sun.groundIrradiance, glm::vec3(1.0f)) > 1e-4f;
+    return m_settings.contactShadows && !classic() && glm::dot(m_sun.groundIrradiance, glm::vec3(1.0f)) > 1e-4f;
 }
 
 bool Renderer::depthPrepassEnabled() const
 {
-    return m_settings.ambientOcclusion > 0 || contactShadowsActive();
+    return (m_settings.ambientOcclusion > 0 && !classic()) || contactShadowsActive();
 }
 
 uint64_t Renderer::skyHash() const
@@ -900,12 +906,14 @@ Renderer::FrameStatus Renderer::renderFrame(const FrameInput& input)
         m_renderCascade[c] = !m_shadowMapValid || shadowHashes[c] != m_cascadeHashes[c];
         m_cascadeHashes[c] = shadowHashes[c];
     }
-    m_shadowMapValid = true;
+    // Classic uses neither the shadow map nor the sky textures; they are rebuilt once Standard is back.
+    const bool classicFrame = classic();
+    m_shadowMapValid = !classicFrame;
 
     const uint64_t sky = skyHash();
-    const bool renderSky = !m_skyValid || sky != m_skyHash;
+    const bool renderSky = !classicFrame && (!m_skyValid || sky != m_skyHash);
     m_skyHash = sky;
-    m_skyValid = true;
+    m_skyValid = !classicFrame;
 
     buildDrawStreams(input, batches);
     uploadDrawStreams();
@@ -916,7 +924,8 @@ Renderer::FrameStatus Renderer::renderFrame(const FrameInput& input)
 
     if (renderSky)
         recordSkyPasses(cmd);
-    recordShadowPasses(cmd, *input.models);
+    if (!classicFrame)
+        recordShadowPasses(cmd, *input.models);
 
     const bool depthPrepass = depthPrepassEnabled();
     transitionFrameTargets(cmd, depthPrepass);
@@ -928,7 +937,7 @@ Renderer::FrameStatus Renderer::renderFrame(const FrameInput& input)
     const bool drawOutline = !m_highlightRuns.empty();
     if (drawOutline)
         recordSelectionMask(cmd, input);
-    if (m_settings.bloom)
+    if (bloomActive())
         recordBloom(cmd, input);
     recordFinalPass(cmd, imageIndex, input, drawOutline);
 
@@ -972,7 +981,7 @@ FrameUBO Renderer::buildFrameUBO(const FrameInput& input) const
     frameData.aoParams2 = glm::vec4(contactShadowsActive() ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f);
     frameData.projParams = glm::vec4(1.0f / input.proj[0][0], 1.0f / input.proj[1][1], 0.0f, 0.0f);
 
-    const vk::Rect2D rect = sceneRect(input);
+    const vk::Rect2D rect = renderRect(input);
     frameData.viewport = glm::vec4(rect.offset.x, rect.offset.y, rect.extent.width, rect.extent.height);
     const vk::Extent2D extent = m_swapchain.extent();
     frameData.renderSize = glm::vec4(extent.width, extent.height, 1.0f / extent.width, 1.0f / extent.height);
@@ -1351,6 +1360,18 @@ vk::Rect2D Renderer::sceneRect(const FrameInput& input) const
     return { { x0, y0 }, { uint32_t(x1 - x0), uint32_t(y1 - y0) } };
 }
 
+vk::Rect2D Renderer::renderRect(const FrameInput& input) const
+{
+    vk::Rect2D rect = sceneRect(input);
+    if (!classic() || m_settings.renderScale >= 1.0f)
+        return rect;
+    const auto scaled = [&](uint32_t size) {
+        return std::max(1u, static_cast<uint32_t>(std::lround(static_cast<float>(size) * m_settings.renderScale)));
+    };
+    rect.extent = vk::Extent2D{ scaled(rect.extent.width), scaled(rect.extent.height) };
+    return rect;
+}
+
 void Renderer::bindModelBuffers(vk::CommandBuffer cmd, const GPUModel* model) const
 {
     const vk::Buffer buffers[1] = { model->vertexBuffer->getBuffer() };
@@ -1493,11 +1514,11 @@ void Renderer::transitionFrameTargets(vk::CommandBuffer cmd, bool depthPrepass)
         toUnusedInput(m_aoDepth);
         toUnusedInput(m_aoRaw);
     }
-    if (m_settings.bloom)
+    if (bloomActive())
         toColorTarget(m_bloom, m_bloomMips);
     else
         toUnusedInput(m_bloom);
-    if (m_settings.fxaa)
+    if (fxaaActive())
         toColorTarget(m_ldrColor, 1);
     pipelineBarriers(cmd, barriers);
 }
@@ -1561,7 +1582,9 @@ void Renderer::recordDepthPrepass(vk::CommandBuffer cmd, const FrameInput& input
 void Renderer::recordScenePass(vk::CommandBuffer cmd, const FrameInput& input, bool depthPrepass)
 {
     const bool msaa = m_samples != vk::SampleCountFlagBits::e1;
-    const vk::Rect2D rect = sceneRect(input);
+    const vk::Rect2D rect = renderRect(input);
+    const bool classicFrame = classic();
+    const ShaderPair& meshShaders = classicFrame ? m_classicShaders : m_meshShaders;
 
     // Cleared to zero coverage: in the solid-background mode, composite.frag fills uncovered pixels.
     vk::RenderingAttachmentInfo colorAttachment{};
@@ -1615,16 +1638,23 @@ void Renderer::recordScenePass(vk::CommandBuffer cmd, const FrameInput& input, b
     cmd.setDepthTestEnable(VK_TRUE);
     cmd.setDepthWriteEnable(depthPrepass ? VK_FALSE : VK_TRUE);
     cmd.setDepthCompareOp(depthPrepass ? vk::CompareOp::eLessOrEqual : vk::CompareOp::eLess);
-    bindShaderPair(cmd, m_meshShaders);
-    cmd.setVertexInputEXT(1, &m_meshBinding, static_cast<uint32_t>(m_meshAttributes.size()), m_meshAttributes.data());
-    cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, m_meshLayout, 0, 1, &m_frameSets[m_currentFrame], 0, nullptr);
-    cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, m_meshLayout, 4, 1, &m_lightingSet, 0, nullptr);
+    // The Classic shaders do not read the lighting set (shadow map, AO, sky textures).
+    const auto bindMeshShaders = [&] {
+        bindShaderPair(cmd, meshShaders);
+        cmd.setVertexInputEXT(1, &m_meshBinding, static_cast<uint32_t>(m_meshAttributes.size()), m_meshAttributes.data());
+        cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, m_meshLayout, 0, 1, &m_frameSets[m_currentFrame], 0, nullptr);
+        if (!classicFrame)
+            cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, m_meshLayout, 4, 1, &m_lightingSet, 0, nullptr);
+    };
+    bindMeshShaders();
     recordMeshRuns(cmd, m_opaqueRuns);
 
     // Sky after the opaque geometry, so it is only shaded where nothing covers it.
     cmd.setDepthWriteEnable(VK_FALSE);
     cmd.setDepthCompareOp(vk::CompareOp::eLessOrEqual);
-    if (m_settings.background == BackgroundMode::Realistic)
+    if (classicFrame)
+        drawFx(cmd, m_classicSkyShaders, {}); // also fills the solid background, so there is no coverage alpha
+    else if (m_settings.background == BackgroundMode::Realistic)
         drawFx(cmd, m_skyShaders, { m_skyLutSet });
 
     // Transparent-ish layers: depth-tested against the opaque scene, no depth writes.
@@ -1651,10 +1681,7 @@ void Renderer::recordScenePass(vk::CommandBuffer cmd, const FrameInput& input, b
     }
 
     if (!m_blendRuns.empty()) {
-        bindShaderPair(cmd, m_meshShaders);
-        cmd.setVertexInputEXT(1, &m_meshBinding, static_cast<uint32_t>(m_meshAttributes.size()), m_meshAttributes.data());
-        cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, m_meshLayout, 0, 1, &m_frameSets[m_currentFrame], 0, nullptr);
-        cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, m_meshLayout, 4, 1, &m_lightingSet, 0, nullptr);
+        bindMeshShaders();
         recordMeshRuns(cmd, m_blendRuns);
     }
 
@@ -1765,8 +1792,16 @@ void Renderer::recordSelectionMask(vk::CommandBuffer cmd, const FrameInput& inpu
     cmd.setVertexInputEXT(1, &m_meshBinding, static_cast<uint32_t>(m_meshAttributes.size()), m_meshAttributes.data());
     cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, m_fxLayout, 0, 1, &m_frameSets[m_currentFrame], 0, nullptr);
     cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, m_fxLayout, 1, 1, &m_sceneDepthSet, 0, nullptr);
-    const std::array<std::byte, kFxPushConstantSize> noPush{};
-    cmd.pushConstants(m_fxLayout, vk::ShaderStageFlagBits::eFragment, 0, kFxPushConstantSize, noPush.data());
+    // The mask is full resolution; the scene depth may be rendered smaller (Classic render scale).
+    const vk::Rect2D depthRect = renderRect(input);
+    const glm::vec2 depthScale(float(depthRect.extent.width) / float(rect.extent.width),
+        float(depthRect.extent.height) / float(rect.extent.height));
+    const glm::vec2 rectOffset(float(rect.offset.x), float(rect.offset.y));
+    const glm::vec2 depthOffset = glm::vec2(depthRect.offset.x, depthRect.offset.y) - rectOffset * depthScale;
+    std::array<std::byte, kFxPushConstantSize> push{};
+    const MaskPushConstants maskPush{ glm::vec4(depthScale, depthOffset) };
+    std::memcpy(push.data(), &maskPush, sizeof(maskPush));
+    cmd.pushConstants(m_fxLayout, vk::ShaderStageFlagBits::eFragment, 0, kFxPushConstantSize, push.data());
 
     const GPUModel* boundModel = nullptr;
     for (const DrawRun& run : m_highlightRuns) {
@@ -1792,7 +1827,7 @@ void Renderer::recordFinalPass(vk::CommandBuffer cmd, uint32_t imageIndex, const
     const vk::Rect2D rect = sceneRect(input);
     const vk::Extent2D extent = m_swapchain.extent();
     const CompositePushConstants composite = compositeConstants();
-    if (m_settings.fxaa) {
+    if (fxaaActive()) {
         beginFxPass(cmd, m_ldrColor.view, rect, vk::AttachmentLoadOp::eDontCare);
         drawFx(cmd, m_compositeShaders, { m_hdrSet, m_bloomSets[0] }, &composite, sizeof(composite));
         cmd.endRendering();
@@ -1821,7 +1856,22 @@ void Renderer::recordFinalPass(vk::CommandBuffer cmd, uint32_t imageIndex, const
     beginRendering(cmd, renderInfo);
     setDefaultDrawState(cmd, vk::SampleCountFlagBits::e1, viewportFor(rect), rect);
 
-    if (m_settings.fxaa) {
+    if (classic()) {
+        // Maps each viewport pixel to the matching point of the (possibly smaller) rendered scene.
+        const vk::Rect2D source = renderRect(input);
+        const glm::vec2 size(float(extent.width), float(extent.height));
+        const glm::vec2 scale = glm::vec2(source.extent.width, source.extent.height) /
+            glm::vec2(rect.extent.width, rect.extent.height);
+        const glm::vec2 offset = glm::vec2(source.offset.x, source.offset.y) -
+            glm::vec2(rect.offset.x, rect.offset.y) * scale;
+        ClassicPresentPushConstants push{};
+        push.transform = glm::vec4(scale / size, offset / size);
+        push.uvClamp = glm::vec4((source.offset.x + 0.5f) / size.x, (source.offset.y + 0.5f) / size.y,
+            (source.offset.x + source.extent.width - 0.5f) / size.x,
+            (source.offset.y + source.extent.height - 0.5f) / size.y);
+        drawFx(cmd, m_classicPresentShaders, { m_hdrSet }, &push, sizeof(push));
+    }
+    else if (fxaaActive()) {
         FxaaPushConstants push{};
         push.texel = glm::vec4(1.0f / extent.width, 1.0f / extent.height, 0.0f, 0.0f);
         push.uvClamp = glm::vec4((rect.offset.x + 0.5f) / extent.width, (rect.offset.y + 0.5f) / extent.height,

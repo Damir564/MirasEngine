@@ -67,6 +67,8 @@ struct FrameInput {
 // Frame: sky LUT (when the sun changes) -> shadow cascades (those that changed) -> depth prepass + half-res
 // AO / contact shadows (when enabled) -> HDR scene pass -> selection mask -> bloom -> composite (tone map)
 // [-> FXAA] -> outline + ImGui on the swapchain image.
+// Classic pipeline: scene pass at the render scale (per-vertex lighting, analytic sky) -> selection mask ->
+// upscale to the swapchain image -> outline + ImGui.
 class Renderer {
 public:
     enum class FrameStatus {
@@ -205,6 +207,9 @@ private:
     void destroyLineBuffer(LineBuffer& buffer);
 
     void updateSun();
+    bool classic() const { return m_settings.pipeline == RenderPipeline::Classic; }
+    bool bloomActive() const { return m_settings.bloom && !classic(); }
+    bool fxaaActive() const { return m_settings.fxaa && !classic(); }
     bool shadowsActive() const;
     bool contactShadowsActive() const;
     bool depthPrepassEnabled() const;
@@ -230,6 +235,9 @@ private:
     void setAlphaBlending(vk::CommandBuffer cmd, bool enabled) const;
     void setAdditiveBlending(vk::CommandBuffer cmd) const;
     vk::Rect2D sceneRect(const FrameInput& input) const;
+    // The part of the scene targets the 3D scene is rendered into: sceneRect, shrunk from its top-left corner
+    // by the Classic render scale.
+    vk::Rect2D renderRect(const FrameInput& input) const;
     void bindModelBuffers(vk::CommandBuffer cmd, const GPUModel* model) const;
     void recordRun(vk::CommandBuffer cmd, const DrawRun& run) const;
     void recordDepthRuns(vk::CommandBuffer cmd, vk::PipelineLayout layout, const std::vector<DrawRun>& runs,
@@ -364,6 +372,9 @@ private:
     ShaderPair m_fxaaShaders;
     ShaderPair m_skyLutShaders;
     ShaderPair m_skyIrradianceShaders;
+    ShaderPair m_classicShaders;
+    ShaderPair m_classicSkyShaders;
+    ShaderPair m_classicPresentShaders;
     vk::PipelineLayout m_meshLayout;
     vk::PipelineLayout m_prepassLayout;
     vk::PipelineLayout m_shadowLayout;

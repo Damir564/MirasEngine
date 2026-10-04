@@ -7,6 +7,11 @@ enum class BackgroundMode {
     Realistic,  // physically based sky with the sun disk
 };
 
+enum class RenderPipeline {
+    Standard, // full PBR with shadows, AO, bloom
+    Classic,  // cheap forward pass: per-vertex lighting, base color only (GTA SA style)
+};
+
 enum class Tonemapper {
     Aces,
     AgX,
@@ -15,6 +20,10 @@ enum class Tonemapper {
 };
 
 struct GraphicsSettings {
+    // Pipeline
+    RenderPipeline pipeline = RenderPipeline::Standard;
+    float renderScale = 1.0f;  // Classic only: internal resolution relative to the window, 0.25..1
+
     // Display
     bool vsync = true;
     int maxFps = 0;            // 0 = unlimited

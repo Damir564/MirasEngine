@@ -86,6 +86,19 @@ struct FxaaPushConstants {
 };
 static_assert(sizeof(FxaaPushConstants) == 32);
 
+// Mirrors the push_constant block in shaders/classic_present.frag.
+struct ClassicPresentPushConstants {
+    glm::vec4 transform; // source UV = gl_FragCoord.xy * xy + zw
+    glm::vec4 uvClamp;   // source UVs are clamped to [xy, zw]
+};
+static_assert(sizeof(ClassicPresentPushConstants) == 32);
+
+// Mirrors the push_constant block in shaders/mask.frag.
+struct MaskPushConstants {
+    glm::vec4 depthTransform; // scene depth pixel = gl_FragCoord.xy * xy + zw
+};
+static_assert(sizeof(MaskPushConstants) == 16);
+
 // Mirrors the push_constant block in shaders/shadow.vert.
 struct ShadowPushConstants {
     uint32_t cascade;
