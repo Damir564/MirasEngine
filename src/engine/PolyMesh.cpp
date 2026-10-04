@@ -325,6 +325,101 @@ bool PolyMesh::isEdge(uint32_t a, uint32_t b) const
     return false;
 }
 
+namespace {
+// Position i in face.verts where the face runs along edge a-b (either way), or -1.
+int edgeInFace(const PolyFace& face, uint32_t a, uint32_t b)
+{
+    const size_t count = face.verts.size();
+    for (size_t i = 0; i < count; ++i) {
+        const uint32_t u = face.verts[i], w = face.verts[(i + 1) % count];
+        if ((u == a && w == b) || (u == b && w == a))
+            return static_cast<int>(i);
+    }
+    return -1;
+}
+}
+
+glm::vec3 PolyMesh::edgeNormal(uint32_t a, uint32_t b) const
+{
+    glm::vec3 sum(0.0f);
+    const PolyFace* first = nullptr;
+    for (const PolyFace& face : faces) {
+        if (edgeInFace(face, a, b) < 0)
+            continue;
+        if (!first)
+            first = &face;
+        sum += faceNormal(face);
+    }
+    if (!first)
+        return glm::vec3(0.0f);
+    // Opposite faces (the rim of a thin sheet) cancel out; use one of them.
+    const float length = glm::length(sum);
+    return length > 1e-4f ? sum / length : faceNormal(*first);
+}
+
+glm::vec3 PolyMesh::edgeExtrudeDirection(uint32_t a, uint32_t b) const
+{
+    const PolyFace* border = nullptr;
+    int position = -1;
+    int users = 0;
+    for (const PolyFace& face : faces) {
+        const int i = edgeInFace(face, a, b);
+        if (i < 0)
+            continue;
+        border = &face;
+        position = i;
+        ++users;
+    }
+    if (users != 1)
+        return edgeNormal(a, b);
+    // Faces wind counter-clockwise around their normal, so the outside is to the right of each edge.
+    const size_t count = border->verts.size();
+    const glm::vec3 along = positions[border->verts[(position + 1) % count]] - positions[border->verts[position]];
+    const glm::vec3 out = glm::cross(along, faceNormal(*border));
+    const float length = glm::length(out);
+    return length > 1e-6f ? out / length : edgeNormal(a, b);
+}
+
+bool PolyMesh::extrudeEdge(uint32_t a, uint32_t b, const glm::vec3& offset, uint32_t& newA, uint32_t& newB)
+{
+    if (a == b || a >= positions.size() || b >= positions.size())
+        return false;
+    size_t first = 0;
+    int position = -1;
+    int users = 0;
+    for (size_t f = 0; f < faces.size(); ++f) {
+        const int i = edgeInFace(faces[f], a, b);
+        if (i >= 0 && users++ == 0) {
+            first = f;
+            position = i;
+        }
+    }
+    if (users == 0)
+        return false;
+    // The face runs u -> w; a face continuing it across the edge must run w -> u.
+    const PolyFace& face = faces[first];
+    const uint32_t u = face.verts[position];
+    const uint32_t w = face.verts[(position + 1) % face.verts.size()];
+    const uint32_t material = face.material;
+
+    newA = static_cast<uint32_t>(positions.size());
+    positions.push_back(positions[a] + offset);
+    newB = static_cast<uint32_t>(positions.size());
+    positions.push_back(positions[b] + offset);
+    const uint32_t newU = u == a ? newA : newB;
+    const uint32_t newW = u == a ? newB : newA;
+
+    PolyFace quad;
+    quad.material = material;
+    quad.verts = { w, u, newU, newW };
+    faces.push_back(quad);
+    if (users > 1) {
+        quad.verts = { newW, newU, u, w };
+        faces.push_back(quad);
+    }
+    return true;
+}
+
 uint32_t PolyMesh::splitEdge(uint32_t a, uint32_t b)
 {
     if (a >= positions.size() || b >= positions.size())

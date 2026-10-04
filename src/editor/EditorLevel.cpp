@@ -85,6 +85,28 @@ glm::vec2 meshExtent(const PolyMesh& mesh, const glm::vec3& normal)
     }
     return mesh.positions.empty() ? glm::vec2(0.0f) : range;
 }
+
+// Edge edits move along directions that are often diagonal (the edge between two box faces), so the
+// offset is snapped per axis: ends that started on the grid stay on it.
+glm::vec3 edgeOffset(const glm::vec3& direction, float distance, float grid, bool snap)
+{
+    const glm::vec3 offset = direction * distance;
+    return snap ? glm::round(offset / grid) * grid : offset;
+}
+
+// Moves edge a-b by offset, or extrudes it; returns the edge to select afterwards (the new one).
+std::array<uint32_t, 2> editEdge(PolyMesh& mesh, uint32_t a, uint32_t b, const glm::vec3& offset, bool extrude)
+{
+    if (extrude) {
+        uint32_t newA, newB;
+        if (mesh.extrudeEdge(a, b, offset, newA, newB))
+            return { newA, newB };
+        return { a, b };
+    }
+    mesh.positions[a] += offset;
+    mesh.positions[b] += offset;
+    return { a, b };
+}
 }
 
 PolyMesh* Editor::selectedLevelMesh()
@@ -174,6 +196,67 @@ const std::vector<uint32_t>& Editor::selectedLevelVertices()
     const size_t count = mesh->positions.size();
     std::erase_if(m_selectedVertices, [count](uint32_t v) { return v >= count; });
     return m_selectedVertices;
+}
+
+bool Editor::selectedLevelEdge(uint32_t& a, uint32_t& b)
+{
+    const PolyMesh* mesh = selectedLevelMesh();
+    // Undo can remove the edge under the selection.
+    if (m_levelMode != LevelEditMode::Edge || !m_edgeSelected || !mesh ||
+        m_levelSelectionInstance != m_gizmo.selectedInstance || !mesh->isEdge(m_selectedEdge[0], m_selectedEdge[1])) {
+        m_edgeSelected = false;
+        return false;
+    }
+    a = m_selectedEdge[0];
+    b = m_selectedEdge[1];
+    return true;
+}
+
+bool Editor::pickLevelEdge(float mouseX, float mouseY, uint32_t& outA, uint32_t& outB) const
+{
+    if (!hasSelection())
+        return false;
+    const ModelInstance& instance = m_models.getInstances()[m_gizmo.selectedInstance];
+    const GPUModel* model = m_models.getModel(instance.modelIndex);
+    if (!model || !model->polyMesh || !instance.visible || instance.locked)
+        return false;
+    const PolyMesh& mesh = *model->polyMesh;
+
+    const glm::mat4 mvp = sceneProjection() * getView(m_camera) * instance.getTransformMatrix();
+    std::vector<glm::vec2> screen(mesh.positions.size());
+    std::vector<float> depth(mesh.positions.size());
+    for (size_t v = 0; v < mesh.positions.size(); ++v) {
+        depth[v] = (mvp * glm::vec4(mesh.positions[v], 1.0f)).w;
+        if (depth[v] > 1e-4f)
+            screen[v] = worldToScreen(mesh.positions[v], mvp, m_sceneView.width, m_sceneView.height);
+    }
+    const glm::vec2 mouse(mouseX, mouseY);
+    bool found = false;
+    float bestDistance = kVertexPickRadius;
+    float bestDepth = FLT_MAX;
+    for (const PolyFace& face : mesh.faces) {
+        const size_t count = face.verts.size();
+        for (size_t i = 0; i < count; ++i) {
+            const uint32_t u = face.verts[i], w = face.verts[(i + 1) % count];
+            if (depth[u] <= 1e-4f || depth[w] <= 1e-4f)
+                continue;
+            const glm::vec2 along = screen[w] - screen[u];
+            const float length2 = glm::dot(along, along);
+            const float t = length2 > 1e-6f ? std::clamp(glm::dot(mouse - screen[u], along) / length2, 0.0f, 1.0f) : 0.0f;
+            const float distance = glm::length(mouse - (screen[u] + along * t));
+            const float d = glm::mix(depth[u], depth[w], t);
+            // Edges drawn on top of each other go to the nearer one, as with vertices.
+            const bool sameSpot = found && std::abs(distance - bestDistance) < 1.0f;
+            if (sameSpot ? d < bestDepth : distance < bestDistance) {
+                found = true;
+                outA = u;
+                outB = w;
+                bestDistance = distance;
+                bestDepth = d;
+            }
+        }
+    }
+    return found;
 }
 
 int Editor::pickLevelFace(float mouseX, float mouseY, int instanceIndex) const
@@ -289,13 +372,45 @@ bool Editor::handleLevelClick(float mouseX, float mouseY)
             m_faceDrag.face = static_cast<uint32_t>(m_selectedFace);
             m_faceDrag.center = mesh->faceCenter(face);
             m_faceDrag.normal = mesh->faceNormal(face);
-            if (faceDragParam(mouseX, mouseY, m_faceDrag.startParam)) {
+            if (lineDragParam(m_faceDrag.instance, m_faceDrag.center, m_faceDrag.normal, mouseX, mouseY,
+                    m_faceDrag.startParam)) {
                 m_faceDrag.active = true;
                 m_faceDrag.moved = false;
                 m_faceDrag.extrude = (SDL_GetModState() & SDL_KMOD_ALT) != 0;
                 m_faceDrag.distance = 0.0f;
                 m_faceDrag.startMesh = *mesh;
             }
+        }
+        return true;
+    }
+
+    if (m_levelMode == LevelEditMode::Edge) {
+        uint32_t a, b;
+        if (!pickLevelEdge(mouseX, mouseY, a, b)) {
+            m_edgeSelected = false;
+            return false;
+        }
+        m_levelSelectionInstance = m_gizmo.selectedInstance;
+        m_edgeSelected = true;
+        m_selectedEdge = { a, b };
+        // Pressing on an edge also grabs it, like faces: drag to push/pull, Alt+drag to extrude.
+        const PolyMesh* mesh = selectedLevelMesh();
+        if (!mesh)
+            return true;
+        const bool extrude = (SDL_GetModState() & SDL_KMOD_ALT) != 0;
+        m_edgeDrag.instance = m_gizmo.selectedInstance;
+        m_edgeDrag.a = a;
+        m_edgeDrag.b = b;
+        m_edgeDrag.center = (mesh->positions[a] + mesh->positions[b]) * 0.5f;
+        m_edgeDrag.direction = extrude ? mesh->edgeExtrudeDirection(a, b) : mesh->edgeNormal(a, b);
+        if (m_edgeDrag.direction != glm::vec3(0.0f) &&
+            lineDragParam(m_edgeDrag.instance, m_edgeDrag.center, m_edgeDrag.direction, mouseX, mouseY,
+                m_edgeDrag.startParam)) {
+            m_edgeDrag.active = true;
+            m_edgeDrag.moved = false;
+            m_edgeDrag.extrude = extrude;
+            m_edgeDrag.offset = glm::vec3(0.0f);
+            m_edgeDrag.startMesh = *mesh;
         }
         return true;
     }
@@ -375,14 +490,15 @@ void Editor::dragLevelVertex(float mouseX, float mouseY)
     }
 }
 
-bool Editor::faceDragParam(float mouseX, float mouseY, float& param) const
+bool Editor::lineDragParam(int instance, const glm::vec3& point, const glm::vec3& localAxis, float mouseX,
+    float mouseY, float& param) const
 {
-    if (!validInstance(m_faceDrag.instance))
+    if (!validInstance(instance))
         return false;
-    // The normal line in world space, parameterized in object units so the result needs no conversion.
-    const glm::mat4 transform = m_models.getInstances()[m_faceDrag.instance].getTransformMatrix();
-    const glm::vec3 origin = glm::vec3(transform * glm::vec4(m_faceDrag.center, 1.0f));
-    const glm::vec3 axis = glm::vec3(transform * glm::vec4(m_faceDrag.normal, 0.0f));
+    // The line in world space, parameterized in object units so the result needs no conversion.
+    const glm::mat4 transform = m_models.getInstances()[instance].getTransformMatrix();
+    const glm::vec3 origin = glm::vec3(transform * glm::vec4(point, 1.0f));
+    const glm::vec3 axis = glm::vec3(transform * glm::vec4(localAxis, 0.0f));
     const Ray ray = screenToWorldRay(mouseX, mouseY, m_sceneView.width, m_sceneView.height,
         getView(m_camera), sceneProjection());
     // Closest points of two lines.
@@ -409,7 +525,7 @@ void Editor::dragLevelFace(float mouseX, float mouseY)
         return;
     }
     float param;
-    if (!faceDragParam(mouseX, mouseY, param))
+    if (!lineDragParam(m_faceDrag.instance, m_faceDrag.center, m_faceDrag.normal, mouseX, mouseY, param))
         return;
     float distance = param - m_faceDrag.startParam;
     if (snapActive())
@@ -426,6 +542,33 @@ void Editor::dragLevelFace(float mouseX, float mouseY)
     }
     // Rebuilt once per frame in updateLevelHistory(); several motion events can arrive per frame.
     m_faceDrag.moved = true;
+}
+
+void Editor::dragLevelEdge(float mouseX, float mouseY)
+{
+    PolyMesh* mesh = selectedLevelMesh();
+    // Anything changing the selection mid-drag (undo, another object, mode) ends the drag.
+    const size_t count = m_edgeDrag.startMesh.positions.size();
+    if (!mesh || m_gizmo.selectedInstance != m_edgeDrag.instance || m_levelMode != LevelEditMode::Edge ||
+        m_edgeDrag.a >= count || m_edgeDrag.b >= count) {
+        m_edgeDrag.active = false;
+        return;
+    }
+    float param;
+    if (!lineDragParam(m_edgeDrag.instance, m_edgeDrag.center, m_edgeDrag.direction, mouseX, mouseY, param))
+        return;
+    const glm::vec3 offset = edgeOffset(m_edgeDrag.direction, param - m_edgeDrag.startParam,
+        m_edgeDrag.startMesh.gridSize, snapActive());
+    if (offset == m_edgeDrag.offset)
+        return;
+    m_edgeDrag.offset = offset;
+    *mesh = m_edgeDrag.startMesh;
+    m_selectedEdge = { m_edgeDrag.a, m_edgeDrag.b };
+    if (glm::length(offset) > 1e-6f)
+        m_selectedEdge = editEdge(*mesh, m_edgeDrag.a, m_edgeDrag.b, offset, m_edgeDrag.extrude);
+    m_edgeSelected = true;
+    // Rebuilt once per frame in updateLevelHistory().
+    m_edgeDrag.moved = true;
 }
 
 bool Editor::faceDrawValid()
@@ -708,6 +851,28 @@ void Editor::drawLevelFaceOverlay()
             char label[48];
             snprintf(label, sizeof(label), "%s %+g", m_faceDrag.extrude ? "Extrude" : "Push/pull", m_faceDrag.distance);
             drawList->AddText(ImVec2(origin.x + p.x + 8.0f, origin.y + p.y - 8.0f), kFaceOutline, label);
+        }
+    }
+    if (m_levelMode == LevelEditMode::Edge) {
+        const ImVec2 mousePos = ImGui::GetMousePos();
+        uint32_t a, b;
+        if (!m_edgeDrag.active && sceneViewContains(mousePos.x, mousePos.y) &&
+            pickLevelEdge(mousePos.x - origin.x, mousePos.y - origin.y, a, b))
+            drawLine(mesh->positions[a], mesh->positions[b], kFaceGroupOutline, 2.0f);
+        if (selectedLevelEdge(a, b)) {
+            drawLine(mesh->positions[a], mesh->positions[b], kFaceOutline, 3.0f);
+            if (m_edgeDrag.active && m_edgeDrag.offset != glm::vec3(0.0f)) {
+                const glm::vec3 middle = (mesh->positions[a] + mesh->positions[b]) * 0.5f;
+                const glm::vec2 p = worldToScreen(middle, mvp, m_sceneView.width, m_sceneView.height);
+                if (p.x > -5000.0f) {
+                    // Signed, so pulling inwards reads as negative.
+                    const float distance = std::copysign(glm::length(m_edgeDrag.offset),
+                        glm::dot(m_edgeDrag.offset, m_edgeDrag.direction));
+                    char label[48];
+                    snprintf(label, sizeof(label), "%s %+g", m_edgeDrag.extrude ? "Extrude" : "Push/pull", distance);
+                    drawList->AddText(ImVec2(origin.x + p.x + 8.0f, origin.y + p.y - 8.0f), kFaceOutline, label);
+                }
+            }
         }
     }
     if (clipPreview) {
@@ -1375,11 +1540,13 @@ void Editor::applyLevelSubtract()
 
 bool Editor::deleteLevelSelection()
 {
-    // In face/vertex mode Del never removes the whole object, even with nothing picked.
+    // In face/edge/vertex mode Del never removes the whole object, even with nothing picked.
     if (m_levelMode == LevelEditMode::Object || !selectedLevelMesh())
         return false;
-    if (m_vertexDrag.active || m_faceDrag.active || m_levelEditPending)
+    if (m_vertexDrag.active || m_faceDrag.active || m_edgeDrag.active || m_levelEditPending)
         return true;
+    if (m_levelMode == LevelEditMode::Edge)
+        return true; // edges have no delete of their own
     if (m_levelMode == LevelEditMode::Face)
         deleteLevelFace();
     else
@@ -1536,6 +1703,54 @@ void Editor::drawFaceGeometry(PolyMesh& mesh, uint32_t faceIndex)
     else
         mesh.extrudeFace(faceIndex, m_faceOpDistance);
     rebuildSelectedLevelModel(push ? "push/pull" : "extrude");
+}
+
+void Editor::drawEdgeGeometry(PolyMesh& mesh, uint32_t a, uint32_t b)
+{
+    EditorStyle::propertyLabel("Distance");
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    // Shared with the face tools; steps by one grid cell.
+    const float grid = mesh.gridSize;
+    ImGui::InputFloat("##edgeDistance", &m_faceOpDistance, grid, grid * 4.0f, "%.3g");
+    if (ImGui::IsItemDeactivatedAfterEdit() && m_gridSnap)
+        m_faceOpDistance = std::round(m_faceOpDistance / grid) * grid;
+    m_faceOpDistance = std::clamp(m_faceOpDistance, -1000.0f, 1000.0f);
+    ImGui::SetItemTooltip("Object space; with snapping on, the offset is rounded to the grid per axis");
+    const float width = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
+    const bool push = ImGui::Button("Push/Pull", ImVec2(width, 0.0f));
+    ImGui::SetItemTooltip("Move the edge along the average normal of its faces; they stretch along");
+    ImGui::SameLine();
+    const bool extrude = ImGui::Button("Extrude", ImVec2(width, 0.0f));
+    ImGui::SetItemTooltip("Build a new face out from the edge: on an open border it continues the surface, "
+        "elsewhere it sticks out along the faces' normal as a two-sided fin");
+
+    if (ImGui::Button("Split", ImVec2(width, 0.0f))) {
+        const uint32_t mid = mesh.splitEdge(a, b);
+        if (mid != UINT32_MAX) {
+            m_selectedEdge = { a, mid };
+            rebuildSelectedLevelModel("split edge");
+            return;
+        }
+    }
+    ImGui::SetItemTooltip("Add a vertex at the edge's middle; the first half stays selected");
+    ImGui::SameLine();
+    if (ImGui::Button("Select vertices", ImVec2(width, 0.0f))) {
+        m_selectedVertices = { a, b };
+        m_levelMode = LevelEditMode::Vertex;
+        return;
+    }
+    ImGui::SetItemTooltip("Switch to vertex mode with the edge's two ends selected");
+
+    if (!push && !extrude)
+        return;
+    const glm::vec3 direction = extrude ? mesh.edgeExtrudeDirection(a, b) : mesh.edgeNormal(a, b);
+    const glm::vec3 offset = edgeOffset(direction, m_faceOpDistance, grid, m_gridSnap);
+    if (glm::length(offset) < 1e-4f) {
+        setStatus("Distance is zero", true);
+        return;
+    }
+    m_selectedEdge = editEdge(mesh, a, b, offset, extrude);
+    rebuildSelectedLevelModel(push ? "push/pull edge" : "extrude edge");
 }
 
 void Editor::drawLevelMaterials(PolyMesh& mesh)
@@ -1760,6 +1975,7 @@ void Editor::drawLevelPanel()
                 *mesh = std::move(rebuilt);
                 clearFaceSelection();
                 m_selectedVertices.clear();
+                m_edgeSelected = false;
                 rebuildSelectedLevelModel("rebuild shape");
                 setStatus("Rebuilt " + m_models.getInstances()[m_gizmo.selectedInstance].name);
             }
@@ -1772,6 +1988,8 @@ void Editor::drawLevelPanel()
             ImGui::RadioButton("Object", &mode, static_cast<int>(LevelEditMode::Object));
             ImGui::SameLine();
             ImGui::RadioButton("Faces", &mode, static_cast<int>(LevelEditMode::Face));
+            ImGui::SameLine();
+            ImGui::RadioButton("Edges", &mode, static_cast<int>(LevelEditMode::Edge));
             ImGui::SameLine();
             ImGui::RadioButton("Vertices", &mode, static_cast<int>(LevelEditMode::Vertex));
             m_levelMode = static_cast<LevelEditMode>(mode);
@@ -1840,6 +2058,18 @@ void Editor::drawLevelPanel()
                 else {
                     ImGui::TextDisabled("Click a face of the shape in the viewport;");
                     ImGui::TextDisabled("Shift+click adds. Drag to push/pull, Alt+drag to extrude.");
+                }
+            }
+            else if (m_levelMode == LevelEditMode::Edge) {
+                uint32_t a, b;
+                if (selectedLevelEdge(a, b)) {
+                    ImGui::Text("Edge %u-%u", a, b);
+                    ImGui::SeparatorText("Geometry");
+                    drawEdgeGeometry(*mesh, a, b);
+                }
+                else {
+                    ImGui::TextDisabled("Click an edge of the shape in the viewport;");
+                    ImGui::TextDisabled("drag to push/pull, Alt+drag to extrude.");
                 }
             }
             else if (m_levelMode == LevelEditMode::Vertex) {

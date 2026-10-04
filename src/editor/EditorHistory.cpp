@@ -27,8 +27,13 @@ void Editor::updateLevelHistory()
         if (selectedLevelMesh())
             rebuildSelectedLevelModel(m_faceDrag.extrude ? "extrude" : "push/pull");
     }
+    if (m_edgeDrag.moved) {
+        m_edgeDrag.moved = false;
+        if (selectedLevelMesh())
+            rebuildSelectedLevelModel(m_edgeDrag.extrude ? "extrude edge" : "push/pull edge");
+    }
     if (m_levelEditPending) {
-        if (ImGui::IsAnyItemActive() || m_vertexDrag.active || m_faceDrag.active)
+        if (ImGui::IsAnyItemActive() || m_vertexDrag.active || m_faceDrag.active || m_edgeDrag.active)
             return;
         const auto found = m_models.findModelByPath(m_levelBaselinePath);
         const GPUModel* model = found ? m_models.getModel(*found) : nullptr;
@@ -57,7 +62,7 @@ void Editor::updateLevelHistory()
 
 bool Editor::editInProgress() const
 {
-    return m_levelEditPending || m_vertexDrag.active || m_faceDrag.active || m_gizmo.isDragging ||
+    return m_levelEditPending || m_vertexDrag.active || m_faceDrag.active || m_edgeDrag.active || m_gizmo.isDragging ||
         ImGui::IsAnyItemActive();
 }
 

@@ -97,6 +97,7 @@ void Editor::onResume()
     m_rightMouseHeld = false;
     m_vertexDrag.active = false;
     m_faceDrag.active = false;
+    m_edgeDrag.active = false;
     m_vertexMarquee.active = false;
     m_cameraSpeedMultiplier = 1.0f;
     SDL_SetWindowRelativeMouseMode(m_window, m_flyMode);
@@ -134,6 +135,7 @@ void Editor::handleViewportMouse(const SDL_Event& event)
         m_gizmo.activeAxis = GizmoAxis::None;
         m_vertexDrag.active = false;
         m_faceDrag.active = false;
+        m_edgeDrag.active = false;
         if (m_vertexMarquee.active)
             finishVertexMarquee(event.button.x - m_sceneView.x, event.button.y - m_sceneView.y);
     }
@@ -144,6 +146,8 @@ void Editor::handleViewportMouse(const SDL_Event& event)
         dragLevelVertex(event.motion.x - m_sceneView.x, event.motion.y - m_sceneView.y);
     if (event.type == SDL_EVENT_MOUSE_MOTION && m_faceDrag.active)
         dragLevelFace(event.motion.x - m_sceneView.x, event.motion.y - m_sceneView.y);
+    if (event.type == SDL_EVENT_MOUSE_MOTION && m_edgeDrag.active)
+        dragLevelEdge(event.motion.x - m_sceneView.x, event.motion.y - m_sceneView.y);
     if (event.type == SDL_EVENT_MOUSE_MOTION && m_vertexMarquee.active)
         m_vertexMarquee.end = glm::vec2(event.motion.x - m_sceneView.x, event.motion.y - m_sceneView.y);
 }
@@ -167,7 +171,7 @@ void Editor::handleViewportClick(float mouseX, float mouseY)
     if (tryBeginGizmoDrag(mouseX, mouseY, view, proj))
         return;
 
-    // In face/vertex mode the selected level shape keeps the selection; clicks elsewhere pick objects as usual.
+    // In face/edge/vertex mode the selected level shape keeps the selection; clicks elsewhere pick objects as usual.
     if (m_levelMode != LevelEditMode::Object && handleLevelClick(mouseX, mouseY))
         return;
     pickObject(mouseX, mouseY);

@@ -218,10 +218,16 @@ private:
     // Face/vertex picking for a viewport click; false when nothing was hit and objects should be picked.
     bool handleLevelClick(float mouseX, float mouseY);
     void dragLevelVertex(float mouseX, float mouseY);
-    // Distance along the dragged face's normal (object units) closest to the mouse ray; false when the
-    // view looks straight along the normal.
-    bool faceDragParam(float mouseX, float mouseY, float& param) const;
+    // The selected edge (edge mode, selected instance); false when there is none or undo removed it.
+    bool selectedLevelEdge(uint32_t& a, uint32_t& b);
+    // Edge of the selected level instance drawn closest to the mouse, within a few pixels.
+    bool pickLevelEdge(float mouseX, float mouseY, uint32_t& a, uint32_t& b) const;
+    // Position along the line point + t * axis (object space of the instance; t in object units)
+    // closest to the mouse ray; false when the view looks straight along the line.
+    bool lineDragParam(int instance, const glm::vec3& point, const glm::vec3& axis, float mouseX, float mouseY,
+        float& param) const;
     void dragLevelFace(float mouseX, float mouseY);
+    void dragLevelEdge(float mouseX, float mouseY);
     // Drawing on a face: false (and drawing ends) once the face or selection it was started on is gone.
     bool faceDrawValid();
     // Point on the drawn face's plane under the mouse: a face corner within a few pixels, else snapped to
@@ -241,6 +247,7 @@ private:
     void drawVertexProperties(PolyMesh& mesh);
     // Push/pull and extrude; by index, because extruding adds faces and moves the face storage.
     void drawFaceGeometry(PolyMesh& mesh, uint32_t faceIndex);
+    void drawEdgeGeometry(PolyMesh& mesh, uint32_t a, uint32_t b);
     void drawLevelMaterials(PolyMesh& mesh);
     // What the open texture dialog sets: an inline slot of the selected shape, or a shared material.
     struct TextureDialogTarget {
@@ -480,8 +487,8 @@ private:
 
     // Level tool
     PolyShapeParams m_newShape;
-    // Face and vertex modes: clicks on the selected level shape pick its parts instead of objects.
-    enum class LevelEditMode { Object, Face, Vertex };
+    // Face, edge and vertex modes: clicks on the selected level shape pick its parts instead of objects.
+    enum class LevelEditMode { Object, Face, Vertex, Edge };
     LevelEditMode m_levelMode = LevelEditMode::Object;
     // Face mode: m_selectedFace is the active face (properties shown, dragged, source of wraps);
     // m_selectedFaces holds every selected face, the active one included.
@@ -536,6 +543,24 @@ private:
         PolyMesh startMesh;
     };
     FaceDrag m_faceDrag;
+    // Edge mode: one selected edge, by its two vertices.
+    bool m_edgeSelected = false;
+    std::array<uint32_t, 2> m_selectedEdge{};
+    // Dragging an edge moves it along the average normal of its faces, or extrudes it (Alt at the start)
+    // along PolyMesh::edgeExtrudeDirection(); re-applied to the starting mesh like FaceDrag.
+    struct EdgeDrag {
+        bool active = false;
+        bool moved = false; // mesh changed since the last rebuild
+        bool extrude = false;
+        int instance = -1;
+        uint32_t a = 0, b = 0;
+        glm::vec3 center{ 0.0f };    // object space
+        glm::vec3 direction{ 0.0f }; // object space, unit length
+        float startParam = 0.0f;
+        glm::vec3 offset{ 0.0f };    // currently applied, object space
+        PolyMesh startMesh;
+    };
+    EdgeDrag m_edgeDrag;
     // Face mode: a shape drawn on the active face, which then divides it (PolyMesh::divideFace).
     enum class FaceDrawShape { Polygon, Rectangle, Circle };
     struct FaceDraw {

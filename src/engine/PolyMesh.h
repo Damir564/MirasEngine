@@ -79,6 +79,16 @@ struct PolyMesh {
     std::vector<uint32_t> removeUnusedVertices();
     // True when some face has a and b as neighbouring corners.
     bool isEdge(uint32_t a, uint32_t b) const;
+    // Unit average of the normals of the faces using edge a-b; zero if a-b is not an edge.
+    glm::vec3 edgeNormal(uint32_t a, uint32_t b) const;
+    // Where extrudeEdge() builds by default: for a border edge (one face) outward within that face's
+    // plane, so the surface continues; otherwise edgeNormal().
+    glm::vec3 edgeExtrudeDirection(uint32_t a, uint32_t b) const;
+    // Copies the edge's ends out by `offset` and joins old and new edge with a quad taking the material
+    // of a face using the edge. On a border edge the quad continues that face's winding; elsewhere it
+    // is a two-sided fin (two quads back to back). Returns false, with the mesh unchanged, if a-b is
+    // not an edge; otherwise newA/newB are the copies of a and b.
+    bool extrudeEdge(uint32_t a, uint32_t b, const glm::vec3& offset, uint32_t& newA, uint32_t& newB);
     // Adds a vertex halfway along edge a-b, inserted into every face using that edge.
     // Returns its index, or UINT32_MAX if a-b is not an edge.
     uint32_t splitEdge(uint32_t a, uint32_t b);
