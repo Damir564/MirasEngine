@@ -3,8 +3,10 @@
 #include <algorithm>
 #include <utility>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <exception>
+#include <iterator>
 #include <limits>
 #include "engine/ModelLoader.h"
 #include "engine/ModelManager.h"
@@ -18,6 +20,7 @@ Editor::Editor(const EngineContext& engine)
     , m_models(engine.models)
     , m_scenes(engine.scenes)
     , m_settings(engine.settings)
+    , m_materials(engine.materials)
 {
     int width = 0, height = 0;
     SDL_GetWindowSize(m_window, &width, &height);
@@ -93,6 +96,7 @@ void Editor::onResume()
     m_windowTitle.clear();
     m_rightMouseHeld = false;
     m_vertexDrag.active = false;
+    m_faceDrag.active = false;
     m_vertexMarquee.active = false;
     m_cameraSpeedMultiplier = 1.0f;
     SDL_SetWindowRelativeMouseMode(m_window, m_flyMode);
@@ -129,6 +133,7 @@ void Editor::handleViewportMouse(const SDL_Event& event)
         m_gizmo.isDragging = false;
         m_gizmo.activeAxis = GizmoAxis::None;
         m_vertexDrag.active = false;
+        m_faceDrag.active = false;
         if (m_vertexMarquee.active)
             finishVertexMarquee(event.button.x - m_sceneView.x, event.button.y - m_sceneView.y);
     }
@@ -137,6 +142,8 @@ void Editor::handleViewportMouse(const SDL_Event& event)
         dragGizmo(event.motion.x - m_sceneView.x, event.motion.y - m_sceneView.y);
     if (event.type == SDL_EVENT_MOUSE_MOTION && m_vertexDrag.active)
         dragLevelVertex(event.motion.x - m_sceneView.x, event.motion.y - m_sceneView.y);
+    if (event.type == SDL_EVENT_MOUSE_MOTION && m_faceDrag.active)
+        dragLevelFace(event.motion.x - m_sceneView.x, event.motion.y - m_sceneView.y);
     if (event.type == SDL_EVENT_MOUSE_MOTION && m_vertexMarquee.active)
         m_vertexMarquee.end = glm::vec2(event.motion.x - m_sceneView.x, event.motion.y - m_sceneView.y);
 }
@@ -249,7 +256,7 @@ void Editor::dragGizmo(float mouseX, float mouseY)
     if (axis < 0 || axis > 2)
         return;
     const glm::vec3 axisDir = gizmoAxisDirection(m_gizmo.activeAxis);
-    const bool snap = (SDL_GetModState() & SDL_KMOD_CTRL) != 0;
+    const bool snap = snapActive();
     const auto snapTo = [](float value, float step) { return step > 0.0f ? std::round(value / step) * step : value; };
     markSceneChanged(); // recorded when the drag ends
 
@@ -257,7 +264,7 @@ void Editor::dragGizmo(float mouseX, float mouseY)
     case GizmoMode::Translate:
         instance.position = m_gizmo.originalPosition + axisDir * (amount / m_gizmo.pixelsPerUnit);
         if (snap)
-            instance.position[axis] = snapTo(instance.position[axis], m_snapTranslate);
+            instance.position[axis] = snapTo(instance.position[axis], m_gridSize);
         break;
     case GizmoMode::Rotate: {
         const float degreesPerPixel = 0.5f;
@@ -349,6 +356,7 @@ void Editor::drawUi()
 {
     validateSelection();
     handleShortcuts();
+    applyPendingMaterialDrop();
     // The gizmo shows the active tool on the selected object ("Select" tool = no gizmo).
     m_gizmo.mode = hasSelection() ? m_tool : GizmoMode::None;
     updateWindowTitle();
@@ -365,6 +373,8 @@ void Editor::drawUi()
     if (m_showInspector) drawInspector();
     if (m_showStatisticsPanel) drawStatisticsPanel();
     if (m_showLevelPanel) drawLevelPanel();
+    if (m_showMaterialsPanel) drawMaterialsPanel();
+    drawMaterialDropTarget();
     if (m_showAnimationPanel) drawAnimationPanel();
     if (m_showGraphicsSettings) drawGraphicsSettingsWindow();
     updateLevelHistory();
@@ -382,7 +392,58 @@ void Editor::fillFrame(FrameInput& frame)
     frame.viewport = m_sceneView;
     fillHighlight(frame.highlight);
     frame.showPath = !m_flyMode && m_showCameraPath;
-    frame.showGrid = !m_flyMode && m_showGrid;
+    const bool levelGrid = !m_flyMode && m_showGrid && levelGridActive();
+    frame.showGrid = !m_flyMode && m_showGrid && !levelGrid;
+    frame.levelGrid = levelGrid;
+    frame.gridCellSize = activeGridSize();
+}
+
+bool Editor::snapActive() const
+{
+    const bool ctrl = (SDL_GetModState() & SDL_KMOD_CTRL) != 0;
+    return m_gridSnap != ctrl;
+}
+
+bool Editor::levelGridActive()
+{
+    return m_levelMode != LevelEditMode::Object && selectedLevelMesh() != nullptr;
+}
+
+float Editor::activeGridSize()
+{
+    return levelGridActive() ? selectedLevelMesh()->gridSize : m_gridSize;
+}
+
+void Editor::setActiveGridSize(float size)
+{
+    size = std::clamp(size, kMinPolyGridSize, kMaxPolyGridSize);
+    char text[64];
+    if (levelGridActive()) {
+        PolyMesh* mesh = selectedLevelMesh();
+        if (mesh->gridSize == size)
+            return;
+        mesh->gridSize = size;
+        // Saved with the shape, so it goes through the level history like other shape edits.
+        rebuildSelectedLevelModel("shape grid size");
+        snprintf(text, sizeof(text), "Shape grid size %g", size);
+    }
+    else {
+        m_gridSize = size;
+        snprintf(text, sizeof(text), "Grid size %g", size);
+    }
+    setStatus(text);
+}
+
+void Editor::stepGridSize(int direction)
+{
+    constexpr int count = static_cast<int>(std::size(kGridSizes));
+    const float size = activeGridSize();
+    // Nearest preset first, so a size set elsewhere still steps sensibly.
+    int current = 0;
+    for (int i = 1; i < count; ++i)
+        if (std::abs(std::log2(kGridSizes[i] / size)) < std::abs(std::log2(kGridSizes[current] / size)))
+            current = i;
+    setActiveGridSize(kGridSizes[std::clamp(current + direction, 0, count - 1)]);
 }
 
 glm::mat4 Editor::sceneProjection() const
@@ -418,6 +479,10 @@ void Editor::handleShortcuts()
     if (ImGui::IsKeyChordPressed(ImGuiKey_1)) m_tool = GizmoMode::Translate;
     if (ImGui::IsKeyChordPressed(ImGuiKey_2)) m_tool = GizmoMode::Rotate;
     if (ImGui::IsKeyChordPressed(ImGuiKey_3)) m_tool = GizmoMode::Scale;
+    if (ImGui::IsKeyChordPressed(ImGuiKey_I)) pickMaterialUnderMouse();
+    handleFaceKeys();
+    if (ImGui::IsKeyChordPressed(ImGuiKey_LeftBracket)) stepGridSize(-1);
+    if (ImGui::IsKeyChordPressed(ImGuiKey_RightBracket)) stepGridSize(1);
     if (ImGui::IsKeyChordPressed(ImGuiKey_F1)) m_openControlsPopup = true;
     if (ImGui::IsKeyChordPressed(ImGuiKey_F2) && selection) beginRename(m_gizmo.selectedInstance);
 }
@@ -587,8 +652,7 @@ void Editor::addCube()
             return;
         }
     }
-    const float step = m_snapTranslate > 0.0f ? m_snapTranslate : 1.0f;
-    const glm::vec3 position = glm::round((m_camera.position + getFront(m_camera) * 5.0f) / step) * step;
+    const glm::vec3 position = glm::round((m_camera.position + getFront(m_camera) * 5.0f) / m_gridSize) * m_gridSize;
     const size_t newIndex = m_models.createInstance(modelIndex, position);
     const std::string name = uniqueInstanceName("Cube");
     m_models.getInstances()[newIndex].name = name;

@@ -9,6 +9,7 @@
 #include <set>
 #include <ostream>
 #include <glm/gtc/constants.hpp>
+#include "MaterialLibrary.h"
 #include "Vertex.h"
 
 glm::vec3 PolyMesh::faceNormal(const PolyFace& face) const
@@ -619,32 +620,111 @@ void faceUVRange(const PolyMesh& mesh, const PolyFace& face, glm::vec2& lo, glm:
     }
 }
 
+// The face's planar projection: uv = rotate(dot(p, t), -dot(p, b)) / scale + offset.
+struct FaceUVMapping {
+    glm::vec3 t{ 0.0f }, b{ 0.0f };
+    float cr = 1.0f, sr = 0.0f;
+    glm::vec2 scale{ 1.0f };
+    glm::vec2 offset{ 0.0f };
+
+    FaceUVMapping(const PolyMesh& mesh, const PolyFace& face, float texelSize)
+    {
+        faceBasis(mesh.faceNormal(face), t, b);
+        const float r = glm::radians(face.uvRotation);
+        cr = std::cos(r);
+        sr = std::sin(r);
+        scale = glm::max(glm::abs(face.uvScale) * texelSize, glm::vec2(1e-4f));
+        offset = face.uvOffset;
+    }
+    // Before rotation, scale and offset.
+    glm::vec2 project(const glm::vec3& p) const { return glm::vec2(glm::dot(p, t), -glm::dot(p, b)); }
+    glm::vec2 rotate(const glm::vec2& uv) const { return glm::vec2(cr * uv.x - sr * uv.y, sr * uv.x + cr * uv.y); }
+    glm::vec2 operator()(const glm::vec3& p) const { return rotate(project(p)) / scale + offset; }
+};
+
 } // namespace
 
-void PolyMesh::fitFaceUVs(uint32_t faceIndex, bool fitU, bool fitV)
+void PolyMesh::faceUVs(uint32_t faceIndex, float texelSize, std::vector<glm::vec2>& out) const
+{
+    out.clear();
+    const PolyFace& face = faces[faceIndex];
+    if (face.verts.size() < 3)
+        return;
+    const FaceUVMapping mapping(*this, face, texelSize);
+    for (uint32_t v : face.verts)
+        out.push_back(mapping(positions[v]));
+}
+
+bool PolyMesh::wrapFaceUVs(uint32_t from, uint32_t to, float fromTexelSize, float toTexelSize)
+{
+    const PolyFace& source = faces[from];
+    PolyFace& target = faces[to];
+    if (source.verts.size() < 3 || target.verts.size() < 3)
+        return false;
+    // A shared edge: two corners next to each other in both faces.
+    const auto adjacentInTarget = [&](uint32_t p, uint32_t q) {
+        const size_t n = target.verts.size();
+        for (size_t i = 0; i < n; ++i) {
+            const uint32_t u = target.verts[i], w = target.verts[(i + 1) % n];
+            if ((u == p && w == q) || (u == q && w == p))
+                return true;
+        }
+        return false;
+    };
+    uint32_t a = UINT32_MAX, b = UINT32_MAX;
+    for (size_t i = 0; i < source.verts.size() && a == UINT32_MAX; ++i) {
+        const uint32_t p = source.verts[i], q = source.verts[(i + 1) % source.verts.size()];
+        if (adjacentInTarget(p, q)) {
+            a = p;
+            b = q;
+        }
+    }
+    if (a == UINT32_MAX)
+        return false;
+
+    const FaceUVMapping sourceMap(*this, source, fromTexelSize);
+    const glm::vec2 wantA = sourceMap(positions[a]);
+    const glm::vec2 wantB = sourceMap(positions[b]);
+    // Turn the target's projected edge to point the same way as the source's in texture space.
+    const FaceUVMapping targetMap(*this, target, toTexelSize);
+    const glm::vec2 edge = targetMap.project(positions[b]) - targetMap.project(positions[a]);
+    const glm::vec2 wanted = (wantB - wantA) * targetMap.scale;
+    if (glm::length(edge) < 1e-6f || glm::length(wanted) < 1e-6f)
+        return false;
+    const float angle = std::atan2(wanted.y, wanted.x) - std::atan2(edge.y, edge.x);
+    float degrees = glm::degrees(angle);
+    degrees = std::fmod(degrees + 540.0f, 360.0f) - 180.0f;
+    target.uvRotation = degrees;
+    const FaceUVMapping turned(*this, target, toTexelSize);
+    target.uvOffset = wantA - turned.rotate(turned.project(positions[a])) / turned.scale;
+    return true;
+}
+
+void PolyMesh::fitFaceUVs(uint32_t faceIndex, bool fitU, bool fitV, float texelSize)
 {
     PolyFace& face = faces[faceIndex];
     if (face.verts.size() < 3)
         return;
     glm::vec2 lo, hi;
     faceUVRange(*this, face, lo, hi);
+    const float texel = std::max(texelSize, 1e-3f);
     for (int i = 0; i < 2; ++i) {
         if (!(i == 0 ? fitU : fitV))
             continue;
-        face.uvScale[i] = std::max(hi[i] - lo[i], 1e-3f);
-        face.uvOffset[i] = -lo[i] / face.uvScale[i];
+        face.uvScale[i] = std::max((hi[i] - lo[i]) / texel, 1e-3f);
+        face.uvOffset[i] = -lo[i] / (face.uvScale[i] * texel);
         face.uvOffset[i] -= std::floor(face.uvOffset[i]); // whole tiles make no difference
     }
 }
 
-void PolyMesh::alignFaceUVs(uint32_t faceIndex, const glm::vec2& anchor)
+void PolyMesh::alignFaceUVs(uint32_t faceIndex, const glm::vec2& anchor, float texelSize)
 {
     PolyFace& face = faces[faceIndex];
     if (face.verts.size() < 3)
         return;
     glm::vec2 lo, hi;
     faceUVRange(*this, face, lo, hi);
-    const glm::vec2 scale = glm::max(glm::abs(face.uvScale), glm::vec2(1e-4f));
+    const glm::vec2 scale = glm::max(glm::abs(face.uvScale) * texelSize, glm::vec2(1e-4f));
     for (int i = 0; i < 2; ++i) {
         if (anchor[i] < 0.0f)
             continue;
@@ -876,30 +956,28 @@ PolyMesh makePolyShape(const PolyShapeParams& params)
     }
 }
 
-Mesh polyMeshToMesh(const PolyMesh& poly)
+Mesh polyMeshToMesh(const PolyMesh& poly, MaterialLibrary* library)
 {
     Mesh mesh;
+    // Slot values with links resolved; a missing shared material falls back to the inline values.
+    std::vector<MaterialAsset> slots(poly.materials.size());
+    for (size_t i = 0; i < poly.materials.size(); ++i) {
+        const PolyMaterial& source = poly.materials[i];
+        const MaterialAsset* shared = library ? library->find(source.materialPath) : nullptr;
+        if (shared) {
+            slots[i] = *shared;
+            continue;
+        }
+        slots[i].color = source.color;
+        slots[i].roughness = source.roughness;
+        slots[i].metallic = source.metallic;
+        slots[i].baseColorTexture = source.texturePath;
+    }
     const auto toMaterial = [&](uint32_t index) {
         Material material;
         material.metallicFactor = 0.0f;
         material.roughnessFactor = 0.8f;
-        if (index >= poly.materials.size())
-            return material;
-        const PolyMaterial& source = poly.materials[index];
-        material.baseColorFactor = source.color;
-        material.metallicFactor = source.metallic;
-        material.roughnessFactor = source.roughness;
-        if (!source.texturePath.empty()) {
-            const auto it = std::find_if(mesh.textureData.begin(), mesh.textureData.end(),
-                [&](const TextureData& tex) { return tex.path == source.texturePath; });
-            material.baseColorTextureIndex = static_cast<int>(it - mesh.textureData.begin());
-            if (it == mesh.textureData.end()) {
-                TextureData tex;
-                tex.path = source.texturePath;
-                mesh.textureData.push_back(std::move(tex));
-            }
-        }
-        return material;
+        return index < slots.size() ? toRenderMaterial(slots[index], mesh) : material;
     };
 
     std::vector<uint32_t> usedMaterials;
@@ -918,23 +996,19 @@ Mesh polyMeshToMesh(const PolyMesh& poly)
             if (face.material != mat || face.verts.size() < 3)
                 continue;
             const glm::vec3 n = poly.faceNormal(face);
-            glm::vec3 t, b;
-            faceBasis(n, t, b);
-
+            // A shared material's texel size sets how much of the world one texture repeat covers.
+            const float texel = mat < slots.size() ? slots[mat].texelSize : 1.0f;
+            const FaceUVMapping mapping(poly, face, texel);
             // The tangent must follow +U after rotation; the bitangent sign (w = 1) matches generateCube().
-            const float r = glm::radians(face.uvRotation);
-            const float cr = std::cos(r), sr = std::sin(r);
-            const glm::vec2 scale = glm::max(glm::abs(face.uvScale), glm::vec2(1e-4f));
-            const glm::vec3 tangent = glm::normalize(cr * t + sr * b);
+            const glm::vec3 tangent = glm::normalize(mapping.cr * mapping.t + mapping.sr * mapping.b);
 
             const uint32_t base = static_cast<uint32_t>(mesh.vertices.size());
             for (uint32_t v : face.verts) {
                 const glm::vec3& p = poly.positions[v];
-                const glm::vec2 uv(glm::dot(p, t), -glm::dot(p, b));
                 Vertex vert{};
                 vert.position = p;
                 vert.normal = n;
-                vert.texCoord = glm::vec2(cr * uv.x - sr * uv.y, sr * uv.x + cr * uv.y) / scale + face.uvOffset;
+                vert.texCoord = mapping(p);
                 vert.tangent = glm::vec4(tangent, 1.0f);
                 mesh.vertices.push_back(vert);
                 sub.boundsMin = glm::min(sub.boundsMin, p);
@@ -999,10 +1073,13 @@ void writePolyMesh(std::ostream& out, const PolyMesh& mesh)
         writePod(out, material.metallic);
         writePod(out, static_cast<uint32_t>(material.texturePath.size()));
         out.write(material.texturePath.data(), material.texturePath.size());
+        writePod(out, static_cast<uint32_t>(material.materialPath.size()));
+        out.write(material.materialPath.data(), material.materialPath.size());
     }
+    writePod(out, mesh.gridSize);
 }
 
-bool readPolyMesh(std::istream& in, PolyMesh& mesh, bool withMaterials)
+bool readPolyMesh(std::istream& in, PolyMesh& mesh, int format)
 {
     mesh = {};
     uint32_t positionCount = 0;
@@ -1029,21 +1106,33 @@ bool readPolyMesh(std::istream& in, PolyMesh& mesh, bool withMaterials)
         if (std::any_of(face.verts.begin(), face.verts.end(), [&](uint32_t v) { return v >= positionCount; }))
             return false;
     }
-    if (!withMaterials)
+    if (format < 1)
         return true;
+    const auto readString = [&](std::string& out) {
+        uint32_t length = 0;
+        if (!readPod(in, length) || length > kMaxTexturePath)
+            return false;
+        out.resize(length);
+        return static_cast<bool>(in.read(out.data(), length));
+    };
 
     uint32_t materialCount = 0;
     if (!readPod(in, materialCount) || materialCount > kMaxPolyMaterials)
         return false;
     mesh.materials.resize(materialCount);
     for (PolyMaterial& material : mesh.materials) {
-        uint32_t pathLength = 0;
         if (!readPod(in, material.color) || !readPod(in, material.roughness) || !readPod(in, material.metallic) ||
-            !readPod(in, pathLength) || pathLength > kMaxTexturePath)
+            !readString(material.texturePath))
             return false;
-        material.texturePath.resize(pathLength);
-        if (!in.read(material.texturePath.data(), pathLength))
+        if (format >= 3 && !readString(material.materialPath))
             return false;
+    }
+    if (format >= 2) {
+        if (!readPod(in, mesh.gridSize))
+            return false;
+        // Also catches NaN.
+        if (!(mesh.gridSize >= kMinPolyGridSize && mesh.gridSize <= kMaxPolyGridSize))
+            mesh.gridSize = 1.0f;
     }
     return true;
 }

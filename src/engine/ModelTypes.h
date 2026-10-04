@@ -31,7 +31,11 @@ struct SubmeshInfo {
 
     glm::vec3 boundsMin{ std::numeric_limits<float>::max() };
     glm::vec3 boundsMax{ std::numeric_limits<float>::lowest() };
+    // Material slot in the source file (glTF material index); kNoSourceMaterial when it has none.
+    // Shared materials override whole slots (GPUModel::materialOverrides).
+    uint32_t sourceMaterial = UINT32_MAX;
 };
+inline constexpr uint32_t kNoSourceMaterial = UINT32_MAX;
 
 struct TextureData {
     int width = 0, height = 0, channels = 0;
@@ -52,4 +56,6 @@ struct Mesh {
     std::vector<uint32_t> indices;
     std::vector<SubmeshInfo> submeshes;
     std::vector<TextureData> textureData;
+    // Names of the source file's material slots, by SubmeshInfo::sourceMaterial.
+    std::vector<std::string> materialNames;
 };

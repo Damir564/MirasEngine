@@ -22,8 +22,13 @@ void Editor::updateLevelHistory()
         if (selectedLevelMesh())
             rebuildSelectedLevelModel("move vertex");
     }
+    if (m_faceDrag.moved) {
+        m_faceDrag.moved = false;
+        if (selectedLevelMesh())
+            rebuildSelectedLevelModel(m_faceDrag.extrude ? "extrude" : "push/pull");
+    }
     if (m_levelEditPending) {
-        if (ImGui::IsAnyItemActive() || m_vertexDrag.active)
+        if (ImGui::IsAnyItemActive() || m_vertexDrag.active || m_faceDrag.active)
             return;
         const auto found = m_models.findModelByPath(m_levelBaselinePath);
         const GPUModel* model = found ? m_models.getModel(*found) : nullptr;
@@ -52,7 +57,8 @@ void Editor::updateLevelHistory()
 
 bool Editor::editInProgress() const
 {
-    return m_levelEditPending || m_vertexDrag.active || m_gizmo.isDragging || ImGui::IsAnyItemActive();
+    return m_levelEditPending || m_vertexDrag.active || m_faceDrag.active || m_gizmo.isDragging ||
+        ImGui::IsAnyItemActive();
 }
 
 Editor::ObjectRecord Editor::makeObjectRecord(size_t index,

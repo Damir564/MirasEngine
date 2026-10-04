@@ -6,6 +6,13 @@
 layout(location = 0) in vec2 inNdc;
 layout(location = 0) out vec4 outColor;
 
+layout(push_constant) uniform GridPush {
+    float cellSize;
+    float majorEvery; // cells between major lines
+    float _pad0;
+    float _pad1;
+} pc;
+
 // Coverage of grid lines spaced `spacing` apart, about one pixel wide.
 float gridLines(vec2 coord, float spacing) {
     vec2 c = coord / spacing;
@@ -35,8 +42,8 @@ void main() {
     bool valid = t > 0.0 && depth >= 0.0 && depth <= 1.0;
     gl_FragDepth = valid ? depth : 1.0;
 
-    float minor = gridLines(world.xz, 1.0);
-    float major = gridLines(world.xz, 10.0);
+    float minor = gridLines(world.xz, pc.cellSize);
+    float major = gridLines(world.xz, pc.cellSize * pc.majorEvery);
     vec3 color = vec3(0.3);
     float alpha = max(minor * 0.35, major * 0.6);
 

@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <cstdio>
 #include <filesystem>
 #include <numeric>
 #include <SDL3/SDL_keyboard.h>
@@ -11,8 +12,8 @@
 
 namespace {
 constexpr const char* kTexturesRoot = "textures";
-constexpr size_t kMaxPolyMaterials = 255; // below kNoPolyMaterial and the scene reader's cap
 constexpr ImU32 kFaceOutline = IM_COL32(255, 160, 40, 255);
+constexpr ImU32 kFaceGroupOutline = IM_COL32(255, 200, 120, 190);
 constexpr ImU32 kFaceEdges = IM_COL32(255, 255, 255, 70);
 constexpr ImU32 kVertexDot = IM_COL32(255, 255, 255, 200);
 constexpr ImU32 kClipOutline = IM_COL32(80, 200, 255, 255);
@@ -29,6 +30,33 @@ bool rayHitsPlane(const Ray& ray, const glm::vec3& point, const glm::vec3& norma
         return false;
     hit = ray.origin + ray.direction * t;
     return true;
+}
+
+// Shape sizes in whole grid cells (at least one), so the faces of a new shape lie on its grid lines.
+PolyShapeParams snapShapeSize(PolyShapeParams params, float grid)
+{
+    params.size = glm::max(glm::round(params.size / grid), glm::vec3(1.0f)) * grid;
+    return params;
+}
+
+// Shapes are built centered on X/Z; with an odd number of cells that puts their sides between grid
+// lines, so shift them half a cell to put the sides on the object-space grid.
+PolyMesh makeShapeOnGrid(const PolyShapeParams& params, float grid, bool snap)
+{
+    if (!snap) {
+        PolyMesh mesh = makePolyShape(params);
+        mesh.gridSize = grid;
+        return mesh;
+    }
+    const PolyShapeParams snapped = snapShapeSize(params, grid);
+    PolyMesh mesh = makePolyShape(snapped);
+    mesh.gridSize = grid;
+    const glm::vec2 half(snapped.size.x * 0.5f, snapped.size.z * 0.5f);
+    const glm::vec2 shift = glm::round(half / grid) * grid - half;
+    if (shift != glm::vec2(0.0f))
+        for (glm::vec3& p : mesh.positions)
+            p += glm::vec3(shift.x, 0.0f, shift.y);
+    return mesh;
 }
 
 // Smallest and largest dot(normal, p) over the mesh's vertices.
@@ -63,6 +91,62 @@ PolyFace* Editor::selectedLevelFace()
     return &mesh->faces[m_selectedFace];
 }
 
+const std::vector<uint32_t>& Editor::selectedLevelFaces()
+{
+    if (!selectedLevelFace()) {
+        m_selectedFaces.clear();
+        return m_selectedFaces;
+    }
+    // Undo can shrink the mesh under the selection; the active face always leads.
+    const size_t count = selectedLevelMesh()->faces.size();
+    const uint32_t active = static_cast<uint32_t>(m_selectedFace);
+    std::erase_if(m_selectedFaces, [&](uint32_t f) { return f >= count || f == active; });
+    m_selectedFaces.insert(m_selectedFaces.begin(), active);
+    return m_selectedFaces;
+}
+
+void Editor::clearFaceSelection()
+{
+    m_selectedFace = -1;
+    m_selectedFaces.clear();
+}
+
+void Editor::selectLevelFace(uint32_t face, bool toggle)
+{
+    if (m_levelSelectionInstance != m_gizmo.selectedInstance)
+        clearFaceSelection();
+    m_levelSelectionInstance = m_gizmo.selectedInstance;
+    selectedLevelFaces(); // drops faces left over from an undo
+    const auto found = std::find(m_selectedFaces.begin(), m_selectedFaces.end(), face);
+    if (!toggle) {
+        // Clicking a face already in the group keeps the group, so it can be dragged or nudged together.
+        if (found == m_selectedFaces.end())
+            m_selectedFaces.assign(1, face);
+        m_selectedFace = static_cast<int>(face);
+        return;
+    }
+    if (found != m_selectedFaces.end()) {
+        m_selectedFaces.erase(found);
+        m_selectedFace = m_selectedFaces.empty() ? -1 : static_cast<int>(m_selectedFaces.front());
+        return;
+    }
+    m_selectedFaces.push_back(face);
+    m_selectedFace = static_cast<int>(face);
+}
+
+void Editor::selectFacesWhere(const std::function<bool(const PolyMesh&, const PolyFace&)>& predicate)
+{
+    const PolyMesh* mesh = selectedLevelMesh();
+    if (!mesh || !selectedLevelFace())
+        return;
+    const uint32_t active = static_cast<uint32_t>(m_selectedFace);
+    m_selectedFaces.assign(1, active);
+    for (uint32_t f = 0; f < mesh->faces.size(); ++f)
+        if (f != active && predicate(*mesh, mesh->faces[f]))
+            m_selectedFaces.push_back(f);
+    setStatus(std::to_string(m_selectedFaces.size()) + " faces selected");
+}
+
 const std::vector<uint32_t>& Editor::selectedLevelVertices()
 {
     PolyMesh* mesh = selectedLevelMesh();
@@ -76,11 +160,13 @@ const std::vector<uint32_t>& Editor::selectedLevelVertices()
     return m_selectedVertices;
 }
 
-int Editor::pickLevelFace(float mouseX, float mouseY) const
+int Editor::pickLevelFace(float mouseX, float mouseY, int instanceIndex) const
 {
-    if (!hasSelection())
+    if (instanceIndex < 0)
+        instanceIndex = m_gizmo.selectedInstance;
+    if (!validInstance(instanceIndex))
         return -1;
-    const ModelInstance& instance = m_models.getInstances()[m_gizmo.selectedInstance];
+    const ModelInstance& instance = m_models.getInstances()[instanceIndex];
     const GPUModel* model = m_models.getModel(instance.modelIndex);
     if (!model || !model->polyMesh || !instance.visible || instance.locked)
         return -1;
@@ -148,10 +234,53 @@ int Editor::pickLevelVertex(float mouseX, float mouseY) const
 bool Editor::handleLevelClick(float mouseX, float mouseY)
 {
     if (m_levelMode == LevelEditMode::Face) {
-        m_selectedFace = pickLevelFace(mouseX, mouseY);
-        if (m_selectedFace < 0)
+        const int picked = pickLevelFace(mouseX, mouseY);
+        if (picked < 0)
             return false;
-        m_levelSelectionInstance = m_gizmo.selectedInstance;
+        const SDL_Keymod mods = SDL_GetModState();
+        const bool shift = (mods & SDL_KMOD_SHIFT) != 0;
+        const bool alt = (mods & SDL_KMOD_ALT) != 0;
+        if (shift && alt) {
+            // Wrap: the clicked face continues the active face's texture, then becomes the active face,
+            // so clicking around a pillar wraps all the way.
+            PolyMesh* mesh = selectedLevelMesh();
+            const PolyFace* active = selectedLevelFace();
+            if (mesh && active && picked != m_selectedFace) {
+                const uint32_t from = static_cast<uint32_t>(m_selectedFace);
+                if (mesh->wrapFaceUVs(from, static_cast<uint32_t>(picked),
+                        levelSlotTexelSize(*mesh, mesh->faces[from].material),
+                        levelSlotTexelSize(*mesh, mesh->faces[picked].material))) {
+                    rebuildSelectedLevelModel("wrap texture");
+                    if (std::find(m_selectedFaces.begin(), m_selectedFaces.end(), uint32_t(picked)) == m_selectedFaces.end())
+                        m_selectedFaces.push_back(static_cast<uint32_t>(picked));
+                    m_selectedFace = picked;
+                }
+                else {
+                    setStatus("Wrap needs a face sharing an edge with the active face", true);
+                }
+                return true;
+            }
+        }
+        if (shift) {
+            selectLevelFace(static_cast<uint32_t>(picked), true);
+            return true;
+        }
+        selectLevelFace(static_cast<uint32_t>(picked), false);
+        // Pressing on a face also grabs it, so it can be pushed/pulled (or extruded with Alt) right away.
+        if (const PolyMesh* mesh = selectedLevelMesh()) {
+            const PolyFace& face = mesh->faces[m_selectedFace];
+            m_faceDrag.instance = m_gizmo.selectedInstance;
+            m_faceDrag.face = static_cast<uint32_t>(m_selectedFace);
+            m_faceDrag.center = mesh->faceCenter(face);
+            m_faceDrag.normal = mesh->faceNormal(face);
+            if (faceDragParam(mouseX, mouseY, m_faceDrag.startParam)) {
+                m_faceDrag.active = true;
+                m_faceDrag.moved = false;
+                m_faceDrag.extrude = (SDL_GetModState() & SDL_KMOD_ALT) != 0;
+                m_faceDrag.distance = 0.0f;
+                m_faceDrag.startMesh = *mesh;
+            }
+        }
         return true;
     }
 
@@ -213,22 +342,74 @@ void Editor::dragLevelVertex(float mouseX, float mouseY)
     if (!rayHitsPlane(ray, m_vertexDrag.planePoint, getFront(m_camera), world))
         return;
     world += m_vertexDrag.grabOffset;
-    // Ctrl snaps to the world grid, like the move gizmo, so vertices line up with other objects.
-    if ((SDL_GetModState() & SDL_KMOD_CTRL) != 0 && m_snapTranslate > 0.0f)
-        world = glm::round(world / m_snapTranslate) * m_snapTranslate;
 
-    const glm::vec3 delta = world - m_vertexDrag.planePoint;
-    const glm::mat4 transform = m_models.getInstances()[m_gizmo.selectedInstance].getTransformMatrix();
-    const glm::mat4 inverse = glm::inverse(transform);
+    // The shape's grid lives in its object space, so it moves and rotates with the shape.
+    const glm::mat4 inverse = glm::inverse(m_models.getInstances()[m_gizmo.selectedInstance].getTransformMatrix());
+    glm::vec3 grabbed = glm::vec3(inverse * glm::vec4(world, 1.0f));
+    if (snapActive())
+        grabbed = glm::round(grabbed / mesh->gridSize) * mesh->gridSize;
+    const glm::vec3 delta = grabbed - glm::vec3(inverse * glm::vec4(m_vertexDrag.planePoint, 1.0f));
     for (size_t i = 0; i < vertices.size(); ++i) {
-        const glm::vec3 start = glm::vec3(transform * glm::vec4(m_vertexDrag.startPositions[i], 1.0f));
-        const glm::vec3 local = glm::vec3(inverse * glm::vec4(start + delta, 1.0f));
+        const glm::vec3 local = m_vertexDrag.startPositions[i] + delta;
         if (local != mesh->positions[vertices[i]]) {
             mesh->positions[vertices[i]] = local;
             // Rebuilt once per frame in updateLevelHistory(); several motion events can arrive per frame.
             m_vertexDrag.moved = true;
         }
     }
+}
+
+bool Editor::faceDragParam(float mouseX, float mouseY, float& param) const
+{
+    if (!validInstance(m_faceDrag.instance))
+        return false;
+    // The normal line in world space, parameterized in object units so the result needs no conversion.
+    const glm::mat4 transform = m_models.getInstances()[m_faceDrag.instance].getTransformMatrix();
+    const glm::vec3 origin = glm::vec3(transform * glm::vec4(m_faceDrag.center, 1.0f));
+    const glm::vec3 axis = glm::vec3(transform * glm::vec4(m_faceDrag.normal, 0.0f));
+    const Ray ray = screenToWorldRay(mouseX, mouseY, m_sceneView.width, m_sceneView.height,
+        getView(m_camera), sceneProjection());
+    // Closest points of two lines.
+    const glm::vec3 w0 = origin - ray.origin;
+    const float a = glm::dot(axis, axis);
+    const float b = glm::dot(axis, ray.direction);
+    const float c = glm::dot(ray.direction, ray.direction);
+    const float d = glm::dot(axis, w0);
+    const float e = glm::dot(ray.direction, w0);
+    const float denom = a * c - b * b;
+    if (denom < 1e-6f * a * c)
+        return false;
+    param = (b * e - c * d) / denom;
+    return std::isfinite(param);
+}
+
+void Editor::dragLevelFace(float mouseX, float mouseY)
+{
+    PolyMesh* mesh = selectedLevelMesh();
+    // Anything changing the selection mid-drag (undo, deletion, another object) ends the drag.
+    if (!mesh || m_gizmo.selectedInstance != m_faceDrag.instance || m_levelMode != LevelEditMode::Face ||
+        m_faceDrag.face >= m_faceDrag.startMesh.faces.size()) {
+        m_faceDrag.active = false;
+        return;
+    }
+    float param;
+    if (!faceDragParam(mouseX, mouseY, param))
+        return;
+    float distance = param - m_faceDrag.startParam;
+    if (snapActive())
+        distance = std::round(distance / m_faceDrag.startMesh.gridSize) * m_faceDrag.startMesh.gridSize;
+    if (distance == m_faceDrag.distance)
+        return;
+    m_faceDrag.distance = distance;
+    *mesh = m_faceDrag.startMesh;
+    if (std::abs(distance) > 1e-6f) {
+        if (m_faceDrag.extrude)
+            mesh->extrudeFace(m_faceDrag.face, distance);
+        else
+            mesh->moveFace(m_faceDrag.face, distance);
+    }
+    // Rebuilt once per frame in updateLevelHistory(); several motion events can arrive per frame.
+    m_faceDrag.moved = true;
 }
 
 void Editor::finishVertexMarquee(float mouseX, float mouseY)
@@ -301,8 +482,21 @@ void Editor::drawLevelFaceOverlay()
     // Edges are drawn without depth, so hidden ones show through; that also helps aim at back faces.
     for (const PolyFace& face : mesh->faces)
         drawFace(*mesh, face, kFaceEdges, 1.0f);
-    if (selected)
+    if (selected) {
+        // The rest of the group thinner, the active face on top.
+        for (uint32_t f : selectedLevelFaces())
+            if (static_cast<int>(f) != m_selectedFace)
+                drawFace(*mesh, mesh->faces[f], kFaceGroupOutline, 2.0f);
         drawFace(*mesh, *selected, kFaceOutline, 3.0f);
+    }
+    if (selected && m_faceDrag.active && m_faceDrag.distance != 0.0f) {
+        const glm::vec2 p = worldToScreen(mesh->faceCenter(*selected), mvp, m_sceneView.width, m_sceneView.height);
+        if (p.x > -5000.0f) {
+            char label[48];
+            snprintf(label, sizeof(label), "%s %+g", m_faceDrag.extrude ? "Extrude" : "Push/pull", m_faceDrag.distance);
+            drawList->AddText(ImVec2(origin.x + p.x + 8.0f, origin.y + p.y - 8.0f), kFaceOutline, label);
+        }
+    }
     if (clipPreview) {
         // Outline of the cut, plus an arrow from its middle to the front side.
         PolyMesh cut = *mesh;
@@ -389,20 +583,25 @@ void Editor::rebuildSelectedLevelModel(const char* action)
 
 void Editor::drawFaceProperties(PolyMesh& mesh, PolyFace& face)
 {
+    // The widgets show the active face; whatever they change is copied to the rest of the selection.
+    const std::vector<uint32_t> selection = selectedLevelFaces();
+    const PolyFace before = face;
     bool changed = false;
+    if (selection.size() > 1)
+        ImGui::TextDisabled("Editing %zu faces (values of the active one shown)", selection.size());
     const int current = face.material < mesh.materials.size() ? static_cast<int>(face.material) : -1;
-    const auto materialName = [](int index) {
-        return index >= 0 ? "Material " + std::to_string(index) : std::string("None (white)");
-    };
     EditorStyle::propertyLabel("Material");
     ImGui::SetNextItemWidth(-FLT_MIN);
-    if (ImGui::BeginCombo("##faceMaterial", materialName(current).c_str())) {
-        if (ImGui::Selectable(materialName(-1).c_str(), current < 0)) {
+    if (ImGui::BeginCombo("##faceMaterial", levelSlotName(mesh, face.material).c_str())) {
+        if (ImGui::Selectable(levelSlotName(mesh, kNoPolyMaterial).c_str(), current < 0)) {
             face.material = kNoPolyMaterial;
             changed = true;
         }
         for (int i = 0; i < static_cast<int>(mesh.materials.size()); ++i) {
-            if (ImGui::Selectable(materialName(i).c_str(), current == i)) {
+            ImGui::PushID(i);
+            const bool picked = ImGui::Selectable(levelSlotName(mesh, static_cast<uint32_t>(i)).c_str(), current == i);
+            ImGui::PopID();
+            if (picked) {
                 face.material = static_cast<uint32_t>(i);
                 changed = true;
             }
@@ -430,8 +629,18 @@ void Editor::drawFaceProperties(PolyMesh& mesh, PolyFace& face)
         face.uvRotation = 0.0f;
         changed = true;
     }
-
-    const uint32_t faceIndex = static_cast<uint32_t>(&face - mesh.faces.data());
+    ImGui::SetItemTooltip("Scale 1: one texture repeat per material texel size, the same on every face");
+    if (changed) {
+        for (uint32_t f : selection) {
+            PolyFace& other = mesh.faces[f];
+            if (&other == &face)
+                continue;
+            if (face.material != before.material) other.material = face.material;
+            if (face.uvScale != before.uvScale) other.uvScale = face.uvScale;
+            if (face.uvOffset != before.uvOffset) other.uvOffset = face.uvOffset;
+            if (face.uvRotation != before.uvRotation) other.uvRotation = face.uvRotation;
+        }
+    }
     // Each row: label, then three buttons; returns which one was pressed or -1.
     const auto buttonRow = [](const char* label, const char* const (&names)[3]) {
         EditorStyle::propertyLabel(label);
@@ -447,23 +656,37 @@ void Editor::drawFaceProperties(PolyMesh& mesh, PolyFace& face)
         ImGui::PopID();
         return pressed;
     };
+    // Fit, align and rotate work on each selected face by itself.
     if (const int fit = buttonRow("Fit", { "Both", "U", "V" }); fit >= 0) {
-        mesh.fitFaceUVs(faceIndex, fit != 2, fit != 1);
+        for (uint32_t f : selection)
+            mesh.fitFaceUVs(f, fit != 2, fit != 1, levelSlotTexelSize(mesh, mesh.faces[f].material));
         changed = true;
     }
     if (const int align = buttonRow("Align U", { "Left", "Center", "Right" }); align >= 0) {
-        mesh.alignFaceUVs(faceIndex, glm::vec2(align * 0.5f, -1.0f));
+        for (uint32_t f : selection)
+            mesh.alignFaceUVs(f, glm::vec2(align * 0.5f, -1.0f), levelSlotTexelSize(mesh, mesh.faces[f].material));
         changed = true;
     }
     if (const int align = buttonRow("Align V", { "Top", "Center", "Bottom" }); align >= 0) {
-        mesh.alignFaceUVs(faceIndex, glm::vec2(-1.0f, align * 0.5f));
+        for (uint32_t f : selection)
+            mesh.alignFaceUVs(f, glm::vec2(-1.0f, align * 0.5f), levelSlotTexelSize(mesh, mesh.faces[f].material));
         changed = true;
     }
     if (const int rotate = buttonRow("Rotate", { "-90", "+90", "180" }); rotate >= 0) {
-        face.uvRotation += rotate == 0 ? -90.0f : rotate == 1 ? 90.0f : 180.0f;
-        face.uvRotation = std::fmod(face.uvRotation + 540.0f, 360.0f) - 180.0f; // keep within [-180, 180)
+        for (uint32_t f : selection) {
+            float& rotation = mesh.faces[f].uvRotation;
+            rotation += rotate == 0 ? -90.0f : rotate == 1 ? 90.0f : 180.0f;
+            rotation = std::fmod(rotation + 540.0f, 360.0f) - 180.0f; // keep within [-180, 180)
+        }
         changed = true;
     }
+    ImGui::BeginDisabled(selection.size() < 2);
+    if (ImGui::Button("Wrap from active face", ImVec2(-FLT_MIN, 0.0f)))
+        wrapSelectedFaces();
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip("Continue the active face's texture across shared edges onto the other selected faces\n"
+            "(Alt+Shift+click a neighbouring face does one step)");
     if (ImGui::Button("Use UVs on all faces", ImVec2(-FLT_MIN, 0.0f))) {
         // UVs are projected in object space, so faces on one plane still line up after this.
         for (PolyFace& other : mesh.faces) {
@@ -514,12 +737,11 @@ void Editor::drawVertexProperties(PolyMesh& mesh)
     }
 
     if (ImGui::Button("Snap to grid", ImVec2(-FLT_MIN, 0.0f))) {
-        const float step = m_snapTranslate > 0.0f ? m_snapTranslate : 1.0f;
         for (uint32_t v : vertices)
-            mesh.positions[v] = glm::round(mesh.positions[v] / step) * step;
+            mesh.positions[v] = glm::round(mesh.positions[v] / mesh.gridSize) * mesh.gridSize;
         changed = true;
     }
-    ImGui::SetItemTooltip("Round the object-space positions to the move snap step");
+    ImGui::SetItemTooltip("Round the positions to the shape's grid (object space)");
     if (changed)
         rebuildSelectedLevelModel("move vertex");
 }
@@ -545,9 +767,13 @@ void Editor::deleteLevelFace()
     if (!mesh || !selectedLevelFace())
         return;
     PolyMesh edited = *mesh;
-    edited.deleteFace(static_cast<uint32_t>(m_selectedFace));
-    if (commitLevelTopology(std::move(edited), "delete face"))
-        m_selectedFace = -1;
+    // Highest index first, so the indices still to delete stay valid.
+    std::vector<uint32_t> faces = selectedLevelFaces();
+    std::sort(faces.begin(), faces.end(), std::greater<>());
+    for (uint32_t f : faces)
+        edited.deleteFace(f);
+    if (commitLevelTopology(std::move(edited), faces.size() > 1 ? "delete faces" : "delete face"))
+        clearFaceSelection();
 }
 
 void Editor::deleteLevelVertices()
@@ -706,7 +932,7 @@ void Editor::applyLevelClip(ClipKeep keep)
     const ModelInstance source = m_models.getInstances()[m_gizmo.selectedInstance];
     if (!commitLevelTopology(std::move(keep == ClipKeep::Front ? front : back), "clip"))
         return;
-    m_selectedFace = -1;
+    clearFaceSelection();
     m_selectedVertices.clear();
     if (keep != ClipKeep::Both)
         return;
@@ -816,7 +1042,7 @@ void Editor::applyLevelMirror(MirrorAction action)
         return;
     }
     if (commitLevelTopology(std::move(edited), "symmetrize")) {
-        m_selectedFace = -1;
+        clearFaceSelection();
         m_selectedVertices.clear();
     }
 }
@@ -835,7 +1061,7 @@ void Editor::drawLevelHollow()
         PolyMesh edited = *mesh;
         edited.hollow(m_hollowThickness);
         if (commitLevelTopology(std::move(edited), "hollow")) {
-            m_selectedFace = -1;
+            clearFaceSelection();
             m_selectedVertices.clear();
         }
     }
@@ -922,7 +1148,7 @@ void Editor::applyLevelSubtract()
 
     if (!commitLevelTopology(polyMeshSubtract(*mesh, cut), "subtract"))
         return;
-    m_selectedFace = -1;
+    clearFaceSelection();
     m_selectedVertices.clear();
     if (m_deleteCutter) {
         m_models.removeInstance(static_cast<size_t>(cutter));
@@ -939,7 +1165,7 @@ bool Editor::deleteLevelSelection()
     // In face/vertex mode Del never removes the whole object, even with nothing picked.
     if (m_levelMode == LevelEditMode::Object || !selectedLevelMesh())
         return false;
-    if (m_vertexDrag.active || m_levelEditPending)
+    if (m_vertexDrag.active || m_faceDrag.active || m_levelEditPending)
         return true;
     if (m_levelMode == LevelEditMode::Face)
         deleteLevelFace();
@@ -984,8 +1210,7 @@ glm::vec3 Editor::placementPoint() const
         if (t < 50.0f)
             point = m_camera.position + front * t;
     }
-    const float step = m_snapTranslate > 0.0f ? m_snapTranslate : 1.0f;
-    point = glm::round(point / step) * step;
+    point = glm::round(point / m_gridSize) * m_gridSize;
     point.y = std::max(point.y, 0.0f);
     return point;
 }
@@ -995,7 +1220,12 @@ void Editor::addLevelShape(PolyShape shape)
     PolyShapeParams params = m_newShape;
     params.shape = shape;
     const std::string name = uniqueInstanceName(kPolyShapeNames[static_cast<int>(shape)]);
-    const auto modelIndex = createLevelModel(makePolyShape(params), name);
+    // Placed on a world grid point with its sides on its own grid, so they lie on world grid lines too.
+    PolyMesh mesh = makeShapeOnGrid(params, m_gridSize, m_gridSnap);
+    // New shapes are painted with the Materials panel's current material.
+    if (m_materials.find(m_currentMaterial))
+        levelSlotFor(mesh, m_currentMaterial); // slot 0, which every new face uses
+    const auto modelIndex = createLevelModel(std::move(mesh), name);
     if (!modelIndex)
         return;
     const size_t newIndex = m_models.createInstance(*modelIndex, placementPoint());
@@ -1017,7 +1247,13 @@ void Editor::drawFaceGeometry(PolyMesh& mesh, uint32_t faceIndex)
 {
     EditorStyle::propertyLabel("Distance");
     ImGui::SetNextItemWidth(-FLT_MIN);
-    ImGui::DragFloat("##faceDistance", &m_faceOpDistance, 0.05f, -100.0f, 100.0f, "%.2f");
+    // Steps by one grid cell; typed values are rounded to whole cells while snapping is on.
+    const float grid = mesh.gridSize;
+    ImGui::InputFloat("##faceDistance", &m_faceOpDistance, grid, grid * 4.0f, "%.3g");
+    if (ImGui::IsItemDeactivatedAfterEdit() && m_gridSnap)
+        m_faceOpDistance = std::round(m_faceOpDistance / grid) * grid;
+    m_faceOpDistance = std::clamp(m_faceOpDistance, -1000.0f, 1000.0f);
+    ImGui::SetItemTooltip("Distance along the face normal, in object space");
     const float width = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
     const bool push = ImGui::Button("Push/Pull", ImVec2(width, 0.0f));
     ImGui::SetItemTooltip("Move the face along its normal; neighbouring faces stretch");
@@ -1044,7 +1280,42 @@ void Editor::drawLevelMaterials(PolyMesh& mesh)
     for (int i = 0; i < static_cast<int>(mesh.materials.size()); ++i) {
         PolyMaterial& material = mesh.materials[i];
         ImGui::PushID(i);
-        if (ImGui::TreeNodeEx("##material", ImGuiTreeNodeFlags_DefaultOpen, "Material %d", i)) {
+        const std::string slotName = levelSlotName(mesh, static_cast<uint32_t>(i));
+        if (ImGui::TreeNodeEx("##material", ImGuiTreeNodeFlags_DefaultOpen, "%d: %s", i, slotName.c_str())) {
+            if (ImGui::SmallButton("Select faces")) {
+                clearFaceSelection();
+                for (uint32_t f = 0; f < mesh.faces.size(); ++f)
+                    if (mesh.faces[f].material == static_cast<uint32_t>(i))
+                        m_selectedFaces.push_back(f);
+                if (!m_selectedFaces.empty()) {
+                    m_selectedFace = static_cast<int>(m_selectedFaces.front());
+                    m_levelSelectionInstance = m_gizmo.selectedInstance;
+                    m_levelMode = LevelEditMode::Face;
+                }
+                setStatus(std::to_string(m_selectedFaces.size()) + " faces use " + slotName);
+            }
+            ImGui::SetItemTooltip("Switch to face mode with every face using this material selected");
+            EditorStyle::propertyLabel("Shared");
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            changed |= drawSharedMaterialCombo("##shared", material.materialPath, "(this shape only)");
+            ImGui::SetItemTooltip("A shared material (.mat file) is the same on every object using it");
+            if (!material.materialPath.empty()) {
+                if (const MaterialAsset* shared = m_materials.find(material.materialPath)) {
+                    MaterialAsset edited = *shared;
+                    if (drawSharedMaterialProperties(edited))
+                        saveSharedMaterial(edited);
+                    ImGui::TextDisabled("%s", shared->path.c_str());
+                }
+                else {
+                    ImGui::TextColored(EditorStyle::kError, "Missing: %s", material.materialPath.c_str());
+                }
+                if (ImGui::Button("Remove material"))
+                    removed = i;
+                ImGui::TreePop();
+                ImGui::PopID();
+                continue;
+            }
+
             EditorStyle::propertyLabel("Color");
             ImGui::SetNextItemWidth(-FLT_MIN);
             changed |= ImGui::ColorEdit3("##color", &material.color.x);
@@ -1062,11 +1333,8 @@ void Editor::drawLevelMaterials(PolyMesh& mesh)
             ImGui::TextUnformatted(textureName.c_str());
             if (!material.texturePath.empty() && ImGui::IsItemHovered())
                 ImGui::SetTooltip("%s", material.texturePath.c_str());
-            if (ImGui::Button("Browse...")) {
-                m_textureDialogMaterial = i;
-                openFileDialog("BrowseLevelTextureDlg", "Choose Texture",
-                    "Images{.png,.jpg,.jpeg,.tga,.bmp},.png,.jpg,.jpeg,.tga,.bmp", kTexturesRoot, nullptr, false);
-            }
+            if (ImGui::Button("Browse..."))
+                openTextureDialog({ i, std::string(), false });
             ImGui::SameLine();
             if (ImGui::Button("Checker")) {
                 material.texturePath = kCheckerTexturePath;
@@ -1077,6 +1345,24 @@ void Editor::drawLevelMaterials(PolyMesh& mesh)
                 material.texturePath.clear();
                 changed = true;
             }
+            if (ImGui::Button("Make shared")) {
+                MaterialAsset initial;
+                initial.color = material.color;
+                initial.roughness = material.roughness;
+                initial.metallic = material.metallic;
+                initial.baseColorTexture = material.texturePath;
+                const std::string name = m_models.getInstances()[m_gizmo.selectedInstance].name;
+                if (auto created = m_materials.create(name, initial)) {
+                    material.materialPath = *created;
+                    changed = true;
+                    setStatus("Saved " + *created);
+                }
+                else {
+                    setStatus("Failed to create a material in " + m_materials.root(), true);
+                }
+            }
+            ImGui::SetItemTooltip("Save this material as a .mat file other objects can use too");
+            ImGui::SameLine();
             if (ImGui::Button("Remove material"))
                 removed = i;
             ImGui::TreePop();
@@ -1095,7 +1381,7 @@ void Editor::drawLevelMaterials(PolyMesh& mesh)
         }
         changed = true;
     }
-    if (mesh.materials.size() < kMaxPolyMaterials && ImGui::Button("Add material", ImVec2(-FLT_MIN, 0.0f))) {
+    if (mesh.materials.size() < kMaxPolyMaterialSlots &&ImGui::Button("Add material", ImVec2(-FLT_MIN, 0.0f))) {
         mesh.materials.push_back({});
         // A shape's first material goes on every face, which is nearly always what is wanted.
         if (mesh.materials.size() == 1)
@@ -1107,18 +1393,35 @@ void Editor::drawLevelMaterials(PolyMesh& mesh)
         rebuildSelectedLevelModel("material edit");
 }
 
+void Editor::openTextureDialog(TextureDialogTarget target)
+{
+    m_textureDialogTarget = std::move(target);
+    openFileDialog("BrowseLevelTextureDlg", m_textureDialogTarget.normal ? "Choose Normal Map" : "Choose Texture",
+        "Images{.png,.jpg,.jpeg,.tga,.bmp},.png,.jpg,.jpeg,.tga,.bmp", kTexturesRoot, nullptr, false);
+}
+
 void Editor::drawLevelTextureDialog()
 {
     ImGuiFileDialog* dialog = ImGuiFileDialog::Instance();
     if (!dialog->Display("BrowseLevelTextureDlg", ImGuiWindowFlags_NoCollapse, kDialogSize))
         return;
-    PolyMesh* mesh = selectedLevelMesh();
-    if (dialog->IsOk() && mesh && m_textureDialogMaterial >= 0 &&
-        m_textureDialogMaterial < static_cast<int>(mesh->materials.size())) {
-        mesh->materials[m_textureDialogMaterial].texturePath = toStoredPath(dialog->GetFilePathName());
-        rebuildSelectedLevelModel("set texture");
+    const TextureDialogTarget& target = m_textureDialogTarget;
+    if (dialog->IsOk()) {
+        const std::string texture = toStoredPath(dialog->GetFilePathName());
+        if (!target.sharedPath.empty()) {
+            if (const MaterialAsset* shared = m_materials.find(target.sharedPath)) {
+                MaterialAsset edited = *shared;
+                (target.normal ? edited.normalTexture : edited.baseColorTexture) = texture;
+                saveSharedMaterial(edited);
+            }
+        }
+        else if (PolyMesh* mesh = selectedLevelMesh();
+                 mesh && target.slot >= 0 && target.slot < static_cast<int>(mesh->materials.size())) {
+            mesh->materials[target.slot].texturePath = texture;
+            rebuildSelectedLevelModel("set texture");
+        }
     }
-    m_textureDialogMaterial = -1;
+    m_textureDialogTarget = {};
     dialog->Close();
 }
 
@@ -1136,7 +1439,10 @@ void Editor::drawLevelPanel()
 
         EditorStyle::propertyLabel("Size");
         ImGui::SetNextItemWidth(-FLT_MIN);
-        ImGui::DragFloat3("##size", &m_newShape.size.x, 0.05f, 0.01f, 1000.0f, "%.2f");
+        ImGui::DragFloat3("##size", &m_newShape.size.x, m_gridSize * 0.05f, 0.01f, 1000.0f, "%.3g");
+        if (ImGui::IsItemDeactivatedAfterEdit() && m_gridSnap)
+            m_newShape = snapShapeSize(m_newShape, m_gridSize);
+        ImGui::SetItemTooltip("Rounded to whole grid cells while snapping is on");
         switch (m_newShape.shape) {
         case PolyShape::Plane:
         case PolyShape::Cylinder:
@@ -1166,13 +1472,28 @@ void Editor::drawLevelPanel()
         drawPrefabSection();
         if (PolyMesh* mesh = selectedLevelMesh()) {
             ImGui::Text("%zu vertices, %zu faces", mesh->positions.size(), mesh->faces.size());
+            EditorStyle::propertyLabel("Shape grid");
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            char gridLabel[16];
+            snprintf(gridLabel, sizeof(gridLabel), "%g", mesh->gridSize);
+            if (ImGui::BeginCombo("##shapeGrid", gridLabel)) {
+                for (const float size : kGridSizes) {
+                    snprintf(gridLabel, sizeof(gridLabel), "%g", size);
+                    if (ImGui::Selectable(gridLabel, size == mesh->gridSize) && size != mesh->gridSize) {
+                        mesh->gridSize = size;
+                        rebuildSelectedLevelModel("shape grid size");
+                    }
+                }
+                ImGui::EndCombo();
+            }
+            ImGui::SetItemTooltip("This shape's own grid (object space): face and vertex edits snap to it");
             // Rebuilding replaces any manual edits, so it only happens on request.
             if (ImGui::Button("Rebuild from shape settings", ImVec2(-FLT_MIN, 0.0f))) {
                 // Materials survive; the new faces all start on material 0.
-                PolyMesh rebuilt = makePolyShape(m_newShape);
+                PolyMesh rebuilt = makeShapeOnGrid(m_newShape, mesh->gridSize, m_gridSnap);
                 rebuilt.materials = std::move(mesh->materials);
                 *mesh = std::move(rebuilt);
-                m_selectedFace = -1;
+                clearFaceSelection();
                 m_selectedVertices.clear();
                 rebuildSelectedLevelModel("rebuild shape");
                 setStatus("Rebuilt " + m_models.getInstances()[m_gizmo.selectedInstance].name);
@@ -1192,28 +1513,68 @@ void Editor::drawLevelPanel()
 
             if (m_levelMode == LevelEditMode::Face) {
                 if (PolyFace* face = selectedLevelFace()) {
-                    ImGui::Text("Face %d (%zu vertices)", m_selectedFace, face->verts.size());
-                    drawFaceProperties(*mesh, *face);
+                    const size_t selectedCount = selectedLevelFaces().size();
+                    if (selectedCount > 1)
+                        ImGui::Text("%zu faces (active: face %d)", selectedCount, m_selectedFace);
+                    else
+                        ImGui::Text("Face %d (%zu vertices)", m_selectedFace, face->verts.size());
+                    const float half = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
+                    if (ImGui::Button("Select coplanar", ImVec2(half, 0.0f))) {
+                        const glm::vec3 normal = mesh->faceNormal(*face);
+                        const float offset = glm::dot(normal, mesh->faceCenter(*face));
+                        selectFacesWhere([&](const PolyMesh& m, const PolyFace& other) {
+                            return glm::dot(m.faceNormal(other), normal) > 0.999f &&
+                                std::abs(glm::dot(normal, m.faceCenter(other)) - offset) < 1e-3f;
+                        });
+                    }
+                    ImGui::SetItemTooltip("Add every face lying in the active face's plane");
+                    ImGui::SameLine();
+                    if (ImGui::Button("Same material", ImVec2(half, 0.0f))) {
+                        const uint32_t material = face->material;
+                        selectFacesWhere([material](const PolyMesh&, const PolyFace& other) { return other.material == material; });
+                    }
+                    ImGui::SetItemTooltip("Add every face with the active face's material");
+                    if (ImGui::Button("Copy UVs", ImVec2(half, 0.0f)))
+                        copyFaceAttributes();
+                    ImGui::SetItemTooltip("Copy the active face's material and UVs (Ctrl+Shift+C)");
+                    ImGui::SameLine();
+                    ImGui::BeginDisabled(!m_faceClipboard.valid);
+                    if (ImGui::Button("Paste UVs", ImVec2(half, 0.0f)))
+                        pasteFaceAttributes();
+                    ImGui::EndDisabled();
+                    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                        ImGui::SetTooltip("Paste material and UVs onto the selected faces (Ctrl+Shift+V)");
+
+                    if (PolyFace* active = selectedLevelFace())
+                        drawFaceProperties(*mesh, *active);
+                    if (ImGui::CollapsingHeader("UV editor", ImGuiTreeNodeFlags_DefaultOpen))
+                        drawUvEditor(*mesh);
                     ImGui::SeparatorText("Geometry");
                     drawFaceGeometry(*mesh, static_cast<uint32_t>(m_selectedFace));
 
                     const float width = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
                     if (ImGui::Button("Flip", ImVec2(width, 0.0f))) {
-                        mesh->flipFace(static_cast<uint32_t>(m_selectedFace));
+                        for (uint32_t f : selectedLevelFaces())
+                            mesh->flipFace(f);
                         rebuildSelectedLevelModel("flip face");
                     }
-                    ImGui::SetItemTooltip("Turn the face to point the other way");
+                    ImGui::SetItemTooltip("Turn the selected faces to point the other way");
                     ImGui::SameLine();
-                    if (ImGui::Button("Delete face", ImVec2(width, 0.0f)))
+                    if (ImGui::Button("Delete", ImVec2(width, 0.0f)))
                         deleteLevelFace();
-                    ImGui::SetItemTooltip("Remove the face, leaving a hole (Del)");
-                    if (PolyFace* current = selectedLevelFace(); current && ImGui::Button("Select its vertices", ImVec2(-FLT_MIN, 0.0f))) {
-                        m_selectedVertices = current->verts;
+                    ImGui::SetItemTooltip("Remove the selected faces, leaving holes (Del)");
+                    if (selectedLevelFace() && ImGui::Button("Select their vertices", ImVec2(-FLT_MIN, 0.0f))) {
+                        m_selectedVertices.clear();
+                        for (uint32_t f : selectedLevelFaces())
+                            for (uint32_t v : mesh->faces[f].verts)
+                                if (std::find(m_selectedVertices.begin(), m_selectedVertices.end(), v) == m_selectedVertices.end())
+                                    m_selectedVertices.push_back(v);
                         m_levelMode = LevelEditMode::Vertex;
                     }
                 }
                 else {
-                    ImGui::TextDisabled("Click a face of the shape in the viewport.");
+                    ImGui::TextDisabled("Click a face of the shape in the viewport;");
+                    ImGui::TextDisabled("Shift+click adds. Drag to push/pull, Alt+drag to extrude.");
                 }
             }
             else if (m_levelMode == LevelEditMode::Vertex) {
@@ -1259,7 +1620,7 @@ void Editor::drawLevelPanel()
                 }
                 else {
                     ImGui::TextDisabled("Click a vertex or drag a box around some;");
-                    ImGui::TextDisabled("Shift adds. Drag a vertex to move, Ctrl snaps.");
+                    ImGui::TextDisabled("Shift adds. Drag a vertex to move; Ctrl inverts snapping.");
                 }
             }
 
@@ -1282,5 +1643,4 @@ void Editor::drawLevelPanel()
         }
     }
     ImGui::End();
-    drawLevelTextureDialog();
 }

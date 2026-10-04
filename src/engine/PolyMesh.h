@@ -19,16 +19,23 @@ struct PolyFace {
     float uvRotation = 0.0f; // degrees
 };
 
-// Surface of level geometry; faces refer to it by index.
+// Surface of level geometry; faces refer to it by index. A slot linked to a shared material (.mat file,
+// see MaterialLibrary) takes its values from there; the inline values are used when it is not linked
+// or the file is missing.
 struct PolyMaterial {
     glm::vec4 color{ 1.0f };
     float roughness = 0.8f;
     float metallic = 0.0f;
     std::string texturePath; // base color; empty for none, kCheckerTexturePath for the built-in checker
+    std::string materialPath; // shared material; empty when not linked
 };
+
+class MaterialLibrary;
 
 // PolyFace::material value for "no material": the face renders plain white.
 inline constexpr uint32_t kNoPolyMaterial = UINT32_MAX;
+// Most material slots the editor gives a mesh (scene files accept up to 256).
+inline constexpr size_t kMaxPolyMaterialSlots = 255;
 
 // Generated in code, so UVs can be checked without any texture files.
 inline constexpr const char* kCheckerTexturePath = "builtin:checker";
@@ -40,6 +47,8 @@ struct PolyMesh {
     std::vector<PolyFace> faces;
     // Faces whose material index is past the end (e.g. kNoPolyMaterial) render plain white.
     std::vector<PolyMaterial> materials;
+    // Cell size of the shape's own grid, in object space; face and vertex edits snap to it.
+    float gridSize = 1.0f;
 
     glm::vec3 faceNormal(const PolyFace& face) const;
     glm::vec3 faceCenter(const PolyFace& face) const;
@@ -83,10 +92,16 @@ struct PolyMesh {
     // reflection, welded along the plane. Returns false, with the mesh emptied, if nothing was kept.
     bool symmetrize(int axis, float pivot, bool fromNegative);
     // Scales and offsets the face's texture so it covers the face exactly once along U and/or V.
-    void fitFaceUVs(uint32_t faceIndex, bool fitU, bool fitV);
+    // texelSize: the face material's MaterialAsset::texelSize (1 for unlinked materials).
+    void fitFaceUVs(uint32_t faceIndex, bool fitU, bool fitV, float texelSize = 1.0f);
     // Offsets the texture so the face's edge lines up with a texture edge, keeping scale and rotation.
     // anchor per axis: 0 = left/top, 0.5 = center, 1 = right/bottom; negative leaves that axis alone.
-    void alignFaceUVs(uint32_t faceIndex, const glm::vec2& anchor);
+    void alignFaceUVs(uint32_t faceIndex, const glm::vec2& anchor, float texelSize = 1.0f);
+    // Texture coordinates of the face's corners (in face.verts order), as polyMeshToMesh() makes them.
+    void faceUVs(uint32_t faceIndex, float texelSize, std::vector<glm::vec2>& out) const;
+    // Sets `to`'s UV rotation and offset so its texture continues `from`'s across their shared edge
+    // (scale is kept). False when the faces share no edge.
+    bool wrapFaceUVs(uint32_t from, uint32_t to, float fromTexelSize, float toTexelSize);
     // Turns the shape into a shell `thickness` thick: adds an inner copy of the surface, moved inward
     // and facing in, and closes open borders (so a plane becomes a slab). Thickness larger than the
     // shape leaves the inner surface poking through the outer one.
@@ -123,14 +138,21 @@ struct PolyShapeParams {
 PolyMesh makePolyShape(const PolyShapeParams& params);
 
 // Triangulates the mesh with flat per-face normals, one submesh per material. Textures are listed in
-// mesh.textureData by path only (one entry per distinct path, in first-use order); the caller decodes them.
-Mesh polyMeshToMesh(const PolyMesh& mesh);
+// mesh.textureData by path only (one entry per distinct texture, in first-use order); the caller decodes
+// them. Linked slots are resolved through `library` (may be null: inline values are used).
+Mesh polyMeshToMesh(const PolyMesh& mesh, MaterialLibrary* library);
 
 // Models built from a PolyMesh use "level:#<n>" as their source path; scene files store the mesh itself.
 inline constexpr const char* kLevelModelPathPrefix = "level:#";
 inline bool isLevelModelPath(const std::string& path) { return path.rfind(kLevelModelPathPrefix, 0) == 0; }
 
-// Binary form used inside scene files; materials are stored from scene version 4 on.
+// Binary form used inside scene and prefab files. What a file holds depends on its format:
+// 0 = geometry only (scene version 3), 1 = + materials (scene 4-5, prefab 1),
+// 2 = + grid size (scene 6, prefab 2), 3 = + shared material paths (scene 7, prefab 3).
 // readPolyMesh() rejects out-of-range indices and returns false on truncated or corrupt data.
+inline constexpr int kPolyMeshFormat = 3;
 void writePolyMesh(std::ostream& out, const PolyMesh& mesh);
-bool readPolyMesh(std::istream& in, PolyMesh& mesh, bool withMaterials);
+bool readPolyMesh(std::istream& in, PolyMesh& mesh, int format);
+
+inline constexpr float kMinPolyGridSize = 1.0f / 1024.0f;
+inline constexpr float kMaxPolyGridSize = 1024.0f;

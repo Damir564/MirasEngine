@@ -8,6 +8,7 @@
 #include "stb_image.h"
 #include "Shadow.h"
 #include "ModelLoader.h"
+#include "MaterialLibrary.h"
 #include "Log.h"
 
 class TextureImage {
@@ -274,9 +275,12 @@ void allocatePixels(TextureData& tex, int width, int height) {
         throw std::runtime_error("Out of memory for texture " + tex.path);
 }
 
-// Level textures are few and small next to glTF scenes, so they are decoded serially.
-void decodeLevelTextures(Mesh& mesh) {
+// Decodes the textures listed by path only (level slots, shared materials); glTF textures arrive decoded.
+// They are few and small next to glTF scenes, so they are decoded serially.
+void decodePathTextures(Mesh& mesh) {
     for (TextureData& tex : mesh.textureData) {
+        if (tex.pixels)
+            continue;
         if (tex.path == kCheckerTexturePath) {
             constexpr int kSize = 64, kCell = 8;
             allocatePixels(tex, kSize, kSize);
@@ -428,9 +432,9 @@ size_t ModelManager::loadModelSync(const std::string& path, const std::string& n
 }
 
 size_t ModelManager::addPolyMesh(PolyMesh polyMesh, const std::string& name) {
-    Mesh mesh = polyMeshToMesh(polyMesh);
+    Mesh mesh = polyMeshToMesh(polyMesh, m_materialLibrary);
     std::vector<std::string> texturePaths = levelTexturePaths(mesh);
-    decodeLevelTextures(mesh);
+    decodePathTextures(mesh);
     const size_t index = uploadModelToGPU(mesh, name, kLevelModelPathPrefix + std::to_string(m_nextLevelModelId++));
     m_models[index]->polyMesh = std::make_unique<PolyMesh>(std::move(polyMesh));
     m_models[index]->texturePaths = std::move(texturePaths);
@@ -441,23 +445,50 @@ bool ModelManager::rebuildPolyMesh(size_t modelIndex) {
     if (modelIndex >= m_models.size() || !m_models[modelIndex] || !m_models[modelIndex]->polyMesh)
         return false;
     GPUModel& old = *m_models[modelIndex];
-    Mesh mesh = polyMeshToMesh(*old.polyMesh);
+    Mesh mesh = polyMeshToMesh(*old.polyMesh, m_materialLibrary);
     std::vector<std::string> texturePaths = levelTexturePaths(mesh);
     // Same textures in the same order: the old images are moved over instead of decoded and uploaded again.
     const bool keepTextures = texturePaths == old.texturePaths;
     if (keepTextures)
         mesh.textureData.clear();
     else
-        decodeLevelTextures(mesh);
+        decodePathTextures(mesh);
     const size_t uploaded = uploadModelToGPU(mesh, old.name, old.sourcePath);
+    m_models[uploaded]->texturePaths = std::move(texturePaths);
+    replaceWithRebuilt(modelIndex, uploaded, keepTextures);
+    return true;
+}
 
+bool ModelManager::reloadModel(size_t modelIndex) {
+    if (modelIndex >= m_models.size() || !m_models[modelIndex] || m_models[modelIndex]->polyMesh)
+        return false;
+    const GPUModel& old = *m_models[modelIndex];
+    Mesh mesh = loadModelSmart(old.sourcePath);
+    if (m_materialLibrary) {
+        for (SubmeshInfo& sub : mesh.submeshes) {
+            const auto it = old.materialOverrides.find(sub.sourceMaterial);
+            if (it == old.materialOverrides.end())
+                continue;
+            // A missing file leaves the model's own material.
+            if (const MaterialAsset* shared = m_materialLibrary->find(it->second))
+                sub.material = toRenderMaterial(*shared, mesh);
+        }
+    }
+    decodePathTextures(mesh);
+    const size_t uploaded = uploadModelToGPU(mesh, old.name, old.sourcePath);
+    replaceWithRebuilt(modelIndex, uploaded, false);
+    return true;
+}
+
+void ModelManager::replaceWithRebuilt(size_t modelIndex, size_t uploaded, bool keepTextures) {
     std::lock_guard<std::mutex> lock(m_mutex);
     // The old buffers may still be read by frames in flight.
     (void)m_device.waitIdle();
+    GPUModel& old = *m_models[modelIndex];
     GPUModel& rebuilt = *m_models[uploaded];
     rebuilt.polyMesh = std::move(old.polyMesh);
     rebuilt.prefabPath = std::move(old.prefabPath);
-    rebuilt.texturePaths = std::move(texturePaths);
+    rebuilt.materialOverrides = std::move(old.materialOverrides);
     if (keepTextures) {
         rebuilt.textures = std::move(old.textures);
         rebuilt.textureDescriptorSets = std::move(old.textureDescriptorSets);
@@ -467,7 +498,82 @@ bool ModelManager::rebuildPolyMesh(size_t modelIndex) {
     }
     m_models[modelIndex] = std::move(m_models[uploaded]);
     m_models.erase(m_models.begin() + uploaded);
-    return true;
+}
+
+vk::DescriptorSet ModelManager::previewTexture(const std::string& texturePath) {
+    if (texturePath.empty())
+        return {};
+    if (const auto it = m_previews.find(texturePath); it != m_previews.end())
+        return it->second.set;
+    if (m_previewDecodedThisFrame)
+        return {};
+    m_previewDecodedThisFrame = true;
+
+    Mesh holder;
+    holder.textureData.push_back({});
+    TextureData& tex = holder.textureData.back();
+    tex.path = texturePath;
+    decodePathTextures(holder);
+
+    // Box-filtered down to at most kPreviewSize on the longer side; previews are drawn small.
+    constexpr int kPreviewSize = 128;
+    const int step = std::max(1, (std::max(tex.width, tex.height) + kPreviewSize - 1) / kPreviewSize);
+    const int width = std::max(1, tex.width / step), height = std::max(1, tex.height / step);
+    std::vector<unsigned char> pixels(size_t(width) * height * 4);
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            uint32_t sum[4] = {};
+            for (int sy = 0; sy < step; ++sy)
+                for (int sx = 0; sx < step; ++sx) {
+                    const unsigned char* p = tex.pixels + (size_t(y * step + sy) * tex.width + (x * step + sx)) * 4;
+                    for (int c = 0; c < 4; ++c)
+                        sum[c] += p[c];
+                }
+            for (int c = 0; c < 4; ++c)
+                pixels[(size_t(y) * width + x) * 4 + c] = static_cast<unsigned char>(sum[c] / uint32_t(step * step));
+        }
+    }
+    tex.free();
+
+    Preview preview;
+    try {
+        preview.image = std::make_unique<TextureImage>(m_allocator, m_device, uint32_t(width), uint32_t(height),
+            vk::Format::eR8G8B8A8Srgb, 1);
+        UploadBatch batch(m_allocator, m_device, m_cmdPool, m_queue, UploadBatch::alignUp(pixels.size()));
+        batch.copyToImage(*preview.image, pixels.data(), false);
+        batch.submitAndWait();
+        preview.set = allocateTextureDescriptorSet(preview.image->getView());
+    }
+    catch (const std::exception& e) {
+        LOG_ERROR("[ModelManager] Preview of " << texturePath << " failed: " << e.what() << "\n");
+        return {};
+    }
+    return m_previews.emplace(texturePath, std::move(preview)).first->second.set;
+}
+
+bool ModelManager::usesMaterial(const GPUModel& model, const std::string& materialPath) {
+    if (model.polyMesh)
+        return std::any_of(model.polyMesh->materials.begin(), model.polyMesh->materials.end(),
+            [&](const PolyMaterial& m) { return m.materialPath == materialPath; });
+    return std::any_of(model.materialOverrides.begin(), model.materialOverrides.end(),
+        [&](const auto& entry) { return entry.second == materialPath; });
+}
+
+size_t ModelManager::refreshMaterial(const std::string& materialPath) {
+    size_t count = 0;
+    for (size_t i = 0; i < m_models.size(); ++i) {
+        if (!m_models[i] || !m_models[i]->isValid() || !usesMaterial(*m_models[i], materialPath))
+            continue;
+        try {
+            if (m_models[i]->polyMesh ? rebuildPolyMesh(i) : reloadModel(i))
+                ++count;
+        }
+        catch (const std::exception& e) {
+            LOG_ERROR("[ModelManager] Failed to update '" << m_models[i]->name << "' for " << materialPath
+                << ": " << e.what() << "\n");
+        }
+    }
+    return count;
 }
 
 size_t ModelManager::uploadModelToGPU(Mesh& mesh, const std::string& name, const std::string& path) {
@@ -475,6 +581,7 @@ size_t ModelManager::uploadModelToGPU(Mesh& mesh, const std::string& name, const
     gpuModel->name = name;
     gpuModel->sourcePath = path;
     gpuModel->submeshes = mesh.submeshes;
+    gpuModel->materialNames = mesh.materialNames;
     // Ranges running past the index data are clamped so the GPU copy below stays in bounds.
     size_t gpuIndexCount = 0;
     for (SubmeshInfo& sub : gpuModel->submeshes) {
@@ -704,6 +811,7 @@ std::optional<size_t> ModelManager::findModelByPath(const std::string& path) con
 
 void ModelManager::update() {
     std::lock_guard<std::mutex> lock(m_mutex);
+    m_previewDecodedThisFrame = false;
 
     for (auto it = m_loadingTasks.begin(); it != m_loadingTasks.end(); ) {
         LoadingTask& task = *it;

@@ -2,6 +2,7 @@
 #include <memory>
 #include "AppOptions.h"
 #include "engine/GraphicsSettings.h"
+#include "engine/MaterialLibrary.h"
 #include "engine/Renderer.h"
 #include "engine/VulkanContext.h"
 
@@ -53,7 +54,9 @@ private:
     GraphicsSettings m_appliedSettings;
 
     // Destruction order matters: the mode uses everything, SceneManager uses ModelManager, and
-    // ModelManager allocates from the renderer's pools; all of them need the Vulkan device.
+    // ModelManager allocates from the renderer's pools and reads the material library; all of them
+    // need the Vulkan device.
+    MaterialLibrary m_materials;
     VulkanContext m_vulkan;
     Renderer m_renderer;
     std::unique_ptr<ModelManager> m_models;

@@ -48,6 +48,15 @@ struct OutlinePushConstants {
 };
 static_assert(sizeof(OutlinePushConstants) == 32);
 
+// Mirrors the push_constant block in shaders/grid.frag and level_grid.frag.
+struct GridPushConstants {
+    float cellSize;
+    float majorEvery; // cells between major lines
+    float _pad0;
+    float _pad1;
+};
+static_assert(sizeof(GridPushConstants) == 16);
+
 // Mirrors the push_constant block in shaders/ao_depth.frag, ao.frag and ao_blur.frag.
 struct AoPushConstants {
     glm::ivec4 rect;      // pixels the pass may read: xy = min, zw = max (inclusive)

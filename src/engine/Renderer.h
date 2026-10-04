@@ -53,6 +53,9 @@ struct FrameInput {
     SelectionHighlight highlight;
     bool showPath = false;
     bool showGrid = false;
+    // Grid drawn on the highlighted object's surfaces, in its object space (level shape editing).
+    bool levelGrid = false;
+    float gridCellSize = 1.0f;
     ImDrawData* imgui = nullptr;
     float time = 0.0f;
 };
@@ -350,6 +353,7 @@ private:
     ShaderPair m_skyShaders;
     ShaderPair m_gridShaders;
     ShaderPair m_maskShaders;
+    ShaderPair m_levelGridShaders;
     ShaderPair m_outlineShaders;
     ShaderPair m_aoDepthShaders;
     ShaderPair m_aoShaders;

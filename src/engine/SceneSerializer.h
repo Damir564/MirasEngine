@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <map>
 #include <optional>
 #include <string>
 #include <vector>
@@ -23,7 +24,8 @@ struct SceneModelEntry {
     uint32_t nameLength = 0;
     // followed by: char path[pathLength], char name[nameLength]; then (version 3+) uint8_t hasPolyMesh
     // and, when set, the mesh in writePolyMesh() form; then (version 5+) uint32_t prefabPathLength and
-    // char prefabPath[prefabPathLength]
+    // char prefabPath[prefabPathLength]; then (version 7+) uint32_t overrideCount and per override
+    // uint32_t slot, uint32_t pathLength, char path[pathLength]
 };
 
 struct SceneInstanceEntry {
@@ -37,8 +39,16 @@ struct SceneInstanceEntry {
 };
 
 // Version 1 files have no per-instance color, version 2 files no level geometry, version 3 files no
-// level materials, version 4 files no prefabs.
-inline constexpr uint32_t kSceneFileVersion = 5;
+// level materials, version 4 files no prefabs, version 5 files no level grid sizes, version 6 files no
+// shared materials.
+inline constexpr uint32_t kSceneFileVersion = 7;
+inline constexpr uint32_t kMaxSceneMaterialOverrides = 4096;
+
+// PolyMesh format (see readPolyMesh()) stored in a scene file of this version.
+inline int scenePolyMeshFormat(uint32_t version)
+{
+    return version < 4 ? 0 : version < 6 ? 1 : version == 6 ? 2 : 3;
+}
 inline constexpr uint32_t kMaxScenePrefabPathLength = 4096;
 
 class SceneSerializer {
@@ -59,6 +69,7 @@ public:
             std::string name;
             const PolyMesh* polyMesh = nullptr;
             std::string prefabPath;
+            const std::map<uint32_t, std::string>* materialOverrides = nullptr;
         };
         std::vector<ModelEntry> uniqueModels;
         // Map from modelManager model index -> file model index
@@ -78,7 +89,7 @@ public:
             if (!found) {
                 modelIndexMap[i] = static_cast<uint32_t>(uniqueModels.size());
                 uniqueModels.push_back({ models[i]->sourcePath, models[i]->name, models[i]->polyMesh.get(),
-                    models[i]->prefabPath });
+                    models[i]->prefabPath, &models[i]->materialOverrides });
             }
         }
 
@@ -112,6 +123,14 @@ public:
             const uint32_t prefabPathLength = static_cast<uint32_t>(model.prefabPath.size());
             file.write(reinterpret_cast<const char*>(&prefabPathLength), sizeof(prefabPathLength));
             file.write(model.prefabPath.data(), prefabPathLength);
+            const uint32_t overrideCount = static_cast<uint32_t>(model.materialOverrides->size());
+            file.write(reinterpret_cast<const char*>(&overrideCount), sizeof(overrideCount));
+            for (const auto& [slot, materialPath] : *model.materialOverrides) {
+                const uint32_t pathLength = static_cast<uint32_t>(materialPath.size());
+                file.write(reinterpret_cast<const char*>(&slot), sizeof(slot));
+                file.write(reinterpret_cast<const char*>(&pathLength), sizeof(pathLength));
+                file.write(materialPath.data(), pathLength);
+            }
         }
 
         // Write instances
@@ -154,6 +173,7 @@ public:
             std::string name;
             std::optional<PolyMesh> polyMesh; // level geometry stored in the file
             std::string prefabPath;
+            std::map<uint32_t, std::string> materialOverrides; // see GPUModel::materialOverrides
         };
         struct LoadedInstance {
             uint32_t fileModelIndex; // index into loadedModels
@@ -211,7 +231,8 @@ public:
             uint8_t hasPolyMesh = 0;
             if (header.version >= 3)
                 file.read(reinterpret_cast<char*>(&hasPolyMesh), sizeof(hasPolyMesh));
-            if (hasPolyMesh && !readPolyMesh(file, scene.models[i].polyMesh.emplace(), header.version >= 4)) {
+            if (hasPolyMesh && !readPolyMesh(file, scene.models[i].polyMesh.emplace(),
+                    scenePolyMeshFormat(header.version))) {
                 LOG_ERROR("[SCENE] Corrupt level geometry for '" << scene.models[i].name << "' in " << filepath << "\n");
                 return scene;
             }
@@ -224,6 +245,26 @@ public:
                 }
                 scene.models[i].prefabPath.resize(prefabPathLength);
                 file.read(scene.models[i].prefabPath.data(), prefabPathLength);
+            }
+            if (header.version >= 7) {
+                uint32_t overrideCount = 0;
+                file.read(reinterpret_cast<char*>(&overrideCount), sizeof(overrideCount));
+                if (!file || overrideCount > kMaxSceneMaterialOverrides) {
+                    LOG_ERROR("[SCENE] Corrupt material overrides for '" << scene.models[i].name << "' in " << filepath << "\n");
+                    return scene;
+                }
+                for (uint32_t k = 0; k < overrideCount; ++k) {
+                    uint32_t slot = 0, pathLength = 0;
+                    file.read(reinterpret_cast<char*>(&slot), sizeof(slot));
+                    file.read(reinterpret_cast<char*>(&pathLength), sizeof(pathLength));
+                    if (!file || pathLength > kMaxScenePrefabPathLength) {
+                        LOG_ERROR("[SCENE] Corrupt material overrides for '" << scene.models[i].name << "' in " << filepath << "\n");
+                        return scene;
+                    }
+                    std::string materialPath(pathLength, '\0');
+                    file.read(materialPath.data(), pathLength);
+                    scene.models[i].materialOverrides[slot] = std::move(materialPath);
+                }
             }
         }
 

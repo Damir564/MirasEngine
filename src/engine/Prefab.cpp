@@ -6,7 +6,8 @@
 
 namespace {
 constexpr char kPrefabMagic[4] = { 'P', 'F', 'A', 'B' };
-constexpr uint32_t kPrefabVersion = 1;
+// Version 1 files have no grid size, version 2 files no shared material links.
+constexpr uint32_t kPrefabVersion = kPolyMeshFormat;
 constexpr uint32_t kMaxPrefabNameLength = 4096;
 }
 
@@ -52,7 +53,8 @@ std::optional<Prefab> loadPrefab(const std::string& path)
     Prefab prefab;
     prefab.name.resize(nameLength);
     file.read(prefab.name.data(), nameLength);
-    if (!file || !readPolyMesh(file, prefab.mesh, true)) {
+    // Prefab versions match the PolyMesh formats they hold.
+    if (!file || !readPolyMesh(file, prefab.mesh, static_cast<int>(version))) {
         LOG_ERROR("[PREFAB] Corrupt prefab file: " << path << "\n");
         return std::nullopt;
     }

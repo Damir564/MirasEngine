@@ -90,6 +90,22 @@ void SceneManager::instantiatePendingScene()
         }
     }
 
+    // Shared material overrides need the loaded model, so they are applied by loading it once more
+    // (through its cache).
+    for (size_t fi = 0; fi < m_pendingScene.models.size(); ++fi) {
+        auto& overrides = m_pendingScene.models[fi].materialOverrides;
+        GPUModel* model = fileToManager[fi] >= 0 ? m_models.getModel(static_cast<size_t>(fileToManager[fi])) : nullptr;
+        if (overrides.empty() || !model || model->polyMesh)
+            continue;
+        model->materialOverrides = std::move(overrides);
+        try {
+            m_models.reloadModel(static_cast<size_t>(fileToManager[fi]));
+        }
+        catch (const std::exception& e) {
+            LOG_ERROR("[SCENE] Failed to apply materials to '" << model->name << "': " << e.what() << "\n");
+        }
+    }
+
     m_models.reserveInstances(m_pendingScene.instances.size());
     for (const auto& inst : m_pendingScene.instances) {
         if (inst.fileModelIndex >= fileToManager.size()) continue;

@@ -60,6 +60,8 @@ bool Application::init(const AppOptions& options)
     m_appliedSettings = m_settings;
     if (!createModelManager())
         return false;
+    m_materials.scan();
+    m_models->setMaterialLibrary(&m_materials);
     m_scenes = std::make_unique<SceneManager>(*m_models, m_vulkan.device());
     createMode(options);
     return true;
@@ -117,7 +119,7 @@ bool Application::createModelManager()
 
 EngineContext Application::engineContext()
 {
-    return EngineContext{ m_window, m_vulkan, m_renderer, *m_models, *m_scenes, m_settings };
+    return EngineContext{ m_window, m_vulkan, m_renderer, *m_models, *m_scenes, m_settings, m_materials };
 }
 
 void Application::createMode(const AppOptions& options)

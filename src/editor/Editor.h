@@ -1,6 +1,7 @@
 #pragma once
 #include <array>
 #include <cstddef>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -13,6 +14,7 @@
 #include "engine/CameraAnimation.h"
 #include "engine/Gizmo.h"
 #include "engine/GraphicsSettings.h"
+#include "engine/MaterialLibrary.h"
 #include "engine/ModelManager.h"
 #include "engine/PolyMesh.h"
 #include "engine/Renderer.h"
@@ -120,6 +122,15 @@ private:
     void addCube();
     std::string uniqueInstanceName(const std::string& base) const;
     void beginRename(int index);
+    // m_gridSnap, inverted while Ctrl is held.
+    bool snapActive() const;
+    // Face/vertex editing of a level shape: its own object-space grid replaces the ground grid.
+    bool levelGridActive();
+    // The grid in use: the edited shape's (PolyMesh::gridSize) or the world grid.
+    float activeGridSize();
+    void setActiveGridSize(float size);
+    // Moves the active grid to the next larger (+1) or smaller (-1) preset.
+    void stepGridSize(int direction);
 
     // ---- EditorMenus.cpp ----
     void drawMainMenuBar();
@@ -129,6 +140,7 @@ private:
     void drawToolbar();
     void drawToolButton(const char* label, GizmoMode tool, const char* tooltip);
     void drawSnapPopup();
+    void drawGridControls();
     void drawAddMenu();
     void drawStatusBar();
     void drawDockSpace();
@@ -188,17 +200,28 @@ private:
     std::optional<size_t> createLevelModel(PolyMesh mesh, const std::string& name);
     // Editable geometry of the selected instance's model, or null when it is not a level model or is locked.
     PolyMesh* selectedLevelMesh();
-    // The selected face, or null when face editing is off or the face belongs to another instance.
+    // The active selected face, or null when face editing is off or the face belongs to another instance.
     PolyFace* selectedLevelFace();
+    // Every selected face (active one first); drops indices the mesh no longer has. Empty when none.
+    const std::vector<uint32_t>& selectedLevelFaces();
+    void clearFaceSelection();
+    // Plain click: just this face (kept as is when it is already selected, so the group stays);
+    // toggle: Shift+click adds or removes it.
+    void selectLevelFace(uint32_t face, bool toggle);
+    void selectFacesWhere(const std::function<bool(const PolyMesh&, const PolyFace&)>& predicate);
     // Same for vertex editing; drops indices the mesh no longer has. Empty when there is none.
     const std::vector<uint32_t>& selectedLevelVertices();
-    // Face of the selected level instance under the mouse (scene-view pixels), or -1.
-    int pickLevelFace(float mouseX, float mouseY) const;
+    // Face of the level instance (default: the selected one) under the mouse (scene-view pixels), or -1.
+    int pickLevelFace(float mouseX, float mouseY, int instanceIndex = -1) const;
     // Vertex of the selected level instance drawn closest to the mouse, within a few pixels, or -1.
     int pickLevelVertex(float mouseX, float mouseY) const;
     // Face/vertex picking for a viewport click; false when nothing was hit and objects should be picked.
     bool handleLevelClick(float mouseX, float mouseY);
     void dragLevelVertex(float mouseX, float mouseY);
+    // Distance along the dragged face's normal (object units) closest to the mouse ray; false when the
+    // view looks straight along the normal.
+    bool faceDragParam(float mouseX, float mouseY, float& param) const;
+    void dragLevelFace(float mouseX, float mouseY);
     // Selects the vertices inside the box, or picks an object when the mouse barely moved.
     void finishVertexMarquee(float mouseX, float mouseY);
     void drawLevelFaceOverlay();
@@ -207,6 +230,13 @@ private:
     // Push/pull and extrude; by index, because extruding adds faces and moves the face storage.
     void drawFaceGeometry(PolyMesh& mesh, uint32_t faceIndex);
     void drawLevelMaterials(PolyMesh& mesh);
+    // What the open texture dialog sets: an inline slot of the selected shape, or a shared material.
+    struct TextureDialogTarget {
+        int slot = -1;
+        std::string sharedPath;
+        bool normal = false; // shared materials only
+    };
+    void openTextureDialog(TextureDialogTarget target);
     void drawLevelTextureDialog();
     // Uploads the selected shape after an edit and marks the edit for the undo history.
     void rebuildSelectedLevelModel(const char* action);
@@ -239,6 +269,55 @@ private:
     // Level models belong to their instances, so they are unloaded once no instance uses them.
     void releaseUnusedLevelModels();
     glm::vec3 placementPoint() const;
+
+    // ---- EditorUv.cpp ----
+    // Face mode keys over the viewport: arrows nudge the UV offset by one grid cell, Ctrl+Left/Right
+    // rotate, Alt+Up/Down scale; Ctrl+Shift+C / V copy and paste UVs and material.
+    void handleFaceKeys();
+    void copyFaceAttributes();
+    void pasteFaceAttributes();
+    // Wraps the selected faces' textures around from the active face across shared edges.
+    void wrapSelectedFaces();
+    // 2D view of the selected faces' UVs over the texture: drag moves, Shift+drag rotates, wheel scales;
+    // right-drag pans and Ctrl+wheel zooms the view.
+    void drawUvEditor(PolyMesh& mesh);
+
+    // ---- EditorMaterials.cpp ----
+    // "Brick" for a slot linked to materials/Brick.mat, else "Material <n>"; "None (white)" past the end.
+    std::string levelSlotName(const PolyMesh& mesh, uint32_t slot);
+    // MaterialAsset::texelSize of the slot's shared material, 1 when it is not linked.
+    float levelSlotTexelSize(const PolyMesh& mesh, uint32_t slot);
+    // Combo listing the library plus "New material"; `path` empty = `noneLabel`. True when it changed.
+    bool drawSharedMaterialCombo(const char* id, std::string& path, const char* noneLabel);
+    // Editors for a shared material's values; true when one changed (then pass it to saveSharedMaterial()).
+    bool drawSharedMaterialProperties(MaterialAsset& material);
+    // Writes the .mat file and rebuilds every model using it.
+    void saveSharedMaterial(const MaterialAsset& material);
+    // Inspector: shared materials replacing the material slots of a model loaded from a file.
+    void drawModelMaterialOverrides(size_t modelIndex);
+    // The Materials panel: thumbnails of the library, the current material and its properties.
+    void drawMaterialsPanel();
+    void drawMaterialTile(const MaterialAsset& material, float size);
+    void drawMaterialPopups();
+    // Slot of `mesh` linked to the shared material, added when missing; kNoPolyMaterial when full.
+    static uint32_t levelSlotFor(PolyMesh& mesh, const std::string& materialPath);
+    // Drops linked slots no face uses any more, renumbering the faces.
+    static void pruneLinkedSlots(PolyMesh& mesh);
+    // The selected face (face mode) or every face of the selected level shape, or every material slot
+    // of the selected file model.
+    void applyMaterialToSelection(const std::string& materialPath);
+    // `slot` of a file model (kNoSourceMaterial included); all slots when `allSlots`.
+    void applyMaterialToModel(size_t modelIndex, const std::string& materialPath, uint32_t slot, bool allSlots);
+    // Points every object using `from` at `to` (after a rename).
+    void relinkMaterial(const std::string& from, const std::string& to);
+    // While a material is dragged: a drop target over the scene view.
+    void drawMaterialDropTarget();
+    void dropMaterial(const std::string& materialPath, float mouseX, float mouseY, bool wholeObject);
+    // Material drops on another object select it first and are applied the next frame, so the undo
+    // history has its snapshot of that object.
+    void applyPendingMaterialDrop();
+    // Eyedropper (I over the viewport): the shared material of the face or model slot under the mouse.
+    void pickMaterialUnderMouse();
 
     // ---- EditorPrefab.cpp ----
     // The instance's model when it is a level model linked to a prefab file, else null.
@@ -319,6 +398,7 @@ private:
     ModelManager& m_models;
     SceneManager& m_scenes;
     GraphicsSettings& m_settings;
+    MaterialLibrary& m_materials;
 
     // Camera and viewport
     Camera m_camera;
@@ -336,8 +416,12 @@ private:
     Gizmo m_gizmo;
     GizmoMode m_tool = GizmoMode::Translate;
     GizmoAxis m_hoveredAxis = GizmoAxis::None;
-    // Ctrl while dragging: absolute grid step for moves, increments for rotate/scale deltas.
-    float m_snapTranslate = 1.0f;
+    // World grid cell size, also given to new level shapes as their own grid. Snapping (world and shape
+    // grids) is on while m_gridSnap is set; Ctrl inverts it mid-drag.
+    static constexpr float kGridSizes[] = { 0.125f, 0.25f, 0.5f, 1.0f, 2.0f, 4.0f, 8.0f, 16.0f };
+    float m_gridSize = 1.0f;
+    bool m_gridSnap = true;
+    // Increments for rotate/scale gizmo deltas.
     float m_snapRotate = 15.0f;
     float m_snapScale = 0.1f;
 
@@ -351,6 +435,7 @@ private:
     bool m_showAnimationPanel = true;
     bool m_showStatisticsPanel = true;
     bool m_showLevelPanel = true;
+    bool m_showMaterialsPanel = true;
     bool m_showGraphicsSettings = false;
     bool m_resetLayout = false;
     bool m_openControlsPopup = false;
@@ -386,7 +471,32 @@ private:
     // Face and vertex modes: clicks on the selected level shape pick its parts instead of objects.
     enum class LevelEditMode { Object, Face, Vertex };
     LevelEditMode m_levelMode = LevelEditMode::Object;
+    // Face mode: m_selectedFace is the active face (properties shown, dragged, source of wraps);
+    // m_selectedFaces holds every selected face, the active one included.
     int m_selectedFace = -1;
+    std::vector<uint32_t> m_selectedFaces;
+    // Copied face UVs and material (Ctrl+Shift+C), pasted onto selected faces with Ctrl+Shift+V.
+    struct FaceClipboard {
+        bool valid = false;
+        bool hasMaterial = false;
+        PolyMaterial material;
+        glm::vec2 uvScale{ 1.0f };
+        glm::vec2 uvOffset{ 0.0f };
+        float uvRotation = 0.0f;
+    };
+    FaceClipboard m_faceClipboard;
+    // 2D UV editor view: UV coordinate at the canvas center and UV units across it.
+    glm::vec2 m_uvViewCenter{ 0.5f };
+    float m_uvViewSpan = 3.0f;
+    // A UV drag in the 2D editor: faces' values at its start.
+    struct UvDrag {
+        bool active = false;
+        bool rotate = false;
+        glm::vec2 startMouse{ 0.0f };
+        std::vector<glm::vec2> startOffsets;
+        std::vector<float> startRotations;
+    };
+    UvDrag m_uvDrag;
     std::vector<uint32_t> m_selectedVertices;
     int m_levelSelectionInstance = -1; // face and vertex indices are only meaningful for this instance
     // The clicked vertex is dragged in the plane facing the camera through its start position; the
@@ -399,6 +509,21 @@ private:
         std::vector<glm::vec3> startPositions; // object space, parallel to m_selectedVertices
     };
     VertexDrag m_vertexDrag;
+    // Face mode: dragging a face moves it along its normal (push/pull), or extrudes it when Alt was held
+    // at the start. Each step re-applies the edit to the mesh as it was when the drag began.
+    struct FaceDrag {
+        bool active = false;
+        bool moved = false; // mesh changed since the last rebuild
+        bool extrude = false;
+        int instance = -1;
+        uint32_t face = 0;
+        glm::vec3 center{ 0.0f }; // object space
+        glm::vec3 normal{ 0.0f }; // object space, unit length
+        float startParam = 0.0f;  // position along the normal under the mouse when the drag began
+        float distance = 0.0f;    // currently applied, object space
+        PolyMesh startMesh;
+    };
+    FaceDrag m_faceDrag;
     // Box selection started on empty space in vertex mode; scene-view pixels.
     struct VertexMarquee {
         bool active = false;
@@ -407,7 +532,25 @@ private:
         glm::vec2 end{ 0.0f };
     };
     VertexMarquee m_vertexMarquee;
-    int m_textureDialogMaterial = -1; // material of the selected shape the open texture dialog is for
+    TextureDialogTarget m_textureDialogTarget;
+
+    // Materials panel
+    std::string m_currentMaterial; // path; new level shapes get it too
+    ImGuiTextFilter m_materialFilter;
+    float m_materialTileSize = 72.0f;
+    char m_materialNameBuffer[128] = "";
+    std::string m_materialPopupPath; // material the rename/delete popup is for
+    bool m_openMaterialRename = false;
+    bool m_openMaterialDelete = false;
+    struct MaterialDrop {
+        bool pending = false;
+        uint64_t instanceId = 0;
+        int face = -1;           // level shapes; -1 = whole object
+        uint32_t slot = kNoSourceMaterial; // file models
+        bool wholeObject = false;
+        std::string materialPath;
+    };
+    MaterialDrop m_materialDrop;
     float m_faceOpDistance = 1.0f;
     // Plane dot(normal, p) == offset in the selected shape's object space. "Front" is the side the
     // normal points to.

@@ -10,7 +10,10 @@
 namespace {
 
 constexpr uint32_t kCacheMagic = 0x564B4D44; // "VKMD"
-constexpr uint32_t kCacheVersion = 3;
+// Version 4: SubmeshInfo::sourceMaterial, material names after the textures.
+constexpr uint32_t kCacheVersion = 4;
+constexpr uint32_t kMaxMaterialNames = 1u << 16;
+constexpr uint32_t kMaxMaterialNameLength = 4096;
 
 // Written verbatim (including the implicit padding after version), so its layout is part of the file format.
 struct ModelCacheHeader {
@@ -76,6 +79,14 @@ bool save(const std::string& cachePath, const Mesh& mesh) {
         }
     }
 
+    const uint32_t nameCount = static_cast<uint32_t>(mesh.materialNames.size());
+    file.write(reinterpret_cast<const char*>(&nameCount), sizeof(nameCount));
+    for (const std::string& name : mesh.materialNames) {
+        const uint32_t length = static_cast<uint32_t>(name.size());
+        file.write(reinterpret_cast<const char*>(&length), sizeof(length));
+        file.write(name.data(), length);
+    }
+
     return static_cast<bool>(file);
 }
 
@@ -114,6 +125,20 @@ bool load(const std::string& cachePath, Mesh& outMesh) {
         tex.pixels = static_cast<unsigned char*>(malloc(dataSize));
         tex.fromCache = true;
         file.read(reinterpret_cast<char*>(tex.pixels), dataSize);
+    }
+
+    uint32_t nameCount = 0;
+    file.read(reinterpret_cast<char*>(&nameCount), sizeof(nameCount));
+    if (!file || nameCount > kMaxMaterialNames)
+        return false;
+    outMesh.materialNames.resize(nameCount);
+    for (std::string& name : outMesh.materialNames) {
+        uint32_t length = 0;
+        file.read(reinterpret_cast<char*>(&length), sizeof(length));
+        if (!file || length > kMaxMaterialNameLength)
+            return false;
+        name.resize(length);
+        file.read(name.data(), length);
     }
     return static_cast<bool>(file);
 }

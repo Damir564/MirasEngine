@@ -537,6 +537,8 @@ bool Renderer::createShaders()
             frameOnlyLayouts, { &gizmoPushRange, 1 });
         m_maskShaders = createShaderPair(m_device, "shaders/mask.vert.spv", "shaders/mask.frag.spv",
             fxLayouts, { &fxPushRange, 1 });
+        m_levelGridShaders = createShaderPair(m_device, "shaders/level_grid.vert.spv", "shaders/level_grid.frag.spv",
+            fxLayouts, { &fxPushRange, 1 });
 
         const std::pair<ShaderPair*, const char*> fullscreen[] = {
             { &m_skyShaders, "shaders/sky.frag.spv" },
@@ -683,7 +685,7 @@ void Renderer::shutdown()
     destroyLineBuffer(m_pathLines);
 
     for (ShaderPair* pair : { &m_meshShaders, &m_prepassShaders, &m_shadowShaders, &m_gizmoShaders, &m_skyShaders,
-             &m_gridShaders, &m_maskShaders, &m_outlineShaders, &m_aoDepthShaders, &m_aoShaders, &m_aoBlurShaders,
+             &m_gridShaders, &m_maskShaders, &m_levelGridShaders, &m_outlineShaders, &m_aoDepthShaders, &m_aoShaders, &m_aoBlurShaders,
              &m_bloomDownShaders, &m_bloomUpShaders, &m_compositeShaders, &m_fxaaShaders, &m_skyLutShaders,
              &m_skyIrradianceShaders })
         destroyShaderPair(m_device, *pair);
@@ -1627,8 +1629,26 @@ void Renderer::recordScenePass(vk::CommandBuffer cmd, const FrameInput& input, b
 
     // Transparent-ish layers: depth-tested against the opaque scene, no depth writes.
     setAlphaBlending(cmd, true);
+    const GridPushConstants gridPush{ std::max(input.gridCellSize, 1e-3f), 8.0f, 0.0f, 0.0f };
     if (input.showGrid)
-        drawFx(cmd, m_gridShaders, {});
+        drawFx(cmd, m_gridShaders, {}, &gridPush, sizeof(gridPush));
+    if (input.levelGrid && !m_highlightRuns.empty()) {
+        // Same invariant position as the mesh pass, so LessOrEqual puts the lines exactly on the surface.
+        bindShaderPair(cmd, m_levelGridShaders);
+        cmd.setVertexInputEXT(1, &m_meshBinding, static_cast<uint32_t>(m_meshAttributes.size()), m_meshAttributes.data());
+        cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, m_fxLayout, 0, 1, &m_frameSets[m_currentFrame], 0, nullptr);
+        std::array<std::byte, kFxPushConstantSize> push{};
+        std::memcpy(push.data(), &gridPush, sizeof(gridPush));
+        cmd.pushConstants(m_fxLayout, vk::ShaderStageFlagBits::eFragment, 0, kFxPushConstantSize, push.data());
+        const GPUModel* boundModel = nullptr;
+        for (const DrawRun& run : m_highlightRuns) {
+            if (run.model != boundModel) {
+                bindModelBuffers(cmd, run.model);
+                boundModel = run.model;
+            }
+            recordRun(cmd, run);
+        }
+    }
 
     if (!m_blendRuns.empty()) {
         bindShaderPair(cmd, m_meshShaders);

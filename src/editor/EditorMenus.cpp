@@ -100,6 +100,7 @@ void Editor::drawViewMenu()
     ImGui::MenuItem("Camera Animation", nullptr, &m_showAnimationPanel);
     ImGui::MenuItem("Statistics", nullptr, &m_showStatisticsPanel);
     ImGui::MenuItem("Level", nullptr, &m_showLevelPanel);
+    ImGui::MenuItem("Materials", nullptr, &m_showMaterialsPanel);
     ImGui::Separator();
     ImGui::MenuItem("Show Camera Path", nullptr, &m_showCameraPath);
     ImGui::MenuItem("Grid", nullptr, &m_showGrid);
@@ -146,9 +147,7 @@ void Editor::drawToolbar()
         ImGui::EndDisabled();
 
         ImGui::SameLine(0, 16);
-        if (ImGui::Button("Snap")) ImGui::OpenPopup("SnapSettings");
-        ImGui::SetItemTooltip("Snap increments used while holding Ctrl during a gizmo drag");
-        drawSnapPopup();
+        drawGridControls();
 
         ImGui::SameLine(0, 16);
         ImGui::AlignTextToFramePadding();
@@ -185,21 +184,49 @@ void Editor::drawToolbar()
     ImGui::PopStyleVar();
 }
 
+void Editor::drawGridControls()
+{
+    const bool shapeGrid = levelGridActive();
+    const float current = activeGridSize();
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextDisabled(shapeGrid ? "Shape grid" : "Grid");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(70);
+    char preview[16];
+    snprintf(preview, sizeof(preview), "%g", current);
+    if (ImGui::BeginCombo("##gridSize", preview)) {
+        for (const float size : kGridSizes) {
+            char label[16];
+            snprintf(label, sizeof(label), "%g", size);
+            if (ImGui::Selectable(label, size == current))
+                setActiveGridSize(size);
+        }
+        ImGui::EndCombo();
+    }
+    ImGui::SetItemTooltip(shapeGrid
+        ? "Grid of the selected shape ([ smaller, ] larger); saved with the shape and moves with it"
+        : "World grid cell size ([ smaller, ] larger); new level shapes start with this grid");
+    ImGui::SameLine();
+    ImGui::Checkbox("Snap", &m_gridSnap);
+    ImGui::SetItemTooltip("Snap moves, vertices and new shapes to the grid; hold Ctrl while dragging to invert");
+    ImGui::SameLine();
+    if (ImGui::Button("Steps")) ImGui::OpenPopup("SnapSettings");
+    ImGui::SetItemTooltip("Rotate and scale snap increments");
+    drawSnapPopup();
+}
+
 void Editor::drawSnapPopup()
 {
     if (!ImGui::BeginPopup("SnapSettings"))
         return;
-    ImGui::TextDisabled("Hold Ctrl while dragging the gizmo");
+    ImGui::TextDisabled("Used by the rotate and scale gizmos while snapping");
     ImGui::PushItemWidth(120);
-    if (ImGui::DragFloat("Move (grid step)", &m_snapTranslate, 0.05f, 0.01f, 100.0f, "%.2f"))
-        m_snapTranslate = std::max(m_snapTranslate, 0.01f);
     if (ImGui::DragFloat("Rotate (degrees)", &m_snapRotate, 0.5f, 0.1f, 180.0f, "%.1f"))
         m_snapRotate = std::max(m_snapRotate, 0.1f);
     if (ImGui::DragFloat("Scale", &m_snapScale, 0.01f, 0.01f, 10.0f, "%.2f"))
         m_snapScale = std::max(m_snapScale, 0.01f);
     ImGui::PopItemWidth();
     if (ImGui::Button("Reset")) {
-        m_snapTranslate = 1.0f;
         m_snapRotate = 15.0f;
         m_snapScale = 0.1f;
     }
@@ -232,8 +259,8 @@ void Editor::drawStatusBar()
                 if (GPUModel* model = m_models.getModel(instance.modelIndex)) triangles += model->indexCount / 3;
         const ImGuiIO& io = ImGui::GetIO();
         char right[256];
-        snprintf(right, sizeof(right), "Objects: %zu   Models: %zu   Triangles: %s   |   %.0f FPS (%.2f ms)",
-            instances.size(), m_models.getModels().size(), formatCount(triangles).c_str(),
+        snprintf(right, sizeof(right), "Grid: %g%s   |   Objects: %zu   Models: %zu   Triangles: %s   |   %.0f FPS (%.2f ms)",
+            activeGridSize(), m_gridSnap ? "" : " (snap off)", instances.size(), m_models.getModels().size(), formatCount(triangles).c_str(),
             io.Framerate, 1000.0f / std::max(io.Framerate, 0.001f));
         const float rightWidth = ImGui::CalcTextSize(right).x;
         ImGui::SameLine(ImGui::GetWindowWidth() - rightWidth - 12);
@@ -259,10 +286,12 @@ void Editor::buildDefaultLayout(ImGuiID dockspaceId)
     ImGui::DockBuilderDockWindow("Hierarchy", left);
     ImGui::DockBuilderDockWindow("Inspector", right);
     ImGui::DockBuilderDockWindow("Level", right);
+    ImGui::DockBuilderDockWindow("Materials", bottom);
     ImGui::DockBuilderDockWindow("Camera Animation", bottom);
     ImGui::DockBuilderDockWindow("Statistics", bottom);
     ImGui::DockBuilderFinish(dockspaceId);
-    m_showHierarchy = m_showInspector = m_showAnimationPanel = m_showStatisticsPanel = m_showLevelPanel = true;
+    m_showHierarchy = m_showInspector = m_showAnimationPanel = m_showStatisticsPanel = m_showLevelPanel =
+        m_showMaterialsPanel = true;
 }
 
 void Editor::drawDockSpace()
@@ -299,7 +328,8 @@ void Editor::drawViewportOverlay()
             : m_tool == GizmoMode::Rotate ? "Rotate" : "Scale";
         ImGui::Text("Perspective  |  %s tool", toolName);
         ImGui::TextDisabled("LMB select   RMB+drag look   WASD move   F focus");
-        ImGui::TextDisabled("Ctrl+drag snap: %.2f / %.1f deg / %.2f", m_snapTranslate, m_snapRotate, m_snapScale);
+        ImGui::TextDisabled("%s grid %g   snap %s, Ctrl inverts", levelGridActive() ? "Shape" : "World",
+            activeGridSize(), m_gridSnap ? "on" : "off");
     }
     ImGui::End();
 }
@@ -333,7 +363,17 @@ void Editor::drawControlsPopup()
             { "Shift (hold)", "Move 4x faster" },
             { "F", "Focus selection" },
             { "Q / 1 / 2 / 3", "Select / Move / Rotate / Scale tool" },
-            { "Ctrl (while dragging)", "Snap move to grid / rotate and scale to steps" },
+            { "[ / ]", "Smaller / larger grid (shape grid in face/vertex mode)" },
+            { "Drag face (face mode)", "Push/pull along its normal; Alt+drag extrudes" },
+            { "Shift+click face", "Add/remove a face from the selection (face mode)" },
+            { "Alt+Shift+click face", "Wrap the active face's texture onto a neighbour" },
+            { "Arrows (over viewport)", "Nudge selected faces' UVs one grid cell" },
+            { "Ctrl+Left/Right, Alt+Up/Down", "Rotate / scale selected faces' UVs" },
+            { "Ctrl+Shift+C / V", "Copy / paste face material and UVs" },
+            { "Drag a material tile", "Drop on a face to apply; Shift+drop: whole object" },
+            { "Double-click a material", "Apply to the selected face or object" },
+            { "I (over the viewport)", "Pick the shared material under the mouse" },
+            { "Ctrl (while dragging)", "Invert grid snapping for moves, vertices, rotate and scale" },
             { "Click view gizmo axis", "Look along that axis (top-right of viewport)" },
             { "F2", "Rename selected object" },
             { "Ctrl+D", "Duplicate selected object" },
@@ -437,6 +477,8 @@ void Editor::drawFileDialogs()
         dialog->Close();
     }
     drawPrefabDialogs();
+    // Also used by the Materials panel, so it is not tied to the Level panel being open.
+    drawLevelTextureDialog();
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -2,6 +2,7 @@
 
 #include <vulkan/vulkan.hpp>
 #include <vk_mem_alloc.h>
+#include <map>
 #include <memory>
 #include <vector>
 #include <future>
@@ -15,6 +16,7 @@
 #include "PolyMesh.h"
 
 class TextureImage;
+class MaterialLibrary;
 
 // Range [begin, end) of positions in GPUModel::drawOrder.
 struct DrawGroup {
@@ -63,6 +65,11 @@ struct GPUModel {
     std::string prefabPath;
     // Where each of textures came from, so a rebuild can keep them when only geometry or UVs changed.
     std::vector<std::string> texturePaths;
+    // Models loaded from files: shared material (.mat path) replacing a source material slot
+    // (SubmeshInfo::sourceMaterial, kNoSourceMaterial for submeshes without one). Applied by reloadModel().
+    std::map<uint32_t, std::string> materialOverrides;
+    // Names of the source file's material slots.
+    std::vector<std::string> materialNames;
 
     bool isValid() const { return vertexBuffer != nullptr && indexBuffer != nullptr; }
 };
@@ -128,6 +135,16 @@ public:
     // Re-uploads a level model after its polyMesh changed (waits for the GPU to go idle); its index,
     // name, path and instances are kept.
     bool rebuildPolyMesh(size_t modelIndex);
+    // Loads a file model again (through its cache) with its materialOverrides applied; kept like above.
+    // Throws like loadModelSync().
+    bool reloadModel(size_t modelIndex);
+    // Rebuilds every model using the shared material, after its file changed. Returns how many.
+    size_t refreshMaterial(const std::string& materialPath);
+    static bool usesMaterial(const GPUModel& model, const std::string& materialPath);
+
+    // Shared materials for level slots and overrides; must outlive the manager. May stay null.
+    void setMaterialLibrary(MaterialLibrary* library) { m_materialLibrary = library; }
+    MaterialLibrary* materialLibrary() const { return m_materialLibrary; }
 
     size_t createInstance(size_t modelIndex, const glm::vec3& position = glm::vec3(0.0f), const glm::vec3& rotation = glm::vec3(0.0f), const glm::vec3& scale = glm::vec3(1.0f));
     void removeInstance(size_t instanceIndex);
@@ -146,12 +163,20 @@ public:
     bool hasActiveTasks() const { return !m_loadingTasks.empty(); }
     const std::vector<LoadingTask>& getLoadingTasks() const { return m_loadingTasks; }
 
+    // Small copy of a texture file (or kCheckerTexturePath) for UI previews such as material thumbnails.
+    // The set's layout matches ImGui's, so it can be used as an ImTextureID. Decoded on first use, at
+    // most one per frame: null until it is ready. Missing files give a magenta texture.
+    vk::DescriptorSet previewTexture(const std::string& texturePath);
+
     vk::DescriptorSet getDefaultBaseColorSet() const { return m_defaultBaseColorSet; }
     vk::DescriptorSet getDefaultNormalSet() const { return m_defaultNormalSet; }
     vk::DescriptorSet getDefaultMRSet() const { return m_defaultMRSet; }
 
 private:
     size_t uploadModelToGPU(Mesh& mesh, const std::string& name, const std::string& path);
+    // Moves the freshly uploaded model at `uploaded` into slot modelIndex, carrying over what belongs to
+    // the model rather than its geometry (level mesh, prefab link, overrides); waits for the GPU first.
+    void replaceWithRebuilt(size_t modelIndex, size_t uploaded, bool keepTextures);
     static void buildDrawOrder(GPUModel& model);
     void createDefaultTextures();
     vk::DescriptorSet allocateTextureDescriptorSet(vk::ImageView view);
@@ -169,6 +194,14 @@ private:
     std::vector<std::unique_ptr<GPUModel>> m_models;
     std::vector<ModelInstance> m_instances;
     std::vector<LoadingTask> m_loadingTasks;
+    MaterialLibrary* m_materialLibrary = nullptr;
+
+    struct Preview {
+        std::unique_ptr<TextureImage> image;
+        vk::DescriptorSet set;
+    };
+    std::map<std::string, Preview> m_previews;
+    bool m_previewDecodedThisFrame = false; // reset in update()
 
     std::unique_ptr<TextureImage> m_defaultBaseColor;
     std::unique_ptr<TextureImage> m_defaultNormal;

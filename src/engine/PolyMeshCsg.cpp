@@ -228,7 +228,7 @@ PolygonList toPolygons(const PolyMesh& mesh, bool fromCutter)
 bool sameMaterial(const PolyMaterial& a, const PolyMaterial& b)
 {
     return a.color == b.color && a.roughness == b.roughness && a.metallic == b.metallic &&
-        a.texturePath == b.texturePath;
+        a.texturePath == b.texturePath && a.materialPath == b.materialPath;
 }
 
 // Merges positions closer than kWeldDistance, using a grid of that cell size.
@@ -313,6 +313,7 @@ PolyMesh polyMeshSubtract(const PolyMesh& target, const PolyMesh& cutter)
 
     PolyMesh result;
     result.materials = target.materials;
+    result.gridSize = target.gridSize;
     std::vector<uint32_t> cutterMaterials(cutter.materials.size(), UINT32_MAX);
     const auto materialFor = [&](const CsgPolygon& polygon) {
         const uint32_t material = (polygon.fromCutter ? cutter : target).faces[polygon.sourceFace].material;

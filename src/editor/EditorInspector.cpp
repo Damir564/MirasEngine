@@ -38,6 +38,13 @@ void Editor::drawInspector()
                 }
                 ImGui::SetItemTooltip("Reset the color to white");
             }
+            // Level shapes pick their materials per face in the Level panel.
+            if (hasSelection() && m_gizmo.selectedInstance == index) {
+                const size_t modelIndex = m_models.getInstances()[index].modelIndex;
+                const GPUModel* model = m_models.getModel(modelIndex);
+                if (model && !model->polyMesh && ImGui::CollapsingHeader("Materials", ImGuiTreeNodeFlags_DefaultOpen))
+                    drawModelMaterialOverrides(modelIndex);
+            }
         }
     }
     ImGui::End();

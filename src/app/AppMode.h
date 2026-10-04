@@ -8,6 +8,7 @@ class ModelManager;
 class SceneManager;
 struct FrameInput;
 struct GraphicsSettings;
+class MaterialLibrary;
 
 // Engine objects owned by Application that a mode works with. They outlive the mode.
 struct EngineContext {
@@ -18,6 +19,8 @@ struct EngineContext {
     SceneManager& scenes;
     // Modes may edit this; Application applies and saves it after the UI ran each frame.
     GraphicsSettings& settings;
+    // Shared materials (.mat files); ModelManager resolves level slots and overrides through it.
+    MaterialLibrary& materials;
 };
 
 // Asks Application to switch modes after the current frame.

@@ -355,6 +355,7 @@ bool appendGltfPrimitive(const fastgltf::Asset& asset, const fastgltf::Primitive
     }
 
     if (primitive.materialIndex.has_value()) {
+        sub.sourceMaterial = static_cast<uint32_t>(primitive.materialIndex.value());
         readGltfMaterial(asset, asset.materials[primitive.materialIndex.value()], result, textureCache, path, sub.material);
     }
     result.submeshes.push_back(sub);
@@ -440,6 +441,9 @@ Mesh loadWithFastGltf(const std::string& path) {
         calculateTotals(asset, nodeIndex, totalVerts, totalIndices);
     result.vertices.reserve(totalVerts);
     result.indices.reserve(totalIndices);
+
+    for (const fastgltf::Material& material : asset.materials)
+        result.materialNames.emplace_back(material.name.begin(), material.name.end());
 
     TextureCache textureCache;
     for (size_t nodeIndex : scene.nodeIndices) {
