@@ -54,8 +54,15 @@ void main() {
     color = mix(color, vec3(0.15, 0.3, 0.95), zAxis);
     alpha = max(alpha, zAxis * 0.9);
 
+    // Strong near the camera, thinning out steadily with distance, and faint where the plane is seen
+    // edge-on (looking along it), where lines bunch up and are hard to read anyway.
     float fadeRadius = clamp(abs(origin.y) * 60.0, 60.0, max(ubo.farPlane * 0.5, 60.0));
-    alpha *= 1.0 - smoothstep(fadeRadius * 0.3, fadeRadius, length(world.xz - origin.xz));
+    float dist = length(world - origin);
+    float distFade = 1.0 - smoothstep(0.0, fadeRadius, dist);
+    distFade *= distFade;
+    float nearBoost = 1.0 + 0.7 * (1.0 - smoothstep(0.0, fadeRadius * 0.15, dist));
+    float facing = mix(0.25, 1.0, smoothstep(0.02, 0.4, abs(dir.y)));
+    alpha = min(alpha * distFade * nearBoost * facing, 1.0);
     if (!valid || alpha < 0.002)
         discard;
     outColor = vec4(color, alpha);
