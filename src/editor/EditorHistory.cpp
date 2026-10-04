@@ -40,9 +40,7 @@ void Editor::updateLevelHistory()
         if (model && model->polyMesh) {
             HistoryEntry entry;
             entry.action = m_levelEditAction;
-            entry.modelPath = m_levelBaselinePath;
-            entry.before = std::move(m_levelBaseline);
-            entry.after = *model->polyMesh;
+            entry.levels.push_back({ m_levelBaselinePath, std::move(m_levelBaseline), *model->polyMesh });
             pushHistory(std::move(entry));
             m_levelEntryPushed = true;
         }
@@ -303,22 +301,31 @@ bool Editor::applyObjectChanges(const std::vector<ObjectChange>& changes, bool u
     return true;
 }
 
-bool Editor::applyLevelEdit(const HistoryEntry& entry, bool undo)
+bool Editor::applyLevelEdits(const HistoryEntry& entry, bool undo)
 {
-    const auto found = m_models.findModelByPath(entry.modelPath);
-    GPUModel* model = found ? m_models.getModel(*found) : nullptr;
-    if (!model || !model->polyMesh) {
-        setStatus("Cannot " + std::string(undo ? "undo " : "redo ") + entry.action + ": the object was deleted", true);
-        return false;
+    // Every shape is looked up first, so a deleted one leaves the others untouched.
+    std::vector<size_t> modelIndices;
+    for (const LevelEdit& edit : entry.levels) {
+        const auto found = m_models.findModelByPath(edit.modelPath);
+        const GPUModel* model = found ? m_models.getModel(*found) : nullptr;
+        if (!model || !model->polyMesh) {
+            setStatus("Cannot " + std::string(undo ? "undo " : "redo ") + entry.action + ": the object was deleted", true);
+            return false;
+        }
+        modelIndices.push_back(*found);
     }
-    *model->polyMesh = undo ? entry.before : entry.after;
-    if (entry.modelPath == m_levelBaselinePath)
-        m_levelBaseline = *model->polyMesh;
-    try {
-        m_models.rebuildPolyMesh(*found);
-    }
-    catch (const std::exception& e) {
-        setStatus("Failed to rebuild " + model->name + ": " + e.what(), true);
+    for (size_t i = 0; i < entry.levels.size(); ++i) {
+        const LevelEdit& edit = entry.levels[i];
+        GPUModel* model = m_models.getModel(modelIndices[i]);
+        *model->polyMesh = undo ? edit.before : edit.after;
+        if (edit.modelPath == m_levelBaselinePath)
+            m_levelBaseline = *model->polyMesh;
+        try {
+            m_models.rebuildPolyMesh(modelIndices[i]);
+        }
+        catch (const std::exception& e) {
+            setStatus("Failed to rebuild " + model->name + ": " + e.what(), true);
+        }
     }
     return true;
 }
@@ -329,8 +336,8 @@ bool Editor::applyHistoryEntry(const HistoryEntry& entry, bool undo)
     bool ok = true;
     if (undo && !entry.objects.empty())
         ok = applyObjectChanges(entry.objects, true);
-    if (ok && !entry.modelPath.empty())
-        ok = applyLevelEdit(entry, undo);
+    if (ok && !entry.levels.empty())
+        ok = applyLevelEdits(entry, undo);
     if (ok && !undo && !entry.objects.empty())
         ok = applyObjectChanges(entry.objects, false);
     resetObjectBaseline();

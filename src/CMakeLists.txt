@@ -68,6 +68,9 @@
   editor/EditorUv.cpp
   editor/EditorPrefab.cpp
   editor/EditorHistory.cpp
+  editor/EditorCommands.cpp
+  editor/McpServer.h
+  editor/McpServer.cpp
   editor/EditorStyle.h
   editor/FileDialog.h
   game/Game.h
@@ -117,5 +120,10 @@ target_link_libraries(engine PRIVATE
     nlohmann_json::nlohmann_json
     Jolt
 )
+
+# Sockets for the editor's MCP server.
+if (WIN32)
+  target_link_libraries(engine PRIVATE ws2_32)
+endif()
 
 

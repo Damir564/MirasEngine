@@ -1,6 +1,7 @@
 #pragma once
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -8,6 +9,7 @@
 #include <unordered_map>
 #include <vector>
 #include <glm/glm.hpp>
+#include <nlohmann/json_fwd.hpp>
 #include "imgui.h"
 #include "app/AppMode.h"
 #include "engine/Camera.h"
@@ -19,11 +21,14 @@
 #include "engine/PolyMesh.h"
 #include "engine/Renderer.h"
 
+class McpServer;
+
 // The scene editor: viewport interaction (picking, gizmo, camera) plus the docked ImGui panels.
 // The implementation is split by panel across the Editor*.cpp files.
 class Editor final : public AppMode {
 public:
     explicit Editor(const EngineContext& engine);
+    ~Editor() override;
 
     Editor(const Editor&) = delete;
     Editor& operator=(const Editor&) = delete;
@@ -40,6 +45,11 @@ public:
 
     // Replaces the current scene and reports the outcome in the status bar.
     void openScene(const std::string& path);
+    // Lets MCP clients (e.g. Claude Code) edit the scene through http://127.0.0.1:<port>/mcp.
+    void startMcpServer(uint16_t port);
+    // Runs a command script (one MCP command per line, see EditorCommands.cpp) as one undo step, once
+    // no edit is in progress and the scene has loaded.
+    void runScript(const std::string& path);
 
 private:
     // Hierarchy actions are applied after the tree is drawn so the instance list is stable while drawing.
@@ -155,6 +165,7 @@ private:
     void openSceneDialog();
     void saveSceneAsDialog();
     void importModelDialog();
+    void runScriptDialog();
     void drawFileDialogs();
 
     // ---- EditorGizmo.cpp ----
@@ -349,6 +360,9 @@ private:
     void saveAsPrefab(int instanceIndex, const std::string& path);
     // Adds a locked instance of the prefab; it shares the model of instances already in the scene.
     void addPrefab(const std::string& path);
+    // The model of the prefab: the one instances already share, else loaded from the file. Empty (with
+    // the status set) when the file can't be loaded.
+    std::optional<size_t> loadPrefabModel(const std::string& path);
     // Prefab files in kPrefabsRoot plus a Browse item.
     void drawPrefabMenuItems();
     // Level panel: link, lock and file actions of the selected prefab instance.
@@ -376,13 +390,18 @@ private:
         std::optional<ObjectRecord> before; // empty: the object was created
         std::optional<ObjectRecord> after;  // empty: the object was deleted
     };
-    // One step: a level geometry edit, object changes (transform, color, visibility, name, lock, model,
-    // existence), or both when one action did both (e.g. subtract deleting the cutter).
-    struct HistoryEntry {
-        std::string action;
-        std::string modelPath; // empty when no geometry changed
+    // A level shape's geometry before and after a step.
+    struct LevelEdit {
+        std::string modelPath;
         PolyMesh before;
         PolyMesh after;
+    };
+    // One step: geometry edits (one shape from the editor, several from an MCP command or script), object
+    // changes (transform, color, visibility, name, lock, model, existence), or both when one action did
+    // both (e.g. subtract deleting the cutter).
+    struct HistoryEntry {
+        std::string action;
+        std::vector<LevelEdit> levels; // empty when no geometry changed
         std::vector<ObjectChange> objects;
     };
     // Turns finished geometry edits into history entries; runs once per frame after the panels.
@@ -404,12 +423,27 @@ private:
     // Model index for a record, rebuilding a released level model under its old path if needed.
     std::optional<size_t> resolveRecordModel(const ObjectRecord& record);
     bool applyObjectChanges(const std::vector<ObjectChange>& changes, bool undo);
-    bool applyLevelEdit(const HistoryEntry& entry, bool undo);
+    bool applyLevelEdits(const HistoryEntry& entry, bool undo);
     bool applyHistoryEntry(const HistoryEntry& entry, bool undo);
     void pushHistory(HistoryEntry entry);
     void undo();
     void redo();
     void clearHistory();
+
+    // ---- EditorCommands.cpp ----
+    // The commands MCP clients call: a table of handlers taking JSON arguments. A nested type, so they
+    // can use the editor's internals.
+    struct CommandApi;
+    // Runs queued MCP calls once no edit is in progress; each call is one undo step. In lateUpdate().
+    void pollMcpServer();
+    // Runs the script queued by runScript(). In lateUpdate().
+    void pollScript();
+    // Commands between these become one undo step named `action`.
+    void beginCommandBatch();
+    void endCommandBatch(const std::string& action);
+    // The mesh of a level model, for a command to edit in place: remembered for the undo step and
+    // re-uploaded once at endCommandBatch().
+    PolyMesh& batchEditMesh(size_t modelIndex);
 
     SDL_Window* m_window;
     const VulkanContext& m_vulkan;
@@ -640,4 +674,15 @@ private:
     std::vector<ObjectRecord> m_objectBaseline;
     bool m_objectBaselineValid = false;
     bool m_sceneChanged = false;
+
+    // MCP server and the command batch being run
+    std::unique_ptr<McpServer> m_mcp;
+    struct CommandBatch {
+        bool active = false;
+        std::vector<std::string> existingModels; // level model paths when the batch began
+        std::vector<LevelEdit> edits;            // `after` is filled in at the end
+        std::vector<std::string> dirty;          // level models to re-upload
+    };
+    CommandBatch m_batch;
+    std::string m_pendingScript;
 };

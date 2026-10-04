@@ -8,6 +8,7 @@
 #include <exception>
 #include <iterator>
 #include <limits>
+#include "McpServer.h" // complete type for m_mcp
 #include "engine/ModelLoader.h"
 #include "engine/ModelManager.h"
 #include "engine/SceneManager.h"
@@ -360,6 +361,8 @@ void Editor::lateUpdate(float dt)
         m_camera.yaw = state.yaw;
         m_camera.pitch = state.pitch;
     }
+    pollMcpServer();
+    pollScript();
 }
 
 void Editor::drawUi()

@@ -132,8 +132,12 @@ void Application::createMode(const AppOptions& options)
         return;
     }
     auto editor = std::make_unique<Editor>(context);
+    if (options.mcpPort > 0)
+        editor->startMcpServer(static_cast<uint16_t>(options.mcpPort));
     if (!options.scenePath.empty())
         editor->openScene(options.scenePath);
+    if (!options.scriptPath.empty())
+        editor->runScript(options.scriptPath);
     m_mode = std::move(editor);
 }
 

@@ -50,6 +50,7 @@ void Editor::drawFileMenu()
     if (ImGui::MenuItem("Save Scene As...", "Ctrl+Shift+S")) saveSceneAsDialog();
     ImGui::Separator();
     if (ImGui::MenuItem("Import Model...", "Ctrl+I")) importModelDialog();
+    if (ImGui::MenuItem("Run Script...")) runScriptDialog();
     ImGui::Separator();
     if (ImGui::MenuItem("Exit", "Alt+F4")) m_quitRequested = true;
     ImGui::EndMenu();
@@ -449,9 +450,19 @@ void Editor::importModelDialog()
         "3D Models{.gltf,.glb},.gltf,.glb", kModelsRoot, nullptr, false);
 }
 
+void Editor::runScriptDialog()
+{
+    openFileDialog("RunScriptDlg", "Run Script", "Scripts{.mscript,.txt},.mscript,.txt", "scripts", nullptr, false);
+}
+
 void Editor::drawFileDialogs()
 {
     ImGuiFileDialog* dialog = ImGuiFileDialog::Instance();
+    if (dialog->Display("RunScriptDlg", ImGuiWindowFlags_NoCollapse, kDialogSize)) {
+        if (dialog->IsOk())
+            runScript(toStoredPath(dialog->GetFilePathName()));
+        dialog->Close();
+    }
     if (dialog->Display("BrowseSceneDlg", ImGuiWindowFlags_NoCollapse, kDialogSize)) {
         if (dialog->IsOk()) {
             openScene(toStoredPath(dialog->GetFilePathName()));

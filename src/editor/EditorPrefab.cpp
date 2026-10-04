@@ -100,29 +100,31 @@ void Editor::saveAsPrefab(int instanceIndex, const std::string& path)
     setStatus("Saved prefab " + path);
 }
 
-void Editor::addPrefab(const std::string& path)
+std::optional<size_t> Editor::loadPrefabModel(const std::string& path)
 {
-    std::optional<size_t> modelIndex;
     const auto& models = m_models.getModels();
     for (size_t i = 0; i < models.size(); ++i) {
-        if (models[i] && models[i]->polyMesh && models[i]->prefabPath == path) {
-            modelIndex = i;
-            break;
-        }
+        if (models[i] && models[i]->polyMesh && models[i]->prefabPath == path)
+            return i;
     }
-    if (!modelIndex) {
-        std::optional<Prefab> prefab = loadPrefab(path);
-        if (!prefab) {
-            setStatus("Failed to load prefab: " + path, true);
-            return;
-        }
-        if (prefab->name.empty())
-            prefab->name = std::filesystem::path(path).stem().string();
-        modelIndex = createLevelModel(std::move(prefab->mesh), prefab->name);
-        if (!modelIndex)
-            return;
+    std::optional<Prefab> prefab = loadPrefab(path);
+    if (!prefab) {
+        setStatus("Failed to load prefab: " + path, true);
+        return std::nullopt;
+    }
+    if (prefab->name.empty())
+        prefab->name = std::filesystem::path(path).stem().string();
+    const auto modelIndex = createLevelModel(std::move(prefab->mesh), prefab->name);
+    if (modelIndex)
         m_models.getModel(*modelIndex)->prefabPath = path;
-    }
+    return modelIndex;
+}
+
+void Editor::addPrefab(const std::string& path)
+{
+    const auto modelIndex = loadPrefabModel(path);
+    if (!modelIndex)
+        return;
 
     const std::string name = uniqueInstanceName(m_models.getModel(*modelIndex)->name);
     const size_t newIndex = m_models.createInstance(*modelIndex, placementPoint());

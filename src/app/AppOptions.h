@@ -14,7 +14,9 @@ struct AppOptions {
     VulkanBackend firstVulkanBackend = VulkanBackend::Native;
     int exitAfterFrames = -1; // -1 = run until the window is closed
     std::string scenePath;
+    std::string scriptPath;   // editor: command script run at startup
     std::string settingsPath; // empty = settings.json next to the executable
+    int mcpPort = 47800;      // editor's MCP server on 127.0.0.1; 0 = off
     bool showHelp = false;
 };
 

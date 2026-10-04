@@ -28,6 +28,16 @@ void parseFrameCount(std::string_view value, AppOptions& options)
         options.exitAfterFrames = frames;
 }
 
+void parseMcpPort(std::string_view value, AppOptions& options)
+{
+    int port = 0;
+    auto [end, ec] = std::from_chars(value.data(), value.data() + value.size(), port);
+    if (ec != std::errc() || end != value.data() + value.size() || port < 0 || port > 65535)
+        LOG_ERROR("Warning: invalid --mcp-port value '" << value << "', ignoring\n");
+    else
+        options.mcpPort = port;
+}
+
 void parseVulkanBackend(std::string_view value, AppOptions& options)
 {
     if (value == "auto")
@@ -68,9 +78,17 @@ AppOptions parseAppOptions(int argc, char** argv)
             if (const char* value = takeValue(argc, argv, i, arg, "a scene path"))
                 options.scenePath = value;
         }
+        else if (arg == "--script") {
+            if (const char* value = takeValue(argc, argv, i, arg, "a script path"))
+                options.scriptPath = value;
+        }
         else if (arg == "--settings") {
             if (const char* value = takeValue(argc, argv, i, arg, "a settings path"))
                 options.settingsPath = value;
+        }
+        else if (arg == "--mcp-port") {
+            if (const char* value = takeValue(argc, argv, i, arg, "a port number"))
+                parseMcpPort(value, options);
         }
         else if (arg == "--help" || arg == "-h") {
             options.showHelp = true;
@@ -90,7 +108,9 @@ void showUsage(const char* executableName)
         "  --editor                 Start the editor (default)\n"
         "  --game                   Start the game (main menu, plays level1.scn)\n"
         "  --scene <path>           Editor: open this .scn at startup; game: use it as the level\n"
-        "  --settings <path>        Load and save graphics settings here instead of settings.json\n"
+        "  --script <path>          Editor: run this command script once the scene has loaded\n"
+        "  --settings <path>       Load and save graphics settings here instead of settings.json\n"
+        "  --mcp-port <N>           Editor: MCP server port on 127.0.0.1 (default 47800, 0 = off)\n"
         "  --validation             Enable the Vulkan validation layers\n"
         "  --vulkan <mode>          auto (default): the GPU driver, then emulation layers, then the CPU\n"
         "                           emulated: force the emulation layers; software: render on the CPU\n"
