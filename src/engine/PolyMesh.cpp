@@ -165,6 +165,53 @@ void PolyMesh::extrudeFace(uint32_t faceIndex, float distance)
     }
 }
 
+bool PolyMesh::insetFace(uint32_t faceIndex, float distance)
+{
+    if (faceIndex >= faces.size() || faces[faceIndex].verts.size() < 3 || distance <= 0.0f)
+        return false;
+    const glm::vec3 n = faceNormal(faces[faceIndex]);
+    const std::vector<uint32_t> oldVerts = faces[faceIndex].verts;
+    const size_t count = oldVerts.size();
+
+    // With counter-clockwise winding, cross(n, edge) points into the face. Each corner moves so that
+    // both of its edges shift inward by exactly `distance` (a miter), concave corners included.
+    std::vector<glm::vec3> inner(count);
+    for (size_t i = 0; i < count; ++i) {
+        const glm::vec3& prev = positions[oldVerts[(i + count - 1) % count]];
+        const glm::vec3& cur = positions[oldVerts[i]];
+        const glm::vec3& next = positions[oldVerts[(i + 1) % count]];
+        const glm::vec3 inPrev = glm::normalize(glm::cross(n, cur - prev));
+        const glm::vec3 inNext = glm::normalize(glm::cross(n, next - cur));
+        const float denom = 1.0f + glm::dot(inPrev, inNext);
+        if (!(denom >= 1e-3f)) // the outline doubles back on itself here (NaN: zero-length edge)
+            return false;
+        inner[i] = cur + (inPrev + inNext) * (distance / denom);
+    }
+    // An inset wider than the face flips edges around; reject that instead of making inverted faces.
+    for (size_t i = 0; i < count; ++i) {
+        const size_t j = (i + 1) % count;
+        const glm::vec3 oldEdge = positions[oldVerts[j]] - positions[oldVerts[i]];
+        const glm::vec3 newEdge = inner[j] - inner[i];
+        if (glm::dot(oldEdge, newEdge) <= 1e-6f * glm::dot(oldEdge, oldEdge))
+            return false;
+    }
+
+    std::vector<uint32_t> newVerts(count);
+    for (size_t i = 0; i < count; ++i) {
+        newVerts[i] = static_cast<uint32_t>(positions.size());
+        positions.push_back(inner[i]);
+    }
+    // Border quads copy the face, so the texture runs on across them unchanged.
+    PolyFace border = faces[faceIndex];
+    faces[faceIndex].verts = newVerts;
+    for (size_t i = 0; i < count; ++i) {
+        const size_t j = (i + 1) % count;
+        border.verts = { oldVerts[i], oldVerts[j], newVerts[j], newVerts[i] };
+        faces.push_back(border);
+    }
+    return true;
+}
+
 void PolyMesh::flipFace(uint32_t faceIndex)
 {
     if (faceIndex < faces.size())
@@ -280,6 +327,13 @@ bool PolyMesh::isEdge(uint32_t a, uint32_t b) const
 
 uint32_t PolyMesh::splitEdge(uint32_t a, uint32_t b)
 {
+    if (a >= positions.size() || b >= positions.size())
+        return UINT32_MAX;
+    return splitEdgeAt(a, b, (positions[a] + positions[b]) * 0.5f);
+}
+
+uint32_t PolyMesh::splitEdgeAt(uint32_t a, uint32_t b, const glm::vec3& point)
+{
     if (a == b || a >= positions.size() || b >= positions.size())
         return UINT32_MAX;
     uint32_t mid = UINT32_MAX;
@@ -291,7 +345,7 @@ uint32_t PolyMesh::splitEdge(uint32_t a, uint32_t b)
                 continue;
             if (mid == UINT32_MAX) {
                 mid = static_cast<uint32_t>(positions.size());
-                positions.push_back((positions[a] + positions[b]) * 0.5f);
+                positions.push_back(point);
             }
             // At i == count - 1 this appends, which is between the last and first corner.
             face.verts.insert(face.verts.begin() + static_cast<std::ptrdiff_t>(i + 1), mid);
@@ -362,6 +416,336 @@ uint32_t PolyMesh::connectVertices(uint32_t a, uint32_t b)
     other.verts = std::move(second);
     faces.push_back(std::move(other));
     return static_cast<uint32_t>(faces.size() - 1);
+}
+
+namespace {
+
+// Drawn points closer than this (object units) to the outline count as on it.
+constexpr float kOnBorder = 1e-4f;
+
+// 2D coordinates on a face's plane; counter-clockwise faces stay counter-clockwise.
+struct FacePlane {
+    glm::vec3 t, b;
+    explicit FacePlane(const glm::vec3& n) { faceBasis(n, t, b); }
+    glm::vec2 operator()(const glm::vec3& p) const { return { glm::dot(p, t), glm::dot(p, b) }; }
+};
+
+std::vector<glm::vec2> projectFace(const PolyMesh& mesh, const PolyFace& face, const FacePlane& plane)
+{
+    std::vector<glm::vec2> out;
+    out.reserve(face.verts.size());
+    for (uint32_t v : face.verts)
+        out.push_back(plane(mesh.positions[v]));
+    return out;
+}
+
+float segmentDistance(const glm::vec2& p, const glm::vec2& a, const glm::vec2& b)
+{
+    const glm::vec2 ab = b - a;
+    const float len2 = glm::dot(ab, ab);
+    const float s = len2 > 0.0f ? std::clamp(glm::dot(p - a, ab) / len2, 0.0f, 1.0f) : 0.0f;
+    return glm::length(p - (a + ab * s));
+}
+
+bool insidePolygon(const glm::vec2& p, const std::vector<glm::vec2>& poly)
+{
+    bool inside = false;
+    for (size_t i = 0, j = poly.size() - 1; i < poly.size(); j = i++)
+        if ((poly[i].y > p.y) != (poly[j].y > p.y) &&
+            p.x < poly[i].x + (p.y - poly[i].y) * (poly[j].x - poly[i].x) / (poly[j].y - poly[i].y))
+            inside = !inside;
+    return inside;
+}
+
+bool onPolygonBorder(const glm::vec2& p, const std::vector<glm::vec2>& poly)
+{
+    for (size_t i = 0; i < poly.size(); ++i)
+        if (segmentDistance(p, poly[i], poly[(i + 1) % poly.size()]) <= kOnBorder)
+            return true;
+    return false;
+}
+
+// Segments a-b and c-d cross at a point clearly inside both; touching at or along them doesn't count.
+bool segmentsCrossClearly(const glm::vec2& a, const glm::vec2& b, const glm::vec2& c, const glm::vec2& d)
+{
+    const auto side = [](const glm::vec2& from, const glm::vec2& to, const glm::vec2& p) {
+        const float len = glm::length(to - from);
+        return len > 0.0f ? cross2(to - from, p - from) / len : 0.0f;
+    };
+    const auto opposite = [](float u, float w) {
+        return (u > kOnBorder && w < -kOnBorder) || (u < -kOnBorder && w > kOnBorder);
+    };
+    return opposite(side(a, b, c), side(a, b, d)) && opposite(side(c, d, a), side(c, d, b));
+}
+
+float signedArea(const std::vector<glm::vec2>& poly)
+{
+    float area = 0.0f;
+    for (size_t i = 0; i < poly.size(); ++i)
+        area += cross2(poly[i], poly[(i + 1) % poly.size()]);
+    return area * 0.5f;
+}
+}
+
+bool PolyMesh::onFaceBorder(uint32_t faceIndex, const glm::vec3& point) const
+{
+    if (faceIndex >= faces.size() || faces[faceIndex].verts.size() < 3)
+        return false;
+    const FacePlane plane(faceNormal(faces[faceIndex]));
+    return onPolygonBorder(plane(point), projectFace(*this, faces[faceIndex], plane));
+}
+
+uint32_t PolyMesh::divideFace(uint32_t faceIndex, const std::vector<glm::vec3>& points, bool closed, std::string* error)
+{
+    const auto fail = [error](const char* message) {
+        if (error)
+            *error = message;
+        return UINT32_MAX;
+    };
+    if (faceIndex >= faces.size() || faces[faceIndex].verts.size() < 3)
+        return fail("No face to divide");
+    const glm::vec3 n = faceNormal(faces[faceIndex]);
+    const FacePlane plane(n);
+    const float planeOffset = glm::dot(n, positions[faces[faceIndex].verts[0]]);
+
+    // Onto the plane; repeats (double clicks, a closing point on the first one) are dropped.
+    std::vector<glm::vec3> pts;
+    for (const glm::vec3& p : points) {
+        const glm::vec3 flat = p - n * (glm::dot(n, p) - planeOffset);
+        if (pts.empty() || glm::length(flat - pts.back()) > kOnBorder)
+            pts.push_back(flat);
+    }
+    if (closed && pts.size() > 1 && glm::length(pts.front() - pts.back()) <= kOnBorder)
+        pts.pop_back();
+    if (pts.size() < (closed ? 3u : 2u))
+        return fail(closed ? "A closed shape needs at least three points" : "A cut needs at least two points");
+
+    const std::vector<glm::vec2> outline = projectFace(*this, faces[faceIndex], plane);
+    const size_t count = pts.size();
+    const size_t segments = closed ? count : count - 1;
+    std::vector<glm::vec2> q(count);
+    std::vector<bool> onBorder(count);
+    for (size_t i = 0; i < count; ++i) {
+        q[i] = plane(pts[i]);
+        onBorder[i] = onPolygonBorder(q[i], outline);
+        if (!onBorder[i] && !insidePolygon(q[i], outline))
+            return fail("The shape must stay on the face");
+        for (size_t j = 0; j < i; ++j)
+            if (glm::length(q[i] - q[j]) <= kOnBorder)
+                return fail("The shape passes the same point twice");
+    }
+    for (size_t s = 0; s < segments; ++s) {
+        const glm::vec2 a = q[s], b = q[(s + 1) % count];
+        for (size_t e = 0; e < outline.size(); ++e)
+            if (segmentsCrossClearly(a, b, outline[e], outline[(e + 1) % outline.size()]))
+                return fail("The shape must stay on the face");
+        // Catches segments leaving a concave face through one of its corners.
+        for (float f : { 0.25f, 0.5f, 0.75f }) {
+            const glm::vec2 p = glm::mix(a, b, f);
+            if (!onPolygonBorder(p, outline) && !insidePolygon(p, outline))
+                return fail("The shape must stay on the face");
+        }
+        for (size_t s2 = s + 2; s2 < segments; ++s2)
+            if (!(closed && s == 0 && s2 == count - 1) && segmentsCrossClearly(a, b, q[s2], q[(s2 + 1) % count]))
+                return fail("The shape crosses itself");
+    }
+
+    PolyMesh work = *this;
+    // Border points become corners of the face, splitting the edge they are on in every face using it so
+    // neighbours get no cracks; the others become new vertices.
+    std::vector<uint32_t> ids(count);
+    for (size_t i = 0; i < count; ++i) {
+        if (!onBorder[i]) {
+            ids[i] = static_cast<uint32_t>(work.positions.size());
+            work.positions.push_back(pts[i]);
+            continue;
+        }
+        const std::vector<uint32_t> verts = work.faces[faceIndex].verts;
+        uint32_t id = UINT32_MAX;
+        for (uint32_t v : verts) {
+            if (glm::length(plane(work.positions[v]) - q[i]) <= kOnBorder) {
+                id = v;
+                break;
+            }
+        }
+        for (size_t e = 0; e < verts.size() && id == UINT32_MAX; ++e) {
+            const uint32_t u = verts[e], w = verts[(e + 1) % verts.size()];
+            const glm::vec2 pu = plane(work.positions[u]), pw = plane(work.positions[w]);
+            if (segmentDistance(q[i], pu, pw) > kOnBorder)
+                continue;
+            // Placed on the edge itself, so the edge stays straight.
+            const float s = glm::dot(q[i] - pu, pw - pu) / glm::dot(pw - pu, pw - pu);
+            id = work.splitEdgeAt(u, w, glm::mix(work.positions[u], work.positions[w], s));
+        }
+        if (id == UINT32_MAX)
+            return fail("The shape must stay on the face");
+        ids[i] = id;
+    }
+
+    if (std::none_of(onBorder.begin(), onBorder.end(), [](bool b) { return b; })) {
+        if (!closed)
+            return fail("A cut must start and end on the face's border");
+        // A hole: the shape becomes the face and the ring around it is split in two by two bridges
+        // between outline and shape corners (shortest ones that stay inside the ring and don't cross).
+        std::vector<uint32_t> inner = ids;
+        std::vector<glm::vec2> innerPts = q;
+        if (signedArea(innerPts) < 0.0f) {
+            std::reverse(inner.begin(), inner.end());
+            std::reverse(innerPts.begin(), innerPts.end());
+        }
+        const std::vector<uint32_t> outer = work.faces[faceIndex].verts;
+        struct Bridge {
+            size_t o, i;
+            float length;
+        };
+        std::vector<Bridge> bridges;
+        for (size_t o = 0; o < outer.size(); ++o) {
+            for (size_t i = 0; i < inner.size(); ++i) {
+                const glm::vec2 a = outline[o], b = innerPts[i];
+                bool valid = true;
+                for (size_t e = 0; e < outline.size() && valid; ++e)
+                    valid = !segmentsCrossClearly(a, b, outline[e], outline[(e + 1) % outline.size()]);
+                for (size_t e = 0; e < innerPts.size() && valid; ++e)
+                    valid = !segmentsCrossClearly(a, b, innerPts[e], innerPts[(e + 1) % innerPts.size()]);
+                const glm::vec2 mid = (a + b) * 0.5f;
+                if (valid && insidePolygon(mid, outline) && !insidePolygon(mid, innerPts))
+                    bridges.push_back({ o, i, glm::length(b - a) });
+            }
+        }
+        std::sort(bridges.begin(), bridges.end(), [](const Bridge& x, const Bridge& y) { return x.length < y.length; });
+        const Bridge* first = bridges.empty() ? nullptr : &bridges.front();
+        const Bridge* second = nullptr;
+        for (const Bridge& bridge : bridges) {
+            if (first && bridge.o != first->o && bridge.i != first->i &&
+                !segmentsCrossClearly(outline[bridge.o], innerPts[bridge.i], outline[first->o], innerPts[first->i])) {
+                second = &bridge;
+                break;
+            }
+        }
+        if (!second)
+            return fail("Can't split the face around this shape");
+        // Outline forward from oFrom to oTo, then the shape backward (the ring runs around it clockwise).
+        const auto piece = [&](size_t oFrom, size_t oTo, size_t iFrom, size_t iTo) {
+            std::vector<uint32_t> verts;
+            for (size_t k = oFrom;; k = (k + 1) % outer.size()) {
+                verts.push_back(outer[k]);
+                if (k == oTo)
+                    break;
+            }
+            for (size_t k = iFrom;; k = (k + inner.size() - 1) % inner.size()) {
+                verts.push_back(inner[k]);
+                if (k == iTo)
+                    break;
+            }
+            return verts;
+        };
+        PolyFace ring = work.faces[faceIndex];
+        work.faces[faceIndex].verts = inner;
+        ring.verts = piece(first->o, second->o, second->i, first->i);
+        work.faces.push_back(ring);
+        ring.verts = piece(second->o, first->o, first->i, second->i);
+        work.faces.push_back(std::move(ring));
+        *this = std::move(work);
+        return faceIndex;
+    }
+
+    if (!closed && (!onBorder.front() || !onBorder.back()))
+        return fail("A cut must start and end on the face's border");
+    // Walked from a border point; each run between two border points cuts the piece it crosses in two.
+    std::vector<uint32_t> walk;
+    std::vector<bool> walkBorder;
+    const size_t start = closed ? static_cast<size_t>(std::find(onBorder.begin(), onBorder.end(), true) - onBorder.begin()) : 0;
+    for (size_t k = 0; k < (closed ? count + 1 : count); ++k) {
+        walk.push_back(ids[(start + k) % count]);
+        walkBorder.push_back(onBorder[(start + k) % count]);
+    }
+    std::vector<uint32_t> pieces{ faceIndex };
+    bool divided = false;
+    size_t runStart = 0;
+    for (size_t k = 1; k < walk.size(); ++k) {
+        if (!walkBorder[k])
+            continue;
+        const uint32_t b0 = walk[runStart], b1 = walk[k];
+        const std::vector<uint32_t> interior(walk.begin() + static_cast<std::ptrdiff_t>(runStart + 1),
+            walk.begin() + static_cast<std::ptrdiff_t>(k));
+        runStart = k;
+        if (b0 == b1)
+            return fail("The shape must touch the border at two different points");
+        const glm::vec2 p0 = plane(work.positions[b0]);
+        const glm::vec2 probe = (p0 + plane(work.positions[interior.empty() ? b1 : interior.front()])) * 0.5f;
+        uint32_t target = UINT32_MAX;
+        bool along = false;
+        for (uint32_t f : pieces) {
+            const PolyFace& face = work.faces[f];
+            const size_t c = face.verts.size();
+            const size_t ia = cornerOf(face, b0), ib = cornerOf(face, b1);
+            if (ia == c || ib == c)
+                continue;
+            const std::vector<glm::vec2> piecePts = projectFace(work, face, plane);
+            // A straight run along the border divides nothing.
+            const size_t gap = (ib + c - ia) % c;
+            if (interior.empty() && (gap == 1 || gap == c - 1 || onPolygonBorder(probe, piecePts))) {
+                along = true;
+                break;
+            }
+            if (insidePolygon(probe, piecePts)) {
+                target = f;
+                break;
+            }
+        }
+        if (along)
+            continue;
+        if (target == UINT32_MAX)
+            return fail("The shape must stay on the face");
+
+        PolyFace& face = work.faces[target];
+        const std::vector<uint32_t> verts = face.verts;
+        const size_t c = verts.size();
+        const size_t ia = cornerOf(face, b0), ib = cornerOf(face, b1);
+        // Both halves keep the face's winding: outline one way round, then back along the run.
+        std::vector<uint32_t> firstHalf, secondHalf;
+        for (size_t i = ia;; i = (i + 1) % c) {
+            firstHalf.push_back(verts[i]);
+            if (i == ib)
+                break;
+        }
+        firstHalf.insert(firstHalf.end(), interior.rbegin(), interior.rend());
+        for (size_t i = ib;; i = (i + 1) % c) {
+            secondHalf.push_back(verts[i]);
+            if (i == ia)
+                break;
+        }
+        secondHalf.insert(secondHalf.end(), interior.begin(), interior.end());
+        PolyFace other = face;
+        face.verts = std::move(firstHalf);
+        other.verts = std::move(secondHalf);
+        work.faces.push_back(std::move(other));
+        pieces.push_back(static_cast<uint32_t>(work.faces.size() - 1));
+        divided = true;
+    }
+    if (!divided)
+        return fail("The shape doesn't divide the face");
+
+    uint32_t result = faceIndex;
+    if (closed) {
+        // Pieces lie wholly inside or outside the shape, so one point of each tells which is which.
+        std::vector<std::array<uint32_t, 3>> tris;
+        for (uint32_t f : pieces) {
+            tris.clear();
+            work.triangulate(work.faces[f], tris);
+            if (tris.empty())
+                continue;
+            const std::vector<uint32_t>& verts = work.faces[f].verts;
+            const glm::vec2 centroid = (plane(work.positions[verts[tris[0][0]]]) + plane(work.positions[verts[tris[0][1]]]) +
+                plane(work.positions[verts[tris[0][2]]])) / 3.0f;
+            if (insidePolygon(centroid, q)) {
+                result = f;
+                break;
+            }
+        }
+    }
+    *this = std::move(work);
+    return result;
 }
 
 size_t PolyMesh::clip(const glm::vec3& normal, float offset)

@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <numeric>
 #include <SDL3/SDL_keyboard.h>
+#include <glm/gtc/constants.hpp>
 #include "EditorStyle.h"
 #include "FileDialog.h"
 #include "engine/ModelManager.h"
@@ -18,7 +19,22 @@ constexpr ImU32 kFaceEdges = IM_COL32(255, 255, 255, 70);
 constexpr ImU32 kVertexDot = IM_COL32(255, 255, 255, 200);
 constexpr ImU32 kClipOutline = IM_COL32(80, 200, 255, 255);
 constexpr ImU32 kMirrorOutline = IM_COL32(230, 110, 255, 255);
+constexpr ImU32 kDrawOutline = IM_COL32(110, 255, 140, 255);
 constexpr float kVertexPickRadius = 10.0f;
+
+int dominantAxis(const glm::vec3& n)
+{
+    const glm::vec3 a = glm::abs(n);
+    return a.x >= a.y && a.x >= a.z ? 0 : (a.y >= a.z ? 1 : 2);
+}
+
+// Recomputes coordinate `axis` of p so that p lies on the plane through `point` with normal n.
+glm::vec3 ontoPlaneAlong(glm::vec3 p, int axis, const glm::vec3& point, const glm::vec3& n)
+{
+    p[axis] = 0.0f;
+    p[axis] = (glm::dot(n, point) - glm::dot(n, p)) / n[axis];
+    return p;
+}
 
 bool rayHitsPlane(const Ray& ray, const glm::vec3& point, const glm::vec3& normal, glm::vec3& hit)
 {
@@ -412,6 +428,183 @@ void Editor::dragLevelFace(float mouseX, float mouseY)
     m_faceDrag.moved = true;
 }
 
+bool Editor::faceDrawValid()
+{
+    if (!m_faceDraw.active)
+        return false;
+    const PolyMesh* mesh = selectedLevelMesh();
+    if (!mesh || m_levelMode != LevelEditMode::Face || m_gizmo.selectedInstance != m_faceDraw.instance ||
+        m_selectedFace != static_cast<int>(m_faceDraw.face) || m_faceDraw.face >= mesh->faces.size()) {
+        m_faceDraw = {};
+        return false;
+    }
+    return true;
+}
+
+bool Editor::faceDrawPoint(float mouseX, float mouseY, glm::vec3& out)
+{
+    const PolyMesh& mesh = *selectedLevelMesh();
+    const PolyFace& face = mesh.faces[m_faceDraw.face];
+    const glm::mat4 transform = m_models.getInstances()[m_gizmo.selectedInstance].getTransformMatrix();
+    const glm::mat4 inverse = glm::inverse(transform);
+    const Ray ray = screenToWorldRay(mouseX, mouseY, m_sceneView.width, m_sceneView.height,
+        getView(m_camera), sceneProjection());
+    Ray localRay;
+    localRay.origin = glm::vec3(inverse * glm::vec4(ray.origin, 1.0f));
+    localRay.direction = glm::vec3(inverse * glm::vec4(ray.direction, 0.0f));
+    const glm::vec3 n = mesh.faceNormal(face);
+    const glm::vec3 p0 = mesh.positions[face.verts[0]];
+    glm::vec3 hit;
+    if (!rayHitsPlane(localRay, p0, n, hit))
+        return false;
+
+    const glm::mat4 mvp = sceneProjection() * getView(m_camera) * transform;
+    const glm::vec2 mouse(mouseX, mouseY);
+    const auto screenDistance = [&](const glm::vec3& p) {
+        if ((mvp * glm::vec4(p, 1.0f)).w <= 1e-4f)
+            return FLT_MAX;
+        return glm::length(worldToScreen(p, mvp, m_sceneView.width, m_sceneView.height) - mouse);
+    };
+    // Face corners and the shape's own points win, so cuts start exactly on corners and shapes close.
+    float best = kVertexPickRadius;
+    bool found = false;
+    const auto consider = [&](const glm::vec3& p) {
+        const float d = screenDistance(p);
+        if (d < best) {
+            best = d;
+            out = p;
+            found = true;
+        }
+    };
+    for (uint32_t v : face.verts)
+        consider(mesh.positions[v]);
+    for (const glm::vec3& p : m_faceDraw.points)
+        consider(p);
+    if (found)
+        return true;
+    if (snapActive()) {
+        // Snapped on the two object axes across the face, the third following from the plane, so on
+        // axis-aligned faces points land exactly on the shape's grid.
+        const int axis = dominantAxis(n);
+        out = ontoPlaneAlong(glm::round(hit / mesh.gridSize) * mesh.gridSize, axis, p0, n);
+        return true;
+    }
+    out = hit;
+    const size_t count = face.verts.size();
+    for (size_t i = 0; i < count; ++i) {
+        const glm::vec3 a = mesh.positions[face.verts[i]];
+        const glm::vec3 ab = mesh.positions[face.verts[(i + 1) % count]] - a;
+        const float len2 = glm::dot(ab, ab);
+        if (len2 > 0.0f)
+            consider(a + ab * std::clamp(glm::dot(hit - a, ab) / len2, 0.0f, 1.0f));
+    }
+    return true;
+}
+
+std::vector<glm::vec3> Editor::faceDrawOutline(const glm::vec3* hover)
+{
+    std::vector<glm::vec3> points = m_faceDraw.points;
+    if (hover)
+        points.push_back(*hover);
+    if (m_faceDrawShape == FaceDrawShape::Polygon || points.size() < 2)
+        return points;
+    const PolyMesh& mesh = *selectedLevelMesh();
+    const glm::vec3 n = mesh.faceNormal(mesh.faces[m_faceDraw.face]);
+    const glm::vec3 a = points[0], b = points[1];
+    if (m_faceDrawShape == FaceDrawShape::Rectangle) {
+        // Sides follow the object axes across the face, like the grid.
+        const int axis = dominantAxis(n);
+        const int u = (axis + 1) % 3;
+        glm::vec3 c1 = a, c2 = b;
+        c1[u] = b[u];
+        c2[u] = a[u];
+        return { a, ontoPlaneAlong(c1, axis, a, n), b, ontoPlaneAlong(c2, axis, a, n) };
+    }
+    // Circle around a, with its first corner on b.
+    const glm::vec3 radius = b - a;
+    const glm::vec3 side = glm::cross(n, radius);
+    const int segments = std::clamp(m_faceDrawSegments, 3, 64);
+    std::vector<glm::vec3> circle;
+    for (int i = 0; i < segments; ++i) {
+        const float angle = glm::two_pi<float>() * static_cast<float>(i) / static_cast<float>(segments);
+        circle.push_back(a + radius * std::cos(angle) + side * std::sin(angle));
+    }
+    return circle;
+}
+
+void Editor::handleFaceDrawClick(float mouseX, float mouseY)
+{
+    glm::vec3 point;
+    if (!faceDrawPoint(mouseX, mouseY, point))
+        return;
+    std::vector<glm::vec3>& points = m_faceDraw.points;
+    if (m_faceDrawShape != FaceDrawShape::Polygon) {
+        points.push_back(point);
+        if (points.size() >= 2)
+            applyFaceDraw(true);
+        return;
+    }
+    // faceDrawPoint() snaps to the first point, so clicking it again closes the shape.
+    if (points.size() >= 3 && point == points.front()) {
+        applyFaceDraw(true);
+        return;
+    }
+    if (!points.empty() && point == points.back())
+        return;
+    points.push_back(point);
+    // A run from the border across the face back to the border is a cut and finishes by itself.
+    const PolyMesh& mesh = *selectedLevelMesh();
+    const uint32_t face = m_faceDraw.face;
+    if (points.size() >= 2 && mesh.onFaceBorder(face, points.front()) && mesh.onFaceBorder(face, point) &&
+        !mesh.onFaceBorder(face, (points[points.size() - 2] + point) * 0.5f))
+        applyFaceDraw(false);
+}
+
+void Editor::applyFaceDraw(bool closed)
+{
+    if (!faceDrawValid())
+        return;
+    PolyMesh& mesh = *selectedLevelMesh();
+    std::string error;
+    const uint32_t piece = mesh.divideFace(m_faceDraw.face, faceDrawOutline(nullptr), closed, &error);
+    if (piece == UINT32_MAX) {
+        setStatus(error, true);
+        // Two-click shapes start over; a polygon keeps its points so the last ones can be taken back.
+        if (m_faceDrawShape != FaceDrawShape::Polygon)
+            m_faceDraw.points.clear();
+        return;
+    }
+    rebuildSelectedLevelModel("divide face");
+    m_faceDraw = {};
+    // The part inside the shape, ready to extrude.
+    clearFaceSelection();
+    selectLevelFace(piece, false);
+    setStatus("Face divided");
+}
+
+bool Editor::handleFaceDrawKeys()
+{
+    if (!faceDrawValid())
+        return false;
+    if (ImGui::IsKeyChordPressed(ImGuiKey_Escape)) {
+        m_faceDraw = {};
+        setStatus("Drawing cancelled");
+        return true;
+    }
+    if (ImGui::IsKeyChordPressed(ImGuiKey_Backspace) && !m_faceDraw.points.empty())
+        m_faceDraw.points.pop_back();
+    if (m_faceDrawShape == FaceDrawShape::Polygon &&
+        (ImGui::IsKeyChordPressed(ImGuiKey_Enter) || ImGui::IsKeyChordPressed(ImGuiKey_KeypadEnter))) {
+        // Ending on the border after starting on it makes a cut; anything else closes the shape.
+        const PolyMesh& mesh = *selectedLevelMesh();
+        const std::vector<glm::vec3>& points = m_faceDraw.points;
+        const bool cut = points.size() >= 2 && mesh.onFaceBorder(m_faceDraw.face, points.front()) &&
+            mesh.onFaceBorder(m_faceDraw.face, points.back());
+        applyFaceDraw(!cut);
+    }
+    return true;
+}
+
 void Editor::finishVertexMarquee(float mouseX, float mouseY)
 {
     m_vertexMarquee.active = false;
@@ -488,6 +681,26 @@ void Editor::drawLevelFaceOverlay()
             if (static_cast<int>(f) != m_selectedFace)
                 drawFace(*mesh, mesh->faces[f], kFaceGroupOutline, 2.0f);
         drawFace(*mesh, *selected, kFaceOutline, 3.0f);
+    }
+    if (faceDrawValid()) {
+        const ImVec2 mousePos = ImGui::GetMousePos();
+        glm::vec3 hover;
+        const bool hovering = sceneViewContains(mousePos.x, mousePos.y) &&
+            faceDrawPoint(mousePos.x - origin.x, mousePos.y - origin.y, hover);
+        const std::vector<glm::vec3> shape = faceDrawOutline(hovering ? &hover : nullptr);
+        for (size_t i = 0; i + 1 < shape.size(); ++i)
+            drawLine(shape[i], shape[i + 1], kDrawOutline, 2.0f);
+        if (m_faceDrawShape != FaceDrawShape::Polygon && shape.size() > 2)
+            drawLine(shape.back(), shape.front(), kDrawOutline, 2.0f);
+        const auto drawDot = [&](const glm::vec3& p, float radius) {
+            const glm::vec2 s = worldToScreen(p, mvp, m_sceneView.width, m_sceneView.height);
+            if (s.x > -5000.0f)
+                drawList->AddCircleFilled(ImVec2(origin.x + s.x, origin.y + s.y), radius, kDrawOutline);
+        };
+        for (const glm::vec3& p : m_faceDraw.points)
+            drawDot(p, 4.0f);
+        if (hovering)
+            drawDot(hover, 5.5f);
     }
     if (selected && m_faceDrag.active && m_faceDrag.distance != 0.0f) {
         const glm::vec2 p = worldToScreen(mesh->faceCenter(*selected), mvp, m_sceneView.width, m_sceneView.height);
@@ -1260,6 +1473,58 @@ void Editor::drawFaceGeometry(PolyMesh& mesh, uint32_t faceIndex)
     ImGui::SameLine();
     const bool extrude = ImGui::Button("Extrude", ImVec2(width, 0.0f));
     ImGui::SetItemTooltip("Build new side faces out to the moved face");
+
+    EditorStyle::propertyLabel("Inset");
+    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.5f);
+    // Insets are usually a fraction of a cell, so this one steps by quarter cells and doesn't snap.
+    ImGui::InputFloat("##faceInset", &m_faceInsetDistance, grid * 0.25f, grid, "%.3g");
+    m_faceInsetDistance = std::clamp(m_faceInsetDistance, 0.0f, 1000.0f);
+    ImGui::SetItemTooltip("How far the new edges sit inside the face's border, in object space");
+    ImGui::SameLine();
+    if (ImGui::Button("Inset", ImVec2(-FLT_MIN, 0.0f))) {
+        if (mesh.insetFace(faceIndex, m_faceInsetDistance))
+            rebuildSelectedLevelModel("inset");
+        else
+            setStatus("Inset too large for this face", true);
+    }
+    ImGui::SetItemTooltip("Add edges inside the face along its border; the inner part stays selected, ready to extrude");
+
+    EditorStyle::propertyLabel("Draw");
+    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.5f);
+    int drawShape = static_cast<int>(m_faceDrawShape);
+    if (ImGui::Combo("##faceDrawShape", &drawShape, "Polygon\0Rectangle\0Circle\0")) {
+        m_faceDrawShape = static_cast<FaceDrawShape>(drawShape);
+        m_faceDraw.points.clear();
+    }
+    ImGui::SetItemTooltip("Shape to draw on the face; applying it divides the face along its outline");
+    ImGui::SameLine();
+    const bool drawing = faceDrawValid();
+    if (ImGui::Button(drawing ? "Cancel##faceDraw" : "Draw##faceDraw", ImVec2(-FLT_MIN, 0.0f))) {
+        m_faceDraw = {};
+        if (!drawing) {
+            m_faceDraw.active = true;
+            m_faceDraw.instance = m_gizmo.selectedInstance;
+            m_faceDraw.face = faceIndex;
+        }
+    }
+    ImGui::SetItemTooltip("Draw on this face in the viewport; points snap to the shape's grid (Ctrl: no snap)");
+    if (m_faceDrawShape == FaceDrawShape::Circle) {
+        EditorStyle::propertyLabel("Sides");
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        ImGui::SliderInt("##faceDrawSides", &m_faceDrawSegments, 3, 64);
+    }
+    if (drawing) {
+        static constexpr const char* kHints[] = {
+            "Click points on the face; click the first one to close. Border to border cuts the face. "
+            "Enter: finish, Backspace: remove point, Esc: cancel",
+            "Click two opposite corners. Esc: cancel",
+            "Click the centre, then a point on the rim. Esc: cancel",
+        };
+        ImGui::PushTextWrapPos(0.0f);
+        ImGui::TextDisabled("%s", kHints[static_cast<int>(m_faceDrawShape)]);
+        ImGui::PopTextWrapPos();
+    }
+
     if (!push && !extrude)
         return;
     if (std::abs(m_faceOpDistance) < 1e-4f) {

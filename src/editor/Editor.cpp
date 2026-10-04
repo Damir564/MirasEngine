@@ -156,6 +156,12 @@ void Editor::handleViewportClick(float mouseX, float mouseY)
         return;
     }
 
+    // Drawing on a face takes every click, so the gizmo or other faces can't get in the way.
+    if (faceDrawValid()) {
+        handleFaceDrawClick(mouseX, mouseY);
+        return;
+    }
+
     const glm::mat4 view = getView(m_camera);
     const glm::mat4 proj = sceneProjection();
     if (tryBeginGizmoDrag(mouseX, mouseY, view, proj))
@@ -474,7 +480,8 @@ void Editor::handleShortcuts()
     if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_D) && selection) duplicateInstance(m_gizmo.selectedInstance);
     if (ImGui::IsKeyChordPressed(ImGuiKey_Delete) && selection && !deleteLevelSelection()) deleteInstance(m_gizmo.selectedInstance);
     if (ImGui::IsKeyChordPressed(ImGuiKey_F) && selection) focusOnInstance(m_gizmo.selectedInstance);
-    if (ImGui::IsKeyChordPressed(ImGuiKey_Escape) && !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId)) deselectAll();
+    const bool drawingOnFace = handleFaceDrawKeys(); // Escape cancels the drawing instead of deselecting
+    if (ImGui::IsKeyChordPressed(ImGuiKey_Escape) && !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId) && !drawingOnFace) deselectAll();
     if (ImGui::IsKeyChordPressed(ImGuiKey_Q)) m_tool = GizmoMode::None;
     if (ImGui::IsKeyChordPressed(ImGuiKey_1)) m_tool = GizmoMode::Translate;
     if (ImGui::IsKeyChordPressed(ImGuiKey_2)) m_tool = GizmoMode::Rotate;

@@ -222,6 +222,18 @@ private:
     // view looks straight along the normal.
     bool faceDragParam(float mouseX, float mouseY, float& param) const;
     void dragLevelFace(float mouseX, float mouseY);
+    // Drawing on a face: false (and drawing ends) once the face or selection it was started on is gone.
+    bool faceDrawValid();
+    // Point on the drawn face's plane under the mouse: a face corner within a few pixels, else snapped to
+    // the shape's grid (or, without snapping, to a nearby edge). False when the plane isn't under the mouse.
+    bool faceDrawPoint(float mouseX, float mouseY, glm::vec3& out);
+    // The shape's outline from the clicked points plus, if given, the point under the mouse.
+    std::vector<glm::vec3> faceDrawOutline(const glm::vec3* hover);
+    void handleFaceDrawClick(float mouseX, float mouseY);
+    // closed: the last point joins the first; otherwise the points are a cut from border to border.
+    void applyFaceDraw(bool closed);
+    // Enter applies, Backspace drops the last point, Escape cancels. True while drawing.
+    bool handleFaceDrawKeys();
     // Selects the vertices inside the box, or picks an object when the mouse barely moved.
     void finishVertexMarquee(float mouseX, float mouseY);
     void drawLevelFaceOverlay();
@@ -524,6 +536,17 @@ private:
         PolyMesh startMesh;
     };
     FaceDrag m_faceDrag;
+    // Face mode: a shape drawn on the active face, which then divides it (PolyMesh::divideFace).
+    enum class FaceDrawShape { Polygon, Rectangle, Circle };
+    struct FaceDraw {
+        bool active = false;
+        int instance = -1;
+        uint32_t face = 0;
+        std::vector<glm::vec3> points; // clicked so far, object space on the face plane
+    };
+    FaceDraw m_faceDraw;
+    FaceDrawShape m_faceDrawShape = FaceDrawShape::Rectangle;
+    int m_faceDrawSegments = 16; // circle
     // Box selection started on empty space in vertex mode; scene-view pixels.
     struct VertexMarquee {
         bool active = false;
@@ -552,6 +575,7 @@ private:
     };
     MaterialDrop m_materialDrop;
     float m_faceOpDistance = 1.0f;
+    float m_faceInsetDistance = 0.25f;
     // Plane dot(normal, p) == offset in the selected shape's object space. "Front" is the side the
     // normal points to.
     struct LevelClip {

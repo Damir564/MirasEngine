@@ -61,6 +61,11 @@ struct PolyMesh {
     // Copies the face's vertices out along its normal and joins old and new outlines with one quad
     // per edge. The face keeps its index and now caps the extrusion; side faces take its material.
     void extrudeFace(uint32_t faceIndex, float distance);
+    // Shrinks a copy of the face's outline by `distance` within its plane and joins old and new
+    // outlines with one quad per edge, adding edges inside the face (e.g. to extrude only its middle).
+    // The face keeps its index and becomes the inner part; the border quads copy its material and UVs.
+    // False, with the mesh unchanged, when the inset would fold the outline over itself.
+    bool insetFace(uint32_t faceIndex, float distance);
     // Reverses the winding, so the face points the other way.
     void flipFace(uint32_t faceIndex);
     // Removes the face and any vertices left unused.
@@ -77,12 +82,24 @@ struct PolyMesh {
     // Adds a vertex halfway along edge a-b, inserted into every face using that edge.
     // Returns its index, or UINT32_MAX if a-b is not an edge.
     uint32_t splitEdge(uint32_t a, uint32_t b);
+    // Same, with the new vertex at `point` (expected to lie on the edge).
+    uint32_t splitEdgeAt(uint32_t a, uint32_t b, const glm::vec3& point);
     // A face holding a and b as non-neighbouring corners, where the line between them stays inside
     // the face. UINT32_MAX if there is none.
     uint32_t faceToConnect(uint32_t a, uint32_t b) const;
     // Cuts that face in two along a-b; both halves keep its material and UVs.
     // Returns the new half's index, or UINT32_MAX if no face can be cut.
     uint32_t connectVertices(uint32_t a, uint32_t b);
+    // True when the point, projected onto the face's plane, lies on the face's outline.
+    bool onFaceBorder(uint32_t faceIndex, const glm::vec3& point) const;
+    // Divides the face along a shape drawn on it (points in order, projected onto the face plane).
+    // A closed shape inside the face becomes a face of its own and the rest is split in two around it;
+    // a shape touching the border cuts the face along its parts between border points (an open one must
+    // start and end on the border). Border points are inserted into the edges they lie on, in every face
+    // using them. All pieces keep the face's material and UVs. Returns the piece inside a closed shape
+    // (the face's own index for an open cut), or UINT32_MAX with the mesh unchanged and `error` set.
+    uint32_t divideFace(uint32_t faceIndex, const std::vector<glm::vec3>& points, bool closed,
+        std::string* error = nullptr);
     // Cuts away everything in front of the plane dot(normal, p) == offset and closes each opening
     // with a cap face. Caps are appended last; returns how many there are.
     size_t clip(const glm::vec3& normal, float offset);
