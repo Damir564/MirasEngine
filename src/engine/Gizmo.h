@@ -1,6 +1,7 @@
 #pragma once
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtc/quaternion.hpp>
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -288,6 +289,20 @@ inline glm::vec3 gizmoAxisDirection(GizmoAxis axis)
     case GizmoAxis::Z: return { 0.0f, 0.0f, 1.0f };
     default: return glm::vec3(0.0f);
     }
+}
+
+// Euler angles in degrees (ModelInstance::rotation, R = Rz * Ry * Rx) after a turn about world axis 0..2.
+// Turns that change a single angle (about Z; about Y with no Z angle; about X alone) just add to it, so
+// the numbers stay readable.
+inline glm::vec3 rotateEulerAboutAxis(glm::vec3 euler, int axis, float degrees)
+{
+    const auto isZero = [](float angle) { return std::abs(std::remainder(angle, 360.0f)) < 1e-4f; };
+    if (axis == 2 || (axis == 1 && isZero(euler.z)) || (axis == 0 && isZero(euler.y) && isZero(euler.z))) {
+        euler[axis] += degrees;
+        return euler;
+    }
+    const glm::quat turn = glm::angleAxis(glm::radians(degrees), gizmoAxisDirection(static_cast<GizmoAxis>(axis + 1)));
+    return glm::degrees(glm::eulerAngles(turn * glm::quat(glm::radians(euler))));
 }
 
 // Transform gizmo geometry in world units of gizmoScale. Drawing and picking both go through

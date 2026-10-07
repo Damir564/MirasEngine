@@ -90,6 +90,13 @@ AppOptions parseAppOptions(int argc, char** argv)
             if (const char* value = takeValue(argc, argv, i, arg, "a port number"))
                 parseMcpPort(value, options);
         }
+        else if (arg == "--mute") {
+            options.mute = true;
+        }
+        else if (arg == "--autoplay") {
+            options.mode = LaunchMode::Game;
+            options.autoplay = true;
+        }
         else if (arg == "--help" || arg == "-h") {
             options.showHelp = true;
         }
@@ -106,7 +113,9 @@ void showUsage(const char* executableName)
         "\n"
         "Options:\n"
         "  --editor                 Start the editor (default)\n"
-        "  --game                   Start the game (main menu, plays level1.scn)\n"
+        "  --game                   Start the game (main menu, plays lvl01.scn)\n"
+        "  --autoplay               Game: a bot plays the level, then quits (for automated tests)\n"
+        "  --mute                   No sound\n"
         "  --scene <path>           Editor: open this .scn at startup; game: use it as the level\n"
         "  --script <path>          Editor: run this command script once the scene has loaded\n"
         "  --settings <path>       Load and save graphics settings here instead of settings.json\n"

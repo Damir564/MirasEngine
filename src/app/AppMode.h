@@ -9,6 +9,7 @@ class SceneManager;
 struct FrameInput;
 struct GraphicsSettings;
 class MaterialLibrary;
+class AudioSystem;
 
 // Engine objects owned by Application that a mode works with. They outlive the mode.
 struct EngineContext {
@@ -21,6 +22,10 @@ struct EngineContext {
     GraphicsSettings& settings;
     // Shared materials (.mat files); ModelManager resolves level slots and overrides through it.
     MaterialLibrary& materials;
+    // Sound playback; silent when there is no audio device. Volumes follow the settings.
+    AudioSystem& audio;
+    // Launch flags the modes care about.
+    bool autoplay = false; // game: a bot plays the level (automated tests)
 };
 
 // Asks Application to switch modes after the current frame.
@@ -42,10 +47,16 @@ public:
     virtual void lateUpdate(float /*dt*/) {}
     // While false, ImGui receives no events and no ImGui frame is built.
     virtual bool uiVisible() const = 0;
+    // Right before ImGui::NewFrame(), outside any ImGui frame: where the style, font size or a saved dock
+    // layout may be changed.
+    virtual void beforeUiFrame() {}
     virtual void drawUi() = 0;
     // Application has already set the window size, ImGui draw data and time.
     virtual void fillFrame(FrameInput& frame) = 0;
     virtual bool quitRequested() const = 0;
+    // The window is being closed: true to quit now; false when the mode asks the user first (and then
+    // reports quitRequested() itself).
+    virtual bool confirmQuit() { return true; }
     // Returns and clears the pending request.
     virtual ModeRequest takeModeRequest() { return ModeRequest::None; }
     // Called when a suspended mode becomes active again.

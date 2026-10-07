@@ -1,7 +1,9 @@
 #version 460
 #extension GL_GOOGLE_include_directive : require
 
+#include "frame_ubo.glsl"
 #include "draw_data.glsl"
+#include "classic.glsl"
 
 layout(location = 0) in vec3 fragLight;
 layout(location = 1) in vec4 fragFog;
@@ -32,5 +34,5 @@ void main() {
         discard;
 
     vec3 color = d.baseColor.rgb * texColor.rgb * fragLight;
-    outColor = vec4(mix(color, fragFog.rgb, fragFog.a), alpha);
+    outColor = vec4(classicDither(mix(color, fragFog.rgb, fragFog.a), gl_FragCoord.xy), alpha);
 }

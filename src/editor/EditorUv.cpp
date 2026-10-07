@@ -37,29 +37,39 @@ void Editor::handleFaceKeys()
 {
     if (m_levelMode != LevelEditMode::Face || !selectedLevelFace())
         return;
-    if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_C))
+    if (m_keymap.pressed(EditorAction::CopyFaceAttributes))
         copyFaceAttributes();
-    if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_V))
+    if (m_keymap.pressed(EditorAction::PasteFaceAttributes))
         pasteFaceAttributes();
+    // One cell of the shape's grid per press.
+    const float grid = selectedLevelMesh()->gridSize;
+    if (m_keymap.pressed(EditorAction::FacePushOut))
+        moveSelectedFaces(grid, false);
+    if (m_keymap.pressed(EditorAction::FacePullIn))
+        moveSelectedFaces(-grid, false);
+    if (m_keymap.pressed(EditorAction::FaceExtrude))
+        moveSelectedFaces(grid, true);
+    if (m_keymap.pressed(EditorAction::FaceExtrudeIn))
+        moveSelectedFaces(-grid, true);
+    if (m_keymap.pressed(EditorAction::SelectSurface))
+        selectSurface();
 
     // Nudging only while the mouse is over the scene, so arrow keys still work in the panels.
     const ImVec2 mouse = ImGui::GetIO().MousePos;
     if (ImGui::GetIO().WantCaptureMouse || !sceneViewContains(mouse.x, mouse.y))
         return;
-    // With key repeat, and only with exactly these modifiers held.
-    const auto pressed = [](ImGuiKey key, ImGuiKeyChord mods) {
-        return ImGui::IsKeyPressed(key, true) && ImGui::GetIO().KeyMods == mods;
-    };
+    // These actions repeat while held.
+    const auto pressed = [this](EditorAction action) { return m_keymap.pressed(action); };
     glm::vec2 move(0.0f);
     float turn = 0.0f, zoom = 1.0f;
-    if (pressed(ImGuiKey_LeftArrow, ImGuiMod_None)) move.x += 1.0f;
-    if (pressed(ImGuiKey_RightArrow, ImGuiMod_None)) move.x -= 1.0f;
-    if (pressed(ImGuiKey_UpArrow, ImGuiMod_None)) move.y += 1.0f;
-    if (pressed(ImGuiKey_DownArrow, ImGuiMod_None)) move.y -= 1.0f;
-    if (pressed(ImGuiKey_LeftArrow, ImGuiMod_Ctrl)) turn -= m_snapRotate;
-    if (pressed(ImGuiKey_RightArrow, ImGuiMod_Ctrl)) turn += m_snapRotate;
-    if (pressed(ImGuiKey_UpArrow, ImGuiMod_Alt)) zoom *= 2.0f;
-    if (pressed(ImGuiKey_DownArrow, ImGuiMod_Alt)) zoom *= 0.5f;
+    if (pressed(EditorAction::UvLeft)) move.x += 1.0f;
+    if (pressed(EditorAction::UvRight)) move.x -= 1.0f;
+    if (pressed(EditorAction::UvUp)) move.y += 1.0f;
+    if (pressed(EditorAction::UvDown)) move.y -= 1.0f;
+    if (pressed(EditorAction::UvRotateLeft)) turn -= m_snapRotate;
+    if (pressed(EditorAction::UvRotateRight)) turn += m_snapRotate;
+    if (pressed(EditorAction::UvScaleUp)) zoom *= 2.0f;
+    if (pressed(EditorAction::UvScaleDown)) zoom *= 0.5f;
     if (move == glm::vec2(0.0f) && turn == 0.0f && zoom == 1.0f)
         return;
 

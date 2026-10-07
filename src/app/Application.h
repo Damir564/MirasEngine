@@ -1,6 +1,7 @@
 #pragma once
 #include <memory>
 #include "AppOptions.h"
+#include "engine/Audio.h"
 #include "engine/GraphicsSettings.h"
 #include "engine/MaterialLibrary.h"
 #include "engine/Renderer.h"
@@ -32,6 +33,8 @@ private:
     void createMode(const AppOptions& options);
     EngineContext engineContext();
     void handleModeRequest();
+    // Ends a game started from the editor and resumes the editor; nothing when no mode is suspended.
+    void resumeSuspendedMode();
     void shutdown();
 
     int mainLoop(int exitAfterFrames);
@@ -52,6 +55,11 @@ private:
     std::string m_settingsPath = kGraphicsSettingsPath;
     GraphicsSettings m_settings;
     GraphicsSettings m_appliedSettings;
+    bool m_muted = false;    // --mute
+    bool m_autoplay = false; // --autoplay
+
+    // Outlives the modes, which play sounds through it.
+    AudioSystem m_audio;
 
     // Destruction order matters: the mode uses everything, SceneManager uses ModelManager, and
     // ModelManager allocates from the renderer's pools and reads the material library; all of them

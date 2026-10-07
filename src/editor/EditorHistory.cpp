@@ -11,7 +11,8 @@ constexpr size_t kMaxUndoSteps = 100;
 bool sameInstanceState(const ModelInstance& a, const ModelInstance& b)
 {
     return a.id == b.id && a.name == b.name && a.position == b.position && a.rotation == b.rotation &&
-        a.scale == b.scale && a.visible == b.visible && a.color == b.color && a.locked == b.locked;
+        a.scale == b.scale && a.visible == b.visible && a.color == b.color && a.locked == b.locked &&
+        a.entity == b.entity && a.entityParams == b.entityParams && a.group == b.group;
 }
 }
 
@@ -32,8 +33,15 @@ void Editor::updateLevelHistory()
         if (selectedLevelMesh())
             rebuildSelectedLevelModel(m_edgeDrag.extrude ? "extrude edge" : "push/pull edge");
     }
+    if (m_partDrag.moved) {
+        m_partDrag.moved = false;
+        if (selectedLevelMesh())
+            rebuildSelectedLevelModel(m_gizmo.mode == GizmoMode::Rotate ? "rotate part"
+                : m_gizmo.mode == GizmoMode::Scale ? "scale part" : "move part");
+    }
     if (m_levelEditPending) {
-        if (ImGui::IsAnyItemActive() || m_vertexDrag.active || m_faceDrag.active || m_edgeDrag.active)
+        if (ImGui::IsAnyItemActive() || m_vertexDrag.active || m_faceDrag.active || m_edgeDrag.active ||
+            m_partDrag.active)
             return;
         const auto found = m_models.findModelByPath(m_levelBaselinePath);
         const GPUModel* model = found ? m_models.getModel(*found) : nullptr;
@@ -60,8 +68,8 @@ void Editor::updateLevelHistory()
 
 bool Editor::editInProgress() const
 {
-    return m_levelEditPending || m_vertexDrag.active || m_faceDrag.active || m_edgeDrag.active || m_gizmo.isDragging ||
-        ImGui::IsAnyItemActive();
+    return m_levelEditPending || m_vertexDrag.active || m_faceDrag.active || m_edgeDrag.active || m_partDrag.active ||
+        m_gizmo.isDragging || ImGui::IsAnyItemActive();
 }
 
 Editor::ObjectRecord Editor::makeObjectRecord(size_t index,
@@ -148,6 +156,10 @@ std::string Editor::describeObjectChanges(const std::vector<ObjectChange>& chang
         return (b.visible ? "show " : "hide ") + b.name;
     if (a.color != b.color)
         return "color " + b.name;
+    if (a.entity != b.entity || a.entityParams != b.entityParams)
+        return "entity " + b.name;
+    if (a.group != b.group)
+        return (b.group.empty() ? "ungroup " : "group ") + b.name;
     const bool moved = a.position != b.position;
     const bool rotated = a.rotation != b.rotation;
     const bool scaled = a.scale != b.scale;
@@ -277,7 +289,7 @@ bool Editor::applyObjectChanges(const std::vector<ObjectChange>& changes, bool u
     }
     // Ascending, so each restored object lands at its old position.
     std::sort(targets.begin(), targets.end(), [](const auto& a, const auto& b) { return a.first->index < b.first->index; });
-    uint64_t selectId = 0;
+    std::vector<uint64_t> selectIds;
     for (const auto& [record, modelIndex] : targets) {
         ModelInstance instance = record->instance;
         instance.modelIndex = modelIndex;
@@ -286,18 +298,22 @@ bool Editor::applyObjectChanges(const std::vector<ObjectChange>& changes, bool u
             instances[index] = std::move(instance);
         else
             instances.insert(instances.begin() + std::min(record->index, instances.size()), std::move(instance));
-        selectId = record->instance.id;
+        selectIds.push_back(record->instance.id);
     }
     releaseUnusedLevelModels();
 
     // Face and vertex picks referred to indices that may have moved.
     m_levelSelectionInstance = -1;
     m_renamingInstance = -1;
-    const int selected = selectId != 0 ? indexOf(selectId) : -1;
-    if (selected >= 0)
-        selectInstance(selected);
-    else
+    // Every object the step touched is selected again; the last one is active.
+    std::vector<int> selected;
+    for (uint64_t id : selectIds)
+        if (const int index = indexOf(id); index >= 0)
+            selected.push_back(index);
+    if (selected.empty())
         deselectAll();
+    else
+        selectIndices(selected, selected.back());
     return true;
 }
 
@@ -348,9 +364,13 @@ bool Editor::applyHistoryEntry(const HistoryEntry& entry, bool undo)
 
 void Editor::pushHistory(HistoryEntry entry)
 {
+    entry.serial = ++m_historySerial;
     m_undoStack.push_back(std::move(entry));
-    if (m_undoStack.size() > kMaxUndoSteps)
+    if (m_undoStack.size() > kMaxUndoSteps) {
+        // Undoing everything now ends at the state after the dropped step.
+        m_baseState = m_undoStack.front().serial;
         m_undoStack.erase(m_undoStack.begin());
+    }
     m_redoStack.clear();
 }
 
@@ -389,6 +409,7 @@ void Editor::clearHistory()
 {
     m_undoStack.clear();
     m_redoStack.clear();
+    m_baseState = ++m_historySerial;
     m_levelEditPending = false;
     m_levelBaselinePath.clear();
     m_levelEntryPushed = false;

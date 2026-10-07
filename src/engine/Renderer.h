@@ -7,7 +7,8 @@
 #include <initializer_list>
 #include <limits>
 #include <memory>
-#include <unordered_map>
+#include <span>
+#include <utility>
 #include <vector>
 #include "Buffers.h"
 #include "Camera.h"
@@ -35,9 +36,18 @@ struct ViewRect {
     float height = 0.0f;
 };
 
-// Instance drawn with the selection outline.
+// Instances drawn with the selection outline; the caller owns the indices until the frame is rendered.
 struct SelectionHighlight {
-    int instance = -1;
+    std::span<const int> instances;
+};
+
+// An object drawn for one frame without being part of the scene (game entities, effects, the weapon). It is
+// drawn with `transform`; of the instance only the model, color, visibility and position (for sorting
+// transparent draws) are used.
+struct DynamicInstance {
+    ModelInstance instance;
+    glm::mat4 transform{ 1.0f };
+    bool castShadow = true;
 };
 
 struct FrameInput {
@@ -58,6 +68,10 @@ struct FrameInput {
     float gridCellSize = 1.0f;
     ImDrawData* imgui = nullptr;
     float time = 0.0f;
+    // Drawn after the scene's instances; the caller owns them until the frame is rendered.
+    std::span<const DynamicInstance> dynamicInstances;
+    // Scene objects standing for game entities (ModelInstance::entity) are not drawn.
+    bool hideEntities = false;
 };
 
 // Owns every GPU resource used to draw a frame and records/submits/presents it. The sun, sky and
@@ -67,8 +81,8 @@ struct FrameInput {
 // Frame: sky LUT (when the sun changes) -> shadow cascades (those that changed) -> depth prepass + half-res
 // AO / contact shadows (when enabled) -> HDR scene pass -> selection mask -> bloom -> composite (tone map)
 // [-> FXAA] -> outline + ImGui on the swapchain image.
-// Classic pipeline: scene pass at the render scale (per-vertex lighting, analytic sky) -> selection mask ->
-// upscale to the swapchain image -> outline + ImGui.
+// Classic pipeline: scene pass at the render scale into an 8-bit sRGB target (per-vertex lighting, analytic
+// sky) -> selection mask -> upscale to the swapchain image -> outline + ImGui.
 class Renderer {
 public:
     enum class FrameStatus {
@@ -136,10 +150,17 @@ private:
         std::vector<InstanceRenderData> instances;
     };
 
-    // Visible models this frame, keyed by model index.
+    // Visible models this frame, indexed by model index. Only the models listed in mainModels / shadowModels
+    // have instances; the rest keep their vectors' capacity for later frames.
     struct FrameBatches {
-        std::unordered_map<size_t, RenderBatch> main;
-        std::unordered_map<size_t, RenderBatch> shadow; // casters in any cascade
+        std::vector<RenderBatch> main;
+        std::vector<RenderBatch> shadow; // casters in any cascade
+        std::vector<size_t> mainModels;
+        std::vector<size_t> shadowModels;
+
+        void clear();
+        RenderBatch& add(std::vector<RenderBatch>& batches, std::vector<size_t>& used, size_t modelIndex,
+            GPUModel* model);
     };
 
     struct CullResult {
@@ -187,6 +208,9 @@ private:
     bool createDescriptors();
     bool createShaders();
     bool initImGuiBackend();
+    // Size and layer count for the current settings: a tiny single layer while shadows can't be used, so
+    // the lighting descriptors stay valid without holding up to 256 MB.
+    std::pair<uint32_t, uint32_t> wantedShadowMap() const;
     bool createShadowMapResources();
     bool createRenderTargets();
     void destroyRenderTargets();
@@ -210,6 +234,8 @@ private:
     bool classic() const { return m_settings.pipeline == RenderPipeline::Classic; }
     bool bloomActive() const { return m_settings.bloom && !classic(); }
     bool fxaaActive() const { return m_settings.fxaa && !classic(); }
+    // Classic stays in display range, so it skips the HDR target and its bandwidth.
+    const RenderImage& sceneColorTarget() const { return classic() ? m_ldrColor : m_hdrColor; }
     bool shadowsActive() const;
     bool contactShadowsActive() const;
     bool depthPrepassEnabled() const;
@@ -299,7 +325,7 @@ private:
     RenderImage m_msaaDepth;
     RenderImage m_selectionMask;
     RenderImage m_hdrColor;  // linear HDR scene, alpha = coverage (see composite.frag)
-    RenderImage m_ldrColor;  // tone-mapped scene, FXAA input
+    RenderImage m_ldrColor;  // tone-mapped scene, FXAA input; the Classic scene pass renders into it
     vk::Extent2D m_halfExtent{};
     RenderImage m_aoDepth;   // half resolution view depth
     RenderImage m_aoRaw;     // half resolution AO + contact shadow; holds the blurred result at the end
@@ -390,6 +416,8 @@ private:
     bool m_imguiInitialized = false;
 
     // Per-frame scratch kept as members so their capacity survives between frames.
+    FrameBatches m_batches;
+    std::vector<InstanceRenderData> m_sortedInstances;
     std::vector<CullResult> m_cullResults;
     std::vector<size_t> m_cullIndices;
     std::vector<CullChunk> m_cullChunks;

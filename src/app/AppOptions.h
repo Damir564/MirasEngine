@@ -17,6 +17,8 @@ struct AppOptions {
     std::string scriptPath;   // editor: command script run at startup
     std::string settingsPath; // empty = settings.json next to the executable
     int mcpPort = 47800;      // editor's MCP server on 127.0.0.1; 0 = off
+    bool mute = false;        // no sound (audio still runs)
+    bool autoplay = false;    // game: a bot plays the level and quits when it ends (automated tests)
     bool showHelp = false;
 };
 

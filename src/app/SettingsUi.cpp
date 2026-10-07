@@ -38,32 +38,6 @@ bool comboEnum(const char* label, Enum& value, const char* const* names, int cou
     return true;
 }
 
-enum class QualityPreset { Low, Medium, High, Ultra };
-
-// Presets only touch the performance-relevant options, not the look (sun, exposure, grading...).
-void applyPreset(GraphicsSettings& s, QualityPreset preset, const RenderCapabilities& caps)
-{
-    switch (preset) {
-    case QualityPreset::Low:
-        s.msaaSamples = 1; s.fxaa = true; s.shadowMapSize = 1024; s.shadowCascades = 2;
-        s.softShadows = false; s.contactShadows = false; s.ambientOcclusion = 0; s.bloom = false;
-        break;
-    case QualityPreset::Medium:
-        s.msaaSamples = 2; s.fxaa = false; s.shadowMapSize = 2048; s.shadowCascades = 3;
-        s.softShadows = false; s.contactShadows = false; s.ambientOcclusion = 1; s.bloom = true;
-        break;
-    case QualityPreset::High:
-        s.msaaSamples = 4; s.fxaa = false; s.shadowMapSize = 2048; s.shadowCascades = 4;
-        s.softShadows = true; s.contactShadows = true; s.ambientOcclusion = 2; s.bloom = true;
-        break;
-    case QualityPreset::Ultra:
-        s.msaaSamples = 8; s.fxaa = false; s.shadowMapSize = 4096; s.shadowCascades = 4;
-        s.softShadows = true; s.contactShadows = true; s.ambientOcclusion = 3; s.bloom = true;
-        break;
-    }
-    s.msaaSamples = std::min(s.msaaSamples, caps.maxMsaaSamples);
-}
-
 constexpr ImGuiSliderFlags kClamp = ImGuiSliderFlags_AlwaysClamp;
 constexpr ImGuiSliderFlags kLogClamp = ImGuiSliderFlags_Logarithmic | ImGuiSliderFlags_AlwaysClamp;
 
@@ -81,6 +55,10 @@ bool drawDisplay(GraphicsSettings& settings, const RenderCapabilities& caps)
     changed |= ImGui::SliderFloat("Render scale", &settings.renderScale, 0.25f, 1.0f, "%.2f", kClamp);
     ImGui::SetItemTooltip("Internal resolution relative to the window (Classic only).");
     ImGui::EndDisabled();
+    changed |= ImGui::SliderFloat("Detail culling", &settings.detailCulling, 0.0f, 16.0f,
+        settings.detailCulling > 0.0f ? "%.1f px" : "Off", kClamp);
+    ImGui::SetItemTooltip("Skips parts of objects smaller than this many pixels on screen.\n"
+        "Saves a lot of work in big scenes on slow GPUs; small distant props may pop in.");
 
     changed |= ImGui::Checkbox("VSync", &settings.vsync);
     {
@@ -185,6 +163,22 @@ bool drawEnvironment(GraphicsSettings& settings)
     return changed;
 }
 
+bool drawAudio(GraphicsSettings& settings)
+{
+    bool changed = false;
+    float master = settings.masterVolume * 100.0f;
+    if (ImGui::SliderFloat("Master volume", &master, 0.0f, 100.0f, "%.0f%%", kClamp)) {
+        settings.masterVolume = master / 100.0f;
+        changed = true;
+    }
+    float music = settings.musicVolume * 100.0f;
+    if (ImGui::SliderFloat("Ambience volume", &music, 0.0f, 100.0f, "%.0f%%", kClamp)) {
+        settings.musicVolume = music / 100.0f;
+        changed = true;
+    }
+    return changed;
+}
+
 } // namespace
 
 bool drawGraphicsSettings(GraphicsSettings& settings, const RenderCapabilities& caps)
@@ -194,13 +188,14 @@ bool drawGraphicsSettings(GraphicsSettings& settings, const RenderCapabilities& 
 
     ImGui::AlignTextToFramePadding();
     ImGui::TextUnformatted("Quality preset");
-    static const char* const presets[] = { "Low", "Medium", "High", "Ultra" };
-    for (int i = 0; i < IM_ARRAYSIZE(presets); ++i) {
+    for (int i = 0; i < IM_ARRAYSIZE(kQualityPresetNames); ++i) {
         ImGui::SameLine();
-        if (ImGui::Button(presets[i])) {
-            applyPreset(settings, static_cast<QualityPreset>(i), caps);
+        if (ImGui::Button(kQualityPresetNames[i])) {
+            applyQualityPreset(settings, static_cast<QualityPreset>(i), caps.maxMsaaSamples);
             changed = true;
         }
+        if (i == static_cast<int>(QualityPreset::Lowest))
+            ImGui::SetItemTooltip("Classic pipeline at 75%% resolution: for integrated graphics.");
     }
 
     if (ImGui::CollapsingHeader("Display", ImGuiTreeNodeFlags_DefaultOpen))
@@ -214,6 +209,8 @@ bool drawGraphicsSettings(GraphicsSettings& settings, const RenderCapabilities& 
     ImGui::EndDisabled();
     if (ImGui::CollapsingHeader("Environment", ImGuiTreeNodeFlags_DefaultOpen))
         changed |= drawEnvironment(settings);
+    if (ImGui::CollapsingHeader("Audio", ImGuiTreeNodeFlags_DefaultOpen))
+        changed |= drawAudio(settings);
 
     ImGui::PopItemWidth();
     ImGui::Spacing();

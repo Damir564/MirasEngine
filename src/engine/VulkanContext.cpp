@@ -170,6 +170,13 @@ bool VulkanContext::init(SDL_Window* window, bool enableValidation, VulkanBacken
     return true;
 }
 
+bool VulkanContext::lowPowerDevice() const
+{
+    const VkPhysicalDeviceType type = m_vkbPhysicalDevice.properties.deviceType;
+    return m_backend == VulkanBackend::Software || type == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ||
+        type == VK_PHYSICAL_DEVICE_TYPE_CPU;
+}
+
 bool VulkanContext::tryBackend(SDL_Window* window, bool enableValidation, VulkanBackend backend, bool forceEmulation)
 {
     LOG_INFO("Trying the " << vulkanBackendName(backend) << " Vulkan backend\n");

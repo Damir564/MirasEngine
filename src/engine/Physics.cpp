@@ -4,7 +4,10 @@
 #include <Jolt/Core/Factory.h>
 #include <Jolt/Core/TempAllocator.h>
 #include <Jolt/Physics/Body/BodyCreationSettings.h>
+#include <Jolt/Physics/Body/BodyLock.h>
 #include <Jolt/Physics/Character/CharacterVirtual.h>
+#include <Jolt/Physics/Collision/CastResult.h>
+#include <Jolt/Physics/Collision/RayCast.h>
 #include <Jolt/Physics/Collision/Shape/CapsuleShape.h>
 #include <Jolt/Physics/Collision/Shape/MeshShape.h>
 #include <Jolt/Physics/Collision/Shape/RotatedTranslatedShape.h>
@@ -153,6 +156,7 @@ struct PhysicsWorld::Impl {
     void clear()
     {
         character = nullptr;
+        characters.clear();
         JPH::BodyInterface& bodies = system->GetBodyInterface();
         if (!staticBodies.empty()) {
             bodies.RemoveBodies(staticBodies.data(), static_cast<int>(staticBodies.size()));
@@ -168,6 +172,7 @@ struct PhysicsWorld::Impl {
     std::unique_ptr<JPH::PhysicsSystem> system;
     std::vector<JPH::BodyID> staticBodies;
     JPH::Ref<JPH::CharacterVirtual> character;
+    std::vector<JPH::Ref<JPH::CharacterVirtual>> characters; // by id; null = removed
 };
 
 PhysicsWorld::PhysicsWorld() : m_impl(std::make_unique<Impl>()) {}
@@ -186,7 +191,7 @@ void PhysicsWorld::buildStaticScene(ModelManager& models)
     std::unordered_map<size_t, JPH::ShapeRefC> shapes;
 
     for (const ModelInstance& instance : models.getInstances()) {
-        if (!instance.visible)
+        if (!instance.visible || !instance.entity.empty())
             continue;
         if (glm::any(glm::lessThan(glm::abs(instance.scale), glm::vec3(1e-4f))))
             continue;
@@ -223,17 +228,28 @@ void PhysicsWorld::buildStaticScene(ModelManager& models)
     m_impl->system->OptimizeBroadPhase();
 }
 
-void PhysicsWorld::spawnPlayer(const glm::vec3& feetPosition)
+namespace {
+
+// A capsule `height` tall whose origin is at its feet.
+JPH::Ref<JPH::CharacterVirtual> createCharacter(JPH::PhysicsSystem* system, const glm::vec3& feetPosition,
+    float radius, float height)
 {
+    const float halfHeight = std::max(height * 0.5f - radius, 0.05f);
     JPH::Ref<JPH::CharacterVirtualSettings> settings = new JPH::CharacterVirtualSettings();
-    // Offset the capsule so the character's origin is at its feet.
-    settings->mShape = new JPH::RotatedTranslatedShape(JPH::Vec3(0.0f, kCapsuleHalfHeight + kCapsuleRadius, 0.0f),
-        JPH::Quat::sIdentity(), new JPH::CapsuleShape(kCapsuleHalfHeight, kCapsuleRadius));
+    settings->mShape = new JPH::RotatedTranslatedShape(JPH::Vec3(0.0f, halfHeight + radius, 0.0f),
+        JPH::Quat::sIdentity(), new JPH::CapsuleShape(halfHeight, radius));
     settings->mMaxSlopeAngle = JPH::DegreesToRadians(kMaxSlopeDegrees);
     // Only contacts below the center of the bottom sphere count as standing on something.
-    settings->mSupportingVolume = JPH::Plane(JPH::Vec3::sAxisY(), -kCapsuleRadius);
-    m_impl->character = new JPH::CharacterVirtual(settings, JPH::RVec3(toJolt(feetPosition)),
-        JPH::Quat::sIdentity(), m_impl->system.get());
+    settings->mSupportingVolume = JPH::Plane(JPH::Vec3::sAxisY(), -radius);
+    return new JPH::CharacterVirtual(settings, JPH::RVec3(toJolt(feetPosition)), JPH::Quat::sIdentity(), system);
+}
+
+} // namespace
+
+void PhysicsWorld::spawnPlayer(const glm::vec3& feetPosition)
+{
+    m_impl->character = createCharacter(m_impl->system.get(), feetPosition, kCapsuleRadius,
+        2.0f * (kCapsuleHalfHeight + kCapsuleRadius));
 }
 
 bool PhysicsWorld::hasPlayer() const
@@ -241,9 +257,66 @@ bool PhysicsWorld::hasPlayer() const
     return m_impl->character != nullptr;
 }
 
+int PhysicsWorld::addCharacter(const glm::vec3& feetPosition, float radius, float height)
+{
+    m_impl->characters.push_back(createCharacter(m_impl->system.get(), feetPosition, radius, height));
+    return static_cast<int>(m_impl->characters.size() - 1);
+}
+
+void PhysicsWorld::removeCharacter(int id)
+{
+    if (id >= 0 && id < static_cast<int>(m_impl->characters.size()))
+        m_impl->characters[id] = nullptr;
+}
+
+void PhysicsWorld::moveCharacter(int id, float dt, const glm::vec3& horizontalVelocity, bool jump)
+{
+    if (id >= 0 && id < static_cast<int>(m_impl->characters.size()) && m_impl->characters[id])
+        updateCharacter(m_impl->characters[id].GetPtr(), dt, horizontalVelocity, jump);
+}
+
+glm::vec3 PhysicsWorld::characterPosition(int id) const
+{
+    if (id < 0 || id >= static_cast<int>(m_impl->characters.size()) || !m_impl->characters[id])
+        return glm::vec3(0.0f);
+    return toGlm(JPH::Vec3(m_impl->characters[id]->GetPosition()));
+}
+
+bool PhysicsWorld::characterOnGround(int id) const
+{
+    return id >= 0 && id < static_cast<int>(m_impl->characters.size()) && m_impl->characters[id] &&
+        m_impl->characters[id]->GetGroundState() == JPH::CharacterVirtual::EGroundState::OnGround;
+}
+
+bool PhysicsWorld::castRay(const glm::vec3& origin, const glm::vec3& direction, float maxDistance,
+    float& hitDistance, glm::vec3* hitNormal) const
+{
+    const float length = glm::length(direction);
+    if (length < 1e-6f || maxDistance <= 0.0f)
+        return false;
+    const glm::vec3 dir = direction / length;
+    const JPH::RRayCast ray{ JPH::RVec3(toJolt(origin)), toJolt(dir * maxDistance) };
+    JPH::RayCastResult hit;
+    if (!m_impl->system->GetNarrowPhaseQuery().CastRay(ray, hit))
+        return false;
+    hitDistance = hit.mFraction * maxDistance;
+    if (hitNormal) {
+        *hitNormal = -dir;
+        JPH::BodyLockRead lock(m_impl->system->GetBodyLockInterface(), hit.mBodyID);
+        if (lock.Succeeded())
+            *hitNormal = toGlm(lock.GetBody().GetWorldSpaceSurfaceNormal(hit.mSubShapeID2, ray.GetPointOnRay(hit.mFraction)));
+    }
+    return true;
+}
+
 void PhysicsWorld::updatePlayer(float dt, const glm::vec3& horizontalVelocity, bool jump)
 {
-    JPH::CharacterVirtual* character = m_impl->character.GetPtr();
+    updateCharacter(m_impl->character.GetPtr(), dt, horizontalVelocity, jump);
+}
+
+void PhysicsWorld::updateCharacter(JPH::CharacterVirtual* character, float dt, const glm::vec3& horizontalVelocity,
+    bool jump)
+{
     if (!character || dt <= 0.0f)
         return;
     dt = std::min(dt, kMaxStep);

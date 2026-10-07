@@ -87,6 +87,13 @@ struct ModelInstance {
     glm::vec3 color{ 1.0f };
     // Prefab instances start locked: their shared geometry can't be edited until unlocked.
     bool locked = false;
+    // Game entity this object stands for (see EntityTypes.h), e.g. "enemy"; empty for plain scenery.
+    // The game hides entity objects and spawns the entity in their place, configured by entityParams
+    // ("key=value" pairs separated by spaces).
+    std::string entity;
+    std::string entityParams;
+    // Objects with the same non-empty group name are selected, moved and copied together in the editor.
+    std::string group;
 
     glm::mat4 getTransformMatrix() const {
         glm::mat4 T = glm::translate(glm::mat4(1.0f), position);
@@ -132,6 +139,9 @@ public:
     // Uploads a level mesh as a new model with a fresh "level:#<n>" source path and keeps the mesh on it.
     // Throws like loadModelSync() when the upload fails.
     size_t addPolyMesh(PolyMesh mesh, const std::string& name);
+    // Uploads a mesh with decoded textures (e.g. one part of an animated model) as a new model under
+    // `sourcePath`. Throws like loadModelSync().
+    size_t addMesh(Mesh mesh, const std::string& name, const std::string& sourcePath);
     // Re-uploads a level model after its polyMesh changed (waits for the GPU to go idle); its index,
     // name, path and instances are kept.
     bool rebuildPolyMesh(size_t modelIndex);

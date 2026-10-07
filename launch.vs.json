@@ -14,7 +14,7 @@
       "project": "CMakeLists.txt",
       "projectTarget": "engine.exe (src\\engine.exe)",
       "name": "Engine (Game)",
-      "args": [ "--game --scene physics_test.scn" ]
+      "args": [ "--game --scene levels/lvl01.scn" ]
     }
   ]
 }

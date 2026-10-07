@@ -70,8 +70,10 @@ endif()
 # --- Game content -------------------------------------------------------------------------------------
 # Scenes next to engine.exe in the build folder (where the editor saves them), shipped with exactly the models
 # they reference. Resolved when installing, so the package always matches the scenes as last saved.
-set(MIRAS_PACKAGE_SCENES "level1.scn" CACHE STRING
+set(MIRAS_PACKAGE_SCENES "lvl01.scn" CACHE STRING
     "Scenes, relative to engine.exe in the build folder, that the package ships along with the models they use")
+# The game's own models (weapon, enemies, pickups) and level scripts, whether or not a scene uses them.
+install(DIRECTORY ${CMAKE_SOURCE_DIR}/assets/ DESTINATION . COMPONENT ${MIRAS_COMPONENT})
 option(MIRAS_PACKAGE_MODEL_CACHES
     "Also ship the models' .cache files: a few times bigger package, but no import on the first load" ON)
 install(CODE "

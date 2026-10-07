@@ -45,6 +45,14 @@ add_subdirectory(src)
 file(COPY ${CMAKE_SOURCE_DIR}/src/shaders
      DESTINATION ${CMAKE_BINARY_DIR}/src)
 
+# Game content next to engine.exe: models (scripts/make_game_assets.py) and level scripts (levels/). Synced
+# on every build too, so regenerated models arrive without reconfiguring.
+file(COPY ${CMAKE_SOURCE_DIR}/assets/ DESTINATION ${CMAKE_BINARY_DIR}/src)
+add_custom_target(game_assets ALL
+    COMMAND ${CMAKE_COMMAND} -E copy_directory_if_different ${CMAKE_SOURCE_DIR}/assets ${CMAKE_BINARY_DIR}/src
+    COMMENT "Copying game assets")
+add_dependencies(engine game_assets)
+
 # ==========================================
 # Shader compilation CMake snippet
 # ==========================================

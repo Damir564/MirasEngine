@@ -27,8 +27,11 @@ inline constexpr float kCameraNearPlane = 0.1f;
 
 // Every consumer (rendering, picking, gizmos) must use this so the math agrees.
 // Depth maps to [0, 1] as Vulkan expects.
-inline glm::mat4 getProjection(float width, float height, float nearPlane, float farPlane) {
-    glm::mat4 proj = glm::perspectiveRH_ZO(glm::radians(60.0f), width / height, nearPlane, farPlane);
+inline constexpr float kDefaultFieldOfView = 60.0f; // vertical, degrees
+
+inline glm::mat4 getProjection(float width, float height, float nearPlane, float farPlane,
+    float fieldOfView = kDefaultFieldOfView) {
+    glm::mat4 proj = glm::perspectiveRH_ZO(glm::radians(fieldOfView), width / height, nearPlane, farPlane);
     proj[1][1] *= -1; // Vulkan clip space has Y pointing down
     return proj;
 }

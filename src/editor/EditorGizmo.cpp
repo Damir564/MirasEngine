@@ -157,10 +157,27 @@ void Editor::drawTransformGizmo()
         const glm::vec3 dir = gizmoAxisDirection(axisShape.axis);
 
         if (shape.mode == GizmoMode::Rotate) {
+            // Only the half of each ring facing the camera is drawn (and pickable); the segments crossing
+            // the edge are cut where it turns away, so the arc ends cleanly.
+            const glm::vec3 toCamera = m_camera.position - shape.center;
+            const float threshold = -0.02f * kGizmoRingRadius * shape.scale * glm::length(toCamera);
             for (size_t k = 0; k + 1 < axisShape.screen.size(); ++k) {
-                const bool front = axisShape.front[k] && axisShape.front[k + 1];
-                drawList->AddLine(toImVec(axisShape.screen[k], origin), toImVec(axisShape.screen[k + 1], origin),
-                    front ? color : withAlpha(color, 0.25f), front ? 3.0f : 1.5f);
+                const bool frontA = axisShape.front[k] != 0;
+                const bool frontB = axisShape.front[k + 1] != 0;
+                if (!frontA && !frontB)
+                    continue;
+                glm::vec2 a = axisShape.screen[k];
+                glm::vec2 b = axisShape.screen[k + 1];
+                if (frontA != frontB) {
+                    const float da = glm::dot(axisShape.world[k] - shape.center, toCamera);
+                    const float db = glm::dot(axisShape.world[k + 1] - shape.center, toCamera);
+                    const float t = std::clamp((threshold - da) / (db - da), 0.0f, 1.0f);
+                    const glm::vec2 edge = worldToScreen(glm::mix(axisShape.world[k], axisShape.world[k + 1], t), viewProj, w, h);
+                    if (edge.x < -5000.0f)
+                        continue;
+                    (frontA ? b : a) = edge;
+                }
+                drawList->AddLine(toImVec(a, origin), toImVec(b, origin), color, 3.0f);
             }
             continue;
         }
@@ -227,7 +244,8 @@ std::array<Editor::OrientationHandle, 6> Editor::orientationHandles() const
 
 int Editor::pickOrientationHandle(float x, float y) const
 {
-    if (m_sceneView.width < kOrientationMargin * 2.0f || m_sceneView.height < kOrientationMargin * 2.0f)
+    if (!m_prefs.showOrientationGizmo || m_sceneView.width < kOrientationMargin * 2.0f ||
+        m_sceneView.height < kOrientationMargin * 2.0f)
         return -1;
     const auto handles = orientationHandles();
     // Nearest handles are last and drawn on top, so they win.
@@ -241,7 +259,8 @@ int Editor::pickOrientationHandle(float x, float y) const
 
 void Editor::drawOrientationGizmo()
 {
-    if (m_sceneView.width < kOrientationMargin * 2.0f || m_sceneView.height < kOrientationMargin * 2.0f) {
+    if (!m_prefs.showOrientationGizmo || m_sceneView.width < kOrientationMargin * 2.0f ||
+        m_sceneView.height < kOrientationMargin * 2.0f) {
         m_hoveredOrientation = -1;
         return;
     }

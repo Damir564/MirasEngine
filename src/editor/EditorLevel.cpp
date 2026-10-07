@@ -48,33 +48,6 @@ bool rayHitsPlane(const Ray& ray, const glm::vec3& point, const glm::vec3& norma
     return true;
 }
 
-// Shape sizes in whole grid cells (at least one), so the faces of a new shape lie on its grid lines.
-PolyShapeParams snapShapeSize(PolyShapeParams params, float grid)
-{
-    params.size = glm::max(glm::round(params.size / grid), glm::vec3(1.0f)) * grid;
-    return params;
-}
-
-// Shapes are built centered on X/Z; with an odd number of cells that puts their sides between grid
-// lines, so shift them half a cell to put the sides on the object-space grid.
-PolyMesh makeShapeOnGrid(const PolyShapeParams& params, float grid, bool snap)
-{
-    if (!snap) {
-        PolyMesh mesh = makePolyShape(params);
-        mesh.gridSize = grid;
-        return mesh;
-    }
-    const PolyShapeParams snapped = snapShapeSize(params, grid);
-    PolyMesh mesh = makePolyShape(snapped);
-    mesh.gridSize = grid;
-    const glm::vec2 half(snapped.size.x * 0.5f, snapped.size.z * 0.5f);
-    const glm::vec2 shift = glm::round(half / grid) * grid - half;
-    if (shift != glm::vec2(0.0f))
-        for (glm::vec3& p : mesh.positions)
-            p += glm::vec3(shift.x, 0.0f, shift.y);
-    return mesh;
-}
-
 // Smallest and largest dot(normal, p) over the mesh's vertices.
 glm::vec2 meshExtent(const PolyMesh& mesh, const glm::vec3& normal)
 {
@@ -99,9 +72,15 @@ std::array<uint32_t, 2> editEdge(PolyMesh& mesh, uint32_t a, uint32_t b, const g
 {
     if (extrude) {
         uint32_t newA, newB;
-        if (mesh.extrudeEdge(a, b, offset, newA, newB))
-            return { newA, newB };
-        return { a, b };
+        const size_t oldFaces = mesh.faces.size();
+        if (!mesh.extrudeEdge(a, b, offset, newA, newB))
+            return { a, b };
+        // Continuing a flat surface keeps it one face: the new quad joins the face it extends.
+        std::vector<int64_t> keys(mesh.faces.size(), -1);
+        std::iota(keys.begin(), keys.begin() + oldFaces, int64_t(0));
+        std::vector<uint32_t> remap;
+        mesh.mergeCoplanarFaces(keys, &remap);
+        return { remap[newA], remap[newB] };
     }
     mesh.positions[a] += offset;
     mesh.positions[b] += offset;
@@ -183,6 +162,48 @@ void Editor::selectFacesWhere(const std::function<bool(const PolyMesh&, const Po
         if (f != active && predicate(*mesh, mesh->faces[f]))
             m_selectedFaces.push_back(f);
     setStatus(std::to_string(m_selectedFaces.size()) + " faces selected");
+}
+
+void Editor::selectSurface()
+{
+    const PolyMesh* mesh = selectedLevelMesh();
+    if (!mesh || !selectedLevelFace())
+        return;
+    std::vector<uint32_t> selection = selectedLevelFaces();
+    for (uint32_t face : std::vector<uint32_t>(selection))
+        for (uint32_t f : mesh->coplanarRegion(face))
+            if (std::find(selection.begin(), selection.end(), f) == selection.end())
+                selection.push_back(f);
+    m_selectedFaces = std::move(selection);
+    setStatus(m_selectedFaces.size() == 1 ? "The surface is one face"
+        : "Surface: " + std::to_string(m_selectedFaces.size()) + " faces selected");
+}
+
+void Editor::mergeLevelFaces()
+{
+    PolyMesh* mesh = selectedLevelMesh();
+    if (!mesh)
+        return;
+    PolyMesh edited = *mesh;
+    const size_t before = edited.faces.size();
+    const std::vector<uint32_t> remap = edited.mergeCoplanarFaces();
+    if (edited.faces.size() == before) {
+        setStatus("No neighbouring faces to join (they must be flat together and share material and UVs)");
+        return;
+    }
+    // The selection follows its faces into the joined ones.
+    std::vector<uint32_t> selection;
+    for (uint32_t f : selectedLevelFaces())
+        if (f < remap.size() && std::find(selection.begin(), selection.end(), remap[f]) == selection.end())
+            selection.push_back(remap[f]);
+    if (commitLevelTopology(std::move(edited), "join faces")) {
+        // Vertices were renumbered.
+        m_selectedVertices.clear();
+        m_edgeSelected = false;
+        m_selectedFaces = selection;
+        m_selectedFace = selection.empty() ? -1 : static_cast<int>(selection.front());
+        setStatus("Joined " + std::to_string(before) + " faces into " + std::to_string(mesh->faces.size()));
+    }
 }
 
 const std::vector<uint32_t>& Editor::selectedLevelVertices()
@@ -332,11 +353,18 @@ int Editor::pickLevelVertex(float mouseX, float mouseY) const
 
 bool Editor::handleLevelClick(float mouseX, float mouseY)
 {
+    if (m_levelMode == LevelEditMode::Part) {
+        const int picked = pickLevelFace(mouseX, mouseY);
+        if (picked < 0)
+            return false;
+        selectPart(static_cast<uint32_t>(picked), (keyMods() & SDL_KMOD_SHIFT) != 0);
+        return true;
+    }
     if (m_levelMode == LevelEditMode::Face) {
         const int picked = pickLevelFace(mouseX, mouseY);
         if (picked < 0)
             return false;
-        const SDL_Keymod mods = SDL_GetModState();
+        const SDL_Keymod mods = keyMods();
         const bool shift = (mods & SDL_KMOD_SHIFT) != 0;
         const bool alt = (mods & SDL_KMOD_ALT) != 0;
         if (shift && alt) {
@@ -376,9 +404,10 @@ bool Editor::handleLevelClick(float mouseX, float mouseY)
                     m_faceDrag.startParam)) {
                 m_faceDrag.active = true;
                 m_faceDrag.moved = false;
-                m_faceDrag.extrude = (SDL_GetModState() & SDL_KMOD_ALT) != 0;
+                m_faceDrag.extrude = (keyMods() & SDL_KMOD_ALT) != 0;
                 m_faceDrag.distance = 0.0f;
                 m_faceDrag.startMesh = *mesh;
+                m_faceDrag.solid = m_faceDrag.extrude && mesh->isClosed();
             }
         }
         return true;
@@ -397,12 +426,13 @@ bool Editor::handleLevelClick(float mouseX, float mouseY)
         const PolyMesh* mesh = selectedLevelMesh();
         if (!mesh)
             return true;
-        const bool extrude = (SDL_GetModState() & SDL_KMOD_ALT) != 0;
+        const bool extrude = (keyMods() & SDL_KMOD_ALT) != 0;
         m_edgeDrag.instance = m_gizmo.selectedInstance;
         m_edgeDrag.a = a;
         m_edgeDrag.b = b;
         m_edgeDrag.center = (mesh->positions[a] + mesh->positions[b]) * 0.5f;
-        m_edgeDrag.direction = extrude ? mesh->edgeExtrudeDirection(a, b) : mesh->edgeNormal(a, b);
+        // A border edge moves within its face's plane (resizing a plane); others along their faces' normal.
+        m_edgeDrag.direction = mesh->edgeExtrudeDirection(a, b);
         if (m_edgeDrag.direction != glm::vec3(0.0f) &&
             lineDragParam(m_edgeDrag.instance, m_edgeDrag.center, m_edgeDrag.direction, mouseX, mouseY,
                 m_edgeDrag.startParam)) {
@@ -415,7 +445,7 @@ bool Editor::handleLevelClick(float mouseX, float mouseY)
         return true;
     }
 
-    const bool shift = (SDL_GetModState() & SDL_KMOD_SHIFT) != 0;
+    const bool shift = (keyMods() & SDL_KMOD_SHIFT) != 0;
     selectedLevelVertices(); // drops a selection left over from another instance or mode
     const int picked = pickLevelVertex(mouseX, mouseY);
     if (picked < 0) {
@@ -534,11 +564,22 @@ void Editor::dragLevelFace(float mouseX, float mouseY)
         return;
     m_faceDrag.distance = distance;
     *mesh = m_faceDrag.startMesh;
+    int selected = static_cast<int>(m_faceDrag.face);
     if (std::abs(distance) > 1e-6f) {
-        if (m_faceDrag.extrude)
-            mesh->extrudeFace(m_faceDrag.face, distance);
-        else
+        std::vector<uint32_t> caps;
+        if (!m_faceDrag.extrude)
             mesh->moveFace(m_faceDrag.face, distance);
+        else if (!m_faceDrag.solid)
+            mesh->extrudeFace(m_faceDrag.face, distance);
+        // A closed shape grows or, pulled inwards, gets cut into; faces move, so the cap is looked up.
+        else if (mesh->extrudeFacesSolid({ m_faceDrag.face }, distance, &caps))
+            selected = caps.empty() ? -1 : static_cast<int>(caps.front());
+    }
+    if (m_faceDrag.solid) {
+        m_selectedFace = selected;
+        m_selectedFaces.clear();
+        if (selected >= 0)
+            m_selectedFaces.push_back(static_cast<uint32_t>(selected));
     }
     // Rebuilt once per frame in updateLevelHistory(); several motion events can arrive per frame.
     m_faceDrag.moved = true;
@@ -729,15 +770,14 @@ bool Editor::handleFaceDrawKeys()
 {
     if (!faceDrawValid())
         return false;
-    if (ImGui::IsKeyChordPressed(ImGuiKey_Escape)) {
+    if (m_keymap.pressed(EditorAction::FaceDrawCancel)) {
         m_faceDraw = {};
         setStatus("Drawing cancelled");
         return true;
     }
-    if (ImGui::IsKeyChordPressed(ImGuiKey_Backspace) && !m_faceDraw.points.empty())
+    if (m_keymap.pressed(EditorAction::FaceDrawRemovePoint) && !m_faceDraw.points.empty())
         m_faceDraw.points.pop_back();
-    if (m_faceDrawShape == FaceDrawShape::Polygon &&
-        (ImGui::IsKeyChordPressed(ImGuiKey_Enter) || ImGui::IsKeyChordPressed(ImGuiKey_KeypadEnter))) {
+    if (m_faceDrawShape == FaceDrawShape::Polygon && m_keymap.pressed(EditorAction::FaceDrawApply)) {
         // Ending on the border after starting on it makes a cut; anything else closes the shape.
         const PolyMesh& mesh = *selectedLevelMesh();
         const std::vector<glm::vec3>& points = m_faceDraw.points;
@@ -825,6 +865,9 @@ void Editor::drawLevelFaceOverlay()
                 drawFace(*mesh, mesh->faces[f], kFaceGroupOutline, 2.0f);
         drawFace(*mesh, *selected, kFaceOutline, 3.0f);
     }
+    if (m_levelMode == LevelEditMode::Part)
+        for (uint32_t f : selectedPartFaces())
+            drawFace(*mesh, mesh->faces[f], kFaceOutline, 2.0f);
     if (faceDrawValid()) {
         const ImVec2 mousePos = ImGui::GetMousePos();
         glm::vec3 hover;
@@ -1543,11 +1586,13 @@ bool Editor::deleteLevelSelection()
     // In face/edge/vertex mode Del never removes the whole object, even with nothing picked.
     if (m_levelMode == LevelEditMode::Object || !selectedLevelMesh())
         return false;
-    if (m_vertexDrag.active || m_faceDrag.active || m_edgeDrag.active || m_levelEditPending)
+    if (m_vertexDrag.active || m_faceDrag.active || m_edgeDrag.active || m_partDrag.active || m_levelEditPending)
         return true;
     if (m_levelMode == LevelEditMode::Edge)
         return true; // edges have no delete of their own
-    if (m_levelMode == LevelEditMode::Face)
+    if (m_levelMode == LevelEditMode::Part)
+        deleteSelectedParts();
+    else if (m_levelMode == LevelEditMode::Face)
         deleteLevelFace();
     else
         deleteLevelVertices();
@@ -1582,15 +1627,16 @@ void Editor::releaseUnusedLevelModels()
 
 glm::vec3 Editor::placementPoint() const
 {
-    // Where the view ray meets the ground (y = 0), else a few units in front of the camera.
-    const glm::vec3 front = getFront(m_camera);
-    glm::vec3 point = m_camera.position + front * 5.0f;
-    if (front.y < -1e-3f) {
-        const float t = -m_camera.position.y / front.y;
-        if (t < 50.0f)
-            point = m_camera.position + front * t;
+    // On the floor or ground under the middle of the view when it is near, else a few units in front of
+    // the camera.
+    glm::vec3 surface;
+    if (surfacePoint(m_sceneView.width * 0.5f, m_sceneView.height * 0.5f, surface) &&
+        glm::distance(surface, m_camera.position) < 50.0f) {
+        surface.x = std::round(surface.x / m_gridSize) * m_gridSize;
+        surface.z = std::round(surface.z / m_gridSize) * m_gridSize;
+        return surface;
     }
-    point = glm::round(point / m_gridSize) * m_gridSize;
+    glm::vec3 point = glm::round((m_camera.position + getFront(m_camera) * 5.0f) / m_gridSize) * m_gridSize;
     point.y = std::max(point.y, 0.0f);
     return point;
 }
@@ -1601,7 +1647,7 @@ void Editor::addLevelShape(PolyShape shape)
     params.shape = shape;
     const std::string name = uniqueInstanceName(kPolyShapeNames[static_cast<int>(shape)]);
     // Placed on a world grid point with its sides on its own grid, so they lie on world grid lines too.
-    PolyMesh mesh = makeShapeOnGrid(params, m_gridSize, m_gridSnap);
+    PolyMesh mesh = makePolyShapeOnGrid(params, m_gridSize, m_gridSnap);
     // New shapes are painted with the Materials panel's current material.
     if (m_materials.find(m_currentMaterial))
         levelSlotFor(mesh, m_currentMaterial); // slot 0, which every new face uses
@@ -1639,7 +1685,8 @@ void Editor::drawFaceGeometry(PolyMesh& mesh, uint32_t faceIndex)
     ImGui::SetItemTooltip("Move the face along its normal; neighbouring faces stretch");
     ImGui::SameLine();
     const bool extrude = ImGui::Button("Extrude", ImVec2(width, 0.0f));
-    ImGui::SetItemTooltip("Build new side faces out to the moved face");
+    ImGui::SetItemTooltip("Build new side faces out to the moved face. On a closed shape the new part merges with "
+        "anything it overlaps, and a negative distance cuts into the shape instead");
 
     EditorStyle::propertyLabel("Inset");
     ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.5f);
@@ -1692,17 +1739,21 @@ void Editor::drawFaceGeometry(PolyMesh& mesh, uint32_t faceIndex)
         ImGui::PopTextWrapPos();
     }
 
+    ImGui::PushTextWrapPos(0.0f);
+    ImGui::TextDisabled("Keys: %s / %s push or pull the selected faces one cell, %s extrudes them, %s extrudes inwards.",
+        m_keymap.shortcutLabel(EditorAction::FacePushOut).c_str(), m_keymap.shortcutLabel(EditorAction::FacePullIn).c_str(),
+        m_keymap.shortcutLabel(EditorAction::FaceExtrude).c_str(),
+        m_keymap.shortcutLabel(EditorAction::FaceExtrudeIn).c_str());
+    ImGui::PopTextWrapPos();
+
     if (!push && !extrude)
         return;
     if (std::abs(m_faceOpDistance) < 1e-4f) {
         setStatus("Distance is zero", true);
         return;
     }
-    if (push)
-        mesh.moveFace(faceIndex, m_faceOpDistance);
-    else
-        mesh.extrudeFace(faceIndex, m_faceOpDistance);
-    rebuildSelectedLevelModel(push ? "push/pull" : "extrude");
+    // Every selected face, not just the active one.
+    moveSelectedFaces(m_faceOpDistance, extrude);
 }
 
 void Editor::drawEdgeGeometry(PolyMesh& mesh, uint32_t a, uint32_t b)
@@ -1718,7 +1769,8 @@ void Editor::drawEdgeGeometry(PolyMesh& mesh, uint32_t a, uint32_t b)
     ImGui::SetItemTooltip("Object space; with snapping on, the offset is rounded to the grid per axis");
     const float width = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
     const bool push = ImGui::Button("Push/Pull", ImVec2(width, 0.0f));
-    ImGui::SetItemTooltip("Move the edge along the average normal of its faces; they stretch along");
+    ImGui::SetItemTooltip("Move the edge along the average normal of its faces, or outward within the face for an "
+        "open border edge (resizing a plane); the faces stretch along");
     ImGui::SameLine();
     const bool extrude = ImGui::Button("Extrude", ImVec2(width, 0.0f));
     ImGui::SetItemTooltip("Build a new face out from the edge: on an open border it continues the surface, "
@@ -1743,7 +1795,7 @@ void Editor::drawEdgeGeometry(PolyMesh& mesh, uint32_t a, uint32_t b)
 
     if (!push && !extrude)
         return;
-    const glm::vec3 direction = extrude ? mesh.edgeExtrudeDirection(a, b) : mesh.edgeNormal(a, b);
+    const glm::vec3 direction = mesh.edgeExtrudeDirection(a, b);
     const glm::vec3 offset = edgeOffset(direction, m_faceOpDistance, grid, m_gridSnap);
     if (glm::length(offset) < 1e-4f) {
         setStatus("Distance is zero", true);
@@ -1921,15 +1973,20 @@ void Editor::drawLevelPanel()
         ImGui::SetNextItemWidth(-FLT_MIN);
         ImGui::DragFloat3("##size", &m_newShape.size.x, m_gridSize * 0.05f, 0.01f, 1000.0f, "%.3g");
         if (ImGui::IsItemDeactivatedAfterEdit() && m_gridSnap)
-            m_newShape = snapShapeSize(m_newShape, m_gridSize);
+            m_newShape = snapPolyShapeSize(m_newShape, m_gridSize);
         ImGui::SetItemTooltip("Rounded to whole grid cells while snapping is on");
         switch (m_newShape.shape) {
         case PolyShape::Plane:
+            EditorStyle::propertyLabel("Subdivisions");
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            ImGui::SliderInt("##subdivisions", &m_newShape.subdivisions, 1, 64);
+            ImGui::SetItemTooltip("Grid cells per side; 1 makes the plane a single face");
+            break;
         case PolyShape::Cylinder:
         case PolyShape::Arch:
-            EditorStyle::propertyLabel(m_newShape.shape == PolyShape::Plane ? "Subdivisions" : "Segments");
+            EditorStyle::propertyLabel("Segments");
             ImGui::SetNextItemWidth(-FLT_MIN);
-            ImGui::SliderInt("##segments", &m_newShape.segments, m_newShape.shape == PolyShape::Plane ? 1 : 3, 64);
+            ImGui::SliderInt("##segments", &m_newShape.segments, 3, 64);
             break;
         case PolyShape::Stairs:
             EditorStyle::propertyLabel("Steps");
@@ -1945,11 +2002,30 @@ void Editor::drawLevelPanel()
             ImGui::DragFloat("##thickness", &m_newShape.thickness, 0.01f, 0.01f, 100.0f, "%.2f");
         }
 
-        if (ImGui::Button("Create", ImVec2(-FLT_MIN, 0.0f)))
+        const float createWidth = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
+        if (ImGui::Button("Create", ImVec2(createWidth, 0.0f)))
             addLevelShape(m_newShape.shape);
+        ImGui::SetItemTooltip("Add the shape on the floor in the middle of the view");
+        ImGui::SameLine();
+        const bool drawing = shapeDrawActive();
+        if (drawing) {
+            ImGui::PushStyleColor(ImGuiCol_Button, EditorStyle::kAccent);
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, EditorStyle::kAccentHover);
+        }
+        if (ImGui::Button(drawing ? "Drawing..." : "Draw", ImVec2(-FLT_MIN, 0.0f)))
+            toggleShapeDraw();
+        if (drawing)
+            ImGui::PopStyleColor(2);
+        ImGui::SetItemTooltip("%s", withShortcut("Draw shapes in the viewport: drag a footprint on the ground or a "
+            "floor, move the mouse to set the height, click. A click places this size. Esc stops",
+            EditorAction::DrawShape).c_str());
+
+        ImGui::SeparatorText("Place entities");
+        drawEntityPalette();
 
         ImGui::SeparatorText("Selected");
         drawPrefabSection();
+        drawUniteSection();
         if (PolyMesh* mesh = selectedLevelMesh()) {
             ImGui::Text("%zu vertices, %zu faces", mesh->positions.size(), mesh->faces.size());
             EditorStyle::propertyLabel("Shape grid");
@@ -1970,7 +2046,7 @@ void Editor::drawLevelPanel()
             // Rebuilding replaces any manual edits, so it only happens on request.
             if (ImGui::Button("Rebuild from shape settings", ImVec2(-FLT_MIN, 0.0f))) {
                 // Materials survive; the new faces all start on material 0.
-                PolyMesh rebuilt = makeShapeOnGrid(m_newShape, mesh->gridSize, m_gridSnap);
+                PolyMesh rebuilt = makePolyShapeOnGrid(m_newShape, mesh->gridSize, m_gridSnap);
                 rebuilt.materials = std::move(mesh->materials);
                 *mesh = std::move(rebuilt);
                 clearFaceSelection();
@@ -1985,14 +2061,25 @@ void Editor::drawLevelPanel()
 
             ImGui::SeparatorText("Edit");
             int mode = static_cast<int>(m_levelMode);
-            ImGui::RadioButton("Object", &mode, static_cast<int>(LevelEditMode::Object));
-            ImGui::SameLine();
-            ImGui::RadioButton("Faces", &mode, static_cast<int>(LevelEditMode::Face));
-            ImGui::SameLine();
-            ImGui::RadioButton("Edges", &mode, static_cast<int>(LevelEditMode::Edge));
-            ImGui::SameLine();
-            ImGui::RadioButton("Vertices", &mode, static_cast<int>(LevelEditMode::Vertex));
+            // One row while it fits the panel, wrapping otherwise.
+            const float rowRight = ImGui::GetCursorScreenPos().x + ImGui::GetContentRegionAvail().x;
+            const auto modeButton = [&](const char* label, LevelEditMode value, EditorAction shortcut, bool first) {
+                const float width = ImGui::GetFrameHeight() + ImGui::GetStyle().ItemInnerSpacing.x +
+                    ImGui::CalcTextSize(label).x;
+                if (!first && ImGui::GetItemRectMax().x + ImGui::GetStyle().ItemSpacing.x + width <= rowRight)
+                    ImGui::SameLine();
+                ImGui::RadioButton(label, &mode, static_cast<int>(value));
+                ImGui::SetItemTooltip("%s", m_keymap.shortcutLabel(shortcut).c_str());
+            };
+            modeButton("Object", LevelEditMode::Object, EditorAction::ObjectMode, true);
+            modeButton("Faces", LevelEditMode::Face, EditorAction::FaceMode, false);
+            modeButton("Edges", LevelEditMode::Edge, EditorAction::EdgeMode, false);
+            modeButton("Vertices", LevelEditMode::Vertex, EditorAction::VertexMode, false);
+            modeButton("Parts", LevelEditMode::Part, EditorAction::PartMode, false);
             m_levelMode = static_cast<LevelEditMode>(mode);
+
+            if (m_levelMode == LevelEditMode::Part)
+                drawPartControls(*mesh);
 
             if (m_levelMode == LevelEditMode::Face) {
                 if (PolyFace* face = selectedLevelFace()) {
@@ -2017,16 +2104,28 @@ void Editor::drawLevelPanel()
                         selectFacesWhere([material](const PolyMesh&, const PolyFace& other) { return other.material == material; });
                     }
                     ImGui::SetItemTooltip("Add every face with the active face's material");
+                    if (ImGui::Button("Select surface", ImVec2(half, 0.0f)))
+                        selectSurface();
+                    ImGui::SetItemTooltip("%s", withShortcut("Add the whole flat surface around the selected faces "
+                        "(faces joined by edges in the same plane). Also: double-click a face", EditorAction::SelectSurface).c_str());
+                    ImGui::SameLine();
+                    // Invalidates `face`; nothing below uses it.
+                    if (ImGui::Button("Join flat faces", ImVec2(half, 0.0f)))
+                        mergeLevelFaces();
+                    ImGui::SetItemTooltip("Join neighbouring faces that lie in one plane and share material and UVs "
+                        "into single faces, dropping the extra edges");
                     if (ImGui::Button("Copy UVs", ImVec2(half, 0.0f)))
                         copyFaceAttributes();
-                    ImGui::SetItemTooltip("Copy the active face's material and UVs (Ctrl+Shift+C)");
+                    ImGui::SetItemTooltip("Copy the active face's material and UVs (%s)",
+                        m_keymap.shortcutLabel(EditorAction::CopyFaceAttributes).c_str());
                     ImGui::SameLine();
                     ImGui::BeginDisabled(!m_faceClipboard.valid);
                     if (ImGui::Button("Paste UVs", ImVec2(half, 0.0f)))
                         pasteFaceAttributes();
                     ImGui::EndDisabled();
                     if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-                        ImGui::SetTooltip("Paste material and UVs onto the selected faces (Ctrl+Shift+V)");
+                        ImGui::SetTooltip("Paste material and UVs onto the selected faces (%s)",
+                            m_keymap.shortcutLabel(EditorAction::PasteFaceAttributes).c_str());
 
                     if (PolyFace* active = selectedLevelFace())
                         drawFaceProperties(*mesh, *active);
@@ -2057,7 +2156,8 @@ void Editor::drawLevelPanel()
                 }
                 else {
                     ImGui::TextDisabled("Click a face of the shape in the viewport;");
-                    ImGui::TextDisabled("Shift+click adds. Drag to push/pull, Alt+drag to extrude.");
+                    ImGui::TextDisabled("Shift+click adds, double-click takes the whole surface.");
+                    ImGui::TextDisabled("Drag to push/pull, Alt+drag to extrude (inwards cuts in).");
                 }
             }
             else if (m_levelMode == LevelEditMode::Edge) {
@@ -2085,6 +2185,10 @@ void Editor::drawLevelPanel()
 
                 if (!selectedLevelVertices().empty()) {
                     drawVertexProperties(*mesh);
+
+                    if (ImGui::Button("Snap to grid", ImVec2(-FLT_MIN, 0.0f)))
+                        snapSelectedVertices();
+                    ImGui::SetItemTooltip("Round the selected vertices to the shape's grid");
 
                     ImGui::BeginDisabled(m_selectedVertices.size() < 2);
                     if (ImGui::Button("Merge", ImVec2(width, 0.0f)))

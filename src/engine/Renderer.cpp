@@ -23,6 +23,10 @@ constexpr uint8_t kVisibleMain = 1;
 // A submesh casts into cascade c when bit (kVisibleShadow << c) is set.
 constexpr uint8_t kVisibleShadow = 2;
 constexpr size_t kCullChunkSize = 1024;
+// Fewer instances than this are culled on the calling thread: handing them to the thread pool costs more.
+constexpr size_t kParallelCullThreshold = 128;
+// Shadow map kept while shadows are off or the Classic pipeline is active; never rendered into.
+constexpr uint32_t kStubShadowMapSize = 16;
 // Unity's selection orange; occluded parts of the outline are drawn fainter.
 constexpr glm::vec3 kOutlineColor{ 1.0f, 0.4f, 0.0f };
 constexpr float kOutlineOccludedAlpha = 0.4f;
@@ -84,7 +88,38 @@ glm::vec2 projectionDepthRange(const glm::mat4& proj)
     return { b / a, b / (a + 1.0f) };
 }
 
+template <typename It, typename Fn>
+void forEachMaybeParallel(bool parallel, It begin, It end, Fn fn)
+{
+    if (parallel)
+        std::for_each(std::execution::par, begin, end, fn);
+    else
+        std::for_each(begin, end, fn);
+}
+
 } // namespace
+
+void Renderer::FrameBatches::clear()
+{
+    for (size_t index : mainModels)
+        main[index].instances.clear();
+    for (size_t index : shadowModels)
+        shadow[index].instances.clear();
+    mainModels.clear();
+    shadowModels.clear();
+}
+
+Renderer::RenderBatch& Renderer::FrameBatches::add(std::vector<RenderBatch>& batches, std::vector<size_t>& used,
+    size_t modelIndex, GPUModel* model)
+{
+    if (modelIndex >= batches.size())
+        batches.resize(modelIndex + 1);
+    RenderBatch& batch = batches[modelIndex];
+    if (batch.instances.empty())
+        used.push_back(modelIndex);
+    batch.model = model;
+    return batch;
+}
 
 Renderer::~Renderer()
 {
@@ -290,10 +325,17 @@ void Renderer::destroySkyResources()
     destroyRenderImage(m_skyIrradiance);
 }
 
+std::pair<uint32_t, uint32_t> Renderer::wantedShadowMap() const
+{
+    if (!m_settings.shadows || classic())
+        return { kStubShadowMapSize, 1u };
+    return { static_cast<uint32_t>(m_settings.shadowMapSize), static_cast<uint32_t>(m_settings.shadowCascades) };
+}
+
 bool Renderer::createShadowMapResources()
 {
-    m_shadowMap = createShadowMap(m_allocator, m_device, static_cast<uint32_t>(m_settings.shadowMapSize),
-        static_cast<uint32_t>(m_settings.shadowCascades));
+    const auto [size, layers] = wantedShadowMap();
+    m_shadowMap = createShadowMap(m_allocator, m_device, size, layers);
     m_shadowMapValid = false;
     writeImageDescriptors();
     return true;
@@ -624,8 +666,11 @@ void Renderer::destroyLineBuffer(LineBuffer& buffer)
 
 bool Renderer::initImGuiBackend()
 {
-    const vk::DescriptorPoolSize imguiPoolSize{ vk::DescriptorType::eCombinedImageSampler, 1 };
-    vk::DescriptorPoolCreateInfo imguiPoolInfo{ vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet, 1, 1, &imguiPoolSize };
+    // ImGui recreates its font atlas texture when the atlas grows and frees the old set a few frames later,
+    // so several sets can be live at once. A failed allocation leaves ImGui writing to a garbage handle.
+    constexpr uint32_t kImGuiMaxSets = 16;
+    const vk::DescriptorPoolSize imguiPoolSize{ vk::DescriptorType::eCombinedImageSampler, kImGuiMaxSets };
+    vk::DescriptorPoolCreateInfo imguiPoolInfo{ vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet, kImGuiMaxSets, 1, &imguiPoolSize };
     if (!takeResult(m_device.createDescriptorPool(imguiPoolInfo), m_imguiDescriptorPool, "ImGui descriptor pool"))
         return false;
 
@@ -651,7 +696,10 @@ bool Renderer::initImGuiBackend()
     initInfo.PipelineInfoMain.Subpass = 0;
     initInfo.PipelineInfoMain.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
     initInfo.PipelineInfoMain.PipelineRenderingCreateInfo = renderingInfo;
-
+    initInfo.CheckVkResultFn = [](VkResult result) {
+        if (result != VK_SUCCESS)
+            LOG_ERROR("ImGui Vulkan backend call failed: " << static_cast<int>(result) << "\n");
+    };
     // Built with IMGUI_IMPL_VULKAN_NO_PROTOTYPES, so the backend loads its entry points through volk's loader.
     // ImGui tries the core dynamic rendering commands before the KHR ones. On a 1.2 device the instance-level
     // vkCmdBeginRendering exists but leads nowhere; the device-level lookup fails instead, so ImGui falls back.
@@ -770,7 +818,7 @@ void Renderer::applySettings(const GraphicsSettings& requested)
             LOG_ERROR("Failed to recreate render targets for MSAA " << settings.msaaSamples << "x\n");
     }
 
-    if (old.shadowMapSize != settings.shadowMapSize || old.shadowCascades != settings.shadowCascades) {
+    if (wantedShadowMap() != std::pair(m_shadowMap.size, m_shadowMap.layers)) {
         (void)m_device.waitIdle();
         destroyShadowMap(m_shadowMap, m_allocator, m_device);
         try {
@@ -898,9 +946,8 @@ Renderer::FrameStatus Renderer::renderFrame(const FrameInput& input)
     const FrameUBO frameData = buildFrameUBO(input);
     memcpy(m_frameUBOs[m_currentFrame].mapped, &frameData, sizeof(FrameUBO));
 
-    FrameBatches batches;
     std::array<uint64_t, kMaxShadowCascades> shadowHashes{};
-    cullAndBatch(input, frameData.proj * frameData.view, batches, shadowHashes);
+    cullAndBatch(input, frameData.proj * frameData.view, m_batches, shadowHashes);
     // A cascade whose casters and matrix did not change keeps last frame's contents.
     for (uint32_t c = 0; c < m_shadowMap.layers; ++c) {
         m_renderCascade[c] = !m_shadowMapValid || shadowHashes[c] != m_cascadeHashes[c];
@@ -915,7 +962,7 @@ Renderer::FrameStatus Renderer::renderFrame(const FrameInput& input)
     m_skyHash = sky;
     m_skyValid = !classicFrame;
 
-    buildDrawStreams(input, batches);
+    buildDrawStreams(input, m_batches);
     uploadDrawStreams();
 
     const vk::CommandBuffer cmd = m_commandBuffers[m_currentFrame];
@@ -1000,13 +1047,29 @@ void Renderer::cullAndBatch(const FrameInput& input, const glm::mat4& viewProj, 
     const bool shadows = shadowsActive();
     const uint32_t cascadeCount = shadows ? m_shadowMap.layers : 0;
     const auto& instances = models.getInstances();
-    m_cullResults.resize(instances.size());
-    m_cullIndices.resize(instances.size());
+    // Scene instances first, then the frame's dynamic ones.
+    const size_t sceneCount = instances.size();
+    const size_t totalCount = sceneCount + input.dynamicInstances.size();
+    m_cullResults.resize(totalCount);
+    m_cullIndices.resize(totalCount);
     std::iota(m_cullIndices.begin(), m_cullIndices.end(), 0);
 
+    // Detail culling: a sphere of radius r at distance d covers about 2 r * pixelsPerUnit / d pixels.
+    const float detailPixels = m_settings.detailCulling;
+    const float pixelsPerUnit = 0.5f * std::abs(input.proj[1][1]) * static_cast<float>(sceneRect(input).extent.height);
+    const glm::vec3 cameraPos = input.cameraPosition;
+    const auto largeEnough = [&](const glm::mat4& transform, const glm::vec3& center, float worldRadius) {
+        if (detailPixels <= 0.0f)
+            return true;
+        const float distance = glm::length(glm::vec3(transform * glm::vec4(center, 1.0f)) - cameraPos);
+        return distance <= worldRadius || 2.0f * worldRadius * pixelsPerUnit >= detailPixels * distance;
+    };
+
     // 1. Per-instance phase: transform + whole-model culling.
-    std::for_each(std::execution::par, m_cullIndices.begin(), m_cullIndices.end(), [&](size_t i) {
-        const auto& inst = instances[i];
+    forEachMaybeParallel(totalCount >= kParallelCullThreshold, m_cullIndices.begin(), m_cullIndices.end(), [&](size_t i) {
+        const bool dynamic = i >= sceneCount;
+        const auto& inst = dynamic ? input.dynamicInstances[i - sceneCount].instance : instances[i];
+        const bool castShadow = !dynamic || input.dynamicInstances[i - sceneCount].castShadow;
         auto& res = m_cullResults[i];
 
         res.instance = &inst;
@@ -1015,19 +1078,27 @@ void Renderer::cullAndBatch(const FrameInput& input, const glm::mat4& viewProj, 
         res.visibleMain = false;
         res.shadowMask = 0;
 
-        if (!inst.visible) return;
+        if (!inst.visible || (input.hideEntities && !dynamic && !inst.entity.empty())) return;
 
         GPUModel* gpuModel = models.getModel(inst.modelIndex);
         if (!gpuModel || !gpuModel->isValid()) return;
 
         res.gpuModel = gpuModel;
-        res.transform = inst.getTransformMatrix();
-        res.maxScale = std::max({ std::abs(inst.scale.x), std::abs(inst.scale.y), std::abs(inst.scale.z) });
+        if (dynamic) {
+            res.transform = input.dynamicInstances[i - sceneCount].transform;
+            res.maxScale = std::max({ glm::length(glm::vec3(res.transform[0])), glm::length(glm::vec3(res.transform[1])),
+                glm::length(glm::vec3(res.transform[2])) });
+        }
+        else {
+            res.transform = inst.getTransformMatrix();
+            res.maxScale = std::max({ std::abs(inst.scale.x), std::abs(inst.scale.y), std::abs(inst.scale.z) });
+        }
 
         res.mainPlanes = extractFrustumPlanes(viewProj * res.transform);
-        res.visibleMain = isAABBInFrustum(res.mainPlanes, gpuModel->boundsMin, gpuModel->boundsMax);
+        res.visibleMain = isAABBInFrustum(res.mainPlanes, gpuModel->boundsMin, gpuModel->boundsMax) &&
+            largeEnough(res.transform, gpuModel->boundsCenter, gpuModel->boundsRadius * res.maxScale);
 
-        for (uint32_t c = 0; c < cascadeCount; ++c) {
+        for (uint32_t c = 0; castShadow && c < cascadeCount; ++c) {
             FrustumPlanes planes = extractFrustumPlanes(m_cascades[c].matrix * res.transform);
             // Casters between the sun and the cascade still throw shadows into it (depth clamp flattens them).
             planes.planes[4] = glm::vec4(0.0f, 0.0f, 0.0f, 1.0f);
@@ -1050,7 +1121,7 @@ void Renderer::cullAndBatch(const FrameInput& input, const glm::mat4& viewProj, 
             m_cullChunks.push_back({ i, b, std::min(b + kCullChunkSize, n) });
     }
 
-    std::for_each(std::execution::par, m_cullChunks.begin(), m_cullChunks.end(), [&](const CullChunk& chunk) {
+    forEachMaybeParallel(m_cullChunks.size() > 1, m_cullChunks.begin(), m_cullChunks.end(), [&](const CullChunk& chunk) {
         auto& res = m_cullResults[chunk.instanceIdx];
         const auto& submeshes = res.gpuModel->submeshes;
 
@@ -1058,8 +1129,10 @@ void Renderer::cullAndBatch(const FrameInput& input, const glm::mat4& viewProj, 
             const SubmeshInfo& sub = submeshes[s];
             const bool validBounds = sub.boundsMin.x <= sub.boundsMax.x;
             uint8_t flags = 0;
-            if (res.visibleMain &&
-                (!validBounds || isAABBInFrustum(res.mainPlanes, sub.boundsMin, sub.boundsMax)))
+            if (res.visibleMain && (!validBounds ||
+                    (isAABBInFrustum(res.mainPlanes, sub.boundsMin, sub.boundsMax) &&
+                     largeEnough(res.transform, 0.5f * (sub.boundsMin + sub.boundsMax),
+                         0.5f * glm::length(sub.boundsMax - sub.boundsMin) * res.maxScale))))
                 flags |= kVisibleMain;
             if (res.shadowMask && sub.material.alphaMode != AlphaMode::BLEND) {
                 const float radius = validBounds
@@ -1087,22 +1160,18 @@ void Renderer::cullAndBatch(const FrameInput& input, const glm::mat4& viewProj, 
     }
 
     m_frameTransforms.clear();
+    batches.clear();
     for (const auto& res : m_cullResults) {
         if (!res.gpuModel || !(res.visibleMain || res.shadowMask)) continue;
 
         const uint32_t transformIndex = pushTransform(res.transform);
         InstanceRenderData renderData{ res.instance, res.transform, res.submeshFlags.data(), transformIndex };
 
-        if (res.visibleMain) {
-            auto& batch = batches.main[res.modelIndex];
-            batch.model = res.gpuModel;
-            batch.instances.push_back(renderData);
-        }
+        if (res.visibleMain)
+            batches.add(batches.main, batches.mainModels, res.modelIndex, res.gpuModel).instances.push_back(renderData);
 
         if (res.shadowMask) {
-            auto& batch = batches.shadow[res.modelIndex];
-            batch.model = res.gpuModel;
-            batch.instances.push_back(renderData);
+            batches.add(batches.shadow, batches.shadowModels, res.modelIndex, res.gpuModel).instances.push_back(renderData);
 
             for (uint32_t c = 0; c < cascadeCount; ++c) {
                 if (!(res.shadowMask & (1u << c))) continue;
@@ -1192,7 +1261,8 @@ void Renderer::buildDrawStreams(const FrameInput& input, FrameBatches& batches)
     for (uint32_t c = 0; c < m_shadowMap.layers; ++c) {
         if (!m_renderCascade[c]) continue;
         const uint8_t bit = static_cast<uint8_t>(kVisibleShadow << c);
-        for (auto& [modelIdx, batch] : batches.shadow) {
+        for (size_t modelIdx : batches.shadowModels) {
+            const RenderBatch& batch = batches.shadow[modelIdx];
             GPUModel* model = batch.model;
             for (uint32_t si : model->drawOrder) {
                 const SubmeshInfo& sub = model->submeshes[si];
@@ -1210,7 +1280,8 @@ void Renderer::buildDrawStreams(const FrameInput& input, FrameBatches& batches)
         }
     }
 
-    for (auto& [modelIdx, batch] : batches.main) {
+    for (size_t modelIdx : batches.mainModels) {
+        const RenderBatch& batch = batches.main[modelIdx];
         GPUModel* model = batch.model;
         for (uint32_t si : model->drawOrder) {
             const SubmeshInfo& sub = model->submeshes[si];
@@ -1223,8 +1294,8 @@ void Renderer::buildDrawStreams(const FrameInput& input, FrameBatches& batches)
         }
     }
 
-    std::vector<InstanceRenderData> sortedInstances;
-    for (auto& [modelIdx, batch] : batches.main) {
+    for (size_t modelIdx : batches.mainModels) {
+        const RenderBatch& batch = batches.main[modelIdx];
         GPUModel* model = batch.model;
         bool sorted = false;
         for (std::size_t si = 0; si < model->submeshes.size(); ++si) {
@@ -1232,8 +1303,8 @@ void Renderer::buildDrawStreams(const FrameInput& input, FrameBatches& batches)
             if (sub.material.alphaMode != AlphaMode::BLEND) continue;
 
             if (!sorted) {
-                sortedInstances = batch.instances;
-                std::sort(sortedInstances.begin(), sortedInstances.end(), [&](const InstanceRenderData& a, const InstanceRenderData& b) {
+                m_sortedInstances.assign(batch.instances.begin(), batch.instances.end());
+                std::sort(m_sortedInstances.begin(), m_sortedInstances.end(), [&](const InstanceRenderData& a, const InstanceRenderData& b) {
                     return glm::distance(cameraPos, a.instance->position) > glm::distance(cameraPos, b.instance->position);
                 });
                 sorted = true;
@@ -1241,7 +1312,7 @@ void Renderer::buildDrawStreams(const FrameInput& input, FrameBatches& batches)
 
             vk::DescriptorSet sets[3];
             materialSets(models, model, sub.material, sets);
-            for (const auto& rd : sortedInstances)
+            for (const auto& rd : m_sortedInstances)
                 if (rd.submeshFlags[si] & kVisibleMain)
                     appendDraw(m_blendRuns, model, sets, true, sub, rd.transformIndex, rd.instance->color);
         }
@@ -1250,25 +1321,25 @@ void Renderer::buildDrawStreams(const FrameInput& input, FrameBatches& batches)
     buildHighlightStream(input);
 }
 
-// The selection mask draws the highlighted instance whether or not its submeshes passed culling, so
+// The selection mask draws the highlighted instances whether or not their submeshes passed culling, so
 // the outline of partly off-screen objects stays correct.
 void Renderer::buildHighlightStream(const FrameInput& input)
 {
     m_highlightRuns.clear();
-    const SelectionHighlight& highlight = input.highlight;
     ModelManager& models = *input.models;
     const auto& instances = models.getInstances();
-    if (highlight.instance < 0 || highlight.instance >= static_cast<int>(instances.size()))
-        return;
-    const ModelInstance& inst = instances[highlight.instance];
-    GPUModel* model = models.getModel(inst.modelIndex);
-    if (!inst.visible || !model || !model->isValid())
-        return;
-
-    const uint32_t transformIndex = pushTransform(inst.getTransformMatrix());
     const vk::DescriptorSet noSets[3] = {};
-    for (const SubmeshInfo& sub : model->submeshes)
-        appendDraw(m_highlightRuns, model, noSets, false, sub, transformIndex, glm::vec3(1.0f));
+    for (const int index : input.highlight.instances) {
+        if (index < 0 || index >= static_cast<int>(instances.size()))
+            continue;
+        const ModelInstance& inst = instances[index];
+        GPUModel* model = models.getModel(inst.modelIndex);
+        if (!inst.visible || !model || !model->isValid())
+            continue;
+        const uint32_t transformIndex = pushTransform(inst.getTransformMatrix());
+        for (const SubmeshInfo& sub : model->submeshes)
+            appendDraw(m_highlightRuns, model, noSets, false, sub, transformIndex, glm::vec3(1.0f));
+    }
 }
 
 void Renderer::uploadDrawStreams()
@@ -1499,7 +1570,7 @@ void Renderer::transitionFrameTargets(vk::CommandBuffer cmd, bool depthPrepass)
     barriers.push_back(imageBarrier(vk::Image(m_sceneDepth.image), depthAspect, previousStages, previousWrites,
         depthStages | Stage::eColorAttachmentOutput, depthAccess | Access::eColorAttachmentWrite,
         vk::ImageLayout::eUndefined, vk::ImageLayout::eDepthAttachmentOptimal));
-    toColorTarget(m_hdrColor, 1);
+    toColorTarget(sceneColorTarget(), 1);
     if (m_samples != vk::SampleCountFlagBits::e1) {
         toColorTarget(m_msaaColor, 1);
         barriers.push_back(imageBarrier(vk::Image(m_msaaDepth.image), depthAspect, previousStages, previousWrites,
@@ -1599,7 +1670,7 @@ void Renderer::recordScenePass(vk::CommandBuffer cmd, const FrameInput& input, b
             .setResolveImageLayout(vk::ImageLayout::eColorAttachmentOptimal);
     }
     else {
-        colorAttachment.setImageView(m_hdrColor.view).setStoreOp(vk::AttachmentStoreOp::eStore);
+        colorAttachment.setImageView(sceneColorTarget().view).setStoreOp(vk::AttachmentStoreOp::eStore);
     }
 
     vk::RenderingAttachmentInfo depthAttachment{};
@@ -1689,12 +1760,13 @@ void Renderer::recordScenePass(vk::CommandBuffer cmd, const FrameInput& input, b
     recordPathLines(cmd, input);
     cmd.endRendering();
 
-    // The HDR image feeds bloom and the composite; without a prepass the depth was only written just now
-    // and the selection mask samples it next. Resolves count as color attachment writes.
+    // The HDR image feeds bloom and the composite (the LDR one the Classic upscale); without a prepass the
+    // depth was only written just now and the selection mask samples it next. Resolves count as color
+    // attachment writes.
     using Stage = vk::PipelineStageFlagBits2;
     using Access = vk::AccessFlagBits2;
     std::vector<vk::ImageMemoryBarrier2> barriers = {
-        imageBarrier(vk::Image(m_hdrColor.image), vk::ImageAspectFlagBits::eColor,
+        imageBarrier(vk::Image(sceneColorTarget().image), vk::ImageAspectFlagBits::eColor,
             Stage::eColorAttachmentOutput, Access::eColorAttachmentWrite,
             Stage::eFragmentShader, Access::eShaderSampledRead,
             vk::ImageLayout::eColorAttachmentOptimal, vk::ImageLayout::eShaderReadOnlyOptimal),
@@ -1869,7 +1941,7 @@ void Renderer::recordFinalPass(vk::CommandBuffer cmd, uint32_t imageIndex, const
         push.uvClamp = glm::vec4((source.offset.x + 0.5f) / size.x, (source.offset.y + 0.5f) / size.y,
             (source.offset.x + source.extent.width - 0.5f) / size.x,
             (source.offset.y + source.extent.height - 0.5f) / size.y);
-        drawFx(cmd, m_classicPresentShaders, { m_hdrSet }, &push, sizeof(push));
+        drawFx(cmd, m_classicPresentShaders, { m_ldrSet }, &push, sizeof(push));
     }
     else if (fxaaActive()) {
         FxaaPushConstants push{};

@@ -49,12 +49,13 @@ FetchContent_Declare(
   GIT_SHALLOW TRUE
 )
 
-# Only windowing, events and Vulkan surfaces are used; drop the other subsystems and renderers.
+# Windowing, events, Vulkan surfaces and audio are used; drop the other subsystems and renderers.
 foreach(SDL_UNUSED_OPTION
-    SDL_AUDIO SDL_GPU SDL_RENDER SDL_CAMERA SDL_JOYSTICK SDL_HAPTIC SDL_HIDAPI SDL_POWER SDL_SENSOR
+    SDL_GPU SDL_RENDER SDL_CAMERA SDL_JOYSTICK SDL_HAPTIC SDL_HIDAPI SDL_POWER SDL_SENSOR
     SDL_DIALOG SDL_TRAY SDL_OPENGL SDL_OPENGLES SDL_TEST_LIBRARY)
   set(${SDL_UNUSED_OPTION} OFF CACHE BOOL "" FORCE)
 endforeach()
+set(SDL_AUDIO ON CACHE BOOL "" FORCE)
 
 FetchContent_Declare(
   glm

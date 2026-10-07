@@ -4,6 +4,7 @@
 #include <cmath>
 #include <iterator>
 #include <map>
+#include <numeric>
 #include <utility>
 
 // BSP-tree CSG after Evan Wallace's csg.js. Trees are stored as node arrays and walked with explicit
@@ -295,21 +296,34 @@ void fixTJunctions(PolyMesh& mesh)
     }
 }
 
-} // namespace
+enum class CsgOp { Subtract, Union };
 
-PolyMesh polyMeshSubtract(const PolyMesh& target, const PolyMesh& cutter)
+// sharedMaterials: the cutter's slots are the target's (an extrusion of its own faces), so its faces keep
+// their slot numbers instead of being matched by value.
+PolyMesh combine(const PolyMesh& target, const PolyMesh& cutter, CsgOp op, bool sharedMaterials,
+    std::vector<int64_t>* sources)
 {
     CsgTree a, b;
     a.build(toPolygons(target, false));
     b.build(toPolygons(cutter, true));
-    a.invert();
-    a.clipTo(b);
-    b.clipTo(a);
-    b.invert();
-    b.clipTo(a);
-    b.invert();
-    a.build(b.allPolygons());
-    a.invert();
+    if (op == CsgOp::Subtract) {
+        a.invert();
+        a.clipTo(b);
+        b.clipTo(a);
+        b.invert();
+        b.clipTo(a);
+        b.invert();
+        a.build(b.allPolygons());
+        a.invert();
+    }
+    else {
+        a.clipTo(b);
+        b.clipTo(a);
+        b.invert();
+        b.clipTo(a);
+        b.invert();
+        a.build(b.allPolygons());
+    }
 
     PolyMesh result;
     result.materials = target.materials;
@@ -317,8 +331,10 @@ PolyMesh polyMeshSubtract(const PolyMesh& target, const PolyMesh& cutter)
     std::vector<uint32_t> cutterMaterials(cutter.materials.size(), UINT32_MAX);
     const auto materialFor = [&](const CsgPolygon& polygon) {
         const uint32_t material = (polygon.fromCutter ? cutter : target).faces[polygon.sourceFace].material;
-        if (!polygon.fromCutter || material >= cutter.materials.size())
-            return polygon.fromCutter ? kNoPolyMaterial : material;
+        if (!polygon.fromCutter || sharedMaterials)
+            return material;
+        if (material >= cutter.materials.size())
+            return kNoPolyMaterial;
         uint32_t& mapped = cutterMaterials[material];
         if (mapped == UINT32_MAX) {
             const PolyMaterial& source = cutter.materials[material];
@@ -338,6 +354,8 @@ PolyMesh polyMeshSubtract(const PolyMesh& target, const PolyMesh& cutter)
         return mapped;
     };
 
+    if (sources)
+        sources->clear();
     Welder welder(result.positions);
     for (const CsgPolygon& polygon : a.allPolygons()) {
         const PolyFace& source = (polygon.fromCutter ? cutter : target).faces[polygon.sourceFace];
@@ -362,8 +380,140 @@ PolyMesh polyMeshSubtract(const PolyMesh& target, const PolyMesh& cutter)
         if (glm::length(area) * 0.5f < 1e-7f)
             continue;
         result.faces.push_back(std::move(face));
+        if (sources)
+            sources->push_back(polygon.fromCutter ? -1 : static_cast<int64_t>(polygon.sourceFace));
     }
     fixTJunctions(result);
     result.removeUnusedVertices();
     return result;
 }
+
+// The point, on the face's plane, is inside the face.
+bool faceContains(const PolyMesh& mesh, const PolyFace& face, const glm::vec3& n, const glm::vec3& p)
+{
+    std::vector<std::array<uint32_t, 3>> tris;
+    mesh.triangulate(face, tris);
+    for (const auto& tri : tris) {
+        const glm::vec3& a = mesh.positions[face.verts[tri[0]]];
+        const glm::vec3& b = mesh.positions[face.verts[tri[1]]];
+        const glm::vec3& c = mesh.positions[face.verts[tri[2]]];
+        if (glm::dot(glm::cross(b - a, p - a), n) >= -1e-6f && glm::dot(glm::cross(c - b, p - b), n) >= -1e-6f &&
+            glm::dot(glm::cross(a - c, p - c), n) >= -1e-6f)
+            return true;
+    }
+    return false;
+}
+
+} // namespace
+
+PolyMesh polyMeshSubtract(const PolyMesh& target, const PolyMesh& cutter, std::vector<int64_t>* sources)
+{
+    return combine(target, cutter, CsgOp::Subtract, false, sources);
+}
+
+PolyMesh polyMeshUnion(const PolyMesh& target, const PolyMesh& other, std::vector<int64_t>* sources)
+{
+    return combine(target, other, CsgOp::Union, false, sources);
+}
+
+bool PolyMesh::extrudeFacesSolid(const std::vector<uint32_t>& faceIndices, float distance, std::vector<uint32_t>* caps)
+{
+    if (std::abs(distance) < 1e-6f || !isClosed())
+        return false;
+    // Where each moved face ends up: its plane, and a point inside it to tell it from other faces there.
+    struct Cap {
+        glm::vec3 normal;
+        float offset;
+        glm::vec3 inside;
+    };
+    std::vector<PolyMesh> prisms;
+    std::vector<Cap> moved;
+    std::vector<std::array<uint32_t, 3>> tris;
+    const float lo = std::min(distance, 0.0f);
+    const float hi = std::max(distance, 0.0f);
+    for (uint32_t f : faceIndices) {
+        if (f >= faces.size() || faces[f].verts.size() < 3)
+            continue;
+        const PolyFace& face = faces[f];
+        const glm::vec3 n = faceNormal(face);
+        const uint32_t count = static_cast<uint32_t>(face.verts.size());
+        PolyMesh prism;
+        prism.materials = materials;
+        for (uint32_t v : face.verts)
+            prism.positions.push_back(positions[v] + n * lo);
+        for (uint32_t v : face.verts)
+            prism.positions.push_back(positions[v] + n * hi);
+        std::vector<uint32_t> bottom(count), top(count);
+        for (uint32_t i = 0; i < count; ++i) {
+            bottom[i] = i;
+            top[i] = count + i;
+        }
+        // The ends carry the face's look, so the moved face keeps its texture; the sides take its material.
+        prism.addFace(top, n);
+        prism.addFace(bottom, -n);
+        for (PolyFace& end : prism.faces) {
+            end.uvScale = face.uvScale;
+            end.uvOffset = face.uvOffset;
+            end.uvRotation = face.uvRotation;
+        }
+        for (uint32_t i = 0; i < count; ++i) {
+            const uint32_t j = (i + 1) % count;
+            const glm::vec3 edge = positions[face.verts[j]] - positions[face.verts[i]];
+            prism.addFace({ bottom[i], bottom[j], top[j], top[i] }, glm::cross(edge, n));
+        }
+        for (PolyFace& side : prism.faces)
+            side.material = face.material;
+
+        tris.clear();
+        triangulate(face, tris);
+        glm::vec3 inside = faceCenter(face);
+        if (!tris.empty())
+            inside = (positions[face.verts[tris[0][0]]] + positions[face.verts[tris[0][1]]] +
+                positions[face.verts[tris[0][2]]]) / 3.0f;
+        moved.push_back({ n, glm::dot(n, faceCenter(face)) + distance, inside + n * distance });
+        prisms.push_back(std::move(prism));
+    }
+    if (prisms.empty())
+        return false;
+
+    PolyMesh result = *this;
+    // Join keys: the original face each piece comes from (-1: new), so faces the user split stay split.
+    std::vector<int64_t> keys(faces.size());
+    std::iota(keys.begin(), keys.end(), int64_t(0));
+    for (const PolyMesh& prism : prisms) {
+        std::vector<int64_t> sources;
+        PolyMesh next = combine(result, prism, distance > 0.0f ? CsgOp::Union : CsgOp::Subtract, true, &sources);
+        for (int64_t& source : sources)
+            source = source >= 0 ? keys[static_cast<size_t>(source)] : -1;
+        keys = std::move(sources);
+        result = std::move(next);
+    }
+    if (result.faces.empty())
+        return false;
+    result.mergeCoplanarFaces(keys);
+
+    if (caps) {
+        caps->clear();
+        for (const Cap& cap : moved) {
+            uint32_t found = UINT32_MAX;
+            for (uint32_t f = 0; f < result.faces.size(); ++f) {
+                const PolyFace& face = result.faces[f];
+                const glm::vec3 n = result.faceNormal(face);
+                if (glm::dot(n, cap.normal) < 0.999f ||
+                    std::abs(glm::dot(cap.normal, result.positions[face.verts[0]]) - cap.offset) > 1e-3f)
+                    continue;
+                if (found == UINT32_MAX)
+                    found = f;
+                if (faceContains(result, face, n, cap.inside)) {
+                    found = f;
+                    break;
+                }
+            }
+            if (found != UINT32_MAX && std::find(caps->begin(), caps->end(), found) == caps->end())
+                caps->push_back(found);
+        }
+    }
+    *this = std::move(result);
+    return true;
+}
+

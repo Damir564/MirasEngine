@@ -457,7 +457,131 @@ Mesh loadWithFastGltf(const std::string& path) {
     return result;
 }
 
+// Node TRS as stored, or decomposed from a matrix (no shear assumed).
+void nodeTrs(const fastgltf::Node& node, AnimNode& out) {
+    std::visit(fastgltf::visitor{
+        [&](const fastgltf::math::fmat4x4& matrix) {
+            glm::mat4 m(1.0f);
+            memcpy(&m, matrix.data(), sizeof(float) * 16);
+            out.translation = glm::vec3(m[3]);
+            glm::vec3 axes[3] = { glm::vec3(m[0]), glm::vec3(m[1]), glm::vec3(m[2]) };
+            out.scale = glm::vec3(glm::length(axes[0]), glm::length(axes[1]), glm::length(axes[2]));
+            for (int i = 0; i < 3; ++i)
+                if (out.scale[i] > 1e-8f) axes[i] /= out.scale[i];
+            out.rotation = glm::normalize(glm::quat_cast(glm::mat3(axes[0], axes[1], axes[2])));
+        },
+        [&](const fastgltf::TRS& trs) {
+            out.translation = glm::vec3(trs.translation[0], trs.translation[1], trs.translation[2]);
+            out.rotation = glm::normalize(glm::quat(trs.rotation[3], trs.rotation[0], trs.rotation[1], trs.rotation[2]));
+            out.scale = glm::vec3(trs.scale[0], trs.scale[1], trs.scale[2]);
+        }
+        }, node.transform);
+}
+
+// Depth first, so every parent is listed before its children.
+void addAnimNode(const fastgltf::Asset& asset, size_t gltfNode, int parent, AnimatedModelData& out,
+    std::vector<int>& nodeMap, std::vector<int>& meshMap, const std::string& path) {
+    if (gltfNode >= asset.nodes.size() || nodeMap[gltfNode] >= 0)
+        return;
+    const fastgltf::Node& node = asset.nodes[gltfNode];
+    const int index = static_cast<int>(out.nodes.size());
+    nodeMap[gltfNode] = index;
+    AnimNode animNode;
+    animNode.name.assign(node.name.begin(), node.name.end());
+    animNode.parent = parent;
+    nodeTrs(node, animNode);
+    if (node.meshIndex.has_value()) {
+        const size_t meshIndex = *node.meshIndex;
+        if (meshMap[meshIndex] < 0) {
+            // Each mesh once, in its own space; nodes using the same mesh share it.
+            Mesh mesh;
+            TextureCache textureCache;
+            for (const auto& primitive : asset.meshes[meshIndex].primitives)
+                appendGltfPrimitive(asset, primitive, glm::mat4(1.0f), glm::mat3(1.0f), mesh, textureCache, path);
+            if (node.skinIndex.has_value())
+                LOG_INFO("[ANIM] " << path << ": skinned meshes are drawn unskinned\n");
+            for (const fastgltf::Material& material : asset.materials)
+                mesh.materialNames.emplace_back(material.name.begin(), material.name.end());
+            computeAllSubmeshBounds(mesh);
+            meshMap[meshIndex] = static_cast<int>(out.meshes.size());
+            out.meshes.push_back(std::move(mesh));
+        }
+        animNode.mesh = meshMap[meshIndex];
+    }
+    out.nodes.push_back(std::move(animNode));
+    for (size_t child : node.children)
+        addAnimNode(asset, child, index, out, nodeMap, meshMap, path);
+}
+
+void readAnimations(const fastgltf::Asset& asset, const std::vector<int>& nodeMap, AnimatedModelData& out) {
+    for (const fastgltf::Animation& animation : asset.animations) {
+        AnimClip clip;
+        clip.name.assign(animation.name.begin(), animation.name.end());
+        for (const fastgltf::AnimationChannel& channel : animation.channels) {
+            if (!channel.nodeIndex.has_value() || *channel.nodeIndex >= nodeMap.size() || nodeMap[*channel.nodeIndex] < 0)
+                continue;
+            AnimChannel track;
+            track.node = nodeMap[*channel.nodeIndex];
+            switch (channel.path) {
+            case fastgltf::AnimationPath::Translation: track.path = AnimPath::Translation; break;
+            case fastgltf::AnimationPath::Rotation: track.path = AnimPath::Rotation; break;
+            case fastgltf::AnimationPath::Scale: track.path = AnimPath::Scale; break;
+            default: continue; // morph target weights
+            }
+            const fastgltf::AnimationSampler& sampler = animation.samplers[channel.samplerIndex];
+            switch (sampler.interpolation) {
+            case fastgltf::AnimationInterpolation::Step: track.interpolation = AnimInterpolation::Step; break;
+            case fastgltf::AnimationInterpolation::CubicSpline: track.interpolation = AnimInterpolation::CubicSpline; break;
+            default: track.interpolation = AnimInterpolation::Linear; break;
+            }
+            const fastgltf::Accessor& input = asset.accessors[sampler.inputAccessor];
+            const fastgltf::Accessor& output = asset.accessors[sampler.outputAccessor];
+            track.times.resize(input.count);
+            fastgltf::iterateAccessorWithIndex<float>(asset, input, [&](float t, size_t i) { track.times[i] = t; });
+            track.values.resize(output.count);
+            if (track.path == AnimPath::Rotation) {
+                fastgltf::iterateAccessorWithIndex<fastgltf::math::fvec4>(asset, output,
+                    [&](fastgltf::math::fvec4 v, size_t i) { track.values[i] = glm::vec4(v.x(), v.y(), v.z(), v.w()); });
+            }
+            else {
+                fastgltf::iterateAccessorWithIndex<fastgltf::math::fvec3>(asset, output,
+                    [&](fastgltf::math::fvec3 v, size_t i) { track.values[i] = glm::vec4(v.x(), v.y(), v.z(), 0.0f); });
+            }
+            if (!track.times.empty())
+                clip.duration = std::max(clip.duration, track.times.back());
+            clip.channels.push_back(std::move(track));
+        }
+        out.clips.push_back(std::move(clip));
+    }
+}
+
 } // namespace
+
+AnimatedModelData loadAnimatedModel(const std::string& path) {
+    fastgltf::Parser parser;
+    auto gltfFile = fastgltf::MappedGltfFile::FromPath(path);
+    if (!gltfFile) throw std::runtime_error("Failed to load glTF file: " + path);
+    auto assetRet = parser.loadGltf(gltfFile.get(), std::filesystem::path(path).parent_path(),
+        fastgltf::Options::LoadGLBBuffers | fastgltf::Options::LoadExternalBuffers);
+    if (auto error = assetRet.error(); error != fastgltf::Error::None)
+        throw std::runtime_error("Failed to parse " + path + ": " + std::string(fastgltf::getErrorMessage(error)));
+    const fastgltf::Asset& asset = assetRet.get();
+
+    AnimatedModelData result;
+    if (asset.scenes.empty())
+        return result;
+    std::vector<int> nodeMap(asset.nodes.size(), -1);
+    std::vector<int> meshMap(asset.meshes.size(), -1);
+    for (size_t root : asset.scenes[asset.defaultScene.value_or(0)].nodeIndices)
+        addAnimNode(asset, root, -1, result, nodeMap, meshMap, path);
+    readAnimations(asset, nodeMap, result);
+    // Embedded textures point into the asset.
+    for (Mesh& mesh : result.meshes)
+        decodeAllTextures(mesh.textureData, false);
+    LOG_INFO("[ANIM] " << path << ": " << result.nodes.size() << " nodes, " << result.meshes.size() << " meshes, "
+        << result.clips.size() << " clips\n");
+    return result;
+}
 
 bool isBuiltinModelPath(const std::string& path) {
     return path.rfind("builtin:", 0) == 0;

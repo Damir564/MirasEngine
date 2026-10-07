@@ -9,6 +9,7 @@
 #include <iterator>
 #include <limits>
 #include "McpServer.h" // complete type for m_mcp
+#include "engine/EntityTypes.h"
 #include "engine/ModelLoader.h"
 #include "engine/ModelManager.h"
 #include "engine/SceneManager.h"
@@ -29,6 +30,15 @@ Editor::Editor(const EngineContext& engine)
 
     m_cameraAnimator.getPath().name = m_pathName;
     LOG_INFO("Camera animation system initialized\n");
+    m_keymap.load(kEditorKeymapPath);
+
+    // Before the first ImGui frame, which reads imgui.ini (and with it the panel visibility).
+    m_prefs = m_savedPrefs = loadEditorPrefs();
+    m_camera.speed = m_prefs.cameraSpeed;
+    m_camera.sensitivity = m_prefs.lookSensitivity;
+    EditorStyle::apply(m_prefs.styleOptions());
+    m_appliedStyle = m_prefs;
+    registerIniHandler();
 
     SDL_SetWindowRelativeMouseMode(m_window, m_flyMode);
 }
@@ -39,33 +49,32 @@ Editor::Editor(const EngineContext& engine)
 
 void Editor::onEvent(const SDL_Event& event)
 {
+    m_keymap.processEvent(event);
     // WantTextInput, not WantCaptureKeyboard: with keyboard nav enabled the latter stays true after clicking any button.
-    if (m_flyMode || !ImGui::GetIO().WantTextInput) {
-        if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat)
-            handleKeyDown(event.key);
-        if (event.type == SDL_EVENT_KEY_UP && !event.key.repeat && !(event.key.mod & SDL_KMOD_SHIFT))
-            m_cameraSpeedMultiplier = 1.0f;
-    }
+    if ((m_flyMode || !ImGui::GetIO().WantTextInput) && event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat)
+        handleKeyDown(event.key);
     if (!m_flyMode)
         handleViewportMouse(event);
     handleCameraLook(event);
 }
 
+// Shortcuts that also work in fly mode, where ImGui gets no input; the rest are in handleShortcuts().
 void Editor::handleKeyDown(const SDL_KeyboardEvent& key)
 {
-    // Escape leaves fly mode (and deselects via the UI shortcut); quitting is File > Exit or closing the window.
-    if (key.scancode == SDL_SCANCODE_ESCAPE && m_flyMode)
+    // Esc always leaves fly mode, whatever the bindings, so the hidden UI can't get stuck. Quitting is
+    // File > Exit or closing the window.
+    if (key.scancode == SDL_SCANCODE_ESCAPE && m_flyMode) {
         setFlyMode(false);
-
-    if (key.mod & SDL_KMOD_SHIFT) {
-        m_cameraSpeedMultiplier = 4.0f;
-        if (key.scancode == SDL_SCANCODE_GRAVE)
-            setFlyMode(!m_flyMode);
+        return;
     }
+    if (capturingKey())
+        return;
+    if (m_keymap.matches(EditorAction::ToggleFlyMode, key))
+        setFlyMode(!m_flyMode);
 
     dropStaleGizmoSelection();
 
-    if (key.scancode == SDL_SCANCODE_F5)
+    if (m_keymap.matches(EditorAction::Play, key))
         requestPlay();
 }
 
@@ -99,8 +108,11 @@ void Editor::onResume()
     m_vertexDrag.active = false;
     m_faceDrag.active = false;
     m_edgeDrag.active = false;
+    m_partDrag.active = false;
     m_vertexMarquee.active = false;
-    m_cameraSpeedMultiplier = 1.0f;
+    m_objectMarquee.active = false;
+    if (shapeDrawActive())
+        m_shapeDraw.phase = ShapeDraw::Phase::Ready;
     SDL_SetWindowRelativeMouseMode(m_window, m_flyMode);
     ImGuiIO& io = ImGui::GetIO();
     io.AddMouseButtonEvent(ImGuiMouseButton_Left, false);
@@ -117,29 +129,35 @@ void Editor::dropStaleGizmoSelection()
         return;
     const auto& instances = m_models.getInstances();
     if (m_gizmo.selectedInstance >= static_cast<int>(instances.size())) {
-        m_gizmo.deselect();
+        deselectAll();
         return;
     }
     GPUModel* model = m_models.getModel(instances[m_gizmo.selectedInstance].modelIndex);
     if (!model || !model->isValid())
-        m_gizmo.deselect();
+        deselectAll();
 }
 
 void Editor::handleViewportMouse(const SDL_Event& event)
 {
     if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN && event.button.button == SDL_BUTTON_LEFT &&
-        !ImGui::GetIO().WantCaptureMouse && sceneViewContains(event.button.x, event.button.y))
-        handleViewportClick(event.button.x - m_sceneView.x, event.button.y - m_sceneView.y);
+        !uiOwnsMouse() && sceneViewContains(event.button.x, event.button.y))
+        handleViewportClick(event.button.x - m_sceneView.x, event.button.y - m_sceneView.y, event.button.clicks);
 
     if (event.type == SDL_EVENT_MOUSE_BUTTON_UP && event.button.button == SDL_BUTTON_LEFT) {
         m_gizmo.isDragging = false;
         m_gizmo.activeAxis = GizmoAxis::None;
+        m_partDrag.active = false;
         m_vertexDrag.active = false;
         m_faceDrag.active = false;
         m_edgeDrag.active = false;
         if (m_vertexMarquee.active)
             finishVertexMarquee(event.button.x - m_sceneView.x, event.button.y - m_sceneView.y);
+        if (m_objectMarquee.active)
+            finishObjectMarquee(event.button.x - m_sceneView.x, event.button.y - m_sceneView.y);
+        handleShapeDrawRelease(event.button.x - m_sceneView.x, event.button.y - m_sceneView.y);
     }
+    if (event.type == SDL_EVENT_MOUSE_MOTION && shapeDrawActive())
+        handleShapeDrawMotion(event.motion.x - m_sceneView.x, event.motion.y - m_sceneView.y);
 
     if (event.type == SDL_EVENT_MOUSE_MOTION && m_gizmo.isDragging && validInstance(m_gizmo.selectedInstance))
         dragGizmo(event.motion.x - m_sceneView.x, event.motion.y - m_sceneView.y);
@@ -151,9 +169,11 @@ void Editor::handleViewportMouse(const SDL_Event& event)
         dragLevelEdge(event.motion.x - m_sceneView.x, event.motion.y - m_sceneView.y);
     if (event.type == SDL_EVENT_MOUSE_MOTION && m_vertexMarquee.active)
         m_vertexMarquee.end = glm::vec2(event.motion.x - m_sceneView.x, event.motion.y - m_sceneView.y);
+    if (event.type == SDL_EVENT_MOUSE_MOTION && m_objectMarquee.active)
+        m_objectMarquee.end = glm::vec2(event.motion.x - m_sceneView.x, event.motion.y - m_sceneView.y);
 }
 
-void Editor::handleViewportClick(float mouseX, float mouseY)
+void Editor::handleViewportClick(float mouseX, float mouseY, int clicks)
 {
     const int orientationAxis = pickOrientationHandle(mouseX, mouseY);
     if (orientationAxis >= 0) {
@@ -161,7 +181,12 @@ void Editor::handleViewportClick(float mouseX, float mouseY)
         return;
     }
 
-    // Drawing on a face takes every click, so the gizmo or other faces can't get in the way.
+    // Drawing a shape or on a face, or placing entities, takes every click, so the gizmo or other objects
+    // can't get in the way.
+    if (handleEntityPlaceClick(mouseX, mouseY))
+        return;
+    if (handleShapeDrawPress(mouseX, mouseY))
+        return;
     if (faceDrawValid()) {
         handleFaceDrawClick(mouseX, mouseY);
         return;
@@ -171,26 +196,43 @@ void Editor::handleViewportClick(float mouseX, float mouseY)
     const glm::mat4 proj = sceneProjection();
     if (tryBeginGizmoDrag(mouseX, mouseY, view, proj))
         return;
+    if (clicks >= 2 && m_levelMode == LevelEditMode::Object) {
+        // The first click took the whole group; the second one picks the object out of it.
+        const int picked = objectUnderMouse(mouseX, mouseY);
+        if (picked >= 0 && wholeGroupSelected(picked)) {
+            selectInstance(picked);
+            setStatus("Selected " + m_models.getInstances()[picked].name + " in its group");
+            return;
+        }
+        if (enterPartMode(mouseX, mouseY))
+            return;
+    }
 
     // In face/edge/vertex mode the selected level shape keeps the selection; clicks elsewhere pick objects as usual.
-    if (m_levelMode != LevelEditMode::Object && handleLevelClick(mouseX, mouseY))
+    if (m_levelMode != LevelEditMode::Object && handleLevelClick(mouseX, mouseY)) {
+        if (clicks >= 2 && m_levelMode == LevelEditMode::Face && selectedLevelFace())
+            selectSurface();
         return;
-    pickObject(mouseX, mouseY);
+    }
+    const SDL_Keymod mods = keyMods();
+    const int picked = objectUnderMouse(mouseX, mouseY);
+    if (picked >= 0) {
+        selectWithGroup(picked, mods);
+        return;
+    }
+    // Empty space starts a box selection; without a drag, the release deselects.
+    const bool additive = (mods & (SDL_KMOD_SHIFT | SDL_KMOD_CTRL)) != 0;
+    m_objectMarquee = { true, additive, glm::vec2(mouseX, mouseY), glm::vec2(mouseX, mouseY) };
 }
 
 void Editor::pickObject(float mouseX, float mouseY)
 {
-    const glm::mat4 view = getView(m_camera);
-    const glm::mat4 proj = sceneProjection();
-    const Ray ray = screenToWorldRay(mouseX, mouseY, m_sceneView.width, m_sceneView.height, view, proj);
-    const SubmeshHitResult hit = pickSubmesh(ray, m_models.getInstances(),
-        [&](size_t index) { return m_models.getModel(index); });
-    if (hit.hit()) {
-        selectPickedSubmesh(hit);
-    }
-    else {
-        m_gizmo.deselect();
-    }
+    const SDL_Keymod mods = keyMods();
+    const int picked = objectUnderMouse(mouseX, mouseY);
+    if (picked >= 0)
+        selectWithGroup(picked, mods);
+    else if (!(mods & (SDL_KMOD_SHIFT | SDL_KMOD_CTRL)))
+        deselectAll();
 }
 
 bool Editor::gizmoVisible() const
@@ -199,12 +241,12 @@ bool Editor::gizmoVisible() const
         m_models.getInstances()[m_gizmo.selectedInstance].visible;
 }
 
-GizmoShape Editor::currentGizmoShape() const
+GizmoShape Editor::currentGizmoShape()
 {
     if (!gizmoVisible())
         return {};
-    return buildGizmoShape(m_gizmo.mode, m_models.getInstances()[m_gizmo.selectedInstance].position,
-        m_camera.position, getView(m_camera), sceneProjection(), m_sceneView.width, m_sceneView.height);
+    return buildGizmoShape(m_gizmo.mode, gizmoPivot(), m_camera.position, getView(m_camera), sceneProjection(),
+        m_sceneView.width, m_sceneView.height);
 }
 
 bool Editor::tryBeginGizmoDrag(float mouseX, float mouseY, const glm::mat4& view, const glm::mat4& proj)
@@ -249,14 +291,11 @@ bool Editor::tryBeginGizmoDrag(float mouseX, float mouseY, const glm::mat4& view
     m_gizmo.originalPosition = instance.position;
     m_gizmo.originalRotation = instance.rotation;
     m_gizmo.originalScale = instance.scale;
+    // In part mode with parts selected the gizmo is theirs; otherwise the selected objects follow it.
+    beginPartDrag();
+    if (!m_partDrag.active)
+        beginGroupDrag();
     return true;
-}
-
-void Editor::selectPickedSubmesh(const SubmeshHitResult& hit)
-{
-    m_gizmo.select(hit.instanceIndex);
-    LOG_INFO("[PICK] Instance " << hit.instanceIndex << " | Submesh " << hit.submeshIndex
-        << " | t: " << hit.t << "\n");
 }
 
 void Editor::dragGizmo(float mouseX, float mouseY)
@@ -266,11 +305,17 @@ void Editor::dragGizmo(float mouseX, float mouseY)
     const int axis = static_cast<int>(m_gizmo.activeAxis) - 1;
     if (axis < 0 || axis > 2)
         return;
+    if (m_partDrag.active) {
+        dragParts(amount, axis);
+        return;
+    }
     const glm::vec3 axisDir = gizmoAxisDirection(m_gizmo.activeAxis);
     const bool snap = snapActive();
     const auto snapTo = [](float value, float step) { return step > 0.0f ? std::round(value / step) * step : value; };
     markSceneChanged(); // recorded when the drag ends
 
+    float degrees = 0.0f;
+    float scaleFactor = 1.0f;
     switch (m_gizmo.mode) {
     case GizmoMode::Translate:
         instance.position = m_gizmo.originalPosition + axisDir * (amount / m_gizmo.pixelsPerUnit);
@@ -279,9 +324,10 @@ void Editor::dragGizmo(float mouseX, float mouseY)
         break;
     case GizmoMode::Rotate: {
         const float degreesPerPixel = 0.5f;
-        float degrees = amount * degreesPerPixel;
+        degrees = amount * degreesPerPixel;
         if (snap) degrees = snapTo(degrees, m_snapRotate);
-        instance.rotation = m_gizmo.originalRotation + axisDir * degrees;
+        // About the world axis of the ring that is dragged.
+        instance.rotation = rotateEulerAboutAxis(m_gizmo.originalRotation, axis, degrees);
         break;
     }
     case GizmoMode::Scale: {
@@ -289,40 +335,45 @@ void Editor::dragGizmo(float mouseX, float mouseY)
         float delta = amount * scalePerPixel;
         if (snap) delta = snapTo(delta, m_snapScale);
         instance.scale = glm::max(m_gizmo.originalScale + axisDir * delta, glm::vec3(0.01f));
+        scaleFactor = instance.scale[axis] / std::max(m_gizmo.originalScale[axis], 1e-4f);
         break;
     }
     default:
         break;
     }
+    dragGroup(axis, degrees, scaleFactor);
 }
 
 void Editor::handleCameraLook(const SDL_Event& event)
 {
     if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN && event.button.button == SDL_BUTTON_RIGHT &&
-        !m_flyMode && !ImGui::GetIO().WantCaptureMouse && sceneViewContains(event.button.x, event.button.y))
+        !m_flyMode && !uiOwnsMouse() && sceneViewContains(event.button.x, event.button.y))
         m_rightMouseHeld = true;
     if (event.type == SDL_EVENT_MOUSE_BUTTON_UP && event.button.button == SDL_BUTTON_RIGHT)
         m_rightMouseHeld = false;
 
     if (event.type == SDL_EVENT_MOUSE_MOTION && !m_cameraAnimator.isPlaying() && (m_flyMode || m_rightMouseHeld)) {
         m_camera.yaw += event.motion.xrel * m_camera.sensitivity;
-        m_camera.pitch -= event.motion.yrel * m_camera.sensitivity;
+        m_camera.pitch -= event.motion.yrel * m_camera.sensitivity * (m_prefs.invertLookY ? -1.0f : 1.0f);
         m_camera.pitch = glm::clamp(m_camera.pitch, -89.0f, 89.0f);
     }
 }
 
 void Editor::moveCamera(float dt)
 {
-    if ((!m_flyMode && ImGui::GetIO().WantTextInput) || m_cameraAnimator.isPlaying())
+    if ((!m_flyMode && ImGui::GetIO().WantTextInput) || m_cameraAnimator.isPlaying() || capturingKey())
         return;
-    const bool* keys = SDL_GetKeyboardState(nullptr);
+    const glm::vec3 up(0.0f, 1.0f, 0.0f);
     const glm::vec3 front = getFront(m_camera);
-    const glm::vec3 right = glm::normalize(glm::cross(front, glm::vec3(0, 1, 0)));
-    const float step = m_camera.speed * dt * m_cameraSpeedMultiplier;
-    if (keys[SDL_SCANCODE_W]) m_camera.position += front * step;
-    if (keys[SDL_SCANCODE_A]) m_camera.position -= right * step;
-    if (keys[SDL_SCANCODE_D]) m_camera.position += right * step;
-    if (keys[SDL_SCANCODE_S]) m_camera.position -= front * step;
+    const glm::vec3 right = glm::normalize(glm::cross(front, up));
+    const float step = m_camera.speed * dt * (m_keymap.held(EditorAction::CameraFast) ? 4.0f : 1.0f);
+    const auto held = [this](EditorAction action) { return m_keymap.held(action); };
+    if (held(EditorAction::CameraForward)) m_camera.position += front * step;
+    if (held(EditorAction::CameraBack)) m_camera.position -= front * step;
+    if (held(EditorAction::CameraLeft)) m_camera.position -= right * step;
+    if (held(EditorAction::CameraRight)) m_camera.position += right * step;
+    if (held(EditorAction::CameraUp)) m_camera.position += up * step;
+    if (held(EditorAction::CameraDown)) m_camera.position -= up * step;
 }
 
 void Editor::setFlyMode(bool enabled)
@@ -363,6 +414,8 @@ void Editor::lateUpdate(float dt)
     }
     pollMcpServer();
     pollScript();
+    pumpSimulatedKeys();
+    pumpSimulatedMouse();
 }
 
 void Editor::drawUi()
@@ -380,6 +433,9 @@ void Editor::drawUi()
     drawDockSpace();
     drawViewportOverlay();
     drawLevelFaceOverlay();
+    drawObjectMarquee();
+    drawShapeDrawOverlay();
+    drawEntityPlaceOverlay();
     drawTransformGizmo();
     drawOrientationGizmo();
     if (m_showHierarchy) drawHierarchy();
@@ -390,8 +446,13 @@ void Editor::drawUi()
     drawMaterialDropTarget();
     if (m_showAnimationPanel) drawAnimationPanel();
     if (m_showGraphicsSettings) drawGraphicsSettingsWindow();
+    if (m_showKeymap) drawKeymapWindow();
+    else m_keyCapture = {};
+    if (m_showPreferences) drawPreferencesWindow();
     updateLevelHistory();
     updateObjectHistory();
+    settleSavedState();
+    updateAutosave();
     drawFileDialogs();
     drawHelpPopups();
 }
@@ -413,8 +474,13 @@ void Editor::fillFrame(FrameInput& frame)
 
 bool Editor::snapActive() const
 {
-    const bool ctrl = (SDL_GetModState() & SDL_KMOD_CTRL) != 0;
+    const bool ctrl = (keyMods() & SDL_KMOD_CTRL) != 0;
     return m_gridSnap != ctrl;
+}
+
+SDL_Keymod Editor::keyMods() const
+{
+    return m_mouseSimulated ? m_simulatedMods : SDL_GetModState();
 }
 
 bool Editor::levelGridActive()
@@ -461,50 +527,122 @@ void Editor::stepGridSize(int direction)
 
 glm::mat4 Editor::sceneProjection() const
 {
-    return getProjection(m_sceneView.width, m_sceneView.height, kCameraNearPlane, m_settings.viewDistance);
+    return getProjection(m_sceneView.width, m_sceneView.height, kCameraNearPlane, m_settings.viewDistance,
+        m_prefs.fieldOfView);
 }
 
-void Editor::fillHighlight(SelectionHighlight& highlight) const
+void Editor::fillHighlight(SelectionHighlight& highlight)
 {
     highlight = {};
+    m_highlightIndices.clear();
     if (m_flyMode || !hasSelection())
         return;
-    highlight.instance = m_gizmo.selectedInstance;
+    // The shape grid is drawn on what is highlighted, so face/vertex editing outlines the edited shape only.
+    if (levelGridActive())
+        m_highlightIndices.push_back(m_gizmo.selectedInstance);
+    else
+        m_highlightIndices = selectedIndices();
+    highlight.instances = m_highlightIndices;
 }
 
 void Editor::handleShortcuts()
 {
-    if (ImGui::GetIO().WantTextInput)
+    if (ImGui::GetIO().WantTextInput || capturingKey())
         return;
+    using A = EditorAction;
+    const auto pressed = [this](EditorAction action) { return m_keymap.pressed(action); };
     const bool selection = hasSelection();
-    if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_O)) openSceneDialog();
-    if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_S)) saveSceneAsDialog();
-    if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_S)) saveScene();
-    if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_I)) importModelDialog();
-    if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_Z)) undo();
-    if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_Y) ||
-        ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_Z)) redo();
-    if (ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_D) && selection) duplicateInstance(m_gizmo.selectedInstance);
-    if (ImGui::IsKeyChordPressed(ImGuiKey_Delete) && selection && !deleteLevelSelection()) deleteInstance(m_gizmo.selectedInstance);
-    if (ImGui::IsKeyChordPressed(ImGuiKey_F) && selection) focusOnInstance(m_gizmo.selectedInstance);
-    const bool drawingOnFace = handleFaceDrawKeys(); // Escape cancels the drawing instead of deselecting
-    if (ImGui::IsKeyChordPressed(ImGuiKey_Escape) && !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId) && !drawingOnFace) deselectAll();
-    if (ImGui::IsKeyChordPressed(ImGuiKey_Q)) m_tool = GizmoMode::None;
-    if (ImGui::IsKeyChordPressed(ImGuiKey_1)) m_tool = GizmoMode::Translate;
-    if (ImGui::IsKeyChordPressed(ImGuiKey_2)) m_tool = GizmoMode::Rotate;
-    if (ImGui::IsKeyChordPressed(ImGuiKey_3)) m_tool = GizmoMode::Scale;
-    if (ImGui::IsKeyChordPressed(ImGuiKey_I)) pickMaterialUnderMouse();
+    // Part mode on a shape: duplicate, delete, select all, turn and detach act on its parts.
+    const bool partMode = m_levelMode == LevelEditMode::Part && selectedLevelMesh();
+    const bool partsSelected = partMode && !selectedPartFaces().empty();
+    if (pressed(A::NewScene)) requestSceneAction(SceneAction::New);
+    if (pressed(A::OpenScene)) requestSceneAction(SceneAction::OpenDialog);
+    if (pressed(A::SaveSceneAs)) saveSceneAsDialog();
+    if (pressed(A::SaveScene)) saveScene();
+    if (pressed(A::ImportModel)) importModelDialog();
+    if (pressed(A::Undo)) undo();
+    if (pressed(A::Redo)) redo();
+    if (pressed(A::Duplicate) && selection) {
+        if (partsSelected) duplicateSelectedParts();
+        else duplicateSelection();
+    }
+    if (pressed(A::Delete) && selection && !deleteLevelSelection()) deleteSelection();
+    if (pressed(A::Focus) && selection) focusSelection();
+    if (pressed(A::SelectAll)) {
+        if (m_levelMode == LevelEditMode::Face && selectedLevelMesh())
+            selectFacesWhere([](const PolyMesh&, const PolyFace&) { return true; });
+        else if (partMode)
+            selectAllParts();
+        else
+            selectAll();
+    }
+    if (pressed(A::Copy) && selection) copySelection();
+    if (pressed(A::Cut) && selection) cutSelection();
+    if (pressed(A::Paste)) pasteClipboard();
+    if (pressed(A::DropToFloor) && selection) dropSelectionToFloor();
+    if (pressed(A::RotateClockwise) && selection) {
+        if (partsSelected) rotateSelectedParts(-90.0f);
+        else rotateSelection(-90.0f);
+    }
+    if (pressed(A::RotateCounterClockwise) && selection) {
+        if (partsSelected) rotateSelectedParts(90.0f);
+        else rotateSelection(90.0f);
+    }
+    if (pressed(A::Hide) && selection) toggleSelectionVisibility();
+    if (pressed(A::UnhideAll)) unhideAll();
+    // Their cancel key wins over deselecting.
+    const bool drawingOnFace = handleFaceDrawKeys();
+    const bool drawingShape = handleShapeDrawKeys();
+    const bool placingEntities = entityPlacementActive();
+    if (placingEntities && pressed(A::Deselect) && !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId))
+        stopEntityPlacement();
+    if (pressed(A::Deselect) && !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId) && !drawingOnFace &&
+        !drawingShape && !placingEntities) {
+        // Leaves part mode first, keeping the shape selected, like leaving a group.
+        if (m_levelMode == LevelEditMode::Part) {
+            m_levelMode = LevelEditMode::Object;
+            m_selectedParts.clear();
+        }
+        else {
+            deselectAll();
+        }
+    }
+    if (pressed(A::DrawShape)) toggleShapeDraw();
+    if (pressed(A::UniteShapes)) uniteSelectedShapes();
+    if (pressed(A::SeparateShape)) {
+        if (partsSelected) detachSelectedParts();
+        else separateSelectedShape();
+    }
+    if (pressed(A::SaveAsPrefab)) saveSelectionAsPrefab();
+    if (pressed(A::GroupObjects)) groupSelection();
+    if (pressed(A::UngroupObjects) && selection) ungroupSelection();
+    if (pressed(A::SelectTool)) m_tool = GizmoMode::None;
+    if (pressed(A::MoveTool)) m_tool = GizmoMode::Translate;
+    if (pressed(A::RotateTool)) m_tool = GizmoMode::Rotate;
+    if (pressed(A::ScaleTool)) m_tool = GizmoMode::Scale;
+    if (pressed(A::ToggleSnap)) {
+        m_gridSnap = !m_gridSnap;
+        setStatus(m_gridSnap ? "Grid snapping on" : "Grid snapping off");
+    }
+    if (pressed(A::Eyedropper)) pickMaterialUnderMouse();
+    if (pressed(A::ObjectMode)) m_levelMode = LevelEditMode::Object;
+    if (pressed(A::FaceMode)) m_levelMode = LevelEditMode::Face;
+    if (pressed(A::EdgeMode)) m_levelMode = LevelEditMode::Edge;
+    if (pressed(A::VertexMode)) m_levelMode = LevelEditMode::Vertex;
+    if (pressed(A::PartMode)) m_levelMode = LevelEditMode::Part;
     handleFaceKeys();
-    if (ImGui::IsKeyChordPressed(ImGuiKey_LeftBracket)) stepGridSize(-1);
-    if (ImGui::IsKeyChordPressed(ImGuiKey_RightBracket)) stepGridSize(1);
-    if (ImGui::IsKeyChordPressed(ImGuiKey_F1)) m_openControlsPopup = true;
-    if (ImGui::IsKeyChordPressed(ImGuiKey_F2) && selection) beginRename(m_gizmo.selectedInstance);
+    if (pressed(A::GridSmaller)) stepGridSize(-1);
+    if (pressed(A::GridLarger)) stepGridSize(1);
+    if (pressed(A::ToggleGrid)) m_showGrid = !m_showGrid;
+    if (pressed(A::ShowControls)) m_openControlsPopup = true;
+    if (pressed(A::ShowKeymap)) m_showKeymap = true;
+    if (pressed(A::Rename) && selection) beginRename(m_gizmo.selectedInstance);
 }
 
 void Editor::updateWindowTitle()
 {
     const std::string& path = m_scenes.currentPath();
-    std::string title = "MirasEngine - " + (path.empty() ? std::string("Untitled") : path);
+    std::string title = "MirasEngine - " + (path.empty() ? std::string("Untitled") : path) + (sceneDirty() ? "*" : "");
     if (title != m_windowTitle) {
         SDL_SetWindowTitle(m_window, title.c_str());
         m_windowTitle = std::move(title);
@@ -542,22 +680,6 @@ bool Editor::validInstance(int index) const
     return index >= 0 && index < static_cast<int>(m_models.getInstances().size());
 }
 
-void Editor::validateSelection()
-{
-    if (!validInstance(m_gizmo.selectedInstance) && m_gizmo.selectedInstance != -1)
-        m_gizmo.deselect();
-}
-
-void Editor::selectInstance(int index)
-{
-    m_gizmo.select(index);
-}
-
-void Editor::deselectAll()
-{
-    m_gizmo.deselect();
-}
-
 // ---------------------------------------------------------------------------------------------
 // Object actions
 // ---------------------------------------------------------------------------------------------
@@ -573,8 +695,9 @@ void Editor::focusOnInstance(int index)
     const float maxScale = std::max({ instance.scale.x, instance.scale.y, instance.scale.z });
     glm::vec3 center = glm::vec3(instance.getTransformMatrix() * glm::vec4(model->boundsCenter, 1.0f));
     const float radius = model->boundsRadius * maxScale;
-    // 60 degree vertical FOV: a sphere of radius r fits at distance r / sin(30deg) = 2r.
-    m_camera.position = center - getFront(m_camera) * std::max(radius * 2.2f, 1.0f);
+    // A sphere of radius r fits the vertical field of view at distance r / sin(fov / 2); 10% margin.
+    const float fit = 1.1f / std::sin(glm::radians(m_prefs.fieldOfView * 0.5f));
+    m_camera.position = center - getFront(m_camera) * std::max(radius * fit, 1.0f);
 }
 
 void Editor::addModelToScene(size_t modelIndex, bool atOrigin)
@@ -607,24 +730,40 @@ void Editor::duplicateInstance(int index)
 {
     if (!validInstance(index))
         return;
+    const ModelInstance& source = m_models.getInstances()[index];
+    const GPUModel* model = m_models.getModel(source.modelIndex);
+    const float offset = model ? model->boundsRadius * std::max({ source.scale.x, source.scale.y, source.scale.z }) : 1.0f;
+    const std::string name = source.name;
+    const auto copy = copyInstance(index, glm::vec3(offset, 0.0f, 0.0f));
+    if (!copy)
+        return;
+    selectInstance(static_cast<int>(*copy));
+    setStatus("Duplicated " + name);
+}
+
+std::optional<size_t> Editor::copyInstance(int index, const glm::vec3& offset)
+{
     const ModelInstance source = m_models.getInstances()[index];
     GPUModel* model = m_models.getModel(source.modelIndex);
-    const float offset = model ? model->boundsRadius * std::max({ source.scale.x, source.scale.y, source.scale.z }) : 1.0f;
     // Level geometry is copied so the duplicate can be edited on its own; prefab instances keep sharing it.
     size_t modelIndex = source.modelIndex;
     if (model && model->polyMesh && model->prefabPath.empty()) {
         const auto copy = createLevelModel(*model->polyMesh, model->name);
         if (!copy)
-            return;
+            return std::nullopt;
         modelIndex = *copy;
     }
-    const size_t newIndex = m_models.createInstance(modelIndex, source.position + glm::vec3(offset, 0.0f, 0.0f),
-        source.rotation, source.scale);
-    m_models.getInstances()[newIndex].color = source.color;
-    m_models.getInstances()[newIndex].locked = source.locked;
+    const size_t newIndex = m_models.createInstance(modelIndex, source.position + offset, source.rotation, source.scale);
+    ModelInstance& created = m_models.getInstances()[newIndex];
+    created.name = uniqueInstanceName(source.name);
+    created.color = source.color;
+    created.visible = source.visible;
+    created.locked = source.locked;
+    created.entity = source.entity;
+    created.entityParams = source.entityParams;
+    created.group = source.group;
     markSceneChanged();
-    selectInstance(static_cast<int>(newIndex));
-    setStatus("Duplicated " + source.name);
+    return newIndex;
 }
 
 glm::vec3 Editor::instanceWorldCenter(int index) const
@@ -636,14 +775,22 @@ glm::vec3 Editor::instanceWorldCenter(int index) const
     return glm::vec3(instance.getTransformMatrix() * glm::vec4(models[instance.modelIndex]->boundsCenter, 1.0f));
 }
 
-std::string Editor::uniqueInstanceName(const std::string& base) const
+std::string Editor::uniqueInstanceName(const std::string& name) const
 {
+    // "Box (2)" -> "Box", so copies of copies count on from the original name.
+    std::string base = name;
+    if (base.size() > 4 && base.back() == ')') {
+        const size_t open = base.rfind(" (");
+        if (open != std::string::npos && open + 3 < base.size() &&
+            std::all_of(base.begin() + open + 2, base.end() - 1, [](char c) { return c >= '0' && c <= '9'; }))
+            base.erase(open);
+    }
     const auto& instances = m_models.getInstances();
     const auto taken = [&](const std::string& name) {
         return std::any_of(instances.begin(), instances.end(), [&](const ModelInstance& i) { return i.name == name; });
     };
-    if (!taken(base))
-        return base;
+    if (!taken(name))
+        return name;
     for (int n = 1;; ++n) {
         std::string candidate = base + " (" + std::to_string(n) + ")";
         if (!taken(candidate))
@@ -673,6 +820,61 @@ void Editor::addCube()
     markSceneChanged();
     selectInstance(static_cast<int>(newIndex));
     setStatus("Added " + name);
+}
+
+std::optional<size_t> Editor::addEntity(const std::string& type, const glm::vec3* at)
+{
+    const EntityTypeInfo* info = findEntityType(type);
+    if (!info) {
+        setStatus("Unknown entity type: " + type, true);
+        return std::nullopt;
+    }
+    size_t modelIndex = 0;
+    if (const auto found = m_models.findModelByPath(info->model)) {
+        modelIndex = *found;
+    }
+    else {
+        try {
+            modelIndex = m_models.loadModelSync(info->model, info->label);
+        }
+        catch (const std::exception& e) {
+            setStatus(std::string("Can't load ") + info->model + ": " + e.what(), true);
+            return std::nullopt;
+        }
+    }
+    const size_t index = m_models.createInstance(modelIndex, at ? *at : placementPoint());
+    ModelInstance& instance = m_models.getInstances()[index];
+    instance.name = uniqueInstanceName(info->label);
+    instance.entity = info->id;
+    instance.entityParams = info->defaultParams;
+    // Entities face +Z; turn it the way the camera looks, in 45 degree steps.
+    const glm::vec3 front = getFront(m_camera);
+    instance.rotation.y = std::round(glm::degrees(std::atan2(front.x, front.z)) / 45.0f) * 45.0f;
+    markSceneChanged();
+    selectInstance(static_cast<int>(index));
+    setStatus("Added " + instance.name);
+    return index;
+}
+
+void Editor::drawEntityMenuItems()
+{
+    for (const EntityTypeInfo& type : entityTypes()) {
+        if (type.presets.empty()) {
+            if (ImGui::MenuItem(type.label, nullptr, m_entityPlace.type == type.id))
+                beginEntityPlacement(type.id, -1);
+            ImGui::SetItemTooltip("%s\nClick surfaces in the viewport to place it; Esc stops.", type.description);
+            continue;
+        }
+        if (ImGui::BeginMenu(type.label)) {
+            for (size_t i = 0; i < type.presets.size(); ++i) {
+                const bool active = m_entityPlace.type == type.id && m_entityPlace.preset == static_cast<int>(i);
+                if (ImGui::MenuItem(type.presets[i].label, nullptr, active))
+                    beginEntityPlacement(type.id, static_cast<int>(i));
+                ImGui::SetItemTooltip("%s\nClick surfaces in the viewport to place it; Esc stops.", type.presets[i].params);
+            }
+            ImGui::EndMenu();
+        }
+    }
 }
 
 void Editor::beginRename(int index)
@@ -710,6 +912,7 @@ void Editor::newScene()
     m_scenes.clear();
     clearHistory();
     m_scenes.setCurrentPath({});
+    m_savedState = sceneStateId();
     setStatus("New scene");
 }
 
@@ -717,12 +920,17 @@ void Editor::openScene(const std::string& path)
 {
     const SceneManager::OpenResult opened = m_scenes.open(path);
     if (!opened.ok) {
-        setStatus("Failed to open scene: " + path, true);
+        // A recent scene that was moved or deleted leaves the list.
+        if (std::erase(m_prefs.recentScenes, path) > 0)
+            setStatus("Failed to open scene (removed from recent scenes): " + path, true);
+        else
+            setStatus("Failed to open scene: " + path, true);
         return;
     }
     // The previous scene is gone, so the selection would point at a stale instance.
     deselectAll();
     clearHistory();
+    markSceneSaved(path);
     for (const auto& missing : opened.missingFiles)
         setStatus("Model file not found: " + missing, true);
     setStatus("Opening " + path + " (" + std::to_string(opened.queuedModels) + " models)...");
@@ -730,10 +938,13 @@ void Editor::openScene(const std::string& path)
 
 void Editor::saveSceneTo(const std::string& path)
 {
-    if (m_scenes.save(path))
+    if (m_scenes.save(path)) {
+        markSceneSaved(path);
         setStatus("Scene saved: " + path);
-    else
+    }
+    else {
         setStatus("Failed to save scene: " + path, true);
+    }
 }
 
 void Editor::saveScene()

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <initializer_list>
 #include <map>
 #include <optional>
 #include <string>
@@ -35,13 +36,16 @@ struct SceneInstanceEntry {
     float rotX, rotY, rotZ;
     float scaleX, scaleY, scaleZ;
     bool visible = true;
-    // followed by (version 2+): float color[3]; then (version 5+): uint8_t locked; then: char name[nameLength]
+    // followed by (version 2+): float color[3]; then (version 5+): uint8_t locked; then: char name[nameLength];
+    // then (version 8+): uint32_t entityLength, char entity[entityLength], uint32_t paramsLength,
+    // char entityParams[paramsLength]; then (version 9+): uint32_t groupLength, char group[groupLength]
 };
 
 // Version 1 files have no per-instance color, version 2 files no level geometry, version 3 files no
 // level materials, version 4 files no prefabs, version 5 files no level grid sizes, version 6 files no
-// shared materials.
-inline constexpr uint32_t kSceneFileVersion = 7;
+// shared materials, version 7 files no game entities, version 8 files no object groups.
+inline constexpr uint32_t kSceneFileVersion = 9;
+inline constexpr uint32_t kMaxSceneEntityTextLength = 4096;
 inline constexpr uint32_t kMaxSceneMaterialOverrides = 4096;
 
 // PolyMesh format (see readPolyMesh()) stored in a scene file of this version.
@@ -159,6 +163,11 @@ public:
             const uint8_t locked = inst.locked ? 1 : 0;
             file.write(reinterpret_cast<const char*>(&locked), sizeof(locked));
             file.write(inst.name.data(), entry.nameLength);
+            for (const std::string* text : { &inst.entity, &inst.entityParams, &inst.group }) {
+                const uint32_t length = static_cast<uint32_t>(text->size());
+                file.write(reinterpret_cast<const char*>(&length), sizeof(length));
+                file.write(text->data(), length);
+            }
         }
 
         file.close();
@@ -184,6 +193,9 @@ public:
             bool visible;
             glm::vec3 color{ 1.0f };
             bool locked = false;
+            std::string entity;
+            std::string entityParams;
+            std::string group;
         };
 
         std::vector<LoadedModel> models;
@@ -292,6 +304,22 @@ public:
 
             scene.instances[i].name.resize(entry.nameLength);
             file.read(scene.instances[i].name.data(), entry.nameLength);
+            if (header.version >= 8) {
+                LoadedScene::LoadedInstance& loaded = scene.instances[i];
+                std::vector<std::string*> texts{ &loaded.entity, &loaded.entityParams };
+                if (header.version >= 9)
+                    texts.push_back(&loaded.group);
+                for (std::string* text : texts) {
+                    uint32_t length = 0;
+                    file.read(reinterpret_cast<char*>(&length), sizeof(length));
+                    if (!file || length > kMaxSceneEntityTextLength) {
+                        LOG_ERROR("[SCENE] Corrupt entity data for '" << scene.instances[i].name << "' in " << filepath << "\n");
+                        return scene;
+                    }
+                    text->resize(length);
+                    file.read(text->data(), length);
+                }
+            }
         }
 
         if (!file) {

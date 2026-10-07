@@ -23,6 +23,8 @@ struct GraphicsSettings {
     // Pipeline
     RenderPipeline pipeline = RenderPipeline::Standard;
     float renderScale = 1.0f;  // Classic only: internal resolution relative to the window, 0.25..1
+    // Parts of objects whose bounding sphere covers fewer pixels than this on screen are not drawn; 0 = off.
+    float detailCulling = 0.0f;
 
     // Display
     bool vsync = true;
@@ -63,6 +65,10 @@ struct GraphicsSettings {
     float fogDensity = 1.0f;   // multiplier of the base height fog density
     float viewDistance = 5000.0f; // camera far plane
 
+    // Audio (kept here so one settings file covers the game's options)
+    float masterVolume = 0.8f;  // 0..1
+    float musicVolume = 0.5f;   // ambience loops, relative to the master volume
+
     bool operator==(const GraphicsSettings&) const = default;
 };
 
@@ -73,6 +79,12 @@ struct RenderCapabilities {
 
 inline constexpr const char* kGraphicsSettingsPath = "settings.json";
 
+// Lowest = the Classic pipeline at a reduced render scale, for integrated GPUs.
+enum class QualityPreset { Lowest, Low, Medium, High, Ultra };
+inline constexpr const char* kQualityPresetNames[] = { "Lowest", "Low", "Medium", "High", "Ultra" };
+
+// Presets only touch the performance-relevant options, not the look (sun, exposure, grading...).
+void applyQualityPreset(GraphicsSettings& settings, QualityPreset preset, int maxMsaaSamples);
 // Clamps every field into its valid range (unknown MSAA/shadow sizes snap to the nearest valid value).
 GraphicsSettings sanitizeGraphicsSettings(GraphicsSettings settings);
 // A missing or unreadable file yields defaults; missing keys keep their default value.

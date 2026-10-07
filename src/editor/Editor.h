@@ -12,6 +12,8 @@
 #include <nlohmann/json_fwd.hpp>
 #include "imgui.h"
 #include "app/AppMode.h"
+#include "EditorKeymap.h"
+#include "EditorPrefs.h"
 #include "engine/Camera.h"
 #include "engine/CameraAnimation.h"
 #include "engine/Gizmo.h"
@@ -22,6 +24,7 @@
 #include "engine/Renderer.h"
 
 class McpServer;
+struct EntityPreset;
 
 // The scene editor: viewport interaction (picking, gizmo, camera) plus the docked ImGui panels.
 // The implementation is split by panel across the Editor*.cpp files.
@@ -37,9 +40,13 @@ public:
     void update(float dt) override;
     void lateUpdate(float dt) override;
     bool uiVisible() const override { return !m_flyMode; }
+    // Applies style changes and a requested saved layout, and saves changed preferences.
+    void beforeUiFrame() override;
     void drawUi() override;
     void fillFrame(FrameInput& frame) override;
     bool quitRequested() const override { return m_quitRequested; }
+    // With unsaved changes: asks to save them first and returns false.
+    bool confirmQuit() override;
     ModeRequest takeModeRequest() override;
     void onResume() override;
 
@@ -57,7 +64,10 @@ private:
         int deleteIndex = -1;
         int duplicateIndex = -1;
         int focusIndex = -1;
+        int separateIndex = -1;
         bool createCube = false;
+        bool unite = false;
+        bool uniteAndSave = false;
     };
 
     static constexpr const char* kScenesRoot = ".";
@@ -92,14 +102,15 @@ private:
     void handleKeyDown(const SDL_KeyboardEvent& key);
     void dropStaleGizmoSelection();
     void handleViewportMouse(const SDL_Event& event);
-    void handleViewportClick(float mouseX, float mouseY);
-    // Selects the object under the mouse, or deselects when there is none.
+    // clicks: 2 for the second click of a double-click.
+    void handleViewportClick(float mouseX, float mouseY, int clicks);
+    // Selects the object under the mouse (see clickSelect()), or deselects when there is none.
     void pickObject(float mouseX, float mouseY);
     bool tryBeginGizmoDrag(float mouseX, float mouseY, const glm::mat4& view, const glm::mat4& proj);
-    void selectPickedSubmesh(const SubmeshHitResult& hit);
+    // The active object follows the mouse; other selected objects move with it (dragGroup()).
     void dragGizmo(float mouseX, float mouseY);
     bool gizmoVisible() const;
-    GizmoShape currentGizmoShape() const;
+    GizmoShape currentGizmoShape();
     void handleCameraLook(const SDL_Event& event);
     void moveCamera(float dt);
     void setFlyMode(bool enabled);
@@ -111,14 +122,15 @@ private:
 
     // ---- Editor.cpp: selection and actions ----
     bool validInstance(int index) const;
+    // An active object is selected (it is the gizmo's; see EditorSelection.cpp for the rest).
     bool hasSelection() const { return validInstance(m_gizmo.selectedInstance); }
-    void validateSelection();
-    void selectInstance(int index);
-    void deselectAll();
     void focusOnInstance(int index);
     void addModelToScene(size_t modelIndex, bool atOrigin);
     void deleteInstance(int index);
     void duplicateInstance(int index);
+    // A copy of the instance moved by `offset`, named after it; level geometry is copied unless it is a
+    // prefab's. Returns its index, or nothing (status set) when the copy failed.
+    std::optional<size_t> copyInstance(int index, const glm::vec3& offset);
     void unloadModel(size_t modelIndex);
     void newScene();
     void saveSceneTo(const std::string& path);
@@ -127,13 +139,22 @@ private:
     void updateWindowTitle();
     void setStatus(const std::string& message, bool isError = false);
     static std::string formatCount(size_t value);
-    void fillHighlight(SelectionHighlight& highlight) const;
+    void fillHighlight(SelectionHighlight& highlight);
     glm::vec3 instanceWorldCenter(int index) const;
     void addCube();
-    std::string uniqueInstanceName(const std::string& base) const;
+    // A game entity (EntityTypes.h) as its marker model, at `at` (default: the placement point) and facing
+    // the way the camera looks. Returns its index, or nothing (status set) when the model can't be loaded.
+    std::optional<size_t> addEntity(const std::string& type, const glm::vec3* at = nullptr);
+    void drawEntityMenuItems();
+    // Inspector: the object's entity type and parameters.
+    void drawEntitySection(int instanceIndex);
+    // `name`, or when it is taken "name (n)" with the lowest free n; "Box (2)" counts as "Box".
+    std::string uniqueInstanceName(const std::string& name) const;
     void beginRename(int index);
     // m_gridSnap, inverted while Ctrl is held.
     bool snapActive() const;
+    // Held modifier keys: the view_mouse step's while a simulated mouse event runs, else the keyboard's.
+    SDL_Keymod keyMods() const;
     // Face/vertex editing of a level shape: its own object-space grid replaces the ground grid.
     bool levelGridActive();
     // The grid in use: the edited shape's (PolyMesh::gridSize) or the world grid.
@@ -142,19 +163,147 @@ private:
     // Moves the active grid to the next larger (+1) or smaller (-1) preset.
     void stepGridSize(int direction);
 
+    // ---- EditorEntities.cpp ----
+    // Entity placement: pick a type (or enemy preset) in the Level panel or the Add menu, then every click
+    // on a surface places one there and selects it, until Esc or the button again.
+    void beginEntityPlacement(const std::string& type, int preset);
+    void stopEntityPlacement();
+    bool entityPlacementActive() const { return !m_entityPlace.type.empty(); }
+    // "Enemy (Brute)".
+    std::string entityPlaceLabel() const;
+    // A left press in the scene view; false when the tool is off.
+    bool handleEntityPlaceClick(float mouseX, float mouseY);
+    // Where a click puts an entity: on the floor under the mouse; a wall hit stands it in front of the wall.
+    bool entityPlacementPoint(float mouseX, float mouseY, glm::vec3& out) const;
+    void drawEntityPlaceOverlay();
+    // Level panel: a button per entity type and enemy preset.
+    void drawEntityPalette();
+    // The preset's values (others are kept) and tint.
+    static void applyEntityPreset(ModelInstance& instance, const EntityPreset& preset);
+
+    // ---- EditorGroups.cpp ----
+    // Groups are objects sharing a ModelInstance::group name. A click in the viewport selects the whole
+    // group (a double-click then just the object under the mouse); copies of a whole group form a new group.
+    std::vector<int> groupMembers(const std::string& group) const;
+    // `name`, or "name (n)" when a group already uses it.
+    std::string uniqueGroupName(const std::string& name) const;
+    // "Group n" with the lowest free n.
+    std::string nextGroupName() const;
+    // clickSelect() for the object's whole group.
+    void selectWithGroup(int index, SDL_Keymod mods);
+    // The object is in a group of several, all of them selected.
+    bool wholeGroupSelected(int index) const;
+    // Adds the rest of every group that has a selected object.
+    void expandSelectionToGroups();
+    // Puts the selected objects into one new group (taking them out of any other).
+    void groupSelection();
+    void ungroupSelection();
+    void renameGroup(const std::string& from, const std::string& to);
+    // Names for copies of the objects: a group copied whole gets a new name, so the copy is a group of its
+    // own; groups copied in part are missing here, their copies join them. Old -> new name.
+    std::unordered_map<std::string, std::string> groupNamesForCopies(const std::vector<int>& indices) const;
+    // Inspector: the active object's group (rename, select, ungroup).
+    void drawGroupSection(int instanceIndex);
+    void drawGroupNode(const std::string& group, HierarchyActions& actions);
+    // Object prefabs (Prefab.h ObjectPrefab): any selected objects, re-added later as a group.
+    void saveObjectPrefabDialog();
+    // Saves the objects (by id; gone ones are skipped); several become a group. Status says how it went.
+    void saveObjectPrefab(const std::vector<uint64_t>& ids, const std::string& path);
+    // Adds the prefab's objects around `at` (default: the placement point), as a group when there are several.
+    void addObjectPrefab(const std::string& path, const glm::vec3* at = nullptr);
+
+    // ---- EditorSelection.cpp ----
+    // Several objects can be selected (m_selection, by id). The active one, m_gizmo.selectedInstance, carries
+    // the gizmo, the inspector and face editing; group actions act on all of them.
+    bool isSelected(int index) const;
+    // Selected indices in scene order; with activeFirst, the active object comes first.
+    std::vector<int> selectedIndices(bool activeFirst = false) const;
+    size_t selectionCount() const { return m_selection.size(); }
+    // Just this object, active.
+    void selectInstance(int index);
+    void deselectAll();
+    // Adds the object and makes it active.
+    void addToSelection(int index);
+    void toggleSelection(int index);
+    // Visible objects; the active one stays active when it is visible.
+    void selectAll();
+    // Exactly these objects; `active` (one of them) gets the gizmo, else the first.
+    void selectIndices(const std::vector<int>& indices, int active);
+    // Hierarchy Shift+click: the rows from the active object to `to` that pass the search filter.
+    void selectRange(int to);
+    // The gizmo's object, without changing the rest of the selection; -1 = none.
+    void setActive(int index);
+    // Click on an object: plain selects just it, Shift adds it, Ctrl toggles it.
+    void clickSelect(int index, SDL_Keymod mods);
+    // Drops objects that are gone; the active object stays selected, or another selected one takes over.
+    void validateSelection();
+    // Object under the mouse (scene-view pixels), or -1.
+    int objectUnderMouse(float mouseX, float mouseY) const;
+    // Box selection started on empty space: objects whose center is inside; a click without a drag
+    // deselects (unless Shift/Ctrl was held).
+    void finishObjectMarquee(float mouseX, float mouseY);
+    void drawObjectMarquee();
+    // World-space bounds; level shapes from their mesh. False when the model is missing.
+    bool instanceWorldBounds(int index, glm::vec3& lo, glm::vec3& hi) const;
+    bool selectionWorldBounds(glm::vec3& lo, glm::vec3& hi) const;
+    void focusSelection();
+    void deleteSelection();
+    // One object: duplicateInstance(). Several: copied side by side with the group, the copies selected.
+    void duplicateSelection();
+    // The clipboard keeps the geometry of level shapes, so objects can be pasted into another scene.
+    void copySelection();
+    void cutSelection();
+    // At the copied positions; the pasted objects become the selection.
+    void pasteClipboard();
+    // Each selected object, lowest first, falls straight down onto the first surface below (or y = 0).
+    void dropSelectionToFloor();
+    // Distance down from `origin` to the nearest visible object other than `ignore`; infinity when none.
+    float distanceToSurfaceBelow(const glm::vec3& origin, int ignore) const;
+    // Turns the selection about the vertical axis through the active object.
+    void rotateSelection(float degrees);
+    // Hides the selection, or shows it when all of it is hidden.
+    void toggleSelectionVisibility();
+    void unhideAll();
+    // Remembers every selected object's transform as a gizmo drag starts.
+    void beginGroupDrag();
+    // Applies the active object's change since the drag began to the rest of the selection, about the
+    // active object's starting position: same offset, same turn about the gizmo axis, same scale factor.
+    void dragGroup(int axis, float degrees, float scaleFactor);
+
+    // ---- EditorSceneFiles.cpp ----
+    // Unsaved changes: the scene is not at the undo step it was saved or opened at.
+    bool sceneDirty() const;
+    uint64_t sceneStateId() const;
+    // After a save to the scene's file: clean, and listed under recent scenes.
+    void markSceneSaved(const std::string& path);
+    // Once the edits of a script that saved mid-way are in the history, the scene counts as saved again.
+    void settleSavedState();
+    // What waits for the unsaved-changes prompt.
+    enum class SceneAction { None, New, Open, OpenDialog, Quit };
+    // Runs the action, first asking to save unsaved changes.
+    void requestSceneAction(SceneAction action, const std::string& path = {});
+    void runSceneAction(SceneAction action, const std::string& path);
+    // After Save As from the prompt: the waiting action runs if the scene got saved, else is dropped.
+    void finishPendingSceneAction();
+    void drawUnsavedChangesPopup();
+    void drawRecentScenesMenu();
+    // Writes unsaved changes to kAutosavePath every m_prefs.autosaveMinutes; the scene's file is left alone.
+    void updateAutosave();
+
     // ---- EditorMenus.cpp ----
     void drawMainMenuBar();
     void drawFileMenu();
     void drawEditMenu();
     void drawViewMenu();
     void drawToolbar();
-    void drawToolButton(const char* label, GizmoMode tool, const char* tooltip);
+    void drawToolButton(const char* label, GizmoMode tool, const char* tooltip, EditorAction shortcut);
+    // "text (shortcut)", or just the text when the action is unbound.
+    std::string withShortcut(const char* text, EditorAction action) const;
     void drawSnapPopup();
     void drawGridControls();
     void drawAddMenu();
     void drawStatusBar();
     void drawDockSpace();
-    void buildDefaultLayout(ImGuiID dockspaceId);
     void drawViewportOverlay();
     void drawHelpPopups();
     void drawGraphicsSettingsWindow();
@@ -167,6 +316,51 @@ private:
     void importModelDialog();
     void runScriptDialog();
     void drawFileDialogs();
+
+    // ---- EditorShortcuts.cpp ----
+    // The Keyboard Shortcuts window: every action with its two bindings; click one to record a new chord.
+    void drawKeymapWindow();
+    void drawKeymapRow(EditorAction action);
+    // While recording: the next key (with the modifiers held) becomes the binding; a modifier key pressed
+    // and released alone binds that key; Esc cancels.
+    void updateKeyCapture();
+    bool capturingKey() const { return m_keyCapture.action >= 0; }
+    // Sends the chords queued by the press_keys MCP command as SDL events, one at a time with a free frame
+    // between them, so they take the same path as typed keys. In lateUpdate().
+    void pumpSimulatedKeys();
+    // One step of the view_mouse MCP command per frame, given straight to the viewport handlers (the
+    // panels never see it, and ImGui's idea of the mouse, which follows the real cursor, is ignored).
+    void pumpSimulatedMouse();
+    // ImGui has the mouse (over a panel), unless the event being handled is a simulated one.
+    bool uiOwnsMouse() const;
+
+    // ---- EditorPreferences.cpp ----
+    // `pixels` at the current UI scale, for fixed widths in the panels.
+    float px(float pixels) const { return pixels * m_prefs.uiScale; }
+    void drawPreferencesWindow();
+    void drawInterfacePrefs();
+    void drawViewportPrefs();
+    void drawLayoutPrefs();
+    void drawFilePrefs();
+    // Built-in dock layouts, built by drawDockSpace() when requested.
+    enum class LayoutPreset { Default, LevelDesign, Compact };
+    void buildLayout(ImGuiID dockspaceId, LayoutPreset preset);
+    // Saved layouts are imgui.ini snapshots in kLayoutsRoot: dock layout plus panel visibility.
+    std::vector<std::string> savedLayouts() const;
+    void saveLayout(const std::string& name);
+    // Queued: the file is read in beforeUiFrame(), outside the ImGui frame.
+    void loadLayout(const std::string& name);
+    void deleteLayout(const std::string& name);
+    void drawLayoutMenuItems();
+    // Panel visibility is stored in imgui.ini under [MirasEditor][Panels]. The handler stays registered after
+    // the editor is gone (ImGui saves once more on shutdown), writing the last known values.
+    void registerIniHandler();
+    void detachIniHandler();
+    struct PanelFlag {
+        const char* name; // window title
+        bool* shown;
+    };
+    std::array<PanelFlag, 6> panelFlags();
 
     // ---- EditorGizmo.cpp ----
     void drawTransformGizmo();
@@ -220,6 +414,10 @@ private:
     // toggle: Shift+click adds or removes it.
     void selectLevelFace(uint32_t face, bool toggle);
     void selectFacesWhere(const std::function<bool(const PolyMesh&, const PolyFace&)>& predicate);
+    // Adds the whole flat surface of every selected face (PolyMesh::coplanarRegion); also a double-click.
+    void selectSurface();
+    // Joins the selected shape's coplanar neighbouring faces that look alike (PolyMesh::mergeCoplanarFaces).
+    void mergeLevelFaces();
     // Same for vertex editing; drops indices the mesh no longer has. Empty when there is none.
     const std::vector<uint32_t>& selectedLevelVertices();
     // Face of the level instance (default: the selected one) under the mouse (scene-view pixels), or -1.
@@ -298,7 +496,79 @@ private:
 
     // Level models belong to their instances, so they are unloaded once no instance uses them.
     void releaseUnusedLevelModels();
+    // Where Create puts a new shape: on the surface under the middle of the view, snapped to the grid.
     glm::vec3 placementPoint() const;
+
+    // ---- EditorLevelDraw.cpp ----
+    // Shape drawing: drag a footprint on the ground or the top of any object (snapped to the world grid),
+    // then move the mouse up or down to set the height and click. A click without dragging places the
+    // New shape panel's size. Draws the panel's shape type and stays on until Esc or the toggle.
+    void toggleShapeDraw();
+    bool shapeDrawActive() const { return m_shapeDraw.phase != ShapeDraw::Phase::Off; }
+    // A left press in the scene view; false when the tool is off.
+    bool handleShapeDrawPress(float mouseX, float mouseY);
+    void handleShapeDrawMotion(float mouseX, float mouseY);
+    void handleShapeDrawRelease(float mouseX, float mouseY);
+    // Cancel/finish keys; true when they were used.
+    bool handleShapeDrawKeys();
+    void drawShapeDrawOverlay();
+    // The point on the plane y = height under the mouse, X/Z snapped to the world grid while snapping.
+    bool shapeDrawPoint(float mouseX, float mouseY, float height, glm::vec3& out) const;
+    // What the mouse points at to build on: a surface facing up (its hit point), else the ground (y = 0).
+    bool surfacePoint(float mouseX, float mouseY, glm::vec3& out) const;
+    // Adds the drawn shape (or, for a click, one of the panel's size) and keeps the tool ready.
+    void finishShapeDraw(bool clicked);
+    // Moves every selected face `distance` along its normal (each vertex once, so neighbouring selected
+    // faces stay joined), or extrudes each of them.
+    void moveSelectedFaces(float distance, bool extrude);
+    // Rounds the selected vertices to the shape's grid.
+    void snapSelectedVertices();
+
+    // ---- EditorLevelUnite.cpp ----
+    // levelSlotTexelSize() of every material slot, for PolyMesh::transformKeepingUVs().
+    std::vector<float> levelSlotTexelSizes(const PolyMesh& mesh);
+    // Selected objects that are level shapes (prefab instances included), the active one first.
+    std::vector<int> selectedLevelShapes() const;
+    // Merges the selected level shapes into one new shape and selects it. Geometry is baked into world
+    // space around an origin at the bottom center (on the grid while snapping); textures stay in place,
+    // equal materials are shared and differing tints are baked into the materials. The parts stay apart
+    // (not welded), so separateSelectedShape() splits them again. Returns the new index, or -1 (status set).
+    // solid: the shapes (all closed) are merged into one volume instead (polyMeshUnion): overlaps and the
+    // faces inside are removed and flat neighbouring faces joined; they can't be separated again.
+    int uniteSelectedShapes(bool solid = false);
+    // The active shape's connected parts merged into one volume, as uniteSelectedShapes(true).
+    void mergeShapeParts();
+    // Splits the active shape into its connected parts, one object each with its origin at its bottom center.
+    void separateSelectedShape();
+    // One level shape: a shape prefab (savePrefabDialog). Anything else: an object prefab of the selection.
+    void saveSelectionAsPrefab();
+    // Unites the selection when it holds several shapes, then opens Save as Prefab for the result.
+    void uniteAndSavePrefab();
+    // Level panel: unite, separate and save buttons for the selected shapes.
+    void drawUniteSection();
+    // Part mode. Faces of the selected parts; drops parts the mesh no longer has. Empty outside part mode.
+    std::vector<uint32_t> selectedPartFaces();
+    // Plain click: just the part with this face; toggle (Shift): adds or removes it.
+    void selectPart(uint32_t face, bool toggle);
+    void selectAllParts();
+    // Object-space center of the selected parts' bounds; false when none is selected.
+    bool selectedPartsCenter(glm::vec3& center);
+    // Where the transform gizmo sits: the selected parts' center in part mode, else the active object.
+    glm::vec3 gizmoPivot();
+    void beginPartDrag();
+    // The gizmo drag as a world-space move, turn or scale about the parts' center, applied in the shape's space.
+    void dragParts(float amount, int axis);
+    // Transforms the selected parts by a world-space matrix (about nothing: callers build the pivot in).
+    void transformSelectedParts(const glm::mat4& world, const char* action);
+    void rotateSelectedParts(float degrees);
+    // A copy beside the selected parts (whole grid cells along X), which becomes the selection.
+    void duplicateSelectedParts();
+    void deleteSelectedParts();
+    // Moves the selected parts out into an object of their own.
+    void detachSelectedParts();
+    void drawPartControls(PolyMesh& mesh);
+    // Double-click on a shape made of several parts: part mode with the part under the mouse selected.
+    bool enterPartMode(float mouseX, float mouseY);
 
     // ---- EditorUv.cpp ----
     // Face mode keys over the viewport: arrows nudge the UV offset by one grid cell, Ctrl+Left/Right
@@ -400,6 +670,7 @@ private:
     // changes (transform, color, visibility, name, lock, model, existence), or both when one action did
     // both (e.g. subtract deleting the cutter).
     struct HistoryEntry {
+        uint64_t serial = 0; // unique, names the scene state after this step (sceneStateId())
         std::string action;
         std::vector<LevelEdit> levels; // empty when no geometry changed
         std::vector<ObjectChange> objects;
@@ -457,7 +728,6 @@ private:
     Camera m_camera;
     bool m_flyMode = false; // UI hidden, mouse always looks around
     bool m_rightMouseHeld = false;
-    float m_cameraSpeedMultiplier = 1.0f;
     // Scene viewport = central dock area in window coordinates. The 3D scene renders only here,
     // and mouse picking / gizmo math is relative to it.
     ViewRect m_sceneView;
@@ -467,6 +737,26 @@ private:
 
     // Selection and tools
     Gizmo m_gizmo;
+    std::vector<uint64_t> m_selection;   // ModelInstance ids, sorted; the active object's included
+    uint64_t m_activeId = 0;             // id of m_gizmo.selectedInstance, to follow it when indices shift
+    std::vector<int> m_highlightIndices; // what fillHighlight() gave the renderer this frame
+    // Transforms of the selected objects as a gizmo drag began.
+    struct GroupDragItem {
+        int index = -1;
+        glm::vec3 position{ 0.0f };
+        glm::vec3 rotation{ 0.0f };
+        glm::vec3 scale{ 1.0f };
+    };
+    std::vector<GroupDragItem> m_groupDrag;
+    // Objects copied with Ctrl+C, with what it takes to rebuild them in this or another scene.
+    struct ClipboardObject {
+        ModelInstance instance;
+        std::string modelPath;  // file models and built-ins
+        std::string modelName;
+        std::string prefabPath; // prefab instances
+        std::shared_ptr<const PolyMesh> mesh; // level shapes that are not prefabs
+    };
+    std::vector<ClipboardObject> m_clipboard;
     GizmoMode m_tool = GizmoMode::Translate;
     GizmoAxis m_hoveredAxis = GizmoAxis::None;
     // World grid cell size, also given to new level shapes as their own grid. Snapping (world and shape
@@ -490,12 +780,54 @@ private:
     bool m_showLevelPanel = true;
     bool m_showMaterialsPanel = true;
     bool m_showGraphicsSettings = false;
-    bool m_resetLayout = false;
+    bool m_showKeymap = false;
+    bool m_showPreferences = false;
+    std::optional<LayoutPreset> m_layoutRequest;
     bool m_openControlsPopup = false;
     bool m_openAboutPopup = false;
     bool m_quitRequested = false;
     ModeRequest m_modeRequest = ModeRequest::None;
     std::string m_windowTitle;
+
+    // Preferences and layouts
+    static constexpr const char* kLayoutsRoot = "layouts";
+    EditorPrefs m_prefs;
+    EditorPrefs m_savedPrefs;   // as last written to kEditorPrefsPath
+    EditorPrefs m_appliedStyle; // the style fields as last given to EditorStyle::apply()
+    uint32_t m_panelBits = 0;   // panel visibility as last seen, to notice changes for imgui.ini
+    std::string m_pendingLayout; // contents of a saved layout to load before the next frame
+    char m_layoutName[64] = "";
+    int m_preferencesTab = -1; // tab the Preferences window switches to the next time it is drawn
+
+    // Keyboard shortcuts
+    EditorKeymap m_keymap;
+    struct KeyCapture {
+        int action = -1; // EditorAction being rebound, -1 = not recording
+        int slot = 0;
+        ImGuiKey lonelyModifier = ImGuiKey_None; // modifier pressed with no other key since
+        bool openPopup = false;
+    };
+    KeyCapture m_keyCapture;
+    ImGuiTextFilter m_keymapFilter;
+    struct SimulatedKeys {
+        std::vector<ImGuiKeyChord> queue;
+        size_t next = 0;
+        int holdFrames = 2;
+        int framesLeft = 0;
+        ImGuiKeyChord down = ImGuiKey_None; // chord currently held
+    };
+    SimulatedKeys m_simulatedKeys;
+    struct MouseStep {
+        enum class Action { Move, Down, Up } action = Action::Move;
+        glm::vec2 position{ 0.5f }; // 0..1 across the scene view
+        uint8_t button = 1;         // SDL_BUTTON_LEFT / SDL_BUTTON_RIGHT
+        uint8_t clicks = 1;         // 2: the second press of a double-click
+        SDL_Keymod mods = SDL_KMOD_NONE; // modifier keys held for the step
+    };
+    std::vector<MouseStep> m_mouseSteps;
+    size_t m_nextMouseStep = 0;
+    bool m_mouseSimulated = false; // a simulated event is being handled
+    SDL_Keymod m_simulatedMods = SDL_KMOD_NONE;
 
     // Status bar
     std::string m_statusMessage = "Ready";
@@ -522,7 +854,8 @@ private:
     // Level tool
     PolyShapeParams m_newShape;
     // Face, edge and vertex modes: clicks on the selected level shape pick its parts instead of objects.
-    enum class LevelEditMode { Object, Face, Vertex, Edge };
+    // Part: the connected parts of a shape (e.g. of a united group) are picked and transformed whole.
+    enum class LevelEditMode { Object, Face, Vertex, Edge, Part };
     LevelEditMode m_levelMode = LevelEditMode::Object;
     // Face mode: m_selectedFace is the active face (properties shown, dragged, source of wraps);
     // m_selectedFaces holds every selected face, the active one included.
@@ -568,6 +901,7 @@ private:
         bool active = false;
         bool moved = false; // mesh changed since the last rebuild
         bool extrude = false;
+        bool solid = false; // extrude through PolyMesh::extrudeFacesSolid (closed shapes)
         int instance = -1;
         uint32_t face = 0;
         glm::vec3 center{ 0.0f }; // object space
@@ -580,8 +914,8 @@ private:
     // Edge mode: one selected edge, by its two vertices.
     bool m_edgeSelected = false;
     std::array<uint32_t, 2> m_selectedEdge{};
-    // Dragging an edge moves it along the average normal of its faces, or extrudes it (Alt at the start)
-    // along PolyMesh::edgeExtrudeDirection(); re-applied to the starting mesh like FaceDrag.
+    // Dragging an edge moves it, or extrudes it (Alt at the start), along PolyMesh::edgeExtrudeDirection()
+    // (in the face's plane for a border edge); re-applied to the starting mesh like FaceDrag.
     struct EdgeDrag {
         bool active = false;
         bool moved = false; // mesh changed since the last rebuild
@@ -604,16 +938,48 @@ private:
         std::vector<glm::vec3> points; // clicked so far, object space on the face plane
     };
     FaceDraw m_faceDraw;
+    // Part mode: the selected parts of the shape, each by one of its faces (moving parts keeps face indices).
+    std::vector<uint32_t> m_selectedParts;
+    // A gizmo drag of the selected parts, re-applied to the mesh as it was when the drag began.
+    struct PartDrag {
+        bool active = false;
+        bool moved = false; // mesh changed since the last rebuild
+        int instance = -1;
+        std::vector<uint32_t> faces; // every face of the dragged parts
+        glm::vec3 center{ 0.0f };    // object space: the gizmo's pivot
+        glm::mat4 applied{ 1.0f };   // world-space transform applied so far
+        std::vector<float> texelSizes;
+        PolyMesh startMesh;
+    };
+    PartDrag m_partDrag;
+    struct ShapeDraw {
+        enum class Phase { Off, Ready, Footprint, Height };
+        Phase phase = Phase::Off;
+        float baseY = 0.0f;
+        glm::vec3 start{ 0.0f }; // footprint corners in world space, at y = baseY
+        glm::vec3 end{ 0.0f };
+        float height = 0.0f;
+        float startHeight = 0.0f; // when the height phase began
+        float startParam = 0.0f;  // mouse position along the vertical line then
+    };
+    ShapeDraw m_shapeDraw;
+    // Entity placement tool (EditorEntities.cpp); off while type is empty.
+    struct EntityPlace {
+        std::string type;
+        int preset = -1; // into the type's presets, -1 = its defaults
+    };
+    EntityPlace m_entityPlace;
     FaceDrawShape m_faceDrawShape = FaceDrawShape::Rectangle;
     int m_faceDrawSegments = 16; // circle
-    // Box selection started on empty space in vertex mode; scene-view pixels.
-    struct VertexMarquee {
+    // Box selection started on empty space, of vertices (vertex mode) or objects; scene-view pixels.
+    struct Marquee {
         bool active = false;
         bool additive = false; // Shift: add to the selection instead of replacing it
         glm::vec2 start{ 0.0f };
         glm::vec2 end{ 0.0f };
     };
-    VertexMarquee m_vertexMarquee;
+    Marquee m_vertexMarquee;
+    Marquee m_objectMarquee;
     TextureDialogTarget m_textureDialogTarget;
 
     // Materials panel
@@ -658,6 +1024,10 @@ private:
     // Instance the open "Save as Prefab" dialog is for; the name catches index shifts from deletes.
     int m_prefabSaveInstance = -1;
     std::string m_prefabSaveName;
+    // Objects an object-prefab save is for (by id); empty when the dialog saves a shape.
+    std::vector<uint64_t> m_prefabSaveIds;
+    char m_groupNameBuffer[128] = {};
+    bool m_groupNameActive = false; // the inspector's group name field was being edited last frame
 
     // Undo history
     std::vector<HistoryEntry> m_undoStack;
@@ -674,6 +1044,18 @@ private:
     std::vector<ObjectRecord> m_objectBaseline;
     bool m_objectBaselineValid = false;
     bool m_sceneChanged = false;
+
+    // Unsaved changes and autosave (EditorSceneFiles.cpp); states are named by HistoryEntry::serial.
+    uint64_t m_historySerial = 0; // last serial handed out
+    uint64_t m_baseState = 0;     // the state with an empty undo stack
+    uint64_t m_savedState = 0;
+    uint64_t m_autosavedState = 0;
+    uint64_t m_lastAutosaveTicks = 0; // SDL_GetTicks() of the last autosave check
+    SceneAction m_pendingSceneAction = SceneAction::None;
+    std::string m_pendingScenePath;
+    bool m_openUnsavedPopup = false;
+    bool m_pendingAfterSaveAs = false; // the prompt's Save opened Save As
+    bool m_savedBeforeHistory = false; // see settleSavedState()
 
     // MCP server and the command batch being run
     std::unique_ptr<McpServer> m_mcp;

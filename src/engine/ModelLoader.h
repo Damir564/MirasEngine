@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include "Animation.h"
 #include "ModelTypes.h"
 #include "Vertex.h"
 
@@ -13,3 +14,6 @@ bool isBuiltinModelPath(const std::string& path);
 // Builtin paths return generated geometry and never touch the disk or the cache.
 // Throws std::runtime_error when the source cannot be imported.
 Mesh loadModelSmart(const std::string& path);
+
+// Loads a glTF/GLB file with its node hierarchy and animation clips (no cache). Throws like loadModelSmart().
+AnimatedModelData loadAnimatedModel(const std::string& path);

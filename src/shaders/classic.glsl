@@ -29,3 +29,12 @@ vec3 classicSkyColor(vec3 dir) {
     color += pow(sunAmount, 64.0) * 0.6 + pow(sunAmount, 2000.0) * 4.0;
     return color * sunTint;
 }
+
+// The Classic scene target is 8-bit sRGB: +-half a step of noise before the hardware rounds hides banding
+// in the sky gradient and fog. One sRGB step in linear units is approximated from the curve's slope
+// (2.2 sqrt(c), 1 / 12.92 near black), which is cheaper than an exact sRGB round trip.
+vec3 classicDither(vec3 color, vec2 pixel) {
+    float noise = interleavedGradientNoise(pixel) - 0.5;
+    vec3 stepSize = max(sqrt(max(color, 0.0)) * 2.2, vec3(1.0 / 12.92)) / 255.0;
+    return max(color + noise * stepSize, 0.0);
+}

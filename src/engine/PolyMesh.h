@@ -135,12 +135,56 @@ struct PolyMesh {
     void hollow(float thickness);
     // Applies the transform to every position; faces are reversed when it mirrors.
     void transform(const glm::mat4& matrix);
+    // Same, and refits each face's UV rotation, scale and offset so its texture stays where it was on the
+    // surface. slotTexelSizes: MaterialAsset::texelSize per material slot (missing slots count as 1).
+    // Non-uniform scales that skew a face's texture keep only its closest unskewed fit.
+    void transformKeepingUVs(const glm::mat4& matrix, const std::vector<float>& slotTexelSizes = {});
+    // Same for some faces and the vertices they use, which no other face may share (e.g. whole parts).
+    void transformFacesKeepingUVs(const std::vector<uint32_t>& faceIndices, const glm::mat4& matrix,
+        const std::vector<float>& slotTexelSizes = {});
+    // Appends copies of the faces with their own copies of the vertices they use; returns the new faces.
+    std::vector<uint32_t> copyFaces(const std::vector<uint32_t>& faceIndices);
+    // Adds the other mesh's positions and faces (not welded to this one's). Its material slots are added
+    // too, except ones equal to a slot already here (same shared material, or same inline values), which
+    // are shared. False, with nothing added, when the slots would go past kMaxPolyMaterialSlots.
+    bool append(const PolyMesh& other);
+    // The connected parts (faces linked through shared vertices), each with only its own positions and
+    // the material slots its faces use. One part when the mesh is all connected.
+    std::vector<PolyMesh> splitParts() const;
+    size_t partCount() const;
+    // Part number of every face (faces sharing a vertex share a part); returns the number of parts.
+    size_t partIds(std::vector<uint32_t>& partOfFace) const;
+    // Every edge is run once each way by the faces using it, so the mesh encloses a volume (what CSG and
+    // extrudeFacesSolid() need).
+    bool isClosed() const;
+    // The flat surface the face is part of: the faces reached from it across shared edges that lie in its
+    // plane and face the same way, the face first.
+    std::vector<uint32_t> coplanarRegion(uint32_t faceIndex) const;
+    // Joins neighbouring faces that lie in one plane and look alike (material and UV settings) into one
+    // face, as long as the result is one outline without holes, then drops the corners the joined faces
+    // left in the middle of straight edges. joinKeys (one per face; missing = -1): faces join only when
+    // their keys match or one of them is -1, so pieces of different faces can be kept apart.
+    // Returns old -> new face index (a joined face maps to the one it joined); vertexRemap gets
+    // old -> new vertex index (UINT32_MAX for removed ones).
+    std::vector<uint32_t> mergeCoplanarFaces(const std::vector<int64_t>& joinKeys = {},
+        std::vector<uint32_t>* vertexRemap = nullptr);
+    // Extrudes the faces as solids (PolyMeshCsg.cpp): outwards (distance > 0) the prisms over them are
+    // united with the shape, inwards they are cut out of it, so the shape grows or shrinks with no faces
+    // left inside or overlapping. New faces lying in the plane of old ones are joined with them.
+    // `caps` gets the moved faces in the new mesh. False, with the mesh unchanged, when it is not closed
+    // or nothing of it would be left.
+    bool extrudeFacesSolid(const std::vector<uint32_t>& faceIndices, float distance,
+        std::vector<uint32_t>* caps = nullptr);
 };
 
 // Constructive solid geometry (PolyMeshCsg.cpp). Both meshes must be closed and in the same space.
 // The result keeps `target`'s materials and appends those of `cutter`'s faces that end up in it.
 // Faces come out cut into convex pieces; positions closer than a millimetre are welded.
-PolyMesh polyMeshSubtract(const PolyMesh& target, const PolyMesh& cutter);
+// sources, when given, gets for every result face the index of the `target` face it is a piece of, or -1
+// for pieces of `cutter` faces (e.g. as joinKeys for mergeCoplanarFaces()).
+PolyMesh polyMeshSubtract(const PolyMesh& target, const PolyMesh& cutter, std::vector<int64_t>* sources = nullptr);
+// The volume of both; faces that end up inside the other mesh are dropped.
+PolyMesh polyMeshUnion(const PolyMesh& target, const PolyMesh& other, std::vector<int64_t>* sources = nullptr);
 
 enum class PolyShape {
     Box,
@@ -156,13 +200,19 @@ inline constexpr const char* kPolyShapeNames[] = { "Box", "Plane", "Cylinder", "
 struct PolyShapeParams {
     PolyShape shape = PolyShape::Box;
     glm::vec3 size{ 2.0f };
-    int segments = 16;     // plane grid cells per side, cylinder sides, arch segments
+    int segments = 16;     // cylinder sides, arch segments
+    int subdivisions = 1;  // plane grid cells per side
     int steps = 6;         // stairs
     float thickness = 0.5f; // arch
 };
 
 // Every shape is centered on X/Z and rests on y = 0.
 PolyMesh makePolyShape(const PolyShapeParams& params);
+// Sizes in whole grid cells (at least one), so the faces of a new shape lie on its grid lines.
+PolyShapeParams snapPolyShapeSize(PolyShapeParams params, float grid);
+// The shape with `grid` as its own grid. With snap, sizes are whole cells and the shape is shifted half a
+// cell where needed so that, placed on a grid point, its sides lie on grid lines.
+PolyMesh makePolyShapeOnGrid(const PolyShapeParams& params, float grid, bool snap);
 
 // Triangulates the mesh with flat per-face normals, one submesh per material. Textures are listed in
 // mesh.textureData by path only (one entry per distinct texture, in first-use order); the caller decodes

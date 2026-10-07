@@ -120,6 +120,9 @@ void SceneManager::instantiatePendingScene()
         newInst.visible = inst.visible;
         newInst.color = inst.color;
         newInst.locked = inst.locked;
+        newInst.entity = inst.entity;
+        newInst.entityParams = inst.entityParams;
+        newInst.group = inst.group;
     }
 
     m_pendingLoad = false;

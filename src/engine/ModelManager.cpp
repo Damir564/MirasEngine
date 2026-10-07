@@ -441,6 +441,10 @@ size_t ModelManager::addPolyMesh(PolyMesh polyMesh, const std::string& name) {
     return index;
 }
 
+size_t ModelManager::addMesh(Mesh mesh, const std::string& name, const std::string& sourcePath) {
+    return uploadModelToGPU(mesh, name, sourcePath);
+}
+
 bool ModelManager::rebuildPolyMesh(size_t modelIndex) {
     if (modelIndex >= m_models.size() || !m_models[modelIndex] || !m_models[modelIndex]->polyMesh)
         return false;

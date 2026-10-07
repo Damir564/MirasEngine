@@ -56,6 +56,8 @@ public:
     // The Vulkan version used with the device: its own version, capped to what the engine targets.
     uint32_t apiVersion() const { return m_apiVersion; }
     const OptionalDeviceFeatures& features() const { return m_features; }
+    // Integrated or CPU device, or the software backend: graphics settings start at the Lowest preset.
+    bool lowPowerDevice() const;
 
 private:
     bool tryBackend(SDL_Window* window, bool enableValidation, VulkanBackend backend, bool forceEmulation);

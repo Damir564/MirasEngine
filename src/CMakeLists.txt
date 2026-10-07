@@ -48,6 +48,12 @@
   engine/SceneManager.cpp
   engine/CameraAnimation.h
   engine/CameraAnimation.cpp
+  engine/Animation.h
+  engine/Animation.cpp
+  engine/Audio.h
+  engine/Audio.cpp
+  engine/EntityTypes.h
+  engine/EntityTypes.cpp
   app/AppMode.h
   app/AppOptions.h
   app/AppOptions.cpp
@@ -57,13 +63,25 @@
   app/SettingsUi.cpp
   editor/Editor.h
   editor/Editor.cpp
+  editor/EditorSelection.cpp
+  editor/EditorSceneFiles.cpp
   editor/EditorMenus.cpp
+  editor/EditorKeymap.h
+  editor/EditorKeymap.cpp
+  editor/EditorShortcuts.cpp
+  editor/EditorPrefs.h
+  editor/EditorPrefs.cpp
+  editor/EditorPreferences.cpp
   editor/EditorHierarchy.cpp
   editor/EditorInspector.cpp
+  editor/EditorEntities.cpp
+  editor/EditorGroups.cpp
   editor/EditorAnimation.cpp
   editor/EditorStatistics.cpp
   editor/EditorGizmo.cpp
   editor/EditorLevel.cpp
+  editor/EditorLevelDraw.cpp
+  editor/EditorLevelUnite.cpp
   editor/EditorMaterials.cpp
   editor/EditorUv.cpp
   editor/EditorPrefab.cpp
@@ -75,6 +93,12 @@
   editor/FileDialog.h
   game/Game.h
   game/Game.cpp
+  game/GameAssets.h
+  game/GameAssets.cpp
+  game/GameSounds.cpp
+  game/GameWorld.h
+  game/GameWorld.cpp
+  game/GameHud.cpp
 )
 
 if (CMAKE_VERSION VERSION_GREATER 3.12)

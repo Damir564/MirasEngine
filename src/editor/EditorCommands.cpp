@@ -10,8 +10,10 @@
 #include <stdexcept>
 #include <utility>
 #include <nlohmann/json.hpp>
+#include <SDL3/SDL_mouse.h>
 #include "FileDialog.h"
 #include "McpServer.h"
+#include "engine/EntityTypes.h"
 #include "engine/Log.h"
 #include "engine/ModelLoader.h"
 #include "engine/ModelManager.h"
@@ -268,8 +270,8 @@ struct Editor::CommandApi {
     using Handler = json (*)(Editor&, const Args&);
     struct Param {
         const char* name;
-        // vec3, vec2or3, number, integer, string, boolean, object, points2, points3, faces, materials, slots,
-        // or enum:a|b|c
+        // vec3, vec2or3, number, integer, string, strings, boolean, object, points2, points3, faces, materials,
+        // slots, mouse (view_mouse steps), or enum:a|b|c
         const char* type;
         const char* description;
         bool required = false;
@@ -343,6 +345,12 @@ json Editor::CommandApi::describe(Editor& e, size_t index)
         { "visible", instance.visible },
         { "locked", instance.locked },
     };
+    if (!instance.entity.empty()) {
+        out["entity"] = instance.entity;
+        out["entityParams"] = instance.entityParams;
+    }
+    if (!instance.group.empty())
+        out["group"] = instance.group;
     const GPUModel* model = e.m_models.getModel(instance.modelIndex);
     if (!model)
         return out;
@@ -351,26 +359,10 @@ json Editor::CommandApi::describe(Editor& e, size_t index)
         out["prefab"] = model->prefabPath;
     if (!model->polyMesh)
         out["model"] = model->sourcePath;
-
-    // World-space bounds; level shapes from their mesh, which is current even before a deferred rebuild.
-    const glm::mat4 transform = instance.getTransformMatrix();
-    glm::vec3 lo(FLT_MAX), hi(-FLT_MAX);
-    const auto add = [&](const glm::vec3& p) {
-        const glm::vec3 world(transform * glm::vec4(p, 1.0f));
-        lo = glm::min(lo, world);
-        hi = glm::max(hi, world);
-    };
-    if (model->polyMesh) {
-        for (const glm::vec3& p : model->polyMesh->positions)
-            add(p);
+    if (model->polyMesh)
         out["faceCount"] = model->polyMesh->faces.size();
-    }
-    else {
-        for (int i = 0; i < 8; ++i)
-            add({ (i & 1) ? model->boundsMax.x : model->boundsMin.x, (i & 2) ? model->boundsMax.y : model->boundsMin.y,
-                (i & 4) ? model->boundsMax.z : model->boundsMin.z });
-    }
-    if (lo.x <= hi.x)
+    glm::vec3 lo, hi;
+    if (e.instanceWorldBounds(static_cast<int>(index), lo, hi))
         out["bounds"] = { { "min", vecJson(lo) }, { "max", vecJson(hi) } };
     return out;
 }
@@ -490,7 +482,8 @@ json Editor::CommandApi::createShape(Editor& e, PolyShape shape, const glm::vec3
     PolyShapeParams params;
     params.shape = shape;
     params.size = size;
-    params.segments = a.integer("segments", shape == PolyShape::Plane ? 1 : 16);
+    params.segments = a.integer("segments", 16);
+    params.subdivisions = a.integer("segments", 1);
     params.steps = a.integer("steps", 6);
     params.thickness = a.number("thickness", 0.5f);
     return addLevelObject(e, makePolyShape(params), kPolyShapeNames[static_cast<int>(shape)], a);
@@ -515,16 +508,22 @@ const std::vector<Editor::CommandApi::Command>& Editor::CommandApi::table()
     static const std::vector<Command> commands = {
         // ---- Scene ----
         { "get_scene", "Lists every object in the scene with id, name, type (shape, prefab, model), transform, color and "
-            "world bounds, plus the scene file path and the selected object.", {},
+            "world bounds, plus the scene file path, unsaved changes, the active (gizmo) object and every "
+            "selected object.", {},
             [](Editor& e, const Args&) -> json {
                 json objects = json::array();
                 for (size_t i = 0; i < e.m_models.getInstances().size(); ++i)
                     objects.push_back(describe(e, i));
                 const auto& instances = e.m_models.getInstances();
+                json selection = json::array();
+                for (int index : e.selectedIndices(true))
+                    selection.push_back(instances[index].id);
                 return {
                     { "scenePath", e.m_scenes.currentPath() },
                     { "loading", e.m_scenes.isLoading() },
+                    { "unsavedChanges", e.sceneDirty() },
                     { "selected", e.hasSelection() ? json(instances[e.m_gizmo.selectedInstance].id) : json(nullptr) },
+                    { "selection", selection },
                     { "objects", objects },
                 };
             } },
@@ -568,6 +567,7 @@ const std::vector<Editor::CommandApi::Command>& Editor::CommandApi::table()
                     fail("failed to open scene " + path);
                 e.deselectAll();
                 e.clearHistory();
+                e.markSceneSaved(path);
                 e.setStatus("Opening " + path + " (" + std::to_string(opened.queuedModels) + " models)...");
                 return { { "ok", true }, { "path", path }, { "missingFiles", opened.missingFiles } };
             }, false },
@@ -582,6 +582,7 @@ const std::vector<Editor::CommandApi::Command>& Editor::CommandApi::table()
                 if (!e.m_scenes.save(path))
                     fail("failed to save " + path);
                 e.m_scenes.setCurrentPath(path);
+                e.markSceneSaved(path);
                 e.setStatus("Scene saved: " + path);
                 return { { "ok", true }, { "path", path } };
             } },
@@ -763,11 +764,23 @@ const std::vector<Editor::CommandApi::Command>& Editor::CommandApi::table()
             } },
 
         // ---- Prefabs and models ----
-        { "add_prefab", "Adds an instance of a .prefab file. Instances of one prefab share their geometry and start locked.",
+        { "add_prefab", "Adds an instance of a .prefab file. Instances of one shape prefab share their geometry and start "
+            "locked. An object prefab (saved from several objects or models) adds its objects as a group, standing on "
+            "`position`; the other arguments apply to shape prefabs only.",
             { { "path", "string", "Prefab file, e.g. prefabs/Pillar.prefab (see list_assets)", true },
                 position, rotation, scale, name, color },
             [](Editor& e, const Args& a) -> json {
                 const std::string path = a.string("path");
+                if (isObjectPrefab(path)) {
+                    const glm::vec3 at = a.vec3("position", glm::vec3(0.0f));
+                    e.addObjectPrefab(path, &at);
+                    if (e.m_statusIsError || !e.hasSelection())
+                        fail(e.m_statusMessage);
+                    json objects = json::array();
+                    for (int index : e.selectedIndices())
+                        objects.push_back(describe(e, static_cast<size_t>(index)));
+                    return { { "objects", objects } };
+                }
                 const auto modelIndex = e.loadPrefabModel(path);
                 if (!modelIndex)
                     fail(e.m_statusMessage);
@@ -778,9 +791,35 @@ const std::vector<Editor::CommandApi::Command>& Editor::CommandApi::table()
                 return out;
             } },
         { "save_prefab", "Saves a level shape as a .prefab file and links the object to it (locked). Other instances "
-            "of that file in the scene follow the new geometry.",
-            { object, { "path", "string", "Target file; default prefabs/<object name>.prefab" } },
+            "of that file in the scene follow the new geometry. With `objects` instead, saves those objects (any "
+            "models, shapes and entities) as an object prefab that add_prefab places again as a group; they become "
+            "a group in the scene too.",
+            { { "object", "object", "Level shape: id (number) or name (string)" },
+                { "objects", "objects", "Objects for an object prefab: ids or names" },
+                { "path", "string", "Target file; default prefabs/<object or first object name>.prefab" } },
             [](Editor& e, const Args& a) -> json {
+                if (a.has("objects")) {
+                    const json& refs = a.at("objects");
+                    if (!refs.is_array() || refs.empty())
+                        fail("objects must list one or more objects");
+                    std::vector<int> indices;
+                    for (const json& ref : refs)
+                        indices.push_back(instanceIndex(e, ref));
+                    const std::string first = e.m_models.getInstances()[indices.front()].name;
+                    std::filesystem::path path = a.string("path", std::string(kPrefabsRoot) + "/" + first + kPrefabExtension);
+                    if (extensionOf(path) != kPrefabExtension)
+                        path += kPrefabExtension;
+                    std::error_code ec;
+                    if (path.has_parent_path())
+                        std::filesystem::create_directories(path.parent_path(), ec);
+                    std::vector<uint64_t> ids;
+                    for (int index : indices)
+                        ids.push_back(e.m_models.getInstances()[index].id);
+                    e.saveObjectPrefab(ids, toStoredPath(path.string()));
+                    if (e.m_statusIsError)
+                        fail(e.m_statusMessage);
+                    return { { "path", toStoredPath(path.string()) }, { "objects", indices.size() } };
+                }
                 const int index = instanceArg(e, a);
                 const ModelInstance instance = e.m_models.getInstances()[index];
                 const GPUModel* model = e.m_models.getModel(instance.modelIndex);
@@ -824,11 +863,16 @@ const std::vector<Editor::CommandApi::Command>& Editor::CommandApi::table()
         { "set_object", "Changes an object's properties; only the given ones change. `locked` protects a level shape's "
             "geometry from edits (prefab instances start locked).",
             { object, { "name", "string", "New name (must be unused)" }, position, rotation, scale, color,
-                { "visible", "boolean", "Shown in the scene" }, { "locked", "boolean", "Geometry protected from edits" } },
+                { "visible", "boolean", "Shown in the scene" }, { "locked", "boolean", "Geometry protected from edits" },
+                { "entity", "string", "Game entity type (see create_entity), or \"\" for plain scenery" },
+                { "entity_params", "string", "Entity parameters, \"key=value\" pairs separated by spaces" },
+                { "group", "string", "Group name: objects sharing one are selected, moved and copied together; \"\" for none" } },
             [](Editor& e, const Args& a) -> json {
                 const int index = instanceArg(e, a);
                 if (a.has("name"))
                     checkNameFree(e, a.string("name"), index);
+                if (a.has("entity") && !a.string("entity").empty() && !findEntityType(a.string("entity")))
+                    fail("unknown entity type " + a.string("entity"));
                 ModelInstance& instance = e.m_models.getInstances()[index];
                 if (a.has("name")) instance.name = a.string("name");
                 instance.position = a.vec3("position", instance.position);
@@ -837,8 +881,35 @@ const std::vector<Editor::CommandApi::Command>& Editor::CommandApi::table()
                 instance.color = a.vec3("color", instance.color);
                 instance.visible = a.boolean("visible", instance.visible);
                 instance.locked = a.boolean("locked", instance.locked);
+                instance.entity = a.string("entity", instance.entity);
+                instance.entityParams = a.string("entity_params", instance.entityParams);
+                instance.group = a.string("group", instance.group);
                 e.markSceneChanged();
                 return describe(e, index);
+            } },
+        { "create_entity", "Places a game entity: what the game spawns when it plays the scene. Types: player_start "
+            "(where the player begins, looking along the entity's +Z), enemy (params health, speed, damage, cooldown, sight, "
+            "hearing, size, alert=1 for a hunter that always knows where the player is), health "
+            "(param amount), ammo (shotgun shells; param amount), exit (ends the level once every enemy is dead; param "
+            "next = the .scn to load after it). Entities face +Z turned by rotation Y and stand on `position`.",
+            { { "type", "enum:player_start|enemy|health|ammo|exit", "Entity type", true }, position,
+                { "yaw", "number", "Degrees about Y; 0 faces +Z, 90 faces +X" }, name,
+                { "params", "string", "\"key=value\" pairs; default: the type's defaults" } },
+            [](Editor& e, const Args& a) -> json {
+                const std::string type = a.string("type");
+                const std::string instanceName = a.has("name") ? newName(e, a, "") : std::string();
+                const auto index = e.addEntity(type);
+                if (!index)
+                    fail(e.m_statusMessage);
+                ModelInstance& instance = e.m_models.getInstances()[*index];
+                instance.position = a.vec3("position", instance.position);
+                instance.rotation = glm::vec3(0.0f, a.number("yaw", 0.0f), 0.0f);
+                if (!instanceName.empty())
+                    instance.name = instanceName;
+                if (a.has("params"))
+                    instance.entityParams = a.string("params");
+                e.markSceneChanged();
+                return describe(e, *index);
             } },
         { "delete_object", "Removes an object from the scene.", { object },
             [](Editor& e, const Args& a) -> json {
@@ -864,16 +935,61 @@ const std::vector<Editor::CommandApi::Command>& Editor::CommandApi::table()
                     copy.position = source.position + a.vec3("offset");
                 return describe(e, e.m_models.getInstances().size() - 1);
             } },
-        { "select_object", "Selects an object in the editor, or clears the selection when `object` is omitted.",
-            { { "object", "object", "Object id or name" } },
+        { "unite_objects", "Merges level shapes into one new shape (one object), e.g. to save it as a prefab with "
+            "save_prefab. Geometry keeps its place in the world and its textures; the origin goes to the bottom "
+            "center. The parts stay separate pieces of the mesh, so separate_object splits them again.",
+            { { "objects", "objects", "Two or more level shapes: ids or names", true }, name,
+                { "solid", "boolean", "Weld them into one volume instead (closed shapes only): overlaps and the faces "
+                    "inside go, flat neighbouring faces join; can't be separated again" } },
+            [](Editor& e, const Args& a) -> json {
+                const json& refs = a.at("objects");
+                if (!refs.is_array() || refs.size() < 2)
+                    fail("objects must list two or more level shapes");
+                std::vector<int> indices;
+                for (const json& ref : refs) {
+                    const int index = instanceIndex(e, ref);
+                    const GPUModel* model = e.m_models.getModel(e.m_models.getInstances()[index].modelIndex);
+                    if (!model || !model->polyMesh)
+                        fail(e.m_models.getInstances()[index].name + " is not a level shape");
+                    indices.push_back(index);
+                }
+                e.selectIndices(indices, indices.front());
+                const int united = e.uniteSelectedShapes(a.boolean("solid", false));
+                if (united < 0)
+                    fail(e.m_statusMessage);
+                if (a.has("name"))
+                    e.m_models.getInstances()[united].name = newName(e, a, "");
+                return describe(e, static_cast<size_t>(united));
+            } },
+        { "separate_object", "Splits a level shape into its connected parts (e.g. undoing unite_objects), one object "
+            "each, and returns them.", { object },
+            [](Editor& e, const Args& a) -> json {
+                const int index = instanceArg(e, a);
+                const size_t before = e.m_models.getInstances().size();
+                e.selectInstance(index);
+                e.separateSelectedShape();
+                if (e.m_models.getInstances().size() <= before)
+                    fail(e.m_statusMessage);
+                json parts = json::array();
+                for (int part : e.selectedIndices())
+                    parts.push_back(describe(e, static_cast<size_t>(part)));
+                return { { "objects", parts } };
+            } },
+        { "select_object", "Selects an object in the editor, or clears the selection when `object` is omitted. "
+            "With `add`, the object joins the selection and becomes the active (gizmo) object.",
+            { { "object", "object", "Object id or name" },
+                { "add", "boolean", "Add to the selection instead of replacing it (default false)" } },
             [](Editor& e, const Args& a) -> json {
                 if (!a.has("object")) {
                     e.deselectAll();
-                    return { { "selected", nullptr } };
+                    return { { "selected", nullptr }, { "selectionCount", 0 } };
                 }
                 const int index = instanceArg(e, a);
-                e.selectInstance(index);
-                return { { "selected", e.m_models.getInstances()[index].id } };
+                if (a.boolean("add", false))
+                    e.addToSelection(index);
+                else
+                    e.selectInstance(index);
+                return { { "selected", e.m_models.getInstances()[index].id }, { "selectionCount", e.selectionCount() } };
             } },
         { "focus_object", "Moves the editor camera so the object fills the view.", { object },
             [](Editor& e, const Args& a) -> json {
@@ -905,6 +1021,151 @@ const std::vector<Editor::CommandApi::Command>& Editor::CommandApi::table()
                 camera.pitch = std::clamp(camera.pitch, -89.0f, 89.0f);
                 return { { "position", vecJson(camera.position) }, { "yaw", num(camera.yaw) }, { "pitch", num(camera.pitch) } };
             } },
+
+        // ---- Editor UI ----
+        { "press_keys", "Types key chords into the editor window, e.g. [\"Ctrl+D\", \"[\", \"W\"], one after another, as "
+            "if pressed on the keyboard: shortcuts use the user's keymap (editor_keys.json). Returns at once; the keys "
+            "arrive over the next frames (about hold_frames + 1 frames per chord).",
+            { { "keys", "strings", "Chords like \"Ctrl+Shift+S\", \"Esc\", \"F5\", \"Left Shift\"", true },
+                { "hold_frames", "integer", "Frames each chord stays down (default 2); longer holds move the camera further" } },
+            [](Editor& e, const Args& a) -> json {
+                const json& keys = a.at("keys");
+                if (!keys.is_array() || keys.empty())
+                    fail("keys must be a non-empty array of strings");
+                std::vector<ImGuiKeyChord> chords;
+                for (const json& key : keys) {
+                    const ImGuiKeyChord chord = key.is_string() ? parseKeyChord(key.get<std::string>()) : ImGuiKey_None;
+                    if (chord == ImGuiKey_None)
+                        fail("unknown key chord " + key.dump());
+                    chords.push_back(chord);
+                }
+                SimulatedKeys& simulated = e.m_simulatedKeys;
+                simulated.queue.insert(simulated.queue.end(), chords.begin(), chords.end());
+                simulated.holdFrames = std::clamp(a.integer("hold_frames", 2), 1, 600);
+                return { { "queued", simulated.queue.size() - simulated.next } };
+            }, false },
+        { "view_mouse", "Moves and clicks the mouse in the 3D view (not the panels), one step per frame, e.g. to "
+            "pick objects or drag shapes with the Draw tool. x and y run from 0 to 1 across the view (0, 0 = top "
+            "left). Returns at once.",
+            { { "steps", "mouse", "Steps: { action: move|down|up|click|dblclick, x, y, button: left|right, mods: "
+                "e.g. \"shift\" or \"ctrl+alt\" }; click is down then up. Default button left, no modifiers", true } },
+            [](Editor& e, const Args& a) -> json {
+                const json& steps = a.at("steps");
+                if (!steps.is_array() || steps.empty())
+                    fail("steps must be a non-empty array");
+                std::vector<MouseStep> parsed;
+                for (const json& step : steps) {
+                    if (!step.is_object() || !step.contains("action") || !step["action"].is_string())
+                        fail("each step needs an action");
+                    const Args s(step);
+                    const std::string action = s.string("action");
+                    MouseStep m;
+                    m.position = glm::clamp(glm::vec2(s.number("x", 0.5f), s.number("y", 0.5f)), glm::vec2(0.0f),
+                        glm::vec2(1.0f));
+                    m.button = s.string("button", "left") == "right" ? SDL_BUTTON_RIGHT : SDL_BUTTON_LEFT;
+                    std::string mods = s.string("mods", "");
+                    std::transform(mods.begin(), mods.end(), mods.begin(),
+                        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                    for (size_t start = 0; start < mods.size();) {
+                        const size_t end = std::min(mods.find('+', start), mods.size());
+                        const std::string mod = mods.substr(start, end - start);
+                        const SDL_Keymod flag = mod == "shift" ? SDL_KMOD_LSHIFT : mod == "ctrl" ? SDL_KMOD_LCTRL
+                            : mod == "alt" ? SDL_KMOD_LALT : SDL_KMOD_NONE;
+                        if (flag == SDL_KMOD_NONE)
+                            fail("unknown modifier " + mod);
+                        m.mods = static_cast<SDL_Keymod>(m.mods | flag);
+                        start = end + 1;
+                    }
+                    if (action == "move") {
+                        parsed.push_back(m);
+                    }
+                    else if (action == "down" || action == "up") {
+                        m.action = action == "down" ? MouseStep::Action::Down : MouseStep::Action::Up;
+                        parsed.push_back(m);
+                    }
+                    else if (action == "click" || action == "dblclick") {
+                        parsed.push_back(m); // move there first, as a real mouse would
+                        for (uint8_t click = 1; click <= (action == "dblclick" ? 2 : 1); ++click) {
+                            m.clicks = click;
+                            m.action = MouseStep::Action::Down;
+                            parsed.push_back(m);
+                            m.action = MouseStep::Action::Up;
+                            parsed.push_back(m);
+                        }
+                    }
+                    else {
+                        fail("unknown action " + action);
+                    }
+                }
+                e.m_mouseSteps.insert(e.m_mouseSteps.end(), parsed.begin(), parsed.end());
+                return { { "queued", e.m_mouseSteps.size() - e.m_nextMouseStep } };
+            }, false },
+        { "get_editor", "Returns editor state for checking the result of key presses: status bar message, active tool, "
+            "level edit mode, grid size and snapping, fly mode and open windows.", {},
+            [](Editor& e, const Args&) -> json {
+                static const char* const tools[] = { "select", "move", "rotate", "scale" };
+                static const char* const modes[] = { "object", "face", "vertex", "edge", "part" };
+                const int tool = e.m_tool == GizmoMode::None ? 0 : e.m_tool == GizmoMode::Translate ? 1
+                    : e.m_tool == GizmoMode::Rotate ? 2 : 3;
+                return { { "status", e.m_statusMessage }, { "statusIsError", e.m_statusIsError },
+                    { "tool", tools[tool] }, { "levelMode", modes[static_cast<int>(e.m_levelMode)] },
+                    { "gridSize", num(e.m_gridSize) }, { "gridSnap", e.m_gridSnap }, { "showGrid", e.m_showGrid },
+                    { "flyMode", e.m_flyMode }, { "keymapWindow", e.m_showKeymap },
+                    { "selectionCount", e.selectionCount() }, { "clipboardObjects", e.m_clipboard.size() },
+                    { "selectedParts", e.m_levelMode == LevelEditMode::Part ? e.m_selectedParts.size() : 0 },
+                    { "unsavedChanges", e.sceneDirty() }, { "recentScenes", e.m_prefs.recentScenes },
+                    { "unsavedPrompt", e.m_pendingSceneAction != SceneAction::None },
+                    { "shapeDraw", json::array({ "off", "ready", "footprint", "height" })[static_cast<int>(e.m_shapeDraw.phase)] },
+                    { "pendingMouse", e.m_mouseSteps.size() - e.m_nextMouseStep },
+                    { "pendingKeys", e.m_simulatedKeys.queue.size() - e.m_simulatedKeys.next +
+                        (e.m_simulatedKeys.down != ImGuiKey_None ? 1 : 0) } };
+            }, false },
+        { "set_ui", "Changes editor preferences and the panel layout; only the given arguments change. Returns the "
+            "preferences, the open panels and the saved layouts.",
+            { { "theme", "enum:dark|midnight|light", "Color theme" },
+                { "ui_scale", "number", "Fonts and sizes, 0.75 to 2" },
+                { "field_of_view", "number", "Vertical field of view of the editor camera in degrees, 30 to 120" },
+                { "autosave_minutes", "integer", "Autosave interval (unsaved changes to autosave.scn), 0 = off" },
+                { "clear_recent_scenes", "boolean", "Empties File > Open Recent" },
+                { "layout", "enum:default|level_design|compact", "Rebuilds the docked panels as a built-in layout" },
+                { "save_layout", "string", "Saves the current layout under this name (layouts/<name>.ini)" },
+                { "load_layout", "string", "Loads a saved layout before the next frame" },
+                { "delete_layout", "string", "Deletes a saved layout" } },
+            [](Editor& e, const Args& a) -> json {
+                if (a.has("theme")) {
+                    const std::string theme = a.string("theme");
+                    e.m_prefs.theme = theme == "light" ? EditorStyle::Theme::Light
+                        : theme == "midnight" ? EditorStyle::Theme::Midnight : EditorStyle::Theme::Dark;
+                }
+                e.m_prefs.uiScale = a.number("ui_scale", e.m_prefs.uiScale);
+                e.m_prefs.fieldOfView = a.number("field_of_view", e.m_prefs.fieldOfView);
+                e.m_prefs.autosaveMinutes = std::clamp(a.integer("autosave_minutes", e.m_prefs.autosaveMinutes), 0, 60);
+                if (a.boolean("clear_recent_scenes", false))
+                    e.m_prefs.recentScenes.clear();
+                if (a.has("layout")) {
+                    const std::string layout = a.string("layout");
+                    e.m_layoutRequest = layout == "level_design" ? LayoutPreset::LevelDesign
+                        : layout == "compact" ? LayoutPreset::Compact : LayoutPreset::Default;
+                }
+                if (a.has("save_layout"))
+                    e.saveLayout(a.string("save_layout"));
+                if (a.has("load_layout")) {
+                    const std::vector<std::string> saved = e.savedLayouts();
+                    const std::string name = a.string("load_layout");
+                    if (std::find(saved.begin(), saved.end(), name) == saved.end())
+                        fail("no saved layout " + name);
+                    e.loadLayout(name);
+                }
+                if (a.has("delete_layout"))
+                    e.deleteLayout(a.string("delete_layout"));
+                json panels = json::object();
+                for (const PanelFlag& panel : e.panelFlags())
+                    panels[panel.name] = *panel.shown;
+                return { { "theme", EditorStyle::kThemeNames[static_cast<int>(e.m_prefs.theme)] },
+                    { "uiScale", num(e.m_prefs.uiScale) }, { "fieldOfView", num(e.m_prefs.fieldOfView) },
+                    { "autosaveMinutes", e.m_prefs.autosaveMinutes },
+                    { "panels", panels }, { "savedLayouts", e.savedLayouts() }, { "status", e.m_statusMessage } };
+            }, false },
     };
     return commands;
 }
@@ -944,6 +1205,17 @@ json Editor::CommandApi::schema(const Param& param)
             { "metallic", number }, { "texture", { { "type", "string" } } } } } };
         out = { { "type", "array" }, { "items", { { "anyOf", json::array({ { { "type", "string" } }, inlineSlot }) } } } };
     }
+    else if (type == "strings")
+        out = { { "type", "array" }, { "items", { { "type", "string" } } } };
+    else if (type == "objects")
+        out = { { "type", "array" }, { "items", { { "type", json::array({ "integer", "string" }) } } } };
+    else if (type == "mouse")
+        out = { { "type", "array" }, { "items", { { "type", "object" }, { "properties", {
+            { "action", { { "type", "string" }, { "enum", json::array({ "move", "down", "up", "click", "dblclick" }) } } },
+            { "x", number }, { "y", number },
+            { "button", { { "type", "string" }, { "enum", json::array({ "left", "right" }) } } },
+            { "mods", { { "type", "string" } } } } },
+            { "required", json::array({ "action" }) } } } };
     else if (type == "slots")
         out = { { "type", "array" }, { "items", { { "type", json::array({ "integer", "null" }) } } } };
     else if (type.rfind("enum:", 0) == 0) {
@@ -985,7 +1257,14 @@ json Editor::CommandApi::toolDescriptions()
 // Editor side
 // ---------------------------------------------------------------------------------------------
 
-Editor::~Editor() = default;
+Editor::~Editor()
+{
+    detachIniHandler();
+    // beforeUiFrame() saves changes on a later frame, which a change made right before quitting never gets.
+    m_prefs.cameraSpeed = m_camera.speed;
+    if (m_prefs != m_savedPrefs)
+        saveEditorPrefs(m_prefs);
+}
 
 void Editor::startMcpServer(uint16_t port)
 {

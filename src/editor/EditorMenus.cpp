@@ -2,7 +2,9 @@
 #include <SDL3/SDL.h>
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
+#include <iterator>
 #include "imgui_internal.h"
 #include "EditorStyle.h"
 #include "FileDialog.h"
@@ -23,20 +25,25 @@ void Editor::drawMainMenuBar()
     drawAddMenu();
     drawViewMenu();
     if (ImGui::BeginMenu("Settings")) {
+        ImGui::MenuItem("Preferences...", nullptr, &m_showPreferences);
         ImGui::MenuItem("Graphics...", nullptr, &m_showGraphicsSettings);
+        ImGui::MenuItem("Keyboard Shortcuts...", m_keymap.shortcutLabel(EditorAction::ShowKeymap).c_str(), &m_showKeymap);
         ImGui::EndMenu();
     }
     if (ImGui::BeginMenu("Help")) {
-        if (ImGui::MenuItem("Controls", "F1")) m_openControlsPopup = true;
+        if (ImGui::MenuItem("Controls", m_keymap.shortcutLabel(EditorAction::ShowControls).c_str())) m_openControlsPopup = true;
         if (ImGui::MenuItem("About MirasEngine")) m_openAboutPopup = true;
         ImGui::EndMenu();
     }
 
     const std::string& path = m_scenes.currentPath();
-    const char* sceneLabel = path.empty() ? "Untitled scene" : path.c_str();
-    const float labelWidth = ImGui::CalcTextSize(sceneLabel).x;
+    const bool dirty = sceneDirty();
+    const std::string sceneLabel = (path.empty() ? std::string("Untitled scene") : path) + (dirty ? " *" : "");
+    const float labelWidth = ImGui::CalcTextSize(sceneLabel.c_str()).x;
     ImGui::SameLine(ImGui::GetWindowWidth() - labelWidth - ImGui::GetStyle().WindowPadding.x * 2);
-    ImGui::TextDisabled("%s", sceneLabel);
+    ImGui::TextDisabled("%s", sceneLabel.c_str());
+    if (dirty)
+        ImGui::SetItemTooltip("Unsaved changes");
     ImGui::EndMainMenuBar();
 }
 
@@ -44,15 +51,17 @@ void Editor::drawFileMenu()
 {
     if (!ImGui::BeginMenu("File"))
         return;
-    if (ImGui::MenuItem("New Scene")) newScene();
-    if (ImGui::MenuItem("Open Scene...", "Ctrl+O")) openSceneDialog();
-    if (ImGui::MenuItem("Save Scene", "Ctrl+S")) saveScene();
-    if (ImGui::MenuItem("Save Scene As...", "Ctrl+Shift+S")) saveSceneAsDialog();
+    const auto key = [this](EditorAction action) { return m_keymap.shortcutLabel(action); };
+    if (ImGui::MenuItem("New Scene", key(EditorAction::NewScene).c_str())) requestSceneAction(SceneAction::New);
+    if (ImGui::MenuItem("Open Scene...", key(EditorAction::OpenScene).c_str())) requestSceneAction(SceneAction::OpenDialog);
+    drawRecentScenesMenu();
+    if (ImGui::MenuItem("Save Scene", key(EditorAction::SaveScene).c_str())) saveScene();
+    if (ImGui::MenuItem("Save Scene As...", key(EditorAction::SaveSceneAs).c_str())) saveSceneAsDialog();
     ImGui::Separator();
-    if (ImGui::MenuItem("Import Model...", "Ctrl+I")) importModelDialog();
+    if (ImGui::MenuItem("Import Model...", key(EditorAction::ImportModel).c_str())) importModelDialog();
     if (ImGui::MenuItem("Run Script...")) runScriptDialog();
     ImGui::Separator();
-    if (ImGui::MenuItem("Exit", "Alt+F4")) m_quitRequested = true;
+    if (ImGui::MenuItem("Exit", "Alt+F4")) requestSceneAction(SceneAction::Quit);
     ImGui::EndMenu();
 }
 
@@ -63,20 +72,52 @@ void Editor::drawEditMenu()
     const bool selection = hasSelection();
     const std::string undoLabel = m_undoStack.empty() ? "Undo" : "Undo " + m_undoStack.back().action;
     const std::string redoLabel = m_redoStack.empty() ? "Redo" : "Redo " + m_redoStack.back().action;
-    if (ImGui::MenuItem(undoLabel.c_str(), "Ctrl+Z", false, !m_undoStack.empty())) undo();
-    if (ImGui::MenuItem(redoLabel.c_str(), "Ctrl+Y", false, !m_redoStack.empty())) redo();
+    const auto key = [this](EditorAction action) { return m_keymap.shortcutLabel(action); };
+    if (ImGui::MenuItem(undoLabel.c_str(), key(EditorAction::Undo).c_str(), false, !m_undoStack.empty())) undo();
+    if (ImGui::MenuItem(redoLabel.c_str(), key(EditorAction::Redo).c_str(), false, !m_redoStack.empty())) redo();
     ImGui::Separator();
-    if (ImGui::MenuItem("Rename", "F2", false, selection)) beginRename(m_gizmo.selectedInstance);
-    if (ImGui::MenuItem("Duplicate", "Ctrl+D", false, selection)) duplicateInstance(m_gizmo.selectedInstance);
-    if (ImGui::MenuItem("Delete", "Del", false, selection)) deleteInstance(m_gizmo.selectedInstance);
-    if (ImGui::MenuItem("Deselect", "Esc", false, selection)) deselectAll();
+    if (ImGui::MenuItem("Cut", key(EditorAction::Cut).c_str(), false, selection)) cutSelection();
+    if (ImGui::MenuItem("Copy", key(EditorAction::Copy).c_str(), false, selection)) copySelection();
+    if (ImGui::MenuItem("Paste", key(EditorAction::Paste).c_str(), false, !m_clipboard.empty())) pasteClipboard();
+    if (ImGui::MenuItem("Duplicate", key(EditorAction::Duplicate).c_str(), false, selection)) duplicateSelection();
+    if (ImGui::MenuItem("Delete", key(EditorAction::Delete).c_str(), false, selection)) deleteSelection();
+    if (ImGui::MenuItem("Rename", key(EditorAction::Rename).c_str(), false, selection)) beginRename(m_gizmo.selectedInstance);
     ImGui::Separator();
-    if (ImGui::MenuItem("Focus Selected", "F", false, selection)) focusOnInstance(m_gizmo.selectedInstance);
+    if (ImGui::MenuItem("Select All", key(EditorAction::SelectAll).c_str())) selectAll();
+    if (ImGui::MenuItem("Deselect", key(EditorAction::Deselect).c_str(), false, selection)) deselectAll();
+    if (ImGui::MenuItem("Focus Selected", key(EditorAction::Focus).c_str(), false, selection)) focusSelection();
     ImGui::Separator();
-    if (ImGui::MenuItem("Select Tool", "Q", m_tool == GizmoMode::None)) m_tool = GizmoMode::None;
-    if (ImGui::MenuItem("Move Tool", "1", m_tool == GizmoMode::Translate)) m_tool = GizmoMode::Translate;
-    if (ImGui::MenuItem("Rotate Tool", "2", m_tool == GizmoMode::Rotate)) m_tool = GizmoMode::Rotate;
-    if (ImGui::MenuItem("Scale Tool", "3", m_tool == GizmoMode::Scale)) m_tool = GizmoMode::Scale;
+    if (ImGui::MenuItem("Drop to Floor", key(EditorAction::DropToFloor).c_str(), false, selection)) dropSelectionToFloor();
+    if (ImGui::MenuItem("Rotate 90 Clockwise", key(EditorAction::RotateClockwise).c_str(), false, selection))
+        rotateSelection(-90.0f);
+    if (ImGui::MenuItem("Rotate 90 Counter-clockwise", key(EditorAction::RotateCounterClockwise).c_str(), false, selection))
+        rotateSelection(90.0f);
+    if (ImGui::MenuItem("Hide / Show Selected", key(EditorAction::Hide).c_str(), false, selection)) toggleSelectionVisibility();
+    if (ImGui::MenuItem("Show All", key(EditorAction::UnhideAll).c_str())) unhideAll();
+    ImGui::Separator();
+    if (ImGui::MenuItem("Group", key(EditorAction::GroupObjects).c_str(), false, selectionCount() >= 2)) groupSelection();
+    const bool grouped = std::any_of(m_selection.begin(), m_selection.end(), [this](uint64_t id) {
+        const auto& instances = m_models.getInstances();
+        return std::any_of(instances.begin(), instances.end(),
+            [id](const ModelInstance& instance) { return instance.id == id && !instance.group.empty(); });
+    });
+    if (ImGui::MenuItem("Ungroup", key(EditorAction::UngroupObjects).c_str(), false, grouped)) ungroupSelection();
+    ImGui::Separator();
+    const size_t shapes = selectedLevelShapes().size();
+    if (ImGui::MenuItem("Unite Shapes", key(EditorAction::UniteShapes).c_str(), false, shapes >= 2)) uniteSelectedShapes();
+    if (ImGui::MenuItem("Merge Shapes into One Solid", nullptr, false, shapes >= 2)) uniteSelectedShapes(true);
+    if (ImGui::MenuItem("Separate Shape", key(EditorAction::SeparateShape).c_str(), false, shapes == 1)) separateSelectedShape();
+    if (ImGui::MenuItem("Unite and Save as Prefab...", nullptr, false, shapes >= 2)) uniteAndSavePrefab();
+    if (ImGui::MenuItem("Save Selection as Prefab...", key(EditorAction::SaveAsPrefab).c_str(), false, selection))
+        saveSelectionAsPrefab();
+    ImGui::SetItemTooltip("One level shape: its geometry. Anything else (models, entities, several objects): "
+        "the objects, placed again as a group");
+    ImGui::Separator();
+    if (ImGui::MenuItem("Select Tool", key(EditorAction::SelectTool).c_str(), m_tool == GizmoMode::None)) m_tool = GizmoMode::None;
+    if (ImGui::MenuItem("Move Tool", key(EditorAction::MoveTool).c_str(), m_tool == GizmoMode::Translate)) m_tool = GizmoMode::Translate;
+    if (ImGui::MenuItem("Rotate Tool", key(EditorAction::RotateTool).c_str(), m_tool == GizmoMode::Rotate)) m_tool = GizmoMode::Rotate;
+    if (ImGui::MenuItem("Scale Tool", key(EditorAction::ScaleTool).c_str(), m_tool == GizmoMode::Scale)) m_tool = GizmoMode::Scale;
+    if (ImGui::MenuItem("Grid Snapping", key(EditorAction::ToggleSnap).c_str(), m_gridSnap)) m_gridSnap = !m_gridSnap;
     ImGui::EndMenu();
 }
 
@@ -87,6 +128,8 @@ void Editor::drawAddMenu()
     if (ImGui::MenuItem("Cube")) addCube();
     ImGui::SeparatorText("Level shapes");
     drawShapeMenuItems();
+    ImGui::SeparatorText("Game entities");
+    drawEntityMenuItems();
     ImGui::SeparatorText("Prefabs");
     drawPrefabMenuItems();
     ImGui::EndMenu();
@@ -104,10 +147,13 @@ void Editor::drawViewMenu()
     ImGui::MenuItem("Materials", nullptr, &m_showMaterialsPanel);
     ImGui::Separator();
     ImGui::MenuItem("Show Camera Path", nullptr, &m_showCameraPath);
-    ImGui::MenuItem("Grid", nullptr, &m_showGrid);
+    ImGui::MenuItem("Grid", m_keymap.shortcutLabel(EditorAction::ToggleGrid).c_str(), &m_showGrid);
     ImGui::Separator();
-    if (ImGui::MenuItem("Fly Mode (hide UI)", "Shift+`")) setFlyMode(true);
-    if (ImGui::MenuItem("Reset Layout")) m_resetLayout = true;
+    if (ImGui::MenuItem("Fly Mode (hide UI)", m_keymap.shortcutLabel(EditorAction::ToggleFlyMode).c_str())) setFlyMode(true);
+    if (ImGui::BeginMenu("Layout")) {
+        drawLayoutMenuItems();
+        ImGui::EndMenu();
+    }
     ImGui::EndMenu();
 }
 
@@ -119,16 +165,22 @@ namespace {
 constexpr ImGuiWindowFlags kBarFlags = ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoSavedSettings;
 }
 
-void Editor::drawToolButton(const char* label, GizmoMode tool, const char* tooltip)
+std::string Editor::withShortcut(const char* text, EditorAction action) const
+{
+    const std::string shortcut = m_keymap.shortcutLabel(action);
+    return shortcut.empty() ? std::string(text) : std::string(text) + " (" + shortcut + ")";
+}
+
+void Editor::drawToolButton(const char* label, GizmoMode tool, const char* tooltip, EditorAction shortcut)
 {
     const bool active = m_tool == tool;
     if (active) {
         ImGui::PushStyleColor(ImGuiCol_Button, EditorStyle::kAccent);
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, EditorStyle::kAccentHover);
     }
-    if (ImGui::Button(label, ImVec2(64, 0))) m_tool = tool;
+    if (ImGui::Button(label, ImVec2(px(64.0f), 0))) m_tool = tool;
     if (active) ImGui::PopStyleColor(2);
-    ImGui::SetItemTooltip("%s", tooltip);
+    ImGui::SetItemTooltip("%s", withShortcut(tooltip, shortcut).c_str());
     ImGui::SameLine(0, 2);
 }
 
@@ -136,15 +188,15 @@ void Editor::drawToolbar()
 {
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(8, 5));
     if (ImGui::BeginViewportSideBar("##Toolbar", ImGui::GetMainViewport(), ImGuiDir_Up, ImGui::GetFrameHeight() + 10.0f, kBarFlags)) {
-        drawToolButton("Select", GizmoMode::None, "Select objects without a transform gizmo (Q)");
-        drawToolButton("Move", GizmoMode::Translate, "Move the selected object (1)");
-        drawToolButton("Rotate", GizmoMode::Rotate, "Rotate the selected object (2)");
-        drawToolButton("Scale", GizmoMode::Scale, "Scale the selected object (3)");
+        drawToolButton("Select", GizmoMode::None, "Select objects without a transform gizmo", EditorAction::SelectTool);
+        drawToolButton("Move", GizmoMode::Translate, "Move the selected object", EditorAction::MoveTool);
+        drawToolButton("Rotate", GizmoMode::Rotate, "Rotate the selected object", EditorAction::RotateTool);
+        drawToolButton("Scale", GizmoMode::Scale, "Scale the selected object", EditorAction::ScaleTool);
 
         ImGui::SameLine(0, 16);
         ImGui::BeginDisabled(!hasSelection());
-        if (ImGui::Button("Focus")) focusOnInstance(m_gizmo.selectedInstance);
-        ImGui::SetItemTooltip("Move the camera to the selection (F)");
+        if (ImGui::Button("Focus")) focusSelection();
+        ImGui::SetItemTooltip("%s", withShortcut("Move the camera to the selection", EditorAction::Focus).c_str());
         ImGui::EndDisabled();
 
         ImGui::SameLine(0, 16);
@@ -154,9 +206,10 @@ void Editor::drawToolbar()
         ImGui::AlignTextToFramePadding();
         ImGui::TextDisabled("Camera speed");
         ImGui::SameLine();
-        ImGui::SetNextItemWidth(140);
+        ImGui::SetNextItemWidth(px(140.0f));
         ImGui::SliderFloat("##cameraSpeed", &m_camera.speed, 0.5f, 200.0f, "%.1f", ImGuiSliderFlags_Logarithmic);
-        ImGui::SetItemTooltip("WASD movement speed (hold Shift for 4x)");
+        ImGui::SetItemTooltip("Keyboard movement speed (hold %s for 4x)",
+            m_keymap.shortcutLabel(EditorAction::CameraFast).c_str());
 
         ImGui::SameLine(0, 16);
         ImGui::Checkbox("Grid", &m_showGrid);
@@ -167,7 +220,7 @@ void Editor::drawToolbar()
 
         const ImGuiStyle& style = ImGui::GetStyle();
         const float flyWidth = ImGui::CalcTextSize("Fly Mode").x + style.FramePadding.x * 2;
-        const float playWidth = 80.0f;
+        const float playWidth = px(80.0f);
         ImGui::SameLine(ImGui::GetWindowWidth() - flyWidth - playWidth - style.ItemSpacing.x - 8);
         ImGui::BeginDisabled(!canPlay());
         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.16f, 0.45f, 0.22f, 1.0f));
@@ -176,10 +229,13 @@ void Editor::drawToolbar()
         if (ImGui::Button("Play", ImVec2(playWidth, 0))) requestPlay();
         ImGui::PopStyleColor(3);
         ImGui::EndDisabled();
-        ImGui::SetItemTooltip("Play this scene with the player controller (F5). Esc pauses, F5 stops.");
+        ImGui::SetItemTooltip("%s. While playing, Esc pauses and F5 stops.",
+            withShortcut("Play this scene with the player controller", EditorAction::Play).c_str());
         ImGui::SameLine();
         if (ImGui::Button("Fly Mode")) setFlyMode(true);
-        ImGui::SetItemTooltip("Hide the UI and look around with the mouse (Shift+` or Esc to exit)");
+        const std::string flyKey = m_keymap.shortcutLabel(EditorAction::ToggleFlyMode);
+        ImGui::SetItemTooltip("Hide the UI and look around with the mouse (%s%sEsc to exit)", flyKey.c_str(),
+            flyKey.empty() ? "" : " or ");
     }
     ImGui::End();
     ImGui::PopStyleVar();
@@ -192,7 +248,7 @@ void Editor::drawGridControls()
     ImGui::AlignTextToFramePadding();
     ImGui::TextDisabled(shapeGrid ? "Shape grid" : "Grid");
     ImGui::SameLine();
-    ImGui::SetNextItemWidth(70);
+    ImGui::SetNextItemWidth(px(70.0f));
     char preview[16];
     snprintf(preview, sizeof(preview), "%g", current);
     if (ImGui::BeginCombo("##gridSize", preview)) {
@@ -259,10 +315,13 @@ void Editor::drawStatusBar()
             if (instance.visible)
                 if (GPUModel* model = m_models.getModel(instance.modelIndex)) triangles += model->indexCount / 3;
         const ImGuiIO& io = ImGui::GetIO();
+        char selected[32] = "";
+        if (selectionCount() > 1)
+            snprintf(selected, sizeof(selected), " (%zu selected)", selectionCount());
         char right[256];
-        snprintf(right, sizeof(right), "Grid: %g%s   |   Objects: %zu   Models: %zu   Triangles: %s   |   %.0f FPS (%.2f ms)",
-            activeGridSize(), m_gridSnap ? "" : " (snap off)", instances.size(), m_models.getModels().size(), formatCount(triangles).c_str(),
-            io.Framerate, 1000.0f / std::max(io.Framerate, 0.001f));
+        snprintf(right, sizeof(right), "Grid: %g%s   |   Objects: %zu%s   Models: %zu   Triangles: %s   |   %.0f FPS (%.2f ms)",
+            activeGridSize(), m_gridSnap ? "" : " (snap off)", instances.size(), selected, m_models.getModels().size(),
+            formatCount(triangles).c_str(), io.Framerate, 1000.0f / std::max(io.Framerate, 0.001f));
         const float rightWidth = ImGui::CalcTextSize(right).x;
         ImGui::SameLine(ImGui::GetWindowWidth() - rightWidth - 12);
         ImGui::TextDisabled("%s", right);
@@ -275,33 +334,13 @@ void Editor::drawStatusBar()
 // Dock space and viewport
 // ---------------------------------------------------------------------------------------------
 
-void Editor::buildDefaultLayout(ImGuiID dockspaceId)
-{
-    ImGui::DockBuilderRemoveNode(dockspaceId);
-    ImGui::DockBuilderAddNode(dockspaceId, ImGuiDockNodeFlags_DockSpace);
-    ImGui::DockBuilderSetNodeSize(dockspaceId, ImGui::GetMainViewport()->WorkSize);
-    ImGuiID center = dockspaceId;
-    const ImGuiID left = ImGui::DockBuilderSplitNode(center, ImGuiDir_Left, 0.22f, nullptr, &center);
-    const ImGuiID right = ImGui::DockBuilderSplitNode(center, ImGuiDir_Right, 0.30f, nullptr, &center);
-    const ImGuiID bottom = ImGui::DockBuilderSplitNode(center, ImGuiDir_Down, 0.30f, nullptr, &center);
-    ImGui::DockBuilderDockWindow("Hierarchy", left);
-    ImGui::DockBuilderDockWindow("Inspector", right);
-    ImGui::DockBuilderDockWindow("Level", right);
-    ImGui::DockBuilderDockWindow("Materials", bottom);
-    ImGui::DockBuilderDockWindow("Camera Animation", bottom);
-    ImGui::DockBuilderDockWindow("Statistics", bottom);
-    ImGui::DockBuilderFinish(dockspaceId);
-    m_showHierarchy = m_showInspector = m_showAnimationPanel = m_showStatisticsPanel = m_showLevelPanel =
-        m_showMaterialsPanel = true;
-}
-
 void Editor::drawDockSpace()
 {
     ImGuiViewport* mainViewport = ImGui::GetMainViewport();
     const ImGuiID dockspaceId = ImGui::GetID("EditorDockSpace");
-    if (m_resetLayout || ImGui::DockBuilderGetNode(dockspaceId) == nullptr) {
-        m_resetLayout = false;
-        buildDefaultLayout(dockspaceId);
+    if (m_layoutRequest || ImGui::DockBuilderGetNode(dockspaceId) == nullptr) {
+        buildLayout(dockspaceId, m_layoutRequest.value_or(LayoutPreset::Default));
+        m_layoutRequest.reset();
     }
     ImGui::DockSpaceOverViewport(dockspaceId, mainViewport, ImGuiDockNodeFlags_PassthruCentralNode);
 
@@ -318,6 +357,8 @@ void Editor::drawDockSpace()
 
 void Editor::drawViewportOverlay()
 {
+    if (!m_prefs.showViewportHelp)
+        return;
     ImGui::SetNextWindowPos(ImVec2(m_sceneView.x + 10, m_sceneView.y + 10));
     ImGui::SetNextWindowBgAlpha(0.55f);
     const ImGuiWindowFlags overlayFlags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
@@ -328,7 +369,16 @@ void Editor::drawViewportOverlay()
             : m_tool == GizmoMode::Translate ? "Move"
             : m_tool == GizmoMode::Rotate ? "Rotate" : "Scale";
         ImGui::Text("Perspective  |  %s tool", toolName);
-        ImGui::TextDisabled("LMB select   RMB+drag look   WASD move   F focus");
+        // "WASD", or "Up/Left/Down/Right" once a binding is longer than one character.
+        const std::string keys[] = { m_keymap.shortcutLabel(EditorAction::CameraForward),
+            m_keymap.shortcutLabel(EditorAction::CameraLeft), m_keymap.shortcutLabel(EditorAction::CameraBack),
+            m_keymap.shortcutLabel(EditorAction::CameraRight) };
+        const bool single = std::all_of(std::begin(keys), std::end(keys), [](const std::string& k) { return k.size() <= 1; });
+        std::string moveKeys;
+        for (const std::string& key : keys)
+            moveKeys += (moveKeys.empty() || single ? "" : "/") + key;
+        ImGui::TextDisabled("LMB select   RMB+drag look   %s move   %s focus", moveKeys.c_str(),
+            m_keymap.shortcutLabel(EditorAction::Focus).c_str());
         ImGui::TextDisabled("%s grid %g   snap %s, Ctrl inverts", levelGridActive() ? "Shape" : "World",
             activeGridSize(), m_gridSnap ? "on" : "off");
     }
@@ -347,6 +397,7 @@ void Editor::drawHelpPopups()
     m_openAboutPopup = false;
     drawControlsPopup();
     drawAboutPopup();
+    drawUnsavedChangesPopup();
 }
 
 void Editor::drawControlsPopup()
@@ -354,50 +405,64 @@ void Editor::drawControlsPopup()
     ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
     if (!ImGui::BeginPopupModal("Controls", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
         return;
-    if (ImGui::BeginTable("##controls", 2, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV)) {
-        ImGui::TableSetupColumn("Input", ImGuiTableColumnFlags_WidthFixed, 170.0f);
-        ImGui::TableSetupColumn("Action", ImGuiTableColumnFlags_WidthFixed, 300.0f);
-        static constexpr const char* kRows[][2] = {
+    const ImGuiTableFlags flags = ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_ScrollY;
+    if (ImGui::BeginTable("##controls", 2, flags, ImVec2(0.0f, ImGui::GetTextLineHeightWithSpacing() * 24.0f))) {
+        ImGui::TableSetupColumn("Input", ImGuiTableColumnFlags_WidthFixed, px(190.0f));
+        ImGui::TableSetupColumn("Action", ImGuiTableColumnFlags_WidthFixed, px(330.0f));
+        const auto row = [](const char* input, const char* action) {
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::TextColored(EditorStyle::kHighlight, "%s", input);
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(action);
+        };
+        const auto heading = [](const char* text) {
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::TextDisabled("%s", text);
+        };
+        heading("Mouse");
+        static constexpr const char* kMouseRows[][2] = {
             { "Left click", "Select object" },
+            { "Shift / Ctrl+click", "Add to / toggle in the selection (also in the Hierarchy)" },
+            { "Drag on empty space", "Box-select objects (vertices in vertex mode)" },
+            { "Double-click a united shape", "Part mode: pick and move its parts (Esc leaves)" },
             { "Right mouse + drag", "Look around" },
-            { "W A S D", "Move camera" },
-            { "Shift (hold)", "Move 4x faster" },
-            { "F", "Focus selection" },
-            { "Q / 1 / 2 / 3", "Select / Move / Rotate / Scale tool" },
-            { "[ / ]", "Smaller / larger grid (shape grid in face/vertex mode)" },
             { "Drag face (face mode)", "Push/pull along its normal; Alt+drag extrudes" },
             { "Shift+click face", "Add/remove a face from the selection (face mode)" },
             { "Alt+Shift+click face", "Wrap the active face's texture onto a neighbour" },
-            { "Arrows (over viewport)", "Nudge selected faces' UVs one grid cell" },
-            { "Ctrl+Left/Right, Alt+Up/Down", "Rotate / scale selected faces' UVs" },
-            { "Ctrl+Shift+C / V", "Copy / paste face material and UVs" },
             { "Drag a material tile", "Drop on a face to apply; Shift+drop: whole object" },
             { "Double-click a material", "Apply to the selected face or object" },
-            { "I (over the viewport)", "Pick the shared material under the mouse" },
             { "Ctrl (while dragging)", "Invert grid snapping for moves, vertices, rotate and scale" },
             { "Click view gizmo axis", "Look along that axis (top-right of viewport)" },
-            { "F2", "Rename selected object" },
-            { "Ctrl+D", "Duplicate selected object" },
-            { "Ctrl+Z / Ctrl+Y", "Undo / redo object and shape edits" },
-            { "Delete", "Delete selected object" },
-            { "Esc", "Deselect / leave fly mode" },
-            { "Shift+`", "Toggle fly mode (hide UI)" },
-            { "Ctrl+O / Ctrl+S", "Open / save scene" },
-            { "Ctrl+Shift+S", "Save scene as" },
-            { "Ctrl+I", "Import model" },
         };
-        for (const auto& row : kRows) {
-            ImGui::TableNextRow();
-            ImGui::TableNextColumn();
-            ImGui::TextColored(EditorStyle::kHighlight, "%s", row[0]);
-            ImGui::TableNextColumn();
-            ImGui::TextUnformatted(row[1]);
+        for (const auto& mouseRow : kMouseRows)
+            row(mouseRow[0], mouseRow[1]);
+
+        // Keyboard rows come from the keymap, so they show the user's own bindings.
+        const char* category = nullptr;
+        for (int a = 0; a < EditorKeymap::kActionCount; ++a) {
+            const EditorAction action = static_cast<EditorAction>(a);
+            const std::string keys = m_keymap.allShortcutsLabel(action);
+            if (keys.empty())
+                continue;
+            const EditorActionInfo& info = EditorKeymap::info(action);
+            if (!category || std::strcmp(category, info.category) != 0) {
+                category = info.category;
+                heading(category);
+            }
+            row(keys.c_str(), info.label);
         }
         ImGui::EndTable();
     }
     ImGui::Spacing();
     if (ImGui::Button("Close", ImVec2(120, 0)) || ImGui::IsKeyPressed(ImGuiKey_Escape))
         ImGui::CloseCurrentPopup();
+    ImGui::SameLine();
+    if (ImGui::Button("Customize...", ImVec2(120, 0))) {
+        m_showKeymap = true;
+        ImGui::CloseCurrentPopup();
+    }
     ImGui::EndPopup();
 }
 
@@ -477,6 +542,7 @@ void Editor::drawFileDialogs()
             saveSceneTo(m_scenes.currentPath());
         }
         dialog->Close();
+        finishPendingSceneAction();
     }
     if (dialog->Display("BrowseModelDlg", ImGuiWindowFlags_NoCollapse, kDialogSize)) {
         if (dialog->IsOk()) {

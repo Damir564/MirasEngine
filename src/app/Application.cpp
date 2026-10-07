@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <exception>
+#include <filesystem>
 #include "imgui.h"
 #include "backends/imgui_impl_sdl3.h"
 #include "backends/imgui_impl_vulkan.h"
@@ -54,10 +55,22 @@ bool Application::init(const AppOptions& options)
     initImGui();
     if (!options.settingsPath.empty())
         m_settingsPath = options.settingsPath;
+    std::error_code error;
+    const bool firstRun = !std::filesystem::exists(m_settingsPath, error);
     m_settings = loadGraphicsSettings(m_settingsPath);
+    if (firstRun && m_vulkan.lowPowerDevice()) {
+        LOG_INFO("Integrated or software GPU: starting with the Lowest graphics preset\n");
+        applyQualityPreset(m_settings, QualityPreset::Lowest, 1);
+        saveGraphicsSettings(m_settings, m_settingsPath);
+    }
     if (!m_renderer.init(m_vulkan, m_window, m_settings))
         return false;
     m_appliedSettings = m_settings;
+    m_muted = options.mute;
+    m_autoplay = options.autoplay;
+    // No sound is not an error: the audio system then plays nothing.
+    m_audio.init();
+    m_audio.setVolumes(m_muted ? 0.0f : m_settings.masterVolume, m_settings.musicVolume);
     if (!createModelManager())
         return false;
     m_materials.scan();
@@ -119,7 +132,8 @@ bool Application::createModelManager()
 
 EngineContext Application::engineContext()
 {
-    return EngineContext{ m_window, m_vulkan, m_renderer, *m_models, *m_scenes, m_settings, m_materials };
+    return EngineContext{ m_window, m_vulkan, m_renderer, *m_models, *m_scenes, m_settings, m_materials, m_audio,
+        m_autoplay };
 }
 
 void Application::createMode(const AppOptions& options)
@@ -153,20 +167,26 @@ void Application::handleModeRequest()
         }
         break;
     case ModeRequest::ReturnToEditor:
-        if (m_suspendedMode) {
-            // Destroy the game first: it releases the mouse and its physics world.
-            m_mode.reset();
-            m_mode = std::move(m_suspendedMode);
-            m_mode->onResume();
-        }
+        resumeSuspendedMode();
         break;
     }
+}
+
+void Application::resumeSuspendedMode()
+{
+    if (!m_suspendedMode)
+        return;
+    // Destroy the game first: it releases the mouse and its physics world.
+    m_mode.reset();
+    m_mode = std::move(m_suspendedMode);
+    m_mode->onResume();
 }
 
 void Application::shutdown()
 {
     m_mode.reset();
     m_suspendedMode.reset();
+    m_audio.shutdown();
     m_scenes.reset();
     // ModelManager frees descriptor sets and command buffers from the renderer's pools.
     m_models.reset();
@@ -191,13 +211,13 @@ int Application::mainLoop(int exitAfterFrames)
 {
     uint64_t framesRendered = 0;
     float time = 0.0f;
-    uint64_t lastTicks = SDL_GetTicks();
+    uint64_t lastNs = SDL_GetTicksNS();
 
     while (!m_quit && !m_mode->quitRequested()) {
+        // Nanoseconds: whole milliseconds make dt alternate between 0 and 1 ms above a few hundred FPS.
         const uint64_t frameStartNs = SDL_GetTicksNS();
-        const uint64_t ticks = SDL_GetTicks();
-        const float dt = (ticks - lastTicks) / 1000.0f;
-        lastTicks = ticks;
+        const float dt = static_cast<float>(static_cast<double>(frameStartNs - lastNs) * 1e-9);
+        lastNs = frameStartNs;
 
         pollEvents();
         if (!readyToRender()) {
@@ -243,6 +263,7 @@ void Application::applyChangedSettings()
     if (m_settings == m_appliedSettings)
         return;
     m_settings = sanitizeGraphicsSettings(m_settings);
+    m_audio.setVolumes(m_muted ? 0.0f : m_settings.masterVolume, m_settings.musicVolume);
     m_renderer.applySettings(m_settings);
     saveGraphicsSettings(m_settings, m_settingsPath);
     m_appliedSettings = m_settings;
@@ -267,8 +288,12 @@ void Application::pollEvents()
         if (m_mode->uiVisible())
             ImGui_ImplSDL3_ProcessEvent(&event);
 
-        if (event.type == SDL_EVENT_QUIT)
-            m_quit = true;
+        if (event.type == SDL_EVENT_QUIT) {
+            // A game started from the editor returns to it, so the editor can ask about unsaved changes.
+            resumeSuspendedMode();
+            if (m_mode->confirmQuit())
+                m_quit = true;
+        }
         if (event.type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED || event.type == SDL_EVENT_WINDOW_RESIZED)
             m_renderer.requestSwapchainRebuild();
 
@@ -290,6 +315,7 @@ ImDrawData* Application::buildUi()
 {
     if (!m_mode->uiVisible())
         return nullptr;
+    m_mode->beforeUiFrame();
     ImGui_ImplVulkan_NewFrame();
     ImGui_ImplSDL3_NewFrame();
     ImGui::NewFrame();

@@ -11,5 +11,5 @@ layout(location = 0) out vec4 outColor;
 void main() {
     vec4 world = ubo.invViewProj * vec4(inNdc, 1.0, 1.0);
     vec3 dir = normalize(world.xyz / world.w - ubo.cameraPos.xyz);
-    outColor = vec4(classicSkyColor(dir), 1.0);
+    outColor = vec4(classicDither(classicSkyColor(dir), gl_FragCoord.xy), 1.0);
 }

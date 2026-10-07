@@ -73,10 +73,47 @@ glm::vec3 clampColor(const glm::vec3& color)
 
 } // namespace
 
+void applyQualityPreset(GraphicsSettings& s, QualityPreset preset, int maxMsaaSamples)
+{
+    s.pipeline = RenderPipeline::Standard;
+    s.renderScale = 1.0f;
+    s.shadows = true;
+    switch (preset) {
+    case QualityPreset::Lowest:
+        // Shadows and effects are off too, so switching back to Standard stays cheap.
+        s.pipeline = RenderPipeline::Classic; s.renderScale = 0.75f; s.detailCulling = 3.0f;
+        s.msaaSamples = 1; s.fxaa = false; s.shadows = false; s.shadowMapSize = 1024; s.shadowCascades = 1;
+        s.softShadows = false; s.contactShadows = false; s.ambientOcclusion = 0; s.bloom = false;
+        break;
+    case QualityPreset::Low:
+        s.detailCulling = 2.0f;
+        s.msaaSamples = 1; s.fxaa = true; s.shadowMapSize = 1024; s.shadowCascades = 2;
+        s.softShadows = false; s.contactShadows = false; s.ambientOcclusion = 0; s.bloom = false;
+        break;
+    case QualityPreset::Medium:
+        s.detailCulling = 1.0f;
+        s.msaaSamples = 2; s.fxaa = false; s.shadowMapSize = 2048; s.shadowCascades = 3;
+        s.softShadows = false; s.contactShadows = false; s.ambientOcclusion = 1; s.bloom = true;
+        break;
+    case QualityPreset::High:
+        s.detailCulling = 0.0f;
+        s.msaaSamples = 4; s.fxaa = false; s.shadowMapSize = 2048; s.shadowCascades = 4;
+        s.softShadows = true; s.contactShadows = true; s.ambientOcclusion = 2; s.bloom = true;
+        break;
+    case QualityPreset::Ultra:
+        s.detailCulling = 0.0f;
+        s.msaaSamples = 8; s.fxaa = false; s.shadowMapSize = 4096; s.shadowCascades = 4;
+        s.softShadows = true; s.contactShadows = true; s.ambientOcclusion = 3; s.bloom = true;
+        break;
+    }
+    s.msaaSamples = std::min(s.msaaSamples, maxMsaaSamples);
+}
+
 GraphicsSettings sanitizeGraphicsSettings(GraphicsSettings s)
 {
     const GraphicsSettings defaults;
     s.renderScale = clampFinite(s.renderScale, 0.25f, 1.0f, defaults.renderScale);
+    s.detailCulling = clampFinite(s.detailCulling, 0.0f, 16.0f, defaults.detailCulling);
     s.maxFps = std::clamp(s.maxFps, 0, 1000);
     s.msaaSamples = snapToPowerOfTwo(s.msaaSamples, 1, 8);
     s.shadowMapSize = snapToPowerOfTwo(s.shadowMapSize, 1024, 4096);
@@ -99,6 +136,8 @@ GraphicsSettings sanitizeGraphicsSettings(GraphicsSettings s)
     s.haze = clampFinite(s.haze, 0.0f, 10.0f, defaults.haze);
     s.fogDensity = clampFinite(s.fogDensity, 0.0f, 100.0f, defaults.fogDensity);
     s.viewDistance = clampFinite(s.viewDistance, 100.0f, 20000.0f, defaults.viewDistance);
+    s.masterVolume = clampFinite(s.masterVolume, 0.0f, 1.0f, defaults.masterVolume);
+    s.musicVolume = clampFinite(s.musicVolume, 0.0f, 1.0f, defaults.musicVolume);
     return s;
 }
 
@@ -116,6 +155,7 @@ GraphicsSettings loadGraphicsSettings(const std::string& path)
     }
     readField(json, "pipeline", settings.pipeline);
     readField(json, "renderScale", settings.renderScale);
+    readField(json, "detailCulling", settings.detailCulling);
     readField(json, "vsync", settings.vsync);
     readField(json, "maxFps", settings.maxFps);
     readField(json, "msaaSamples", settings.msaaSamples);
@@ -147,6 +187,8 @@ GraphicsSettings loadGraphicsSettings(const std::string& path)
     readField(json, "fog", settings.fog);
     readField(json, "fogDensity", settings.fogDensity);
     readField(json, "viewDistance", settings.viewDistance);
+    readField(json, "masterVolume", settings.masterVolume);
+    readField(json, "musicVolume", settings.musicVolume);
     return sanitizeGraphicsSettings(settings);
 }
 
@@ -155,6 +197,7 @@ bool saveGraphicsSettings(const GraphicsSettings& settings, const std::string& p
     const nlohmann::json json = {
         { "pipeline", settings.pipeline },
         { "renderScale", settings.renderScale },
+        { "detailCulling", settings.detailCulling },
         { "vsync", settings.vsync },
         { "maxFps", settings.maxFps },
         { "msaaSamples", settings.msaaSamples },
@@ -186,6 +229,8 @@ bool saveGraphicsSettings(const GraphicsSettings& settings, const std::string& p
         { "fog", settings.fog },
         { "fogDensity", settings.fogDensity },
         { "viewDistance", settings.viewDistance },
+        { "masterVolume", settings.masterVolume },
+        { "musicVolume", settings.musicVolume },
     };
     std::ofstream file(path);
     if (!file) {
