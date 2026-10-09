@@ -4,6 +4,7 @@
 #include "frame_ubo.glsl"
 #include "draw_data.glsl"
 #include "sky.glsl"
+#include "lights.glsl"
 
 layout(location = 0) in vec3 fragWorldPos;
 layout(location = 1) in vec3 fragNormal;
@@ -21,6 +22,7 @@ layout(set = 4, binding = 2) uniform sampler2D aoTexture;  // half resolution: R
 layout(set = 4, binding = 3) uniform sampler2D aoDepth;    // half resolution view depth
 layout(set = 4, binding = 4) uniform sampler2D skyLut;
 layout(set = 4, binding = 5) uniform sampler2D skyIrradiance;
+layout(set = 4, binding = 6) uniform sampler2DArrayShadow lightShadowMap; // see lightShadowLayer()
 
 // Premultiplied by coverage in the solid-background mode (see composite.frag).
 layout(location = 0) out vec4 outColor;
@@ -137,6 +139,33 @@ float sunShadow(vec3 worldPos, vec3 Ng, vec3 L, float viewDepth) {
     return mix(lit, 1.0, fade);
 }
 
+// Shadow of a point or spot light: the perspective shadow view this point falls in, 4 rotated PCF taps.
+float localLightShadow(LightData light, vec3 worldPos, vec3 Ng, vec3 L, float distance) {
+    int layer = lightShadowLayer(light, worldPos);
+    if (layer < 0)
+        return 1.0;
+    // Texels grow with the distance from the light; offset along the normal by about one of them.
+    float texelWorld = distance * light.params.z;
+    float NdotL = clamp(dot(Ng, L), 0.0, 1.0);
+    vec3 offsetPos = worldPos + Ng * texelWorld * (1.0 + 1.5 * (1.0 - NdotL));
+    vec4 clip = lightShadowMatrices[layer] * vec4(offsetPos, 1.0);
+    if (clip.w <= 0.0)
+        return 1.0;
+    vec3 coord = clip.xyz / clip.w;
+    coord.xy = coord.xy * 0.5 + 0.5;
+    if (coord.z >= 1.0)
+        return 1.0;
+    float texelUv = 1.0 / float(textureSize(lightShadowMap, 0).x);
+    float angle = interleavedGradientNoise(gl_FragCoord.xy) * 2.0 * PI;
+    mat2 rotation = mat2(cos(angle), sin(angle), -sin(angle), cos(angle));
+    float lit = 0.0;
+    for (int i = 0; i < 4; ++i) {
+        vec2 offset = rotation * POISSON[i * 4 + 1] * 1.5 * texelUv;
+        lit += texture(lightShadowMap, vec4(coord.xy + offset, float(layer), coord.z));
+    }
+    return lit * 0.25;
+}
+
 // Joint bilateral upsample of the half-resolution AO: the 2x2 nearest texels, weighted by how close their
 // depth is to this pixel's, so occlusion does not bleed across silhouettes.
 vec2 sampleAmbientOcclusion(float viewDepth) {
@@ -197,6 +226,24 @@ vec3 calcLight(vec3 N, vec3 V, vec3 L, vec3 radiance, vec3 albedo, float metalli
     vec3 specular = (NDF * G * F) / (4.0 * max(dot(N, V), 0.0) * max(dot(N, L), 0.0) + 0.0001);
     vec3 kD = (1.0 - F) * (1.0 - metallic);
     return (kD * albedo / PI + specular) * radiance * max(dot(N, L), 0.0);
+}
+
+// Direct light of the point and spot lights.
+vec3 localLights(vec3 worldPos, vec3 N, vec3 Ng, vec3 V, vec3 albedo, float metallic, float roughness, vec3 F0) {
+    vec3 sum = vec3(0.0);
+    uint count = lightCount();
+    for (uint i = 0u; i < count; ++i) {
+        LightData light = lights[i];
+        vec3 L;
+        float distance;
+        vec3 irradiance = lightIrradiance(light, worldPos, L, distance);
+        if (dot(N, L) <= 0.0 || dot(irradiance, vec3(1.0)) <= 0.0)
+            continue;
+        float shadow = light.params.y >= 0.0 ? localLightShadow(light, worldPos, Ng, L, distance) : 1.0;
+        if (shadow > 0.0)
+            sum += calcLight(N, V, L, irradiance, albedo, metallic, roughness, F0) * shadow;
+    }
+    return sum;
 }
 
 // Split-sum environment BRDF, analytic fit (Karis, "Physically Based Shading on Mobile").
@@ -268,6 +315,7 @@ void main() {
         if (shadow > 0.0)
             direct = calcLight(N, V, L, ubo.sunColor.rgb, albedo, metallic, roughness, F0) * shadow;
     }
+    direct += localLights(fragWorldPos, N, Ng, V, albedo, metallic, roughness, F0);
 
     // Image-based ambient light from the sky model.
     float NdotV = max(dot(N, V), 1e-4);

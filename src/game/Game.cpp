@@ -21,6 +21,10 @@ constexpr float kButtonHeight = 56.0f;
 constexpr float kWalkSpeed = 4.5f;
 constexpr float kSprintMultiplier = 1.8f;
 constexpr float kEyeHeight = 1.65f;
+constexpr float kJacketPitch = -62.0f;     // looking down at the open jacket
+constexpr float kJacketOpenSeconds = 0.25f;
+constexpr float kJacketSpeed = 0.45f;      // walking speed with the jacket fully open
+constexpr float kRestartDelay = 0.3f;      // after dying, so a key still held from the fight doesn't restart
 // Scene loads that make no progress this long (e.g. every model file missing) are reported as failed.
 constexpr float kLoadingStallSeconds = 1.0f;
 constexpr float kBotTimeLimit = 300.0f;
@@ -103,7 +107,7 @@ void Game::setState(State state)
         io.AddMouseButtonEvent(ImGuiMouseButton_Left, false);
         io.ClearInputKeys();
     }
-    m_audio.setPaused(state == State::Paused || state == State::Settings);
+    m_audio.setPaused(state == State::Paused || state == State::Settings || state == State::Controls);
 }
 
 void Game::startLoading()
@@ -244,13 +248,22 @@ void Game::spawnPlayer(const SpawnInfo* start)
     m_eyeHeight = kEyeHeight;
     m_camera.position = eyePosition();
     m_jumpRequested = false;
-    m_reloadRequested = false;
+    m_presses = {};
+    m_jacket = 0.0f;
     m_bot.lastPosition = m_spawnPoint;
 }
 
 glm::vec3 Game::eyePosition() const
 {
     return m_physics.playerPosition() + glm::vec3(0.0f, m_eyeHeight, 0.0f);
+}
+
+Camera Game::viewCamera() const
+{
+    Camera view = m_camera;
+    const float open = m_jacket * m_jacket * (3.0f - 2.0f * m_jacket);
+    view.pitch = std::clamp(glm::mix(m_camera.pitch, kJacketPitch, open) + m_world.recoil(), -89.0f, 89.0f);
+    return view;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -266,7 +279,14 @@ void Game::onEvent(const SDL_Event& event)
     if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat && event.key.scancode == SDL_SCANCODE_ESCAPE) {
         if (m_state == State::Playing) setState(State::Paused);
         else if (m_state == State::Paused) setState(State::Playing);
-        else if (m_state == State::Settings) setState(m_settingsReturn);
+        else if (m_state == State::Settings || m_state == State::Controls) setState(m_screenReturn);
+        return;
+    }
+    // Dying is quick and so is trying again: one key, no loading.
+    if (m_state == State::Dead && m_stateTime > kRestartDelay && event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat &&
+        (event.key.scancode == SDL_SCANCODE_R || event.key.scancode == SDL_SCANCODE_SPACE ||
+            event.key.scancode == SDL_SCANCODE_RETURN)) {
+        restartLevel();
         return;
     }
     if (m_state != State::Playing)
@@ -277,8 +297,29 @@ void Game::onEvent(const SDL_Event& event)
     }
     if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat && event.key.scancode == SDL_SCANCODE_SPACE)
         m_jumpRequested = true;
-    if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat && event.key.scancode == SDL_SCANCODE_R)
-        m_reloadRequested = true;
+    if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat) {
+        GameWorld::Input& press = m_presses;
+        switch (event.key.scancode) {
+        case SDL_SCANCODE_Q: press.zone = static_cast<int>(Zone::Bandolier); break;
+        case SDL_SCANCODE_E: press.zone = static_cast<int>(Zone::JacketPocket); break;
+        case SDL_SCANCODE_C: press.zone = static_cast<int>(Zone::RightPocket); break;
+        case SDL_SCANCODE_R: press.reload = true; break;
+        case SDL_SCANCODE_V: press.forceReload = true; break;
+        case SDL_SCANCODE_X: press.unload = true; break;
+        case SDL_SCANCODE_F: press.putBack = true; break;
+        case SDL_SCANCODE_T: press.pickUp = true; break;
+        case SDL_SCANCODE_G: press.toggleOffGun = true; break;
+        case SDL_SCANCODE_1: press.swapTo = ItemKind::Shotgun; break;
+        case SDL_SCANCODE_2: press.swapTo = ItemKind::Pistol; break;
+        case SDL_SCANCODE_3: press.swapTo = ItemKind::Magazine; break;
+#ifndef NDEBUG
+        case SDL_SCANCODE_F3: m_debugOverlay = !m_debugOverlay; break;
+#endif
+        default: break;
+        }
+    }
+    if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN && event.button.button == SDL_BUTTON_RIGHT)
+        m_presses.secondary = true;
     if (event.type == SDL_EVENT_MOUSE_MOTION && !m_bot.enabled) {
         m_camera.yaw += event.motion.xrel * m_camera.sensitivity;
         m_camera.pitch = glm::clamp(m_camera.pitch - event.motion.yrel * m_camera.sensitivity, -89.0f, 89.0f);
@@ -318,7 +359,7 @@ void Game::update(float dt)
         break;
     }
     m_jumpRequested = false;
-    m_reloadRequested = false;
+    m_presses = {};
 }
 
 void Game::movePlayer(float dt)
@@ -341,7 +382,8 @@ void Game::movePlayer(float dt)
         sprint = keys[SDL_SCANCODE_LSHIFT] || keys[SDL_SCANCODE_RSHIFT];
     }
     if (glm::length(move) > 0.0f)
-        move = glm::normalize(move) * kWalkSpeed * (sprint ? kSprintMultiplier : 1.0f);
+        move = glm::normalize(move) * kWalkSpeed * (sprint ? kSprintMultiplier : 1.0f) *
+            glm::mix(1.0f, kJacketSpeed, m_jacket);
 
     m_physics.updatePlayer(dt, move, m_jumpRequested);
     if (m_physics.playerPosition().y < m_killHeight)
@@ -351,22 +393,32 @@ void Game::movePlayer(float dt)
 
 void Game::updateWorld(float dt, bool controls)
 {
-    GameWorld::Input input;
+    // The presses since the last update (the keys are read in onEvent).
+    GameWorld::Input input = controls ? m_presses : GameWorld::Input{};
     input.dt = dt;
     input.eye = eyePosition();
-    Camera aim = m_camera;
-    aim.pitch = std::clamp(m_camera.pitch + m_world.recoil(), -89.0f, 89.0f);
-    input.forward = getFront(aim);
+    const bool* keys = SDL_GetKeyboardState(nullptr);
+    const bool jacketHeld = controls && keys[SDL_SCANCODE_TAB];
+    m_jacket = std::clamp(m_jacket + (jacketHeld ? dt : -dt) / kJacketOpenSeconds, 0.0f, 1.0f);
+    input.jacket = m_jacket;
+    input.restock = controls && keys[SDL_SCANCODE_Q];
+    input.forward = getFront(viewCamera());
     input.playerFeet = m_physics.playerPosition();
     if (controls) {
-        const bool* keys = SDL_GetKeyboardState(nullptr);
         const bool walking = m_bot.enabled ? glm::length(m_bot.move) > 0.01f
             : keys[SDL_SCANCODE_W] || keys[SDL_SCANCODE_A] || keys[SDL_SCANCODE_S] || keys[SDL_SCANCODE_D];
         input.moving = walking && m_physics.playerOnGround();
         input.sprinting = !m_bot.enabled && (keys[SDL_SCANCODE_LSHIFT] || keys[SDL_SCANCODE_RSHIFT]);
         const SDL_MouseButtonFlags buttons = SDL_GetMouseState(nullptr, nullptr);
-        input.fire = m_bot.enabled ? m_bot.fire : (buttons & SDL_BUTTON_LMASK) != 0;
-        input.reload = m_reloadRequested;
+        if (m_bot.enabled) {
+            input.fire = m_bot.fire;
+            input.secondary = m_bot.pump;
+            input.reload = m_bot.reload;
+            input.zone = m_bot.zone;
+        }
+        else {
+            input.fire = (buttons & SDL_BUTTON_LMASK) != 0;
+        }
     }
     m_world.update(input);
     m_camera.position = input.eye;
@@ -374,8 +426,7 @@ void Game::updateWorld(float dt, bool controls)
 
 void Game::fillFrame(FrameInput& frame)
 {
-    Camera view = m_camera;
-    view.pitch = std::clamp(m_camera.pitch + m_world.recoil(), -89.0f, 89.0f);
+    const Camera view = viewCamera();
     frame.models = &m_models;
     frame.view = getView(view);
     frame.proj = getProjection(frame.windowWidth, frame.windowHeight, kCameraNearPlane, m_settings.viewDistance,
@@ -403,12 +454,20 @@ void Game::updateBot(float dt)
     ++bot.frames;
     bot.move = glm::vec3(0.0f);
     bot.fire = false;
+    bot.pump = false;
+    bot.reload = false;
+    bot.zone = -1;
+    const ArmsState& arms = m_world.arms().state();
+    const int shellsCarried = arms.zones[static_cast<int>(Zone::Bandolier)].shells +
+        arms.zones[static_cast<int>(Zone::JacketPocket)].shells;
 
     if (m_state == State::Dead) {
         if (m_stateTime < 1.5f)
             return;
         LOG_INFO("[AUTOPLAY] Died after " << bot.time << " s (" << m_world.enemiesKilled() << "/"
-            << m_world.enemiesTotal() << " enemies killed)\n");
+            << m_world.enemiesTotal() << " enemies killed; " << bot.shots << " shots, " << bot.pumps << " pumps, chamber "
+            << static_cast<int>(arms.shotgun.chamber) << ", tube " << arms.shotgun.tube << ", carried "
+            << shellsCarried << ")\n");
         if (bot.restarts++ < 2) {
             LOG_INFO("[AUTOPLAY] Restarting the level\n");
             restartLevel();
@@ -424,8 +483,9 @@ void Game::updateBot(float dt)
             return;
         LOG_INFO("[AUTOPLAY] RESULT: level complete in " << m_world.levelTime() << " s, " << m_world.enemiesKilled()
             << "/" << m_world.enemiesTotal() << " enemies, health " << m_world.player().health << ", "
-            << bot.teleports << " teleports, " << bot.restarts << " restarts, "
-            << static_cast<int>(bot.frames / std::max(bot.time, 0.001f)) << " FPS average\n");
+            << bot.teleports << " teleports, " << bot.restarts << " restarts, " << bot.shots << " shots, "
+            << bot.pumps << " pumps, " << arms.shotgun.tube << " in the tube + " << shellsCarried
+            << " carried, " << static_cast<int>(bot.frames / std::max(bot.time, 0.001f)) << " FPS average\n");
         m_quitRequested = true;
         return;
     }
@@ -457,7 +517,7 @@ void Game::updateBot(float dt)
             if (!shotgun.meshModels.empty() && drawable.instance.modelIndex == shotgun.meshModels.front()) {
                 const glm::vec3 local(viewMatrix * drawable.transform[3]);
                 LOG_INFO("[AUTOPLAY] Check: shotgun at (" << local.x << ", " << local.y << ", " << local.z
-                    << ") in view space (expect about 0.17, -0.19, -0.3)\n");
+                    << ") in view space (expect about 0.2, -0.22, -0.34)\n");
                 break;
             }
         }
@@ -475,27 +535,82 @@ void Game::updateBot(float dt)
     }
     if (!enemyLeft)
         target += glm::vec3(0.0f, 1.0f, 0.0f);
+    // An enemy within reach is the target, even when its chest is out of sight (the barrel is lower).
+    bool threatened = false;
+    float closest = 4.0f;
+    for (const Entity& entity : m_world.entities()) {
+        if (entity.kind != Entity::Kind::Enemy || entity.state == EnemyState::Dead)
+            continue;
+        const float d = glm::distance(entity.position, feet);
+        if (d < closest) {
+            closest = d;
+            threatened = visible = true;
+            target = entity.position + glm::vec3(0.0f, 1.2f, 0.0f);
+        }
+    }
 
-    // Turn towards the target, at most 300 degrees per second.
+    // Turn towards the target, at most 300 degrees per second. In a fight the barrel is what has to point
+    // at the enemy; it is held off the view's center, so turn by the barrel's error instead.
     const glm::vec3 toTarget = target - eye;
-    const float wantYaw = glm::degrees(std::atan2(toTarget.z, toTarget.x));
-    const float wantPitch = glm::degrees(std::atan2(toTarget.y, glm::length(glm::vec2(toTarget.x, toTarget.z))));
+    const auto yawOf = [](const glm::vec3& v) { return glm::degrees(std::atan2(v.z, v.x)); };
+    const auto pitchOf = [](const glm::vec3& v) { return glm::degrees(std::atan2(v.y, glm::length(glm::vec2(v.x, v.z)))); };
+    float yawError = std::remainder(yawOf(toTarget) - m_camera.yaw, 360.0f);
+    float pitchError = pitchOf(toTarget) - m_camera.pitch;
+    if (enemyLeft && visible) {
+        const glm::vec3 fromBarrel = target - m_world.barrelOrigin();
+        yawError = std::remainder(yawOf(fromBarrel) - yawOf(m_world.barrelDirection()), 360.0f);
+        pitchError = pitchOf(fromBarrel) - pitchOf(m_world.barrelDirection());
+    }
     const float maxTurn = 300.0f * dt;
-    m_camera.yaw += std::clamp(std::remainder(wantYaw - m_camera.yaw, 360.0f), -maxTurn, maxTurn);
-    m_camera.pitch += std::clamp(wantPitch - m_camera.pitch, -maxTurn, maxTurn);
+    m_camera.yaw += std::clamp(yawError, -maxTurn, maxTurn);
+    m_camera.pitch += std::clamp(pitchError, -maxTurn, maxTurn);
     m_camera.pitch = std::clamp(m_camera.pitch, -89.0f, 89.0f);
-    const float aimError = std::abs(std::remainder(wantYaw - m_camera.yaw, 360.0f)) + std::abs(wantPitch - m_camera.pitch);
     const float distance = glm::length(toTarget);
     const glm::vec3 flatDirection = glm::length(glm::vec2(toTarget.x, toTarget.z)) > 1e-3f
         ? glm::normalize(glm::vec3(toTarget.x, 0.0f, toTarget.z)) : glm::vec3(0.0f);
 
+    // Operate the shotgun: shoot when the barrel (not the view) is on target, pump a spent chamber, load
+    // shells while nothing is in sight.
+    // The bot keeps the shotgun and handles it like a player: shells one at a time from the bandolier or
+    // the pocket, pushed in with R, a pump after every shot.
+    const HandState& off = arms.hand(Hand::Off);
+    const int tubeSize = m_world.arms().config().tubeSize;
+    const bool pumping = off.task == Task::Pump;
+    const bool handFree = off.item.kind == ItemKind::Empty && !off.busy();
+    const bool holdingShell = off.item.kind == ItemKind::Shell && !off.busy();
+    const Chamber chamber = arms.shotgun.chamber;
+    const int tube = arms.shotgun.tube;
+    const bool fighting = (enemyLeft && visible) || threatened;
+    const bool chamberReady = chamber == Chamber::Loaded && !pumping;
+    const bool wantLoad = tube < tubeSize && shellsCarried > 0 &&
+        (!fighting || (tube == 0 && chamber != Chamber::Loaded));
+    const bool needPump = chamber != Chamber::Loaded && tube > 0 && !pumping;
+    // A shell in hand goes in first (a press of reload); pumping would drop it.
+    const bool insertHeld = holdingShell && tube < tubeSize;
+    if (needPump && (fighting || !wantLoad) && !insertHeld) {
+        bot.pump = handFree || holdingShell;
+        bot.pumps += bot.pump ? 1 : 0;
+    }
+    else if (insertHeld) {
+        bot.reload = !bot.reloadWasHeld;
+    }
+    else if (wantLoad && handFree) {
+        // Take a shell (Q / E), then R pushes it in.
+        bot.zone = static_cast<int>(arms.zones[static_cast<int>(Zone::Bandolier)].shells > 0 ? Zone::Bandolier
+                                                                                            : Zone::JacketPocket);
+    }
+    bot.reloadWasHeld = bot.reload;
+
     if (enemyLeft && visible) {
         bot.lostSight = 0.0f;
-        bot.fire = aimError < 3.0f && distance < 25.0f;
-        // Close in from afar, back off from claws.
-        if (distance > 9.0f)
+        const glm::vec3 toAim = glm::normalize(target - m_world.barrelOrigin());
+        const float barrelError = glm::degrees(std::acos(std::clamp(glm::dot(m_world.barrelDirection(), toAim), -1.0f, 1.0f)));
+        bot.fire = chamberReady && barrelError < 3.0f && distance < 14.0f;
+        bot.shots += bot.fire ? 1 : 0;
+        // Close in to shotgun range, and keep out of reach while pumping: three hits kill.
+        if (distance > 8.0f)
             bot.move = flatDirection;
-        else if (distance < 4.0f)
+        else if (distance < 5.5f)
             bot.move = -flatDirection;
     }
     else {
@@ -553,6 +668,7 @@ void Game::drawUi()
     case State::Loading:  drawLoadingScreen(); break;
     case State::Paused:   drawHud(); drawPauseMenu(); break;
     case State::Settings: drawSettingsScreen(); break;
+    case State::Controls: drawControlsScreen(); break;
     case State::Playing:  drawHud(); break;
     case State::Dead:     drawHud(); drawDeathScreen(); break;
     case State::Complete: drawCompleteScreen(); break;
@@ -610,7 +726,7 @@ std::string formatTime(float seconds)
 void Game::drawMainMenu()
 {
     if (beginScreen("##MainMenu", 1.0f)) {
-        const float blockHeight = 3.0f * (kButtonHeight + 14.0f) + 200.0f;
+        const float blockHeight = 4.0f * (kButtonHeight + 14.0f) + 160.0f;
         centerBlock(blockHeight);
         centeredText("MirasEngine", 3.0f, ImVec4(0.95f, 0.95f, 0.97f, 1.0f));
         centeredText("Level 1: The Yard", 1.3f, ImVec4(0.7f, 0.72f, 0.78f, 1.0f));
@@ -618,15 +734,11 @@ void Game::drawMainMenu()
 
         ImGui::SetWindowFontScale(1.4f);
         if (menuButton("Play")) startLoading();
-        if (menuButton("Settings")) {
-            m_settingsReturn = State::MainMenu;
-            setState(State::Settings);
-        }
+        if (menuButton("Controls")) openScreen(State::Controls);
+        if (menuButton("Settings")) openScreen(State::Settings);
         if (menuButton("Exit")) m_quitRequested = true;
         ImGui::SetWindowFontScale(1.0f);
 
-        centeredText("WASD move, Shift sprint, Space jump, mouse aim, left click fire, R reload, Esc pause", 1.0f,
-            ImVec4(0.6f, 0.62f, 0.68f, 1.0f));
         if (!m_error.empty()) {
             ImGui::Dummy(ImVec2(0.0f, 10.0f));
             centeredText(m_error.c_str(), 1.2f, ImVec4(1.0f, 0.4f, 0.35f, 1.0f));
@@ -650,16 +762,14 @@ void Game::drawLoadingScreen()
 void Game::drawPauseMenu()
 {
     if (beginScreen("##Paused", 0.6f)) {
-        centerBlock(5.0f * (kButtonHeight + 14.0f) + 110.0f);
+        centerBlock(6.0f * (kButtonHeight + 14.0f) + 110.0f);
         centeredText("Paused", 2.2f, ImVec4(0.95f, 0.95f, 0.97f, 1.0f));
         ImGui::Dummy(ImVec2(0.0f, 30.0f));
         ImGui::SetWindowFontScale(1.4f);
         if (menuButton("Resume")) setState(State::Playing);
         if (menuButton("Restart Level")) restartLevel();
-        if (menuButton("Settings")) {
-            m_settingsReturn = State::Paused;
-            setState(State::Settings);
-        }
+        if (menuButton("Controls")) openScreen(State::Controls);
+        if (menuButton("Settings")) openScreen(State::Settings);
         if (m_playInEditor) {
             if (menuButton("Stop (Back to Editor)")) stopPlayInEditor();
         }
@@ -675,7 +785,7 @@ void Game::drawPauseMenu()
 void Game::drawDeathScreen()
 {
     // The red fade shows the scene behind for a moment before the buttons appear.
-    const float alpha = std::clamp(m_stateTime / 1.2f, 0.0f, 1.0f);
+    const float alpha = std::clamp(m_stateTime / 0.4f, 0.0f, 1.0f);
     ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.25f, 0.0f, 0.0f, 0.55f * alpha));
     const ImGuiViewport* viewport = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(viewport->Pos);
@@ -687,8 +797,9 @@ void Game::drawDeathScreen()
         const std::string stats = std::to_string(m_world.enemiesKilled()) + " of " +
             std::to_string(m_world.enemiesTotal()) + " enemies killed";
         centeredText(stats.c_str(), 1.2f, ImVec4(0.9f, 0.85f, 0.85f, alpha));
+        centeredText("R / Space: try again", 1.2f, ImVec4(1.0f, 0.92f, 0.6f, m_stateTime > kRestartDelay ? alpha : 0.0f));
         ImGui::Dummy(ImVec2(0.0f, 30.0f));
-        if (m_stateTime > 1.0f) {
+        if (m_stateTime > 0.6f) {
             ImGui::SetWindowFontScale(1.4f);
             if (menuButton("Try Again")) restartLevel();
             if (m_playInEditor) {
@@ -738,7 +849,7 @@ void Game::drawCompleteScreen()
 void Game::drawSettingsScreen()
 {
     // Over the paused scene the settings stay translucent so their effect is visible.
-    const float alpha = m_settingsReturn == State::Paused ? 0.75f : 1.0f;
+    const float alpha = m_screenReturn == State::Paused ? 0.75f : 1.0f;
     if (beginScreen("##Settings", alpha)) {
         const float panelWidth = 480.0f;
         const float panelHeight = std::clamp(ImGui::GetWindowHeight() - 260.0f, 150.0f, 460.0f);
@@ -751,7 +862,88 @@ void Game::drawSettingsScreen()
         ImGui::EndChild();
         ImGui::Dummy(ImVec2(0.0f, 16.0f));
         ImGui::SetWindowFontScale(1.4f);
-        if (menuButton("Back")) setState(m_settingsReturn);
+        if (menuButton("Back")) setState(m_screenReturn);
+        ImGui::SetWindowFontScale(1.0f);
+    }
+    ImGui::End();
+}
+
+void Game::openScreen(State screen)
+{
+    m_screenReturn = m_state;
+    setState(screen);
+}
+
+void Game::drawControlsScreen()
+{
+    struct Row {
+        const char* keys;
+        const char* action;
+    };
+    // Headings have no keys.
+    static constexpr Row kRows[] = {
+        { nullptr, "Moving" },
+        { "W A S D", "Walk" },
+        { "Shift", "Sprint" },
+        { "Space", "Jump" },
+        { "Mouse", "Look; the gun follows, a little behind" },
+        { nullptr, "Hands" },
+        { "1 / 2 / 3", "Right hand takes the shotgun / the pistol / a magazine (to load rounds into)" },
+        { "G", "Left hand takes the other gun, or puts it away (a gun in each hand: no reloading)" },
+        { "Left click", "Fire the gun in the right hand" },
+        { "Right click", "Fire the gun in the left hand; otherwise pump the shotgun / rack the pistol" },
+        { "T", "Pick up the nearest dropped item" },
+        { nullptr, "Shotgun" },
+        { "Q / E", "Take a shell from the bandolier (quick) / the jacket pocket (slow)" },
+        { "R", "Push the shell in your left hand into the tube" },
+        { nullptr, "Pistol" },
+        { "X", "Drop the magazine out: into the free left hand, or onto the floor" },
+        { "R", "Reload step by step: magazine out, put an empty one away, fetch the fullest, push it in, rack" },
+        { "V", "Reload even with a gun in each hand: the left hand drops its gun first" },
+        { "Holding a magazine", "R presses one loose round in (from the right pocket)" },
+        { nullptr, "Inventory" },
+        { "Q / E / C", "With the left hand empty: take from the bandolier / jacket pocket / right pocket" },
+        { "Q / E / C", "With something in the left hand: put it there" },
+        { "F", "Put what the left hand holds back where it came from" },
+        { "Tab (hold)", "Open the jacket and look at what you carry" },
+        { "Tab + Q (hold)", "Move shells from the pocket to the bandolier" },
+        { nullptr, "Game" },
+        { "Esc", "Pause" },
+        { "R / Space", "Try again after dying" },
+    };
+    const float alpha = m_screenReturn == State::Paused ? 0.85f : 1.0f;
+    if (beginScreen("##Controls", alpha)) {
+        const float panelWidth = 640.0f;
+        const float panelHeight = std::clamp(ImGui::GetWindowHeight() - 260.0f, 150.0f, 520.0f);
+        centerBlock(panelHeight + 120.0f);
+        centeredText("Controls", 2.2f, ImVec4(0.95f, 0.95f, 0.97f, 1.0f));
+        ImGui::Dummy(ImVec2(0.0f, 20.0f));
+        ImGui::SetCursorPosX((ImGui::GetWindowWidth() - panelWidth) * 0.5f);
+        if (ImGui::BeginChild("##controlsPanel", ImVec2(panelWidth, panelHeight), ImGuiChildFlags_Borders)) {
+            ImGui::SetWindowFontScale(1.15f);
+            if (ImGui::BeginTable("##controls", 2, ImGuiTableFlags_SizingFixedFit)) {
+                ImGui::TableSetupColumn("keys", ImGuiTableColumnFlags_WidthFixed, 170.0f);
+                ImGui::TableSetupColumn("action", ImGuiTableColumnFlags_WidthStretch);
+                for (const Row& row : kRows) {
+                    ImGui::TableNextRow();
+                    ImGui::TableSetColumnIndex(0);
+                    if (!row.keys) {
+                        ImGui::Dummy(ImVec2(0.0f, 4.0f));
+                        ImGui::TextColored(ImVec4(1.0f, 0.82f, 0.45f, 1.0f), "%s", row.action);
+                        continue;
+                    }
+                    ImGui::TextColored(ImVec4(0.75f, 0.85f, 1.0f, 1.0f), "%s", row.keys);
+                    ImGui::TableSetColumnIndex(1);
+                    ImGui::TextWrapped("%s", row.action);
+                }
+                ImGui::EndTable();
+            }
+            ImGui::SetWindowFontScale(1.0f);
+        }
+        ImGui::EndChild();
+        ImGui::Dummy(ImVec2(0.0f, 16.0f));
+        ImGui::SetWindowFontScale(1.4f);
+        if (menuButton("Back")) setState(m_screenReturn);
         ImGui::SetWindowFontScale(1.0f);
     }
     ImGui::End();

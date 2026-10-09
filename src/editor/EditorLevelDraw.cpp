@@ -226,9 +226,89 @@ void Editor::finishShapeDraw(bool clicked)
     m_models.getInstances()[newIndex].name = name;
     markSceneChanged();
     selectInstance(static_cast<int>(newIndex));
+    if (m_editAfterDraw) {
+        m_shapeDraw = {};
+        beginShapeEdit();
+        return;
+    }
     char text[160];
     snprintf(text, sizeof(text), "Added %s (%g x %g x %g)", name.c_str(), params.size.x, params.size.y, params.size.z);
     setStatus(text);
+}
+
+void Editor::toggleShapeEdit()
+{
+    if (shapeEditActive())
+        finishShapeEdit();
+    else
+        beginShapeEdit();
+}
+
+void Editor::beginShapeEdit()
+{
+    if (!selectedLevelMesh()) {
+        setStatus("Select a level shape (unlocked) to edit it", true);
+        return;
+    }
+    m_shapeDraw = {};
+    m_entityPlace = {};
+    clearShapeEditPicks();
+    m_levelMode = m_lastShapeEditMode;
+    setStatus("Editing " + m_models.getInstances()[m_gizmo.selectedInstance].name + ": " +
+        m_keymap.shortcutLabel(EditorAction::EditShape) + " or Esc finishes");
+}
+
+void Editor::finishShapeEdit()
+{
+    if (m_levelMode == LevelEditMode::Object)
+        return;
+    m_lastShapeEditMode = m_levelMode;
+    m_faceDraw = {};
+    clearShapeEditPicks();
+    m_levelMode = LevelEditMode::Object;
+    if (selectedLevelMesh())
+        setStatus("Finished editing " + m_models.getInstances()[m_gizmo.selectedInstance].name);
+}
+
+bool Editor::shapeEditHasPicks()
+{
+    switch (m_levelMode) {
+    case LevelEditMode::Face: return !selectedLevelFaces().empty();
+    case LevelEditMode::Vertex: return !selectedLevelVertices().empty();
+    case LevelEditMode::Edge: return m_edgeSelected;
+    case LevelEditMode::Part: return !m_selectedParts.empty();
+    default: return false;
+    }
+}
+
+void Editor::clearShapeEditPicks()
+{
+    clearFaceSelection();
+    m_selectedVertices.clear();
+    m_edgeSelected = false;
+    m_selectedParts.clear();
+}
+
+void Editor::drawShapeEditOverlay()
+{
+    if (m_flyMode || shapeDrawActive() || entityPlacementActive() || !shapeEditActive())
+        return;
+    static constexpr const char* kModeNames[] = { "Object", "Faces", "Vertices", "Edges", "Parts" };
+    const auto key = [&](EditorAction action) {
+        const std::string label = m_keymap.shortcutLabel(action);
+        return label.empty() ? std::string() : " (" + label + ")";
+    };
+    char title[256];
+    snprintf(title, sizeof(title), "Editing %s: %s   |   Faces%s  Edges%s  Vertices%s  Parts%s   |   Done: %s / Esc",
+        m_models.getInstances()[m_gizmo.selectedInstance].name.c_str(), kModeNames[static_cast<int>(m_levelMode)],
+        key(EditorAction::FaceMode).c_str(), key(EditorAction::EdgeMode).c_str(), key(EditorAction::VertexMode).c_str(),
+        key(EditorAction::PartMode).c_str(), m_keymap.shortcutLabel(EditorAction::EditShape).c_str());
+    ImDrawList* foreground = ImGui::GetForegroundDrawList();
+    const ImVec2 size = ImGui::CalcTextSize(title);
+    const ImVec2 at(m_sceneView.x + (m_sceneView.width - size.x) * 0.5f, m_sceneView.y + 12.0f);
+    foreground->AddRectFilled(ImVec2(at.x - 8.0f, at.y - 4.0f), ImVec2(at.x + size.x + 8.0f, at.y + size.y + 4.0f),
+        IM_COL32(0, 0, 0, 150), 4.0f);
+    foreground->AddText(at, kDrawColor, title);
 }
 
 void Editor::drawShapeDrawOverlay()

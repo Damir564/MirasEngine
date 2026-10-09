@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <string>
 #include "imgui.h"
+#include "engine/ConfigPaths.h"
 
 union SDL_Event;
 struct SDL_KeyboardEvent;
@@ -13,7 +14,7 @@ enum class EditorAction {
     Undo, Redo, Duplicate, Delete, Deselect, Rename, Focus,
     SelectAll, Copy, Cut, Paste, DropToFloor, RotateClockwise, RotateCounterClockwise, Hide, UnhideAll,
     SelectTool, MoveTool, RotateTool, ScaleTool, ToggleSnap, GridSmaller, GridLarger, Eyedropper,
-    ObjectMode, FaceMode, EdgeMode, VertexMode, PartMode, DrawShape, UniteShapes, SeparateShape, SaveAsPrefab,
+    ObjectMode, FaceMode, EdgeMode, VertexMode, PartMode, EditShape, DrawShape, UniteShapes, SeparateShape, SaveAsPrefab,
     GroupObjects, UngroupObjects,
     CopyFaceAttributes, PasteFaceAttributes, FacePushOut, FacePullIn, FaceExtrude, FaceExtrudeIn, SelectSurface,
     UvLeft, UvRight, UvUp, UvDown, UvRotateLeft, UvRotateRight, UvScaleUp, UvScaleDown,
@@ -76,7 +77,8 @@ private:
     std::array<bool, ImGuiKey_NamedKey_COUNT> m_down{};
 };
 
-inline constexpr const char* kEditorKeymapPath = "editor_keys.json";
+// In the shared config folder, so every build uses the same shortcuts.
+inline std::string editorKeymapPath() { return configPath("editor_keys.json"); }
 
 bool isModifierKey(ImGuiKey key);
 // Keyboard keys only (no mouse or gamepad), the range shortcuts can use.

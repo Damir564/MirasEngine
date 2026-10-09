@@ -29,10 +29,10 @@ void Editor::drawKeymapWindow()
     ImGui::SameLine();
     if (ImGui::Button("Reset all")) {
         m_keymap.resetAll();
-        m_keymap.save(kEditorKeymapPath);
+        m_keymap.save(editorKeymapPath());
         setStatus("Keyboard shortcuts reset to the defaults");
     }
-    ImGui::TextDisabled("Click a shortcut to change it, right-click to clear it. Saved to %s.", kEditorKeymapPath);
+    ImGui::TextDisabled("Click a shortcut to change it, right-click to clear it. Saved to %s.", editorKeymapPath().c_str());
 
     const ImGuiTableFlags flags = ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_ScrollY;
     if (ImGui::BeginTable("##keymap", 4, flags)) {
@@ -96,7 +96,7 @@ void Editor::drawKeymapRow(EditorAction action)
             ImGui::PopStyleColor();
         if (ImGui::IsItemClicked(ImGuiMouseButton_Right) && chord != ImGuiKey_None) {
             m_keymap.setBinding(action, slot, ImGuiKey_None);
-            m_keymap.save(kEditorKeymapPath);
+            m_keymap.save(editorKeymapPath());
         }
         if (!conflict.empty())
             ImGui::SetItemTooltip("Also used by: %s", conflict.c_str());
@@ -109,7 +109,7 @@ void Editor::drawKeymapRow(EditorAction action)
     if (!m_keymap.isDefault(action)) {
         if (ImGui::Button("Reset")) {
             m_keymap.reset(action);
-            m_keymap.save(kEditorKeymapPath);
+            m_keymap.save(editorKeymapPath());
         }
         std::string defaults;
         for (ImGuiKeyChord chord : info.defaults) {
@@ -241,7 +241,7 @@ void Editor::updateKeyCapture()
     if (done) {
         if (!cancelled) {
             m_keymap.setBinding(action, m_keyCapture.slot, result);
-            m_keymap.save(kEditorKeymapPath);
+            m_keymap.save(editorKeymapPath());
             const std::string conflict = m_keymap.conflicts(action, m_keyCapture.slot);
             std::string message = std::string(info.label) + ": " + keyChordName(result);
             if (!conflict.empty())

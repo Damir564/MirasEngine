@@ -42,7 +42,8 @@ private:
     // False while there is nothing to render into (minimized, zero-sized, swapchain not rebuildable).
     bool readyToRender();
     ImDrawData* buildUi();
-    // Pushes settings the mode changed this frame to the renderer and settings.json.
+    // Applies the open scene's SceneSettings over m_settings and pushes what changed this frame to the
+    // renderer; changes to the global part also go to settings.json.
     void applyChangedSettings();
     // Sleeps until the frame that started at frameStartNs has lasted 1 / maxFps.
     void limitFrameRate(uint64_t frameStartNs) const;
@@ -52,7 +53,7 @@ private:
     bool m_imguiInitialized = false;
     bool m_quit = false;
 
-    std::string m_settingsPath = kGraphicsSettingsPath;
+    std::string m_settingsPath;
     GraphicsSettings m_settings;
     GraphicsSettings m_appliedSettings;
     bool m_muted = false;    // --mute

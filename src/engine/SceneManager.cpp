@@ -42,6 +42,7 @@ SceneManager::OpenResult SceneManager::open(const std::string& path)
         ++result.queuedModels;
     }
 
+    m_settings = loaded.settings;
     m_pendingScene = std::move(loaded);
     m_pendingLoad = true;
     m_currentPath = path;
@@ -51,7 +52,7 @@ SceneManager::OpenResult SceneManager::open(const std::string& path)
 
 bool SceneManager::save(const std::string& path)
 {
-    return SceneSerializer::Save(path, m_models);
+    return SceneSerializer::Save(path, m_models, m_settings);
 }
 
 void SceneManager::clear()
@@ -123,6 +124,7 @@ void SceneManager::instantiatePendingScene()
         newInst.entity = inst.entity;
         newInst.entityParams = inst.entityParams;
         newInst.group = inst.group;
+        newInst.collision = inst.collision;
     }
 
     m_pendingLoad = false;

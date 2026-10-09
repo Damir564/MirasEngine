@@ -11,6 +11,7 @@
 
 // Forward declarations - adjust these includes to match your project
 #include "ModelManager.h" // For ModelManager, ModelInstance, GPUModel
+#include "GraphicsSettings.h"
 #include "Log.h"
 
 struct SceneFileHeader {
@@ -38,13 +39,17 @@ struct SceneInstanceEntry {
     bool visible = true;
     // followed by (version 2+): float color[3]; then (version 5+): uint8_t locked; then: char name[nameLength];
     // then (version 8+): uint32_t entityLength, char entity[entityLength], uint32_t paramsLength,
-    // char entityParams[paramsLength]; then (version 9+): uint32_t groupLength, char group[groupLength]
+    // char entityParams[paramsLength]; then (version 9+): uint32_t groupLength, char group[groupLength];
+    // then (version 10+): uint8_t collision (CollisionMode)
 };
 
 // Version 1 files have no per-instance color, version 2 files no level geometry, version 3 files no
 // level materials, version 4 files no prefabs, version 5 files no level grid sizes, version 6 files no
-// shared materials, version 7 files no game entities, version 8 files no object groups.
-inline constexpr uint32_t kSceneFileVersion = 9;
+// shared materials, version 7 files no game entities, version 8 files no object groups, version 9 files
+// no collision modes, version 10 files no scene settings. Version 11+ files end with uint32_t length and
+// the SceneSettings as JSON text (sceneSettingsToJson()).
+inline constexpr uint32_t kSceneFileVersion = 11;
+inline constexpr uint32_t kMaxSceneSettingsLength = 1u << 20;
 inline constexpr uint32_t kMaxSceneEntityTextLength = 4096;
 inline constexpr uint32_t kMaxSceneMaterialOverrides = 4096;
 
@@ -57,7 +62,7 @@ inline constexpr uint32_t kMaxScenePrefabPathLength = 4096;
 
 class SceneSerializer {
 public:
-    static bool Save(const std::string& filepath, ModelManager& modelManager) {
+    static bool Save(const std::string& filepath, ModelManager& modelManager, const SceneSettings& settings) {
         std::ofstream file(filepath, std::ios::binary);
         if (!file.is_open()) {
             LOG_ERROR("[SCENE] Failed to open file for writing: " << filepath << "\n");
@@ -168,9 +173,20 @@ public:
                 file.write(reinterpret_cast<const char*>(&length), sizeof(length));
                 file.write(text->data(), length);
             }
+            const uint8_t collision = static_cast<uint8_t>(inst.collision);
+            file.write(reinterpret_cast<const char*>(&collision), sizeof(collision));
         }
 
+        const std::string settingsJson = sceneSettingsToJson(settings);
+        const uint32_t settingsLength = static_cast<uint32_t>(settingsJson.size());
+        file.write(reinterpret_cast<const char*>(&settingsLength), sizeof(settingsLength));
+        file.write(settingsJson.data(), settingsLength);
+
         file.close();
+        if (!file) {
+            LOG_ERROR("[SCENE] Failed to write " << filepath << "\n");
+            return false;
+        }
         LOG_INFO("[SCENE] Saved: " << uniqueModels.size() << " models, "
             << validInstanceCount << " instances to " << filepath << "\n");
         return true;
@@ -196,10 +212,12 @@ public:
             std::string entity;
             std::string entityParams;
             std::string group;
+            CollisionMode collision = CollisionMode::Mesh;
         };
 
         std::vector<LoadedModel> models;
         std::vector<LoadedInstance> instances;
+        SceneSettings settings; // defaults for files from before version 11
         bool valid = false;
     };
 
@@ -320,6 +338,24 @@ public:
                     file.read(text->data(), length);
                 }
             }
+            if (header.version >= 10) {
+                uint8_t collision = 0;
+                file.read(reinterpret_cast<char*>(&collision), sizeof(collision));
+                if (collision < static_cast<uint8_t>(CollisionMode::Count))
+                    scene.instances[i].collision = static_cast<CollisionMode>(collision);
+            }
+        }
+
+        if (header.version >= 11) {
+            uint32_t settingsLength = 0;
+            file.read(reinterpret_cast<char*>(&settingsLength), sizeof(settingsLength));
+            if (!file || settingsLength > kMaxSceneSettingsLength) {
+                LOG_ERROR("[SCENE] Corrupt scene settings in " << filepath << "\n");
+                return scene;
+            }
+            std::string settingsJson(settingsLength, '\0');
+            file.read(settingsJson.data(), settingsLength);
+            scene.settings = sceneSettingsFromJson(settingsJson);
         }
 
         if (!file) {

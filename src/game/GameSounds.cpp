@@ -4,7 +4,9 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <initializer_list>
 #include <iterator>
+#include <utility>
 #include <string>
 #include <vector>
 #include "engine/Audio.h"
@@ -179,6 +181,153 @@ std::vector<float> shellInsert()
     click(out, 0.0f, 0.85f, 0.8f, 31);
     click(out, 0.09f, 1.3f, 0.5f, 32);
     normalize(out, 0.7f);
+    return out;
+}
+
+// Fingers in cloth: a short filtered rustle.
+void rustle(std::vector<float>& out, float start, float length, float cutoff, float level, uint32_t seed)
+{
+    Noise noise(seed);
+    LowPass soft;
+    BandPass band;
+    const size_t begin = static_cast<size_t>(start * kRate);
+    for (size_t i = begin; i < out.size() && i < begin + static_cast<size_t>(length * kRate); ++i) {
+        const float t = (i - begin) / kRate;
+        const float shape = std::sin(kPi * t / length) * (0.6f + 0.4f * std::abs(noise.next()));
+        out[i] += band.process(soft.process(noise.next(), cutoff), cutoff * 0.6f, 1.2f) * shape * level;
+    }
+}
+
+std::vector<float> shellGrab()
+{
+    auto out = buffer(0.2f);
+    rustle(out, 0.0f, 0.12f, 2500.0f, 1.0f, 111);
+    click(out, 0.1f, 2.1f, 0.25f, 112); // the brass head touching the next shell
+    normalize(out, 0.5f);
+    return out;
+}
+
+std::vector<float> pocketEmpty()
+{
+    auto out = buffer(0.25f);
+    rustle(out, 0.0f, 0.2f, 1400.0f, 1.0f, 121);
+    normalize(out, 0.45f);
+    return out;
+}
+
+std::vector<float> shellDrop()
+{
+    // A plastic hull with a brass head bouncing: a few quick, fading ticks.
+    auto out = buffer(0.4f);
+    click(out, 0.0f, 2.3f, 1.0f, 131);
+    click(out, 0.11f, 2.5f, 0.45f, 132);
+    click(out, 0.19f, 2.4f, 0.2f, 133);
+    normalize(out, 0.5f);
+    return out;
+}
+
+std::vector<float> pistolFire()
+{
+    // Sharper and shorter than the shotgun: a crack, a small boom, a short room tail.
+    auto out = buffer(0.6f);
+    Noise noise(141);
+    LowPass blast, tail;
+    Sweep boom;
+    for (size_t i = 0; i < out.size(); ++i) {
+        const float t = i / kRate;
+        const float n = noise.next();
+        const float body = blast.process(n, 12000.0f * std::exp(-t / 0.02f) + 900.0f) * env(t, 0.0005f, 0.045f) * 1.5f;
+        const float crack = n * env(t, 0.0001f, 0.006f) * 0.9f;
+        const float low = boom.next(180.0f, 70.0f, t / 0.12f) * env(t, 0.001f, 0.07f) * 0.7f;
+        const float room = tail.process(n, 1400.0f) * env(t, 0.01f, 0.2f) * 0.4f;
+        out[i] = std::tanh(1.8f * (body + crack + low + room));
+    }
+    normalize(out);
+    return out;
+}
+
+std::vector<float> clicks(std::initializer_list<std::pair<float, float>> times, float pitch, float level, uint32_t seed,
+    float length = 0.3f)
+{
+    auto out = buffer(length);
+    uint32_t s = seed;
+    for (const auto& [time, gain] : times)
+        click(out, time, pitch, gain, s++);
+    normalize(out, level);
+    return out;
+}
+
+// Metal sliding on metal between two clicks.
+std::vector<float> slideRack()
+{
+    auto out = buffer(0.3f);
+    click(out, 0.0f, 1.3f, 0.9f, 151);
+    click(out, 0.17f, 1.1f, 1.1f, 152);
+    Noise noise(153);
+    LowPass slide;
+    for (size_t i = 0; i < out.size(); ++i) {
+        const float t = i / kRate;
+        const float shape = std::exp(-std::pow((t - 0.08f) / 0.04f, 2.0f));
+        out[i] += slide.process(noise.next(), 3000.0f) * shape * 0.3f;
+    }
+    normalize(out, 0.75f);
+    return out;
+}
+
+// Loose things in a pocket: many quick ticks when it's full, a few when it's nearly empty.
+std::vector<float> rattle(int ticks, uint32_t seed)
+{
+    auto out = buffer(0.25f);
+    Noise noise(seed);
+    for (int i = 0; i < ticks; ++i) {
+        const float time = 0.01f + 0.18f * (0.5f + 0.5f * noise.next()) * (i + 1) / ticks;
+        click(out, time, 2.2f + 0.4f * noise.next(), 0.3f + 0.2f * std::abs(noise.next()), seed + 10 + i);
+    }
+    rustle(out, 0.0f, 0.2f, 2000.0f, 0.4f, seed + 99);
+    normalize(out, 0.4f);
+    return out;
+}
+
+// Something heavy hitting the floor: a thud with a metallic ring.
+std::vector<float> heavyDrop(float pitch, float ringLevel, uint32_t seed)
+{
+    auto out = buffer(0.45f);
+    Noise noise(seed);
+    LowPass thud;
+    Sweep body;
+    for (size_t i = 0; i < out.size(); ++i) {
+        const float t = i / kRate;
+        out[i] = thud.process(noise.next(), 900.0f) * env(t, 0.001f, 0.03f) * 2.0f +
+            body.next(140.0f * pitch, 60.0f * pitch, t / 0.1f) * env(t, 0.001f, 0.05f) * 0.6f;
+    }
+    click(out, 0.0f, pitch, ringLevel, seed + 1);
+    click(out, 0.12f, pitch * 1.1f, ringLevel * 0.4f, seed + 2);
+    normalize(out, 0.7f);
+    return out;
+}
+
+// A refused action: a dull, muted knock.
+std::vector<float> reject()
+{
+    auto out = buffer(0.18f);
+    Noise noise(171);
+    LowPass dull;
+    Sweep knock;
+    for (size_t i = 0; i < out.size(); ++i) {
+        const float t = i / kRate;
+        out[i] = knock.next(220.0f, 140.0f, t / 0.08f) * env(t, 0.002f, 0.035f) +
+            dull.process(noise.next(), 500.0f) * env(t, 0.001f, 0.02f) * 1.2f;
+    }
+    normalize(out, 0.5f);
+    return out;
+}
+
+std::vector<float> holster()
+{
+    auto out = buffer(0.3f);
+    rustle(out, 0.0f, 0.25f, 1800.0f, 1.0f, 181);
+    click(out, 0.2f, 0.9f, 0.2f, 182);
+    normalize(out, 0.45f);
     return out;
 }
 
@@ -370,6 +519,22 @@ void registerGameSounds(AudioSystem& audio)
         { "shotgun_pump", shotgunPump },
         { "shotgun_empty", dryClick },
         { "shell_insert", shellInsert },
+        { "shell_grab", shellGrab },
+        { "pocket_empty", pocketEmpty },
+        { "shell_drop", shellDrop },
+        { "pistol_fire", pistolFire },
+        { "pistol_dry", [] { return clicks({ { 0.0f, 1.0f } }, 1.9f, 0.5f, 191, 0.1f); } },
+        { "mag_eject", [] { return clicks({ { 0.0f, 0.8f }, { 0.05f, 0.5f } }, 1.2f, 0.6f, 192); } },
+        { "mag_insert", [] { return clicks({ { 0.0f, 0.5f }, { 0.07f, 1.2f } }, 0.95f, 0.75f, 193); } },
+        { "slide_rack", slideRack },
+        { "slide_lock", [] { return clicks({ { 0.0f, 1.0f } }, 1.6f, 0.45f, 194, 0.1f); } },
+        { "round_insert", [] { return clicks({ { 0.0f, 0.6f }, { 0.04f, 0.9f } }, 2.0f, 0.5f, 195, 0.15f); } },
+        { "pocket_rattle_full", [] { return rattle(9, 201); } },
+        { "pocket_rattle_low", [] { return rattle(2, 211); } },
+        { "mag_drop", [] { return heavyDrop(1.6f, 0.5f, 221); } },
+        { "gun_drop", [] { return heavyDrop(0.9f, 0.9f, 231); } },
+        { "reject", reject },
+        { "holster", holster },
         { "enemy_alert", [] { return growl(0.9f, 85.0f, 70.0f, 480.0f, 1150.0f, 0.08f, 0.35f, 1); } },
         { "enemy_hurt", [] { return growl(0.32f, 150.0f, 95.0f, 620.0f, 1500.0f, 0.01f, 0.12f, 2); } },
         { "enemy_death", enemyDeath },

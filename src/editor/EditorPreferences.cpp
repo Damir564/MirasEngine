@@ -218,7 +218,7 @@ std::vector<std::string> Editor::savedLayouts() const
     namespace fs = std::filesystem;
     std::vector<std::string> names;
     std::error_code ec;
-    for (const fs::directory_entry& entry : fs::directory_iterator(kLayoutsRoot, ec)) {
+    for (const fs::directory_entry& entry : fs::directory_iterator(layoutsRoot(), ec)) {
         std::error_code fileEc;
         if (entry.is_regular_file(fileEc) && entry.path().extension() == ".ini")
             names.push_back(entry.path().stem().string());
@@ -235,8 +235,8 @@ void Editor::saveLayout(const std::string& name)
         return;
     }
     std::error_code ec;
-    std::filesystem::create_directories(kLayoutsRoot, ec);
-    const std::filesystem::path path = std::filesystem::path(kLayoutsRoot) / (fileName + ".ini");
+    std::filesystem::create_directories(layoutsRoot(), ec);
+    const std::filesystem::path path = std::filesystem::path(layoutsRoot()) / (fileName + ".ini");
     std::ofstream file(path, std::ios::binary);
     size_t size = 0;
     const char* data = ImGui::SaveIniSettingsToMemory(&size);
@@ -250,7 +250,7 @@ void Editor::saveLayout(const std::string& name)
 
 void Editor::loadLayout(const std::string& name)
 {
-    const std::filesystem::path path = std::filesystem::path(kLayoutsRoot) / (name + ".ini");
+    const std::filesystem::path path = std::filesystem::path(layoutsRoot()) / (name + ".ini");
     std::ifstream file(path, std::ios::binary);
     std::stringstream contents;
     contents << file.rdbuf();
@@ -265,7 +265,7 @@ void Editor::loadLayout(const std::string& name)
 void Editor::deleteLayout(const std::string& name)
 {
     std::error_code ec;
-    if (std::filesystem::remove(std::filesystem::path(kLayoutsRoot) / (name + ".ini"), ec))
+    if (std::filesystem::remove(std::filesystem::path(layoutsRoot()) / (name + ".ini"), ec))
         setStatus("Layout deleted: " + name);
     else
         setStatus("Failed to delete layout " + name, true);
@@ -327,7 +327,7 @@ void Editor::drawPreferencesWindow()
     if (ImGui::Button("Keyboard Shortcuts..."))
         m_showKeymap = true;
     ImGui::SameLine();
-    ImGui::TextDisabled("Saved to %s", kEditorPrefsPath);
+    ImGui::TextDisabled("Saved to %s", editorPrefsPath().c_str());
     ImGui::End();
 }
 
@@ -414,8 +414,8 @@ void Editor::drawFilePrefs()
     ImGui::PushItemWidth(px(220.0f));
     ImGui::SliderInt("Autosave", &m_prefs.autosaveMinutes, 0, 30,
         m_prefs.autosaveMinutes == 0 ? "Off" : "every %d min", ImGuiSliderFlags_AlwaysClamp);
-    ImGui::SetItemTooltip("Unsaved changes are written to %s in the editor's folder; the scene's own file is "
-        "left alone.", kAutosavePath);
+    ImGui::SetItemTooltip("Unsaved changes are written to %s; the scene's own file is left alone.",
+        autosavePath().c_str());
     ImGui::PopItemWidth();
     ImGui::Spacing();
     ImGui::AlignTextToFramePadding();
@@ -463,5 +463,5 @@ void Editor::drawLayoutPrefs()
     ImGui::SameLine();
     if (ImGui::Button("Save current layout") || entered)
         saveLayout(m_layoutName);
-    ImGui::TextDisabled("Saves panel positions, docking and which panels are open, to %s/.", kLayoutsRoot);
+    ImGui::TextDisabled("Saves panel positions, docking and which panels are open, to %s.", layoutsRoot().c_str());
 }

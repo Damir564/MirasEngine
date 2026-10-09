@@ -15,12 +15,14 @@ uint64_t Editor::sceneStateId() const
 bool Editor::sceneDirty() const
 {
     // A change still being made (a drag) has no history entry yet.
-    return sceneStateId() != m_savedState || m_sceneChanged || m_levelEditPending;
+    return sceneStateId() != m_savedState || m_sceneChanged || m_levelEditPending ||
+        m_scenes.settings() != m_savedSceneSettings;
 }
 
 void Editor::markSceneSaved(const std::string& path)
 {
     m_savedState = sceneStateId();
+    m_savedSceneSettings = m_scenes.settings();
     m_autosavedState = m_savedState;
     // Saved from a script or command batch: its edits become a history entry only afterwards, and the
     // file already holds them.
@@ -175,11 +177,12 @@ void Editor::updateAutosave()
     const uint64_t state = sceneStateId();
     if (!sceneDirty() || state == m_autosavedState)
         return;
-    if (m_scenes.save(kAutosavePath)) {
+    const std::string path = autosavePath();
+    if (m_scenes.save(path)) {
         m_autosavedState = state;
-        setStatus(std::string("Autosaved to ") + kAutosavePath);
+        setStatus("Autosaved to " + path);
     }
     else {
-        setStatus(std::string("Autosave to ") + kAutosavePath + " failed", true);
+        setStatus("Autosave to " + path + " failed", true);
     }
 }

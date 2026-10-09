@@ -12,7 +12,7 @@ bool sameInstanceState(const ModelInstance& a, const ModelInstance& b)
 {
     return a.id == b.id && a.name == b.name && a.position == b.position && a.rotation == b.rotation &&
         a.scale == b.scale && a.visible == b.visible && a.color == b.color && a.locked == b.locked &&
-        a.entity == b.entity && a.entityParams == b.entityParams && a.group == b.group;
+        a.entity == b.entity && a.entityParams == b.entityParams && a.group == b.group && a.collision == b.collision;
 }
 }
 
@@ -160,6 +160,8 @@ std::string Editor::describeObjectChanges(const std::vector<ObjectChange>& chang
         return "entity " + b.name;
     if (a.group != b.group)
         return (b.group.empty() ? "ungroup " : "group ") + b.name;
+    if (a.collision != b.collision)
+        return "collision " + b.name;
     const bool moved = a.position != b.position;
     const bool rotated = a.rotation != b.rotation;
     const bool scaled = a.scale != b.scale;

@@ -19,7 +19,37 @@ enum class Tonemapper {
     Reinhard,
 };
 
-struct GraphicsSettings {
+// The look of one scene, saved in its .scn file: sky, sun, fog and grading. Defaults match what every scene
+// looked like before scenes had their own settings.
+struct SceneSettings {
+    // Environment
+    BackgroundMode background = BackgroundMode::Realistic;
+    glm::vec3 backgroundColor{ 0.24f, 0.26f, 0.29f }; // sRGB
+    bool sun = true;           // off: no sun disk or direct sunlight (and no shadows); the sky stays lit
+    float sunAzimuth = 135.0f; // degrees clockwise from -Z (north) towards +X (east)
+    float sunElevation = 35.0f; // degrees above the horizon
+    float sunIntensity = 1.0f;
+    glm::vec3 sunColor{ 1.0f }; // sRGB tint; the atmosphere already reddens a low sun
+    float haze = 1.0f;         // aerosol density of the atmosphere: whiter sky, softer sun
+    bool fog = true;
+    float fogDensity = 1.0f;   // multiplier of the base height fog density
+
+    // Look (the effects themselves are switched on in GraphicsSettings)
+    float aoRadius = 1.0f;     // meters
+    float aoIntensity = 1.0f;
+    float bloomIntensity = 0.5f;
+    float exposure = 0.0f;     // EV compensation
+    Tonemapper tonemapper = Tonemapper::Aces;
+    float contrast = 1.0f;
+    float saturation = 1.0f;
+    float vignette = 0.25f;
+
+    bool operator==(const SceneSettings&) const = default;
+};
+
+// What the renderer draws with: the user's global settings (settings.json: quality, display, audio) with the
+// open scene's SceneSettings applied over the base (Application does that every frame).
+struct GraphicsSettings : SceneSettings {
     // Pipeline
     RenderPipeline pipeline = RenderPipeline::Standard;
     float renderScale = 1.0f;  // Classic only: internal resolution relative to the window, 0.25..1
@@ -39,30 +69,11 @@ struct GraphicsSettings {
     float shadowDistance = 150.0f;
     bool softShadows = true;   // penumbrae widen with the distance to the caster (PCSS)
     bool contactShadows = true; // screen-space shadows for small details the shadow map is too coarse for
+    bool lightShadows = true;  // point and spot lights that ask for shadows get them (Standard only)
 
-    // Lighting and post-processing
+    // Effects
     int ambientOcclusion = 2;  // 0 = off, 1 = low, 2 = medium, 3 = high
-    float aoRadius = 1.0f;     // meters
-    float aoIntensity = 1.0f;
     bool bloom = true;
-    float bloomIntensity = 0.5f;
-    float exposure = 0.0f;     // EV compensation
-    Tonemapper tonemapper = Tonemapper::Aces;
-    float contrast = 1.0f;
-    float saturation = 1.0f;
-    float vignette = 0.25f;
-
-    // Environment
-    BackgroundMode background = BackgroundMode::Realistic;
-    glm::vec3 backgroundColor{ 0.24f, 0.26f, 0.29f }; // sRGB
-    bool sun = true;           // off: no sun disk or direct sunlight (and no shadows); the sky stays lit
-    float sunAzimuth = 135.0f; // degrees clockwise from -Z (north) towards +X (east)
-    float sunElevation = 35.0f; // degrees above the horizon
-    float sunIntensity = 1.0f;
-    glm::vec3 sunColor{ 1.0f }; // sRGB tint; the atmosphere already reddens a low sun
-    float haze = 1.0f;         // aerosol density of the atmosphere: whiter sky, softer sun
-    bool fog = true;
-    float fogDensity = 1.0f;   // multiplier of the base height fog density
     float viewDistance = 5000.0f; // camera far plane
 
     // Audio (kept here so one settings file covers the game's options)
@@ -70,6 +81,11 @@ struct GraphicsSettings {
     float musicVolume = 0.5f;   // ambience loops, relative to the master volume
 
     bool operator==(const GraphicsSettings&) const = default;
+
+    SceneSettings& scene() { return *this; }
+    const SceneSettings& scene() const { return *this; }
+    // The global part equals the other's (the scene part is ignored).
+    bool sameGlobal(const GraphicsSettings& other) const;
 };
 
 struct RenderCapabilities {
@@ -77,7 +93,8 @@ struct RenderCapabilities {
     float maxAnisotropy = 1.0f;
 };
 
-inline constexpr const char* kGraphicsSettingsPath = "settings.json";
+// settings.json in the shared config folder (ConfigPaths.h), so every build uses the same settings.
+std::string graphicsSettingsPath();
 
 // Lowest = the Classic pipeline at a reduced render scale, for integrated GPUs.
 enum class QualityPreset { Lowest, Low, Medium, High, Ultra };
@@ -87,6 +104,12 @@ inline constexpr const char* kQualityPresetNames[] = { "Lowest", "Low", "Medium"
 void applyQualityPreset(GraphicsSettings& settings, QualityPreset preset, int maxMsaaSamples);
 // Clamps every field into its valid range (unknown MSAA/shadow sizes snap to the nearest valid value).
 GraphicsSettings sanitizeGraphicsSettings(GraphicsSettings settings);
+SceneSettings sanitizeSceneSettings(SceneSettings settings);
+// Only the global part is read and written; the scene part keeps its defaults.
 // A missing or unreadable file yields defaults; missing keys keep their default value.
-GraphicsSettings loadGraphicsSettings(const std::string& path = kGraphicsSettingsPath);
-bool saveGraphicsSettings(const GraphicsSettings& settings, const std::string& path = kGraphicsSettingsPath);
+GraphicsSettings loadGraphicsSettings(const std::string& path = graphicsSettingsPath());
+bool saveGraphicsSettings(const GraphicsSettings& settings, const std::string& path = graphicsSettingsPath());
+// SceneSettings as JSON text, as the scene file stores them. Unknown keys are ignored and missing ones keep
+// their defaults, so files from newer or older builds still load.
+std::string sceneSettingsToJson(const SceneSettings& settings);
+SceneSettings sceneSettingsFromJson(const std::string& text);

@@ -94,7 +94,7 @@ ShadowMapResources createShadowMap(VmaAllocator allocator, vk::Device device, ui
 {
     ShadowMapResources shadow{};
     shadow.size = size;
-    shadow.layers = std::clamp(layers, 1u, kMaxShadowCascades);
+    shadow.layers = std::max(layers, 1u);
 
     VkImageCreateInfo imageInfo{};
     imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
@@ -129,7 +129,7 @@ ShadowMapResources createShadowMap(VmaAllocator allocator, vk::Device device, ui
     };
     shadow.view = createView(vk::ImageViewType::e2DArray, 0, shadow.layers);
     for (uint32_t layer = 0; layer < shadow.layers; ++layer)
-        shadow.layerViews[layer] = createView(vk::ImageViewType::e2D, layer, 1);
+        shadow.layerViews.push_back(createView(vk::ImageViewType::e2D, layer, 1));
 
     // Outside the map counts as lit: the border is the far plane.
     vk::SamplerCreateInfo samplerInfo{};

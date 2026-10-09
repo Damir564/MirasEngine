@@ -46,6 +46,7 @@ private:
         Playing,
         Paused,
         Settings,
+        Controls,
         Dead,
         Complete,
     };
@@ -67,6 +68,8 @@ private:
     void returnToMainMenu();
     void stopPlayInEditor();
     glm::vec3 eyePosition() const;
+    // The camera actually used: the mouse pitch plus the shot's kick, tilted down while the jacket is open.
+    Camera viewCamera() const;
 
     // Autoplay: aims at and shoots the nearest enemy, walks or teleports to the next one and to the exit.
     void updateBot(float dt);
@@ -75,10 +78,14 @@ private:
     void drawLoadingScreen();
     void drawPauseMenu();
     void drawSettingsScreen();
+    void drawControlsScreen();
+    // Opens Settings or Controls; Back (or Esc) returns to the current screen.
+    void openScreen(State screen);
     void drawDeathScreen();
     void drawCompleteScreen();
     // GameHud.cpp
     void drawHud();
+    void drawDebugOverlay();
     // Full-window ImGui window for a menu screen; returns the result of Begin().
     bool beginScreen(const char* id, float backgroundAlpha);
     bool menuButton(const char* label);
@@ -92,7 +99,7 @@ private:
     std::string m_levelPath;
 
     State m_state = State::MainMenu;
-    State m_settingsReturn = State::MainMenu;
+    State m_screenReturn = State::MainMenu;
     std::string m_error;
     float m_loadingStallTime = 0.0f;
     bool m_quitRequested = false;
@@ -112,7 +119,11 @@ private:
     float m_killHeight = -100.0f;
     float m_eyeHeight = 1.65f;
     bool m_jumpRequested = false;
-    bool m_reloadRequested = false;
+    // Weapon and inventory key presses since the last update (only the pressed-this-frame fields are used).
+    GameWorld::Input m_presses;
+    bool m_debugOverlay = false; // F3 in debug builds: hands, pistol and storage state
+    // 0..1: Tab held opens the jacket, tilting the view down to the body and slowing the player.
+    float m_jacket = 0.0f;
     float m_stateTime = 0.0f;
 
     struct Bot {
@@ -124,7 +135,13 @@ private:
         glm::vec3 lastPosition{ 0.0f };
         glm::vec3 move{ 0.0f };
         bool fire = false;
+        bool pump = false;
+        bool reload = false;
+        bool reloadWasHeld = false;
+        int zone = -1;
         int frames = 0;
+        int shots = 0;
+        int pumps = 0;
         int teleports = 0;
     };
     Bot m_bot;

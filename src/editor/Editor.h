@@ -25,6 +25,7 @@
 
 class McpServer;
 struct EntityPreset;
+struct EntityTypeInfo;
 
 // The scene editor: viewport interaction (picking, gizmo, camera) plus the docked ImGui panels.
 // The implementation is split by panel across the Editor*.cpp files.
@@ -176,10 +177,16 @@ private:
     // Where a click puts an entity: on the floor under the mouse; a wall hit stands it in front of the wall.
     bool entityPlacementPoint(float mouseX, float mouseY, glm::vec3& out) const;
     void drawEntityPlaceOverlay();
+    // Range sphere or cone of the selected lights.
+    void drawLightOverlay();
     // Level panel: a button per entity type and enemy preset.
     void drawEntityPalette();
     // The preset's values (others are kept) and tint.
     static void applyEntityPreset(ModelInstance& instance, const EntityPreset& preset);
+    // The type's own defaults get a palette button next to its presets unless a built-in preset covers them.
+    static bool entityDefaultPlaceable(const EntityTypeInfo& type);
+    // Inspector: "Save as preset..." for the entity's current values, and its name popup.
+    void drawSaveEntityPreset(const ModelInstance& instance);
 
     // ---- EditorGroups.cpp ----
     // Groups are objects sharing a ModelInstance::group name. A click in the viewport selects the whole
@@ -307,6 +314,8 @@ private:
     void drawViewportOverlay();
     void drawHelpPopups();
     void drawGraphicsSettingsWindow();
+    // The open scene's sky, sun, fog and grading (SceneManager::settings()), saved with the scene.
+    void drawSceneSettingsWindow();
     void drawControlsPopup();
     void drawAboutPopup();
     void openFileDialog(const char* key, const char* title, const char* filters, const std::string& root,
@@ -345,7 +354,7 @@ private:
     // Built-in dock layouts, built by drawDockSpace() when requested.
     enum class LayoutPreset { Default, LevelDesign, Compact };
     void buildLayout(ImGuiID dockspaceId, LayoutPreset preset);
-    // Saved layouts are imgui.ini snapshots in kLayoutsRoot: dock layout plus panel visibility.
+    // Saved layouts are imgui.ini snapshots in layoutsRoot(): dock layout plus panel visibility.
     std::vector<std::string> savedLayouts() const;
     void saveLayout(const std::string& name);
     // Queued: the file is read in beforeUiFrame(), outside the ImGui frame.
@@ -382,6 +391,8 @@ private:
     // ---- EditorInspector.cpp ----
     void drawInspector();
     void drawInspectorHeader(ModelInstance& instance, const GPUModel* model);
+    // What the game collides with (ModelInstance::collision), for every selected object.
+    void drawCollisionSection(int instanceIndex);
     void drawTransformSection(int instanceIndex);
 
     // ---- EditorAnimation.cpp ----
@@ -516,8 +527,21 @@ private:
     bool shapeDrawPoint(float mouseX, float mouseY, float height, glm::vec3& out) const;
     // What the mouse points at to build on: a surface facing up (its hit point), else the ground (y = 0).
     bool surfacePoint(float mouseX, float mouseY, glm::vec3& out) const;
-    // Adds the drawn shape (or, for a click, one of the panel's size) and keeps the tool ready.
+    // Adds the drawn shape (or, for a click, one of the panel's size). Keeps the tool ready, or with
+    // m_editAfterDraw turns it off and starts editing the new shape.
     void finishShapeDraw(bool clicked);
+    // Shape editing session on the selected level shape, like a brush in TrenchBroom: Tab enters the last
+    // used face/edge/vertex/part mode and leaves it again; Esc clears the faces/vertices picked, then leaves.
+    // The shape stays one object throughout.
+    void toggleShapeEdit();
+    void beginShapeEdit();
+    void finishShapeEdit();
+    bool shapeEditActive() { return m_levelMode != LevelEditMode::Object && selectedLevelMesh() != nullptr; }
+    // Faces, an edge, vertices or parts are picked on the edited shape.
+    bool shapeEditHasPicks();
+    void clearShapeEditPicks();
+    // Banner over the viewport naming the edited shape and the keys.
+    void drawShapeEditOverlay();
     // Moves every selected face `distance` along its normal (each vertex once, so neighbouring selected
     // faces stay joined), or extrudes each of them.
     void moveSelectedFaces(float distance, bool extrude);
@@ -780,6 +804,8 @@ private:
     bool m_showLevelPanel = true;
     bool m_showMaterialsPanel = true;
     bool m_showGraphicsSettings = false;
+    bool m_showSceneSettings = false;
+    SceneSettings m_savedSceneSettings; // as in the scene's file, for sceneDirty()
     bool m_showKeymap = false;
     bool m_showPreferences = false;
     std::optional<LayoutPreset> m_layoutRequest;
@@ -790,7 +816,7 @@ private:
     std::string m_windowTitle;
 
     // Preferences and layouts
-    static constexpr const char* kLayoutsRoot = "layouts";
+    static std::string layoutsRoot() { return configPath("layouts"); }
     EditorPrefs m_prefs;
     EditorPrefs m_savedPrefs;   // as last written to kEditorPrefsPath
     EditorPrefs m_appliedStyle; // the style fields as last given to EditorStyle::apply()
@@ -857,6 +883,8 @@ private:
     // Part: the connected parts of a shape (e.g. of a united group) are picked and transformed whole.
     enum class LevelEditMode { Object, Face, Vertex, Edge, Part };
     LevelEditMode m_levelMode = LevelEditMode::Object;
+    LevelEditMode m_lastShapeEditMode = LevelEditMode::Face; // what Tab goes back to
+    bool m_editAfterDraw = true; // the Draw tool hands the new shape over to editing
     // Face mode: m_selectedFace is the active face (properties shown, dragged, source of wraps);
     // m_selectedFaces holds every selected face, the active one included.
     int m_selectedFace = -1;
@@ -969,6 +997,7 @@ private:
         int preset = -1; // into the type's presets, -1 = its defaults
     };
     EntityPlace m_entityPlace;
+    char m_entityPresetName[64] = {}; // Save as preset popup
     FaceDrawShape m_faceDrawShape = FaceDrawShape::Rectangle;
     int m_faceDrawSegments = 16; // circle
     // Box selection started on empty space, of vertices (vertex mode) or objects; scene-view pixels.

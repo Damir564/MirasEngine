@@ -67,6 +67,7 @@ const EditorActionInfo kActions[] = {
     { "edgeMode", "Edge mode", kLevel, { kCtrl | ImGuiKey_3 } },
     { "vertexMode", "Vertex mode", kLevel, { kCtrl | ImGuiKey_4 } },
     { "partMode", "Part mode (parts of a united shape)", kLevel, { kCtrl | ImGuiKey_5 } },
+    { "editShape", "Edit the selected shape / finish editing", kLevel, { ImGuiKey_Tab } },
     { "drawShape", "Draw shape tool", kLevel, { ImGuiKey_B } },
     { "uniteShapes", "Unite selected shapes into one", kLevel, { kCtrl | ImGuiKey_G } },
     { "separateShape", "Separate shape into its parts", kLevel, { kCtrl | kShift | ImGuiKey_G } },

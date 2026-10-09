@@ -14,6 +14,7 @@
 #include "Camera.h"
 #include "Gizmo.h"
 #include "GraphicsSettings.h"
+#include "Lights.h"
 #include "RenderTypes.h"
 #include "ShaderUtils.h"
 #include "Shadow.h"
@@ -78,7 +79,7 @@ struct FrameInput {
 // post-processing come from GraphicsSettings.
 // Requires an ImGui context to exist before init() (it initializes the ImGui Vulkan backend).
 //
-// Frame: sky LUT (when the sun changes) -> shadow cascades (those that changed) -> depth prepass + half-res
+// Frame: sky LUT (when the sun changes) -> shadow cascades (those that changed) -> light shadow views -> depth prepass + half-res
 // AO / contact shadows (when enabled) -> HDR scene pass -> selection mask -> bloom -> composite (tone map)
 // [-> FXAA] -> outline + ImGui on the swapchain image.
 // Classic pipeline: scene pass at the render scale into an 8-bit sRGB target (per-vertex lighting, analytic
@@ -197,6 +198,13 @@ private:
         uint32_t commandCount;
     };
 
+    // One perspective shadow view of a point or spot light: a layer of m_lightShadowMap.
+    struct LightShadowView {
+        glm::mat4 matrix{ 1.0f }; // world -> shadow clip space
+        glm::vec3 lightPosition{ 0.0f };
+        float range = 0.0f;
+    };
+
     struct SunState {
         glm::vec3 direction{ 0.0f, -1.0f, 0.0f }; // direction the light travels
         glm::vec3 topIrradiance{ 0.0f };          // above the atmosphere; lights the sky
@@ -212,6 +220,14 @@ private:
     // the lighting descriptors stay valid without holding up to 256 MB.
     std::pair<uint32_t, uint32_t> wantedShadowMap() const;
     bool createShadowMapResources();
+    // Full size once a light needs shadows (and light shadows are on), else a stub; rewrites the lighting set.
+    void resizeLightShadowMap(bool full);
+    bool lightShadowsAllowed() const;
+    // The scene's light objects nearest the camera into this frame's light buffer, with shadow views for
+    // the nearest ones that cast shadows.
+    void gatherLights(const FrameInput& input);
+    void buildLightShadowStreams(const FrameInput& input);
+    void recordLightShadowPasses(vk::CommandBuffer cmd, const ModelManager& models);
     bool createRenderTargets();
     void destroyRenderTargets();
     bool createSkyResources();
@@ -367,6 +383,13 @@ private:
     std::array<bool, kMaxShadowCascades> m_renderCascade{};
     bool m_shadowMapValid = false;
 
+    // Point and spot lights: per-frame light buffers (set 0, binding 3) and the shadow views of this frame,
+    // redrawn every frame.
+    std::vector<std::unique_ptr<HostBuffer>> m_lightBuffers;
+    ShadowMapResources m_lightShadowMap;
+    std::vector<SceneLight> m_sceneLights;
+    std::vector<LightShadowView> m_lightShadowViews;
+
     // Set 4 of the mesh shaders: shadow map, AO and sky textures.
     vk::DescriptorSet m_lightingSet;
     // Single-image sets (m_textureSetLayout) for the effect passes.
@@ -425,6 +448,8 @@ private:
     std::vector<GpuDrawData> m_frameDraws;
     std::vector<vk::DrawIndexedIndirectCommand> m_frameCommands;
     std::array<std::vector<DrawRun>, kMaxShadowCascades> m_shadowRuns;
+    std::array<std::vector<DrawRun>, kMaxLightShadowLayers> m_lightShadowRuns;
+    std::vector<uint32_t> m_lightTransformIndices; // per cull result; UINT32_MAX = not pushed yet
     std::vector<DrawRun> m_opaqueRuns;
     std::vector<DrawRun> m_blendRuns;
     std::vector<DrawRun> m_highlightRuns;

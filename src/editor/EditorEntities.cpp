@@ -1,15 +1,19 @@
 #include "Editor.h"
+#include <algorithm>
 #include <cfloat>
 #include <cmath>
 #include <cstdio>
 #include <glm/gtc/constants.hpp>
 #include "EditorStyle.h"
 #include "engine/EntityTypes.h"
+#include "engine/Lights.h"
 #include "engine/ModelManager.h"
 
 namespace {
 
 constexpr ImU32 kPlaceColor = IM_COL32(255, 210, 90, 255);
+constexpr ImU32 kLightRangeColor = IM_COL32(255, 230, 140, 110);
+constexpr float kLightPlaceHeight = 2.5f;
 // Floors face up more than this (normal.y); anything steeper counts as a wall.
 constexpr float kFloorFacing = 0.7f;
 
@@ -21,6 +25,11 @@ bool isEntityMarkerModel(const GPUModel* model)
         if (model->sourcePath == type.model)
             return true;
     return false;
+}
+
+bool validPreset(const EntityTypeInfo& type, int preset)
+{
+    return preset >= 0 && static_cast<size_t>(preset) < type.presets.size();
 }
 
 } // namespace
@@ -39,6 +48,55 @@ void Editor::applyEntityPreset(ModelInstance& instance, const EntityPreset& pres
     instance.color = glm::vec3(preset.color[0], preset.color[1], preset.color[2]);
 }
 
+bool Editor::entityDefaultPlaceable(const EntityTypeInfo& type)
+{
+    return std::all_of(type.presets.begin(), type.presets.end(), [](const EntityPreset& p) { return p.user; });
+}
+
+void Editor::drawSaveEntityPreset(const ModelInstance& instance)
+{
+    if (ImGui::SmallButton("Save as preset...")) {
+        snprintf(m_entityPresetName, sizeof(m_entityPresetName), "%s", instance.name.c_str());
+        ImGui::OpenPopup("Save entity preset");
+    }
+    ImGui::SetItemTooltip("Saves the current values and color as a preset of this type to %s",
+        entityPresetsPath().c_str());
+    if (!ImGui::BeginPopup("Save entity preset"))
+        return;
+    ImGui::TextUnformatted("Preset name");
+    if (ImGui::IsWindowAppearing())
+        ImGui::SetKeyboardFocusHere();
+    const bool enter = ImGui::InputText("##presetName", m_entityPresetName, sizeof(m_entityPresetName),
+        ImGuiInputTextFlags_EnterReturnsTrue);
+    const std::string name = m_entityPresetName;
+    const EntityTypeInfo* type = findEntityType(instance.entity);
+    const bool replaces = type && std::any_of(type->presets.begin(), type->presets.end(),
+        [&](const EntityPreset& p) { return p.label == name; });
+    if (replaces)
+        ImGui::TextColored(EditorStyle::kHighlight, "Replaces the preset with this name");
+    ImGui::BeginDisabled(name.empty());
+    if ((ImGui::Button("Save") || enter) && !name.empty()) {
+        EntityPreset preset;
+        preset.label = name;
+        preset.params = instance.entityParams;
+        preset.color[0] = instance.color.r;
+        preset.color[1] = instance.color.g;
+        preset.color[2] = instance.color.b;
+        // Indices into the presets may move.
+        stopEntityPlacement();
+        if (saveEntityPreset(instance.entity, std::move(preset)))
+            setStatus("Saved preset " + name + " to " + entityPresetsPath());
+        else
+            setStatus("Failed to save preset " + name, true);
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel"))
+        ImGui::CloseCurrentPopup();
+    ImGui::EndPopup();
+}
+
 void Editor::beginEntityPlacement(const std::string& type, int preset)
 {
     const EntityTypeInfo* info = findEntityType(type);
@@ -49,7 +107,7 @@ void Editor::beginEntityPlacement(const std::string& type, int preset)
     m_faceDraw = {};
     m_levelMode = LevelEditMode::Object;
     m_entityPlace.type = type;
-    m_entityPlace.preset = preset >= 0 && static_cast<size_t>(preset) < info->presets.size() ? preset : -1;
+    m_entityPlace.preset = validPreset(*info, preset) ? preset : -1;
     setStatus("Place " + entityPlaceLabel() + ": click a floor or wall in the viewport. Esc stops");
 }
 
@@ -67,8 +125,8 @@ std::string Editor::entityPlaceLabel() const
     if (!info)
         return m_entityPlace.type;
     std::string label = info->label;
-    if (m_entityPlace.preset >= 0)
-        label += std::string(" (") + info->presets[m_entityPlace.preset].label + ")";
+    if (validPreset(*info, m_entityPlace.preset))
+        label += " (" + info->presets[m_entityPlace.preset].label + ")";
     return label;
 }
 
@@ -132,12 +190,15 @@ bool Editor::handleEntityPlaceClick(float mouseX, float mouseY)
         setStatus("Click a surface or the ground", true);
         return true;
     }
+    // Lamps hang above the floor that was clicked.
+    if (m_entityPlace.type == kLightEntity)
+        point.y += kLightPlaceHeight;
     const auto index = addEntity(m_entityPlace.type, &point);
     if (!index)
         return true;
     ModelInstance& instance = m_models.getInstances()[*index];
     const EntityTypeInfo* info = findEntityType(m_entityPlace.type);
-    if (info && m_entityPlace.preset >= 0) {
+    if (info && validPreset(*info, m_entityPlace.preset)) {
         const EntityPreset& preset = info->presets[m_entityPlace.preset];
         applyEntityPreset(instance, preset);
         instance.name = uniqueInstanceName(preset.label);
@@ -185,6 +246,63 @@ void Editor::drawEntityPlaceOverlay()
     foreground->AddText(at, kPlaceColor, title);
 }
 
+void Editor::drawLightOverlay()
+{
+    if (m_flyMode)
+        return;
+    const glm::mat4 viewProj = sceneProjection() * getView(m_camera);
+    const ImVec2 origin(m_sceneView.x, m_sceneView.y);
+    ImDrawList* drawList = ImGui::GetBackgroundDrawList();
+    drawList->PushClipRect(origin, ImVec2(origin.x + m_sceneView.width, origin.y + m_sceneView.height), false);
+    // worldToScreen() reports points behind the camera far off-screen; those segments are skipped.
+    const auto toScreen = [&](const glm::vec3& p, ImVec2& out) {
+        const glm::vec2 s = worldToScreen(p, viewProj, m_sceneView.width, m_sceneView.height);
+        out = ImVec2(origin.x + s.x, origin.y + s.y);
+        return s.x > -5000.0f;
+    };
+    const auto line = [&](const glm::vec3& a, const glm::vec3& b) {
+        ImVec2 sa, sb;
+        if (toScreen(a, sa) && toScreen(b, sb))
+            drawList->AddLine(sa, sb, kLightRangeColor, 1.5f);
+    };
+    // A circle around `center` in the plane spanned by u and v (unit vectors).
+    const auto circle = [&](const glm::vec3& center, const glm::vec3& u, const glm::vec3& v, float radius) {
+        constexpr int kSegments = 48;
+        for (int i = 0; i < kSegments; ++i) {
+            const float a0 = glm::two_pi<float>() * static_cast<float>(i) / kSegments;
+            const float a1 = glm::two_pi<float>() * static_cast<float>(i + 1) / kSegments;
+            line(center + (u * std::cos(a0) + v * std::sin(a0)) * radius,
+                center + (u * std::cos(a1) + v * std::sin(a1)) * radius);
+        }
+    };
+
+    for (int index : selectedIndices()) {
+        const ModelInstance& instance = m_models.getInstances()[index];
+        if (instance.entity != kLightEntity)
+            continue;
+        const SceneLight light = lightFromInstance(instance);
+        if (!light.spot) {
+            // The sphere the light reaches.
+            circle(light.position, { 1.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 1.0f }, light.range);
+            circle(light.position, { 1.0f, 0.0f, 0.0f }, { 0.0f, 1.0f, 0.0f }, light.range);
+            circle(light.position, { 0.0f, 0.0f, 1.0f }, { 0.0f, 1.0f, 0.0f }, light.range);
+            continue;
+        }
+        // The cone, as far as the light reaches.
+        const glm::vec3 axis = light.direction;
+        const glm::vec3 u = glm::normalize(glm::cross(axis, std::abs(axis.y) > 0.99f ? glm::vec3(1.0f, 0.0f, 0.0f)
+                                                                                      : glm::vec3(0.0f, 1.0f, 0.0f)));
+        const glm::vec3 v = glm::cross(axis, u);
+        const float angle = glm::radians(light.coneDegrees);
+        const glm::vec3 baseCenter = light.position + axis * (light.range * std::cos(angle));
+        const float baseRadius = light.range * std::sin(angle);
+        circle(baseCenter, u, v, baseRadius);
+        for (const glm::vec3& side : { u, -u, v, -v })
+            line(light.position, baseCenter + side * baseRadius);
+    }
+    drawList->PopClipRect();
+}
+
 void Editor::drawEntityPalette()
 {
     const float rowRight = ImGui::GetCursorScreenPos().x + ImGui::GetContentRegionAvail().x;
@@ -209,18 +327,23 @@ void Editor::drawEntityPalette()
     };
     for (const EntityTypeInfo& type : entityTypes()) {
         ImGui::PushID(type.id);
-        if (type.presets.empty()) {
+        if (entityDefaultPlaceable(type))
             button(type.label, type.id, -1, type.description);
-        }
-        else {
-            for (size_t i = 0; i < type.presets.size(); ++i) {
-                ImGui::PushID(static_cast<int>(i));
-                char tooltip[256];
-                snprintf(tooltip, sizeof(tooltip), "%s: %s\n%s", type.label, type.presets[i].params, type.description);
-                button(type.presets[i].label, type.id, static_cast<int>(i), tooltip);
-                ImGui::PopID();
-            }
+        for (size_t i = 0; i < type.presets.size(); ++i) {
+            ImGui::PushID(static_cast<int>(i));
+            char tooltip[512];
+            snprintf(tooltip, sizeof(tooltip), "%s: %s\n%s", type.label, type.presets[i].params.c_str(), type.description);
+            button(type.presets[i].label.c_str(), type.id, static_cast<int>(i), tooltip);
+            ImGui::PopID();
         }
         ImGui::PopID();
     }
+    if (ImGui::SmallButton("Reload presets")) {
+        stopEntityPlacement();
+        if (loadEntityPresets())
+            setStatus("Reloaded entity presets from " + entityPresetsPath());
+        else
+            setStatus("Can't read " + entityPresetsPath(), true);
+    }
+    ImGui::SetItemTooltip("Rereads %s after editing it by hand", entityPresetsPath().c_str());
 }

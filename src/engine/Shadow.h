@@ -5,15 +5,16 @@
 #include <array>
 #include <cstdint>
 #include <span>
+#include <vector>
 
 inline constexpr uint32_t kMaxShadowCascades = 4;
 
-// A depth array with one layer per cascade.
+// A depth array with one layer per cascade (sun) or per shadow view (point and spot lights).
 struct ShadowMapResources {
     VkImage image = VK_NULL_HANDLE;
     VmaAllocation allocation = VK_NULL_HANDLE;
-    vk::ImageView view;                                         // all layers, for sampling
-    std::array<vk::ImageView, kMaxShadowCascades> layerViews{}; // one layer each, for rendering
+    vk::ImageView view;                    // all layers, for sampling
+    std::vector<vk::ImageView> layerViews; // one layer each, for rendering
     vk::Sampler sampler;      // depth comparison (hardware PCF)
     vk::Sampler depthSampler; // raw depth, for the soft-shadow blocker search
     uint32_t size = 0;

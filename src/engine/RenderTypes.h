@@ -118,6 +118,28 @@ struct GpuDrawData {
 };
 static_assert(sizeof(GpuDrawData) == 48);
 
+// Point and spot lights (Lights.h). Must match MAX_LIGHTS / MAX_LIGHT_SHADOW_LAYERS in shaders/lights.glsl.
+inline constexpr uint32_t kMaxLights = 64;
+inline constexpr uint32_t kMaxLightShadowLayers = 16;
+
+// Mirrors LightData in shaders/lights.glsl (std430).
+struct GpuLight {
+    glm::vec4 positionRange; // xyz = world position, w = range (m)
+    glm::vec4 color;         // rgb = linear color * intensity, w = 0 point / 1 spot
+    glm::vec4 direction;     // xyz = where a spot points, w = cos(outer cone angle)
+    glm::vec4 params;        // x = cos(inner cone angle), y = first shadow layer (-1 = none),
+                             // z = shadow texel size per meter of distance; w unused
+};
+static_assert(sizeof(GpuLight) == 64);
+
+// Mirrors the start of LightBuffer (set 0, binding 3) in shaders/lights.glsl; kMaxLights GpuLights follow.
+struct GpuLightHeader {
+    glm::uvec4 info;                                  // x = light count
+    glm::mat4 shadowMatrices[kMaxLightShadowLayers];  // world -> shadow clip space, per light shadow layer
+};
+static_assert(sizeof(GpuLightHeader) == 16 + 64 * kMaxLightShadowLayers);
+inline constexpr size_t kLightBufferSize = sizeof(GpuLightHeader) + sizeof(GpuLight) * kMaxLights;
+
 // Mirrors TransformData (set 0, binding 2) in shaders/draw_data.glsl (std430). The normal
 // matrix is precomputed so shaders don't invert per vertex.
 struct GpuTransform {

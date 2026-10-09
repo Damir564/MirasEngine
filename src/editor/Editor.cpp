@@ -30,7 +30,8 @@ Editor::Editor(const EngineContext& engine)
 
     m_cameraAnimator.getPath().name = m_pathName;
     LOG_INFO("Camera animation system initialized\n");
-    m_keymap.load(kEditorKeymapPath);
+    m_keymap.load(editorKeymapPath());
+    loadEntityPresets();
 
     // Before the first ImGui frame, which reads imgui.ini (and with it the panel visibility).
     m_prefs = m_savedPrefs = loadEditorPrefs();
@@ -436,6 +437,8 @@ void Editor::drawUi()
     drawObjectMarquee();
     drawShapeDrawOverlay();
     drawEntityPlaceOverlay();
+    drawShapeEditOverlay();
+    drawLightOverlay();
     drawTransformGizmo();
     drawOrientationGizmo();
     if (m_showHierarchy) drawHierarchy();
@@ -446,6 +449,7 @@ void Editor::drawUi()
     drawMaterialDropTarget();
     if (m_showAnimationPanel) drawAnimationPanel();
     if (m_showGraphicsSettings) drawGraphicsSettingsWindow();
+    if (m_showSceneSettings) drawSceneSettingsWindow();
     if (m_showKeymap) drawKeymapWindow();
     else m_keyCapture = {};
     if (m_showPreferences) drawPreferencesWindow();
@@ -598,8 +602,15 @@ void Editor::handleShortcuts()
         stopEntityPlacement();
     if (pressed(A::Deselect) && !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId) && !drawingOnFace &&
         !drawingShape && !placingEntities) {
-        // Leaves part mode first, keeping the shape selected, like leaving a group.
-        if (m_levelMode == LevelEditMode::Part) {
+        // While editing a shape: first drops the picked faces/vertices, then ends the edit keeping the shape
+        // selected, like leaving a group.
+        if (shapeEditActive()) {
+            if (shapeEditHasPicks())
+                clearShapeEditPicks();
+            else
+                finishShapeEdit();
+        }
+        else if (m_levelMode == LevelEditMode::Part) {
             m_levelMode = LevelEditMode::Object;
             m_selectedParts.clear();
         }
@@ -607,6 +618,7 @@ void Editor::handleShortcuts()
             deselectAll();
         }
     }
+    if (pressed(A::EditShape) && !drawingOnFace && !drawingShape) toggleShapeEdit();
     if (pressed(A::DrawShape)) toggleShapeDraw();
     if (pressed(A::UniteShapes)) uniteSelectedShapes();
     if (pressed(A::SeparateShape)) {
@@ -630,6 +642,8 @@ void Editor::handleShortcuts()
     if (pressed(A::EdgeMode)) m_levelMode = LevelEditMode::Edge;
     if (pressed(A::VertexMode)) m_levelMode = LevelEditMode::Vertex;
     if (pressed(A::PartMode)) m_levelMode = LevelEditMode::Part;
+    if (m_levelMode != LevelEditMode::Object)
+        m_lastShapeEditMode = m_levelMode;
     handleFaceKeys();
     if (pressed(A::GridSmaller)) stepGridSize(-1);
     if (pressed(A::GridLarger)) stepGridSize(1);
@@ -762,6 +776,7 @@ std::optional<size_t> Editor::copyInstance(int index, const glm::vec3& offset)
     created.entity = source.entity;
     created.entityParams = source.entityParams;
     created.group = source.group;
+    created.collision = source.collision;
     markSceneChanged();
     return newIndex;
 }
@@ -866,11 +881,16 @@ void Editor::drawEntityMenuItems()
             continue;
         }
         if (ImGui::BeginMenu(type.label)) {
+            if (entityDefaultPlaceable(type)) {
+                if (ImGui::MenuItem("Default", nullptr, m_entityPlace.type == type.id && m_entityPlace.preset < 0))
+                    beginEntityPlacement(type.id, -1);
+                ImGui::SetItemTooltip("%s\nClick surfaces in the viewport to place it; Esc stops.", type.description);
+            }
             for (size_t i = 0; i < type.presets.size(); ++i) {
                 const bool active = m_entityPlace.type == type.id && m_entityPlace.preset == static_cast<int>(i);
-                if (ImGui::MenuItem(type.presets[i].label, nullptr, active))
+                if (ImGui::MenuItem(type.presets[i].label.c_str(), nullptr, active))
                     beginEntityPlacement(type.id, static_cast<int>(i));
-                ImGui::SetItemTooltip("%s\nClick surfaces in the viewport to place it; Esc stops.", type.presets[i].params);
+                ImGui::SetItemTooltip("%s\nClick surfaces in the viewport to place it; Esc stops.", type.presets[i].params.c_str());
             }
             ImGui::EndMenu();
         }
@@ -910,6 +930,8 @@ void Editor::newScene()
 {
     deselectAll();
     m_scenes.clear();
+    m_scenes.settings() = {};
+    m_savedSceneSettings = {};
     clearHistory();
     m_scenes.setCurrentPath({});
     m_savedState = sceneStateId();

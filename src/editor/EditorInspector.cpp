@@ -46,6 +46,10 @@ void Editor::drawInspector()
                 }
                 ImGui::SetItemTooltip("Reset the color to white");
             }
+            // Entities never collide as scene objects; the game gives them their own bodies.
+            if (hasSelection() && m_gizmo.selectedInstance == index && m_models.getInstances()[index].entity.empty() &&
+                ImGui::CollapsingHeader("Collision", ImGuiTreeNodeFlags_DefaultOpen))
+                drawCollisionSection(index);
             if (hasSelection() && m_gizmo.selectedInstance == index) {
                 const bool entity = !m_models.getInstances()[index].entity.empty();
                 if (ImGui::CollapsingHeader("Game entity", entity ? ImGuiTreeNodeFlags_DefaultOpen : 0))
@@ -112,21 +116,41 @@ void Editor::drawEntitySection(int instanceIndex)
         ImGui::TextColored(EditorStyle::kHighlight, "Changes apply to %zu selected %s objects", sameType.size() + 1,
             type ? type->label : instance.entity.c_str());
 
-    if (type && !type->presets.empty()) {
+    if (type) {
         EditorStyle::propertyLabel("Preset");
         const float rowRight = ImGui::GetCursorScreenPos().x + ImGui::GetContentRegionAvail().x;
+        std::string deleteLabel;
         for (size_t i = 0; i < type->presets.size(); ++i) {
             const EntityPreset& preset = type->presets[i];
-            const float width = ImGui::CalcTextSize(preset.label).x + ImGui::GetStyle().FramePadding.x * 2.0f;
+            ImGui::PushID(static_cast<int>(i));
+            const float width = ImGui::CalcTextSize(preset.label.c_str()).x + ImGui::GetStyle().FramePadding.x * 2.0f;
             if (i > 0 && ImGui::GetItemRectMax().x + ImGui::GetStyle().ItemSpacing.x + width <= rowRight)
                 ImGui::SameLine();
-            if (ImGui::Button(preset.label)) {
+            if (ImGui::Button(preset.label.c_str())) {
                 applyEntityPreset(instance, preset);
                 for (int other : sameType)
                     applyEntityPreset(m_models.getInstances()[other], preset);
                 markSceneChanged();
             }
-            ImGui::SetItemTooltip("%s (also tints the object)", preset.params);
+            ImGui::SetItemTooltip("%s (also tints the object)%s", preset.params.c_str(),
+                preset.user ? "\nYour preset: right-click to delete it" : "");
+            if (preset.user && ImGui::BeginPopupContextItem("presetMenu")) {
+                if (ImGui::MenuItem("Delete preset"))
+                    deleteLabel = preset.label;
+                ImGui::EndPopup();
+            }
+            ImGui::PopID();
+        }
+        if (!type->presets.empty())
+            EditorStyle::propertyLabel("");
+        drawSaveEntityPreset(instance);
+        // After the loop: deleting changes the presets it walks.
+        if (!deleteLabel.empty()) {
+            stopEntityPlacement();
+            if (deleteEntityPreset(instance.entity, deleteLabel))
+                setStatus("Deleted preset " + deleteLabel);
+            else
+                setStatus("Failed to delete preset " + deleteLabel, true);
         }
     }
 
@@ -178,6 +202,36 @@ void Editor::drawEntitySection(int instanceIndex)
             type && *type->defaultParams ? type->defaultParams : "none");
         ImGui::TreePop();
     }
+}
+
+void Editor::drawCollisionSection(int instanceIndex)
+{
+    static constexpr const char* kTooltips[] = {
+        "Exact triangles of the model. Best for level geometry; the most expensive",
+        "The model's bounding box: cheap and smooth to walk along. Good for crates and props",
+        "The tightest convex shape around the model: closer than a box, still cheap. Hollows get filled",
+        "Not solid: the player walks and shoots through it (decoration, foliage, light fittings)",
+    };
+    ModelInstance& instance = m_models.getInstances()[instanceIndex];
+    const std::vector<int> selected = selectedIndices();
+    EditorStyle::propertyLabel("Collision");
+    if (ImGui::BeginCombo("##collision", kCollisionModeNames[static_cast<int>(instance.collision)])) {
+        for (int m = 0; m < static_cast<int>(CollisionMode::Count); ++m) {
+            const CollisionMode mode = static_cast<CollisionMode>(m);
+            if (ImGui::Selectable(kCollisionModeNames[m], instance.collision == mode)) {
+                // Every selected object gets it, so a room of props is set up at once.
+                instance.collision = mode;
+                for (int other : selected)
+                    if (m_models.getInstances()[other].entity.empty())
+                        m_models.getInstances()[other].collision = mode;
+                markSceneChanged();
+            }
+            ImGui::SetItemTooltip("%s", kTooltips[m]);
+        }
+        ImGui::EndCombo();
+    }
+    ImGui::SetItemTooltip("What the player and shots collide with while playing%s",
+        selected.size() > 1 ? " (applies to every selected object)" : "");
 }
 
 void Editor::drawInspectorHeader(ModelInstance& instance, const GPUModel* model)

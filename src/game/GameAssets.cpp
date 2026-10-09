@@ -12,6 +12,12 @@ const char* gameModelPath(GameModelId id)
     switch (id) {
     case GameModelId::Enemy: return "models/enemy_grunt.glb";
     case GameModelId::Shotgun: return "models/shotgun.glb";
+    case GameModelId::Pistol: return "models/pistol.glb";
+    case GameModelId::Magazine: return "models/magazine.glb";
+    case GameModelId::Hands: return "models/hands.glb";
+    case GameModelId::ShellItem: return "models/shell.glb";
+    case GameModelId::RoundItem: return "models/round.glb";
+    case GameModelId::PlayerBody: return "models/player_body.glb";
     case GameModelId::Medkit: return "models/medkit.glb";
     case GameModelId::Shells: return "models/shells.glb";
     case GameModelId::Exit: return "models/exit_portal.glb";

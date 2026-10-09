@@ -27,6 +27,9 @@ constexpr size_t kCullChunkSize = 1024;
 constexpr size_t kParallelCullThreshold = 128;
 // Shadow map kept while shadows are off or the Classic pipeline is active; never rendered into.
 constexpr uint32_t kStubShadowMapSize = 16;
+// Per light shadow view (a spotlight has one, a point light six), all redrawn every frame.
+constexpr uint32_t kLightShadowMapSize = 1024;
+constexpr float kLightShadowNear = 0.05f;
 // Unity's selection orange; occluded parts of the outline are drawn fainter.
 constexpr glm::vec3 kOutlineColor{ 1.0f, 0.4f, 0.0f };
 constexpr float kOutlineOccludedAlpha = 0.4f;
@@ -337,8 +340,33 @@ bool Renderer::createShadowMapResources()
     const auto [size, layers] = wantedShadowMap();
     m_shadowMap = createShadowMap(m_allocator, m_device, size, layers);
     m_shadowMapValid = false;
+    if (!m_lightShadowMap.image)
+        m_lightShadowMap = createShadowMap(m_allocator, m_device, kStubShadowMapSize, 1);
     writeImageDescriptors();
     return true;
+}
+
+bool Renderer::lightShadowsAllowed() const
+{
+    return m_settings.lightShadows && !classic();
+}
+
+void Renderer::resizeLightShadowMap(bool full)
+{
+    const uint32_t size = full ? kLightShadowMapSize : kStubShadowMapSize;
+    if (m_lightShadowMap.size == size)
+        return;
+    // The other frame in flight may still sample the old map through the lighting set.
+    (void)m_device.waitIdle();
+    destroyShadowMap(m_lightShadowMap, m_allocator, m_device);
+    try {
+        m_lightShadowMap = createShadowMap(m_allocator, m_device, size, full ? kMaxLightShadowLayers : 1);
+    }
+    catch (const std::exception& e) {
+        LOG_ERROR(e.what() << "; light shadows are off\n");
+        m_lightShadowMap = createShadowMap(m_allocator, m_device, kStubShadowMapSize, 1);
+    }
+    writeImageDescriptors();
 }
 
 bool Renderer::createFrameResources()
@@ -434,17 +462,21 @@ bool Renderer::createDescriptors()
     if (!takeResult(m_device.createDescriptorSetLayout({ {}, 1, &textureBinding }), m_textureSetLayout, "texture set layout"))
         return false;
 
-    // Binding 0: FrameUBO, 1: per-draw data (GpuDrawData[]), 2: per-instance transforms (GpuTransform[]).
-    const vk::DescriptorSetLayoutBinding frameBindings[3] = {
-        { 0, vk::DescriptorType::eUniformBuffer, 1, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment },
-        { 1, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment },
+    // Binding 0: FrameUBO, 1: per-draw data (GpuDrawData[]), 2: per-instance transforms (GpuTransform[]),
+    // 3: point and spot lights with their shadow matrices (GpuLightHeader + GpuLight[]).
+    const auto vertexAndFragment = vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment;
+    const vk::DescriptorSetLayoutBinding frameBindings[4] = {
+        { 0, vk::DescriptorType::eUniformBuffer, 1, vertexAndFragment },
+        { 1, vk::DescriptorType::eStorageBuffer, 1, vertexAndFragment },
         { 2, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eVertex },
+        { 3, vk::DescriptorType::eStorageBuffer, 1, vertexAndFragment },
     };
-    if (!takeResult(m_device.createDescriptorSetLayout({ {}, 3, frameBindings }), m_frameSetLayout, "frame set layout"))
+    if (!takeResult(m_device.createDescriptorSetLayout({ {}, 4, frameBindings }), m_frameSetLayout, "frame set layout"))
         return false;
 
-    // Set 4 of triangle.frag: shadow map (comparison and raw depth), AO, AO depth, sky LUT, sky irradiance.
-    std::array<vk::DescriptorSetLayoutBinding, 6> lightingBindings;
+    // Set 4 of triangle.frag: shadow map (comparison and raw depth), AO, AO depth, sky LUT, sky irradiance,
+    // light shadow map.
+    std::array<vk::DescriptorSetLayoutBinding, 7> lightingBindings;
     for (uint32_t i = 0; i < lightingBindings.size(); ++i)
         lightingBindings[i] = { i, vk::DescriptorType::eCombinedImageSampler, 1, vk::ShaderStageFlagBits::eFragment };
     vk::DescriptorSetLayoutCreateInfo lightingInfo{};
@@ -456,7 +488,7 @@ bool Renderer::createDescriptors()
     const vk::DescriptorPoolSize poolSizes[] = {
         { vk::DescriptorType::eCombinedImageSampler, 1100 },
         { vk::DescriptorType::eUniformBuffer, m_framesInFlight + 10 },
-        { vk::DescriptorType::eStorageBuffer, 2 * m_framesInFlight + 10 },
+        { vk::DescriptorType::eStorageBuffer, 3 * m_framesInFlight + 10 },
     };
     vk::DescriptorPoolCreateInfo poolInfo{};
     poolInfo.flags = vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet;
@@ -504,6 +536,14 @@ bool Renderer::createDescriptors()
             HostBuffer(m_allocator, vk::BufferUsageFlagBits::eIndirectBuffer, sizeof(vk::DrawIndexedIndirectCommand) * 4096),
         });
         writeDrawDescriptors(i);
+
+        // Fixed size: the light count is capped at kMaxLights.
+        auto& lightBuffer = m_lightBuffers.emplace_back(
+            std::make_unique<HostBuffer>(m_allocator, vk::BufferUsageFlagBits::eStorageBuffer, kLightBufferSize));
+        std::memset(lightBuffer->mapped(), 0, sizeof(GpuLightHeader));
+        const vk::DescriptorBufferInfo lightsInfo(lightBuffer->getBuffer(), 0, kLightBufferSize);
+        const vk::WriteDescriptorSet write(m_frameSets[i], 3, 0, 1, vk::DescriptorType::eStorageBuffer, nullptr, &lightsInfo);
+        m_device.updateDescriptorSets(1, &write, 0, nullptr);
     }
     return true;
 }
@@ -523,7 +563,7 @@ void Renderer::writeDrawDescriptors(uint32_t frame)
 void Renderer::writeImageDescriptors()
 {
     // Before createDescriptors() ran there is nothing to write; it calls this itself once the sets exist.
-    if (!m_lightingSet || !m_shadowMap.view)
+    if (!m_lightingSet || !m_shadowMap.view || !m_lightShadowMap.view)
         return;
 
     constexpr size_t kMaxWrites = 16 + kMaxBloomMips;
@@ -543,6 +583,7 @@ void Renderer::writeImageDescriptors()
     add(m_lightingSet, 3, m_nearestSampler, m_aoDepth.view, sampled);
     add(m_lightingSet, 4, m_skySampler, m_skyLut.view, sampled);
     add(m_lightingSet, 5, m_skySampler, m_skyIrradiance.view, sampled);
+    add(m_lightingSet, 6, m_lightShadowMap.sampler, m_lightShadowMap.view, shadowLayout);
     add(m_sceneDepthSet, 0, m_nearestSampler, m_sceneDepth.view, vk::ImageLayout::eDepthReadOnlyOptimal);
     add(m_selectionMaskSet, 0, m_nearestSampler, m_selectionMask.view, sampled);
     add(m_hdrSet, 0, m_linearClampSampler, m_hdrColor.view, sampled);
@@ -749,6 +790,7 @@ void Renderer::shutdown()
     }
 
     m_frameDrawBuffers.clear();
+    m_lightBuffers.clear();
     for (UBOBuffer& ubo : m_frameUBOs)
         if (ubo.buffer) vmaDestroyBuffer(m_allocator, ubo.buffer, ubo.allocation);
     m_frameUBOs.clear();
@@ -787,6 +829,7 @@ void Renderer::shutdown()
     destroyRenderTargets();
     destroySkyResources();
     destroyShadowMap(m_shadowMap, m_allocator, m_device);
+    destroyShadowMap(m_lightShadowMap, m_allocator, m_device);
     m_swapchain.destroy();
 
     m_device = nullptr;
@@ -833,6 +876,9 @@ void Renderer::applySettings(const GraphicsSettings& requested)
     // Sun direction, shadow distance and caster changes are caught by the per-cascade hashes.
     if (old.shadows != settings.shadows)
         m_shadowMapValid = false;
+    // Grows again when a light asks for shadows (gatherLights()).
+    if (!lightShadowsAllowed())
+        resizeLightShadowMap(false);
 }
 
 void Renderer::updateSun()
@@ -945,6 +991,7 @@ Renderer::FrameStatus Renderer::renderFrame(const FrameInput& input)
 
     const FrameUBO frameData = buildFrameUBO(input);
     memcpy(m_frameUBOs[m_currentFrame].mapped, &frameData, sizeof(FrameUBO));
+    gatherLights(input);
 
     std::array<uint64_t, kMaxShadowCascades> shadowHashes{};
     cullAndBatch(input, frameData.proj * frameData.view, m_batches, shadowHashes);
@@ -971,8 +1018,10 @@ Renderer::FrameStatus Renderer::renderFrame(const FrameInput& input)
 
     if (renderSky)
         recordSkyPasses(cmd);
-    if (!classicFrame)
+    if (!classicFrame) {
         recordShadowPasses(cmd, *input.models);
+        recordLightShadowPasses(cmd, *input.models);
+    }
 
     const bool depthPrepass = depthPrepassEnabled();
     transitionFrameTargets(cmd, depthPrepass);
@@ -1279,6 +1328,7 @@ void Renderer::buildDrawStreams(const FrameInput& input, FrameBatches& batches)
             }
         }
     }
+    buildLightShadowStreams(input);
 
     for (size_t modelIdx : batches.mainModels) {
         const RenderBatch& batch = batches.main[modelIdx];
@@ -1539,6 +1589,179 @@ void Renderer::recordShadowPasses(vk::CommandBuffer cmd, const ModelManager& mod
             vk::ImageLayout::eDepthAttachmentOptimal, vk::ImageLayout::eDepthStencilReadOnlyOptimal, 0, 1, c, 1);
         pipelineBarriers(cmd, { &toSampled, 1 });
     }
+}
+
+// ---------------------------------------------------------------------------
+// Point and spot lights
+// ---------------------------------------------------------------------------
+
+void Renderer::gatherLights(const FrameInput& input)
+{
+    m_sceneLights.clear();
+    m_lightShadowViews.clear();
+    if (input.models)
+        collectSceneLights(input.models->getInstances(), m_sceneLights);
+
+    // Nearest first, measured to the edge of each light's reach: past kMaxLights the distant ones drop out,
+    // and shadows go to the near ones.
+    const glm::vec3 camera = input.cameraPosition;
+    const auto reach = [&](const SceneLight& light) { return glm::distance(light.position, camera) - light.range; };
+    std::sort(m_sceneLights.begin(), m_sceneLights.end(),
+        [&](const SceneLight& a, const SceneLight& b) { return reach(a) < reach(b); });
+    if (m_sceneLights.size() > kMaxLights)
+        m_sceneLights.resize(kMaxLights);
+
+    const bool shadowsAllowed = lightShadowsAllowed();
+    if (shadowsAllowed && std::any_of(m_sceneLights.begin(), m_sceneLights.end(),
+            [](const SceneLight& light) { return light.shadows; }))
+        resizeLightShadowMap(true);
+    const bool shadowMapReady = shadowsAllowed && m_lightShadowMap.size == kLightShadowMapSize;
+    const float shadowSize = static_cast<float>(kLightShadowMapSize);
+
+    std::byte* mapped = static_cast<std::byte*>(m_lightBuffers[m_currentFrame]->mapped());
+    GpuLight* gpuLights = reinterpret_cast<GpuLight*>(mapped + sizeof(GpuLightHeader));
+    for (size_t i = 0; i < m_sceneLights.size(); ++i) {
+        const SceneLight& light = m_sceneLights[i];
+        const float outer = glm::radians(light.coneDegrees);
+        const float inner = outer * (1.0f - light.softness);
+        GpuLight& gpu = gpuLights[i];
+        gpu.positionRange = glm::vec4(light.position, light.range);
+        gpu.color = glm::vec4(light.color * light.intensity, light.spot ? 1.0f : 0.0f);
+        gpu.direction = glm::vec4(light.direction, std::cos(outer));
+        gpu.params = glm::vec4(std::cos(inner), -1.0f, 0.0f, 0.0f);
+
+        const size_t layersNeeded = light.spot ? 1 : 6;
+        if (!light.shadows || !shadowMapReady || m_lightShadowViews.size() + layersNeeded > kMaxLightShadowLayers)
+            continue;
+        // A cube face sees a little more than 90 degrees, so filtering near its edge stays on the face.
+        const float fov = light.spot ? std::min(2.0f * outer + glm::radians(4.0f), glm::radians(170.0f))
+                                     : 2.0f * std::atan(1.0f + 4.0f / shadowSize);
+        gpu.params.y = static_cast<float>(m_lightShadowViews.size());
+        gpu.params.z = 2.0f * std::tan(0.5f * fov) / shadowSize;
+        const glm::mat4 proj = glm::perspectiveRH_ZO(fov, 1.0f, kLightShadowNear, light.range);
+        const auto addView = [&](const glm::vec3& forward, const glm::vec3& up) {
+            const glm::mat4 view = glm::lookAtRH(light.position, light.position + forward, up);
+            m_lightShadowViews.push_back({ proj * view, light.position, light.range });
+        };
+        if (light.spot) {
+            addView(light.direction, std::abs(light.direction.y) > 0.99f ? glm::vec3(0.0f, 0.0f, 1.0f) : glm::vec3(0.0f, 1.0f, 0.0f));
+        }
+        else {
+            // In the order lightShadowLayer() in lights.glsl picks them.
+            addView({ 1.0f, 0.0f, 0.0f }, { 0.0f, -1.0f, 0.0f });
+            addView({ -1.0f, 0.0f, 0.0f }, { 0.0f, -1.0f, 0.0f });
+            addView({ 0.0f, 1.0f, 0.0f }, { 0.0f, 0.0f, 1.0f });
+            addView({ 0.0f, -1.0f, 0.0f }, { 0.0f, 0.0f, -1.0f });
+            addView({ 0.0f, 0.0f, 1.0f }, { 0.0f, -1.0f, 0.0f });
+            addView({ 0.0f, 0.0f, -1.0f }, { 0.0f, -1.0f, 0.0f });
+        }
+    }
+
+    GpuLightHeader header{};
+    header.info.x = static_cast<uint32_t>(m_sceneLights.size());
+    for (size_t layer = 0; layer < m_lightShadowViews.size(); ++layer)
+        header.shadowMatrices[layer] = m_lightShadowViews[layer].matrix;
+    std::memcpy(mapped, &header, sizeof(header));
+}
+
+// Every caster within a shadow view's light range and frustum draws into that view. Entity markers (a lamp's
+// own model around the light) cast none.
+void Renderer::buildLightShadowStreams(const FrameInput& input)
+{
+    for (auto& runs : m_lightShadowRuns)
+        runs.clear();
+    if (m_lightShadowViews.empty())
+        return;
+    ModelManager& models = *input.models;
+    const size_t sceneCount = models.getInstances().size();
+    m_lightTransformIndices.assign(m_cullResults.size(), std::numeric_limits<uint32_t>::max());
+
+    for (size_t layer = 0; layer < m_lightShadowViews.size(); ++layer) {
+        const LightShadowView& view = m_lightShadowViews[layer];
+        for (size_t i = 0; i < m_cullResults.size(); ++i) {
+            const CullResult& res = m_cullResults[i];
+            GPUModel* model = res.gpuModel;
+            if (!model)
+                continue;
+            const bool dynamic = i >= sceneCount;
+            if (dynamic ? !input.dynamicInstances[i - sceneCount].castShadow : !res.instance->entity.empty())
+                continue;
+            const glm::vec3 center = glm::vec3(res.transform * glm::vec4(model->boundsCenter, 1.0f));
+            if (glm::distance(center, view.lightPosition) > view.range + model->boundsRadius * res.maxScale)
+                continue;
+            if (!isAABBInFrustum(extractFrustumPlanes(view.matrix * res.transform), model->boundsMin, model->boundsMax))
+                continue;
+            uint32_t& transformIndex = m_lightTransformIndices[i];
+            if (transformIndex == std::numeric_limits<uint32_t>::max())
+                transformIndex = pushTransform(res.transform);
+            for (uint32_t si : model->drawOrder) {
+                const SubmeshInfo& sub = model->submeshes[si];
+                if (sub.material.alphaMode == AlphaMode::BLEND)
+                    continue;
+                vk::DescriptorSet sets[3] = {};
+                if (sub.material.alphaMode == AlphaMode::MASK) {
+                    vk::DescriptorSet all[3];
+                    materialSets(models, model, sub.material, all);
+                    sets[0] = all[0];
+                }
+                appendDraw(m_lightShadowRuns[layer], model, sets, false, sub, transformIndex, glm::vec3(1.0f));
+            }
+        }
+    }
+}
+
+void Renderer::recordLightShadowPasses(vk::CommandBuffer cmd, const ModelManager& models)
+{
+    using Stage = vk::PipelineStageFlagBits2;
+    using Access = vk::AccessFlagBits2;
+    const vk::Image image(m_lightShadowMap.image);
+    const auto depthAspect = vk::ImageAspectFlagBits::eDepth;
+    const auto depthStages = Stage::eEarlyFragmentTests | Stage::eLateFragmentTests;
+    const uint32_t layers = m_lightShadowMap.layers;
+
+    // Every layer starts over each frame; the ones no light uses this frame only need the layout the
+    // lighting set promises.
+    const vk::ImageMemoryBarrier2 toAttachment = imageBarrier(image, depthAspect,
+        Stage::eFragmentShader, Access::eNone,
+        depthStages, Access::eDepthStencilAttachmentRead | Access::eDepthStencilAttachmentWrite,
+        vk::ImageLayout::eUndefined, vk::ImageLayout::eDepthAttachmentOptimal, 0, 1, 0, layers);
+    pipelineBarriers(cmd, { &toAttachment, 1 });
+
+    const uint32_t size = m_lightShadowMap.size;
+    const vk::Rect2D area{ { 0, 0 }, { size, size } };
+    const uint32_t used = std::min(static_cast<uint32_t>(m_lightShadowViews.size()), layers);
+    for (uint32_t layer = 0; layer < used; ++layer) {
+        vk::RenderingAttachmentInfo depthAttachment{};
+        depthAttachment.setImageView(m_lightShadowMap.layerViews[layer])
+            .setImageLayout(vk::ImageLayout::eDepthAttachmentOptimal)
+            .setLoadOp(vk::AttachmentLoadOp::eClear)
+            .setStoreOp(vk::AttachmentStoreOp::eStore)
+            .setClearValue(vk::ClearValue(vk::ClearDepthStencilValue{ 1.0f, 0 }));
+        vk::RenderingInfo renderInfo{};
+        renderInfo.setRenderArea(area).setLayerCount(1).setPDepthAttachment(&depthAttachment);
+
+        beginRendering(cmd, renderInfo);
+        if (!m_lightShadowRuns[layer].empty()) {
+            bindShaderPair(cmd, m_shadowShaders);
+            setDefaultDrawState(cmd, vk::SampleCountFlagBits::e1, viewportFor(area), area);
+            // As the sun's: both faces cast, slope bias against acne (the shader adds a normal offset).
+            cmd.setDepthTestEnable(VK_TRUE);
+            cmd.setDepthWriteEnable(VK_TRUE);
+            cmd.setDepthBiasEnable(VK_TRUE);
+            cmd.setDepthBias(1.25f, 0.0f, 1.75f);
+            cmd.setDepthClampEnableEXT(VK_FALSE);
+            const ShadowPushConstants push{ kMaxShadowCascades + layer, {} };
+            cmd.pushConstants(m_shadowLayout, vk::ShaderStageFlagBits::eVertex, 0, sizeof(push), &push);
+            recordDepthRuns(cmd, m_shadowLayout, m_lightShadowRuns[layer], models);
+        }
+        cmd.endRendering();
+    }
+
+    const vk::ImageMemoryBarrier2 toSampled = imageBarrier(image, depthAspect,
+        depthStages, Access::eDepthStencilAttachmentWrite,
+        Stage::eFragmentShader, Access::eShaderSampledRead,
+        vk::ImageLayout::eDepthAttachmentOptimal, vk::ImageLayout::eDepthStencilReadOnlyOptimal, 0, 1, 0, layers);
+    pipelineBarriers(cmd, { &toSampled, 1 });
 }
 
 void Renderer::transitionFrameTargets(vk::CommandBuffer cmd, bool depthPrepass)

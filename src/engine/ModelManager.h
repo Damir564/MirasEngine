@@ -74,6 +74,17 @@ struct GPUModel {
     bool isValid() const { return vertexBuffer != nullptr && indexBuffer != nullptr; }
 };
 
+// What the game collides with for a scene object (see PhysicsWorld::buildStaticScene).
+enum class CollisionMode : uint8_t {
+    Mesh,   // its triangles, exactly
+    Box,    // its bounding box: cheap, and smooth to walk along (crates, props)
+    Convex, // the convex hull of its triangles
+    None,   // walked and shot through
+    Count,
+};
+inline constexpr const char* kCollisionModeNames[] = { "Mesh", "Box", "Convex hull", "None" };
+inline constexpr const char* kCollisionModeIds[] = { "mesh", "box", "convex", "none" };
+
 struct ModelInstance {
     // Unique for the session and kept while the index shifts; 0 = never created by ModelManager.
     uint64_t id = 0;
@@ -94,6 +105,7 @@ struct ModelInstance {
     std::string entityParams;
     // Objects with the same non-empty group name are selected, moved and copied together in the editor.
     std::string group;
+    CollisionMode collision = CollisionMode::Mesh;
 
     glm::mat4 getTransformMatrix() const {
         glm::mat4 T = glm::translate(glm::mat4(1.0f), position);

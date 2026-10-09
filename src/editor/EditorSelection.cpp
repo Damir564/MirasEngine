@@ -451,6 +451,7 @@ void Editor::pasteClipboard()
         created.locked = source.locked;
         created.entity = source.entity;
         created.entityParams = source.entityParams;
+        created.collision = source.collision;
         const auto renamed = groupNames.find(source.group);
         created.group = renamed != groupNames.end() ? renamed->second : source.group;
         pasted.push_back(static_cast<int>(index));

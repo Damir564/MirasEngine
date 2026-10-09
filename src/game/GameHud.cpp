@@ -27,6 +27,57 @@ ImVec2 textSize(float size, const char* text)
 
 } // namespace
 
+// Developer view of the hands, guns and storage (F3 in debug builds); the game itself shows no numbers.
+void Game::drawDebugOverlay()
+{
+    const Arms& arms = m_world.arms();
+    const ArmsState& s = arms.state();
+    ImGui::SetNextWindowPos(ImVec2(ImGui::GetMainViewport()->Pos.x + 10.0f, ImGui::GetMainViewport()->Pos.y + 60.0f),
+        ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowBgAlpha(0.7f);
+    if (ImGui::Begin("Arms (F3)", nullptr, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoFocusOnAppearing)) {
+        const auto describe = [&](const HeldItem& item) {
+            std::string text = itemName(item.kind);
+            if (const Magazine* magazine = s.magazine(item.magazine))
+                text += " #" + std::to_string(magazine->id) + " (" + std::to_string(magazine->rounds) + "/" +
+                    std::to_string(magazine->capacity) + ")";
+            return text;
+        };
+        for (Hand hand : { Hand::Main, Hand::Off }) {
+            const HandState& h = s.hand(hand);
+            ImGui::Text("%s hand: %s", hand == Hand::Main ? "Main" : "Off", describe(h.item).c_str());
+            if (h.busy())
+                ImGui::Text("    %s %.0f%%%s", taskName(h.task), h.progress() * 100.0f, h.eventDone ? " (event done)" : "");
+        }
+        ImGui::Separator();
+        const PistolGun& pistol = s.pistol;
+        const char* where = s.handHolding(ItemKind::Pistol) == 0 ? "main hand"
+            : s.handHolding(ItemKind::Pistol) == 1 ? "off hand" : s.onGround(ItemKind::Pistol) ? "ground" : "holster";
+        ImGui::Text("Pistol: %s, %s", pistolStateName(pistol.state), where);
+        ImGui::Text("    chambered %s, slide %s", pistol.chambered ? "yes" : "no", pistol.slideLocked ? "locked back" : "forward");
+        if (const Magazine* magazine = s.magazine(pistol.magazine))
+            ImGui::Text("    magazine #%d: %d/%d", magazine->id, magazine->rounds, magazine->capacity);
+        else
+            ImGui::Text("    no magazine");
+        static constexpr const char* kChamber[] = { "empty", "loaded", "spent" };
+        ImGui::Text("Shotgun: chamber %s, tube %d", kChamber[static_cast<int>(s.shotgun.chamber)], s.shotgun.tube);
+        ImGui::Separator();
+        for (int z = 0; z < kZoneCount; ++z) {
+            const ZoneState& zone = s.zones[z];
+            std::string magazines;
+            for (int id : zone.magazines)
+                if (const Magazine* magazine = s.magazine(id))
+                    magazines += " #" + std::to_string(id) + "(" + std::to_string(magazine->rounds) + ")";
+            ImGui::Text("%s: %d shells, %d rounds, mags%s", zoneName(static_cast<Zone>(z)), zone.shells, zone.rounds,
+                magazines.empty() ? " -" : magazines.c_str());
+        }
+        ImGui::Text("Ground: %d items", static_cast<int>(s.ground.size()));
+        ImGui::Separator();
+        ImGui::Text("Last refused: %s", arms.lastRejection().empty() ? "-" : arms.lastRejection().c_str());
+    }
+    ImGui::End();
+}
+
 void Game::drawHud()
 {
     const ImGuiViewport* viewport = ImGui::GetMainViewport();
@@ -37,9 +88,14 @@ void Game::drawHud()
     const float scale = std::clamp(size.y / 900.0f, 0.75f, 2.0f);
     const PlayerState& player = m_world.player();
 
-    // Being hit: a red edge that fades.
-    if (player.damageFlash > 0.0f) {
-        const float a = player.damageFlash * 0.45f;
+    // Wounds: the edges stay red, more with every wound, and pulse like a heartbeat on the last one. Being
+    // hit flashes them brighter.
+    const float wounded = 1.0f - std::clamp(player.health / GameWorld::kMaxHealth, 0.0f, 1.0f);
+    const bool lastWound = player.alive && player.health < GameWorld::kMaxHealth * 0.4f;
+    const float beat = lastWound ? 0.5f + 0.5f * std::pow(std::abs(std::sin(static_cast<float>(ImGui::GetTime()) * 2.6f)), 8.0f) : 0.0f;
+    const float edge = std::max(player.damageFlash * 0.45f, wounded * 0.35f + beat * 0.25f);
+    if (edge > 0.0f) {
+        const float a = edge;
         const float band = size.y * 0.18f;
         const ImU32 red = rgba(0.8f, 0.0f, 0.0f, a);
         const ImU32 clear = rgba(0.8f, 0.0f, 0.0f, 0.0f);
@@ -50,68 +106,36 @@ void Game::drawHud()
         draw->AddRectFilledMultiColor(ImVec2(origin.x + size.x - band, origin.y), ImVec2(origin.x + size.x, origin.y + size.y),
             clear, red, red, clear);
     }
+#ifndef NDEBUG
+    if (m_debugOverlay)
+        drawDebugOverlay();
+#endif
     if (!player.alive)
         return;
 
-    // Crosshair: four ticks around a gap as wide as the pellet spread; a red X when pellets hit.
-    const float gap = 9.0f * scale;
-    const float tick = 7.0f * scale;
-    for (int i = 0; i < 4; ++i) {
-        const float dx = i == 0 ? 1.0f : i == 1 ? -1.0f : 0.0f;
-        const float dy = i == 2 ? 1.0f : i == 3 ? -1.0f : 0.0f;
-        const ImVec2 a(center.x + dx * gap, center.y + dy * gap);
-        const ImVec2 b(center.x + dx * (gap + tick), center.y + dy * (gap + tick));
-        draw->AddLine(a, b, rgba(0, 0, 0, 0.6f), 3.5f * scale);
-        draw->AddLine(a, b, rgba(1, 1, 1, 0.9f), 1.6f * scale);
-    }
-    draw->AddCircleFilled(center, 1.6f * scale, rgba(1, 1, 1, 0.9f));
-    if (player.hitMarker > 0.0f) {
-        const float r0 = 5.0f * scale, r1 = 12.0f * scale;
-        const ImU32 color = rgba(1.0f, 0.25f, 0.2f, player.hitMarker);
-        for (int sx = -1; sx <= 1; sx += 2)
-            for (int sy = -1; sy <= 1; sy += 2)
-                draw->AddLine(ImVec2(center.x + sx * r0, center.y + sy * r0), ImVec2(center.x + sx * r1, center.y + sy * r1),
-                    color, 2.5f * scale);
+    // Where the hit came from: a red arc around the middle, pointing at the attacker.
+    if (player.damageFlash > 0.0f) {
+        const float yaw = glm::radians(m_camera.yaw);
+        const glm::vec2 forward(std::cos(yaw), std::sin(yaw));
+        const glm::vec2 right(-forward.y, forward.x);
+        const glm::vec3 eye = eyePosition();
+        const glm::vec2 toAttacker(player.hitFrom.x - eye.x, player.hitFrom.z - eye.z);
+        if (glm::length(toAttacker) > 0.01f) {
+            const float angle = std::atan2(glm::dot(toAttacker, right), glm::dot(toAttacker, forward));
+            const float radius = size.y * 0.22f;
+            // ImGui's angles run clockwise from +X; straight ahead (angle 0) is up the screen.
+            const float middle = angle - 1.5707963f;
+            draw->PathArcTo(center, radius, middle - 0.35f, middle + 0.35f, 24);
+            draw->PathStroke(rgba(0.95f, 0.1f, 0.05f, player.damageFlash * 0.9f), 0, 10.0f * scale);
+        }
     }
 
+    // No crosshair and no ammo counter: the gun is aimed by where its barrel points, and the shells are
+    // counted on the body.
     const float margin = 28.0f * scale;
     const float big = 44.0f * scale;
     const float small = 18.0f * scale;
     char text[64];
-
-    // Health, bottom left.
-    const float health = player.health;
-    const float healthFraction = std::clamp(health / GameWorld::kMaxHealth, 0.0f, 1.0f);
-    const bool low = health < 30.0f;
-    const float pulse = low ? 0.6f + 0.4f * std::sin(static_cast<float>(ImGui::GetTime()) * 8.0f) : 1.0f;
-    snprintf(text, sizeof(text), "%d", static_cast<int>(std::ceil(health)));
-    const ImVec2 healthPos(origin.x + margin, origin.y + size.y - margin - big - 14.0f * scale);
-    shadowText(draw, small, ImVec2(healthPos.x, healthPos.y - small), rgba(0.85f, 0.85f, 0.9f, 0.9f), "HEALTH");
-    shadowText(draw, big, healthPos, low ? rgba(1.0f, 0.3f, 0.25f, pulse) : rgba(1, 1, 1, 1), text);
-    const ImVec2 barMin(origin.x + margin, origin.y + size.y - margin - 8.0f * scale);
-    const ImVec2 barMax(barMin.x + 220.0f * scale, barMin.y + 8.0f * scale);
-    draw->AddRectFilled(barMin, barMax, rgba(0, 0, 0, 0.5f), 3.0f);
-    draw->AddRectFilled(barMin, ImVec2(barMin.x + (barMax.x - barMin.x) * healthFraction, barMax.y),
-        low ? rgba(0.9f, 0.2f, 0.15f, 1.0f) : rgba(0.35f, 0.85f, 0.4f, 1.0f), 3.0f);
-
-    // Shells, bottom right: loaded as icons, the reserve as a number.
-    snprintf(text, sizeof(text), "%d", player.reserve);
-    const ImVec2 reserveSize = textSize(big, text);
-    const ImVec2 reservePos(origin.x + size.x - margin - reserveSize.x, origin.y + size.y - margin - big - 14.0f * scale);
-    shadowText(draw, big, reservePos, player.reserve == 0 && player.shells == 0 ? rgba(1, 0.3f, 0.25f, 1) : rgba(1, 1, 1, 1), text);
-    const char* label = m_world.reloading() ? "RELOADING" : "SHELLS";
-    shadowText(draw, small, ImVec2(origin.x + size.x - margin - textSize(small, label).x, reservePos.y - small),
-        rgba(0.85f, 0.85f, 0.9f, 0.9f), label);
-    const float shellWidth = 9.0f * scale, shellHeight = 22.0f * scale, shellGap = 4.0f * scale;
-    float x = origin.x + size.x - margin - GameWorld::kMagazineSize * (shellWidth + shellGap);
-    const float y = origin.y + size.y - margin - shellHeight;
-    for (int i = 0; i < GameWorld::kMagazineSize; ++i, x += shellWidth + shellGap) {
-        const bool loaded = i < player.shells;
-        draw->AddRectFilled(ImVec2(x, y), ImVec2(x + shellWidth, y + shellHeight * 0.72f),
-            loaded ? rgba(0.85f, 0.15f, 0.1f, 1.0f) : rgba(0.2f, 0.2f, 0.2f, 0.5f), 2.0f);
-        draw->AddRectFilled(ImVec2(x, y + shellHeight * 0.72f), ImVec2(x + shellWidth, y + shellHeight),
-            loaded ? rgba(0.85f, 0.65f, 0.25f, 1.0f) : rgba(0.2f, 0.2f, 0.2f, 0.5f), 2.0f);
-    }
 
     // Enemies left and time, top center.
     const int left = m_world.enemiesTotal() - m_world.enemiesKilled();

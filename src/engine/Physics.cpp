@@ -8,7 +8,9 @@
 #include <Jolt/Physics/Character/CharacterVirtual.h>
 #include <Jolt/Physics/Collision/CastResult.h>
 #include <Jolt/Physics/Collision/RayCast.h>
+#include <Jolt/Physics/Collision/Shape/BoxShape.h>
 #include <Jolt/Physics/Collision/Shape/CapsuleShape.h>
+#include <Jolt/Physics/Collision/Shape/ConvexHullShape.h>
 #include <Jolt/Physics/Collision/Shape/MeshShape.h>
 #include <Jolt/Physics/Collision/Shape/RotatedTranslatedShape.h>
 #include <Jolt/Physics/Collision/Shape/ScaledShape.h>
@@ -133,6 +135,51 @@ JPH::ShapeRefC createMeshShape(const GPUModel& model)
     return result.Get();
 }
 
+// The model's bounding box, placed where the model's bounds are.
+JPH::ShapeRefC createBoxShape(const GPUModel& model)
+{
+    // Flat models (planes) still get a thin slab to stand on.
+    const glm::vec3 half = glm::max((model.boundsMax - model.boundsMin) * 0.5f, glm::vec3(0.01f));
+    const float convexRadius = std::min(JPH::cDefaultConvexRadius, std::min({ half.x, half.y, half.z }) * 0.5f);
+    JPH::BoxShapeSettings box(toJolt(half), convexRadius);
+    JPH::ShapeSettings::ShapeResult result = box.Create();
+    if (result.HasError()) {
+        std::cerr << "[Physics] Box shape for '" << model.name << "' failed: " << result.GetError().c_str() << "\n";
+        return nullptr;
+    }
+    const glm::vec3 center = (model.boundsMin + model.boundsMax) * 0.5f;
+    return new JPH::RotatedTranslatedShape(toJolt(center), JPH::Quat::sIdentity(), result.Get());
+}
+
+JPH::ShapeRefC createConvexShape(const GPUModel& model)
+{
+    JPH::Array<JPH::Vec3> points;
+    points.reserve(model.collisionTriangles.size());
+    for (const glm::vec3& p : model.collisionTriangles)
+        points.push_back(toJolt(p));
+    if (points.size() < 4)
+        return createBoxShape(model);
+    JPH::ConvexHullShapeSettings settings(points);
+    JPH::ShapeSettings::ShapeResult result = settings.Create();
+    if (result.HasError()) {
+        // Degenerate hulls (a flat model) fall back to the box.
+        std::cerr << "[Physics] Convex hull for '" << model.name << "' failed (" << result.GetError().c_str()
+            << "); using its box\n";
+        return createBoxShape(model);
+    }
+    return result.Get();
+}
+
+JPH::ShapeRefC createShape(const GPUModel& model, CollisionMode mode)
+{
+    switch (mode) {
+    case CollisionMode::Box: return createBoxShape(model);
+    case CollisionMode::Convex: return createConvexShape(model);
+    case CollisionMode::Mesh: return createMeshShape(model);
+    default: return nullptr;
+    }
+}
+
 } // namespace
 
 struct PhysicsWorld::Impl {
@@ -187,20 +234,21 @@ void PhysicsWorld::buildStaticScene(ModelManager& models)
 {
     clear();
     JPH::BodyInterface& bodies = m_impl->system->GetBodyInterface();
-    // Instances usually share models, so each mesh shape is built once.
+    // Instances usually share models, so each (model, collision mode) shape is built once.
     std::unordered_map<size_t, JPH::ShapeRefC> shapes;
+    constexpr size_t kModes = static_cast<size_t>(CollisionMode::Count);
 
     for (const ModelInstance& instance : models.getInstances()) {
-        if (!instance.visible || !instance.entity.empty())
+        if (!instance.visible || !instance.entity.empty() || instance.collision == CollisionMode::None)
             continue;
         if (glm::any(glm::lessThan(glm::abs(instance.scale), glm::vec3(1e-4f))))
             continue;
         const GPUModel* model = models.getModel(instance.modelIndex);
         if (!model || !model->isValid())
             continue;
-        auto [it, inserted] = shapes.try_emplace(instance.modelIndex);
+        auto [it, inserted] = shapes.try_emplace(instance.modelIndex * kModes + static_cast<size_t>(instance.collision));
         if (inserted)
-            it->second = createMeshShape(*model);
+            it->second = createShape(*model, instance.collision);
         if (!it->second)
             continue;
 

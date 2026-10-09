@@ -4,6 +4,7 @@
 #include <array>
 #include <cmath>
 #include <fstream>
+#include "ConfigPaths.h"
 #include "Log.h"
 
 NLOHMANN_JSON_SERIALIZE_ENUM(BackgroundMode, {
@@ -78,17 +79,20 @@ void applyQualityPreset(GraphicsSettings& s, QualityPreset preset, int maxMsaaSa
     s.pipeline = RenderPipeline::Standard;
     s.renderScale = 1.0f;
     s.shadows = true;
+    s.lightShadows = true;
     switch (preset) {
     case QualityPreset::Lowest:
         // Shadows and effects are off too, so switching back to Standard stays cheap.
         s.pipeline = RenderPipeline::Classic; s.renderScale = 0.75f; s.detailCulling = 3.0f;
         s.msaaSamples = 1; s.fxaa = false; s.shadows = false; s.shadowMapSize = 1024; s.shadowCascades = 1;
         s.softShadows = false; s.contactShadows = false; s.ambientOcclusion = 0; s.bloom = false;
+        s.lightShadows = false;
         break;
     case QualityPreset::Low:
         s.detailCulling = 2.0f;
         s.msaaSamples = 1; s.fxaa = true; s.shadowMapSize = 1024; s.shadowCascades = 2;
         s.softShadows = false; s.contactShadows = false; s.ambientOcclusion = 0; s.bloom = false;
+        s.lightShadows = false;
         break;
     case QualityPreset::Medium:
         s.detailCulling = 1.0f;
@@ -109,9 +113,17 @@ void applyQualityPreset(GraphicsSettings& s, QualityPreset preset, int maxMsaaSa
     s.msaaSamples = std::min(s.msaaSamples, maxMsaaSamples);
 }
 
+bool GraphicsSettings::sameGlobal(const GraphicsSettings& other) const
+{
+    GraphicsSettings copy = other;
+    copy.scene() = scene();
+    return copy == *this;
+}
+
 GraphicsSettings sanitizeGraphicsSettings(GraphicsSettings s)
 {
     const GraphicsSettings defaults;
+    s.scene() = sanitizeSceneSettings(s.scene());
     s.renderScale = clampFinite(s.renderScale, 0.25f, 1.0f, defaults.renderScale);
     s.detailCulling = clampFinite(s.detailCulling, 0.0f, 16.0f, defaults.detailCulling);
     s.maxFps = std::clamp(s.maxFps, 0, 1000);
@@ -120,6 +132,15 @@ GraphicsSettings sanitizeGraphicsSettings(GraphicsSettings s)
     s.shadowCascades = std::clamp(s.shadowCascades, 1, 4);
     s.shadowDistance = clampFinite(s.shadowDistance, 10.0f, 1000.0f, defaults.shadowDistance);
     s.ambientOcclusion = std::clamp(s.ambientOcclusion, 0, 3);
+    s.viewDistance = clampFinite(s.viewDistance, 100.0f, 20000.0f, defaults.viewDistance);
+    s.masterVolume = clampFinite(s.masterVolume, 0.0f, 1.0f, defaults.masterVolume);
+    s.musicVolume = clampFinite(s.musicVolume, 0.0f, 1.0f, defaults.musicVolume);
+    return s;
+}
+
+SceneSettings sanitizeSceneSettings(SceneSettings s)
+{
+    const SceneSettings defaults;
     s.aoRadius = clampFinite(s.aoRadius, 0.1f, 5.0f, defaults.aoRadius);
     s.aoIntensity = clampFinite(s.aoIntensity, 0.0f, 4.0f, defaults.aoIntensity);
     s.bloomIntensity = clampFinite(s.bloomIntensity, 0.0f, 1.0f, defaults.bloomIntensity);
@@ -135,10 +156,12 @@ GraphicsSettings sanitizeGraphicsSettings(GraphicsSettings s)
     s.sunColor = clampColor(s.sunColor);
     s.haze = clampFinite(s.haze, 0.0f, 10.0f, defaults.haze);
     s.fogDensity = clampFinite(s.fogDensity, 0.0f, 100.0f, defaults.fogDensity);
-    s.viewDistance = clampFinite(s.viewDistance, 100.0f, 20000.0f, defaults.viewDistance);
-    s.masterVolume = clampFinite(s.masterVolume, 0.0f, 1.0f, defaults.masterVolume);
-    s.musicVolume = clampFinite(s.musicVolume, 0.0f, 1.0f, defaults.musicVolume);
     return s;
+}
+
+std::string graphicsSettingsPath()
+{
+    return configPath("settings.json");
 }
 
 GraphicsSettings loadGraphicsSettings(const std::string& path)
@@ -166,26 +189,9 @@ GraphicsSettings loadGraphicsSettings(const std::string& path)
     readField(json, "shadowDistance", settings.shadowDistance);
     readField(json, "softShadows", settings.softShadows);
     readField(json, "contactShadows", settings.contactShadows);
+    readField(json, "lightShadows", settings.lightShadows);
     readField(json, "ambientOcclusion", settings.ambientOcclusion);
-    readField(json, "aoRadius", settings.aoRadius);
-    readField(json, "aoIntensity", settings.aoIntensity);
     readField(json, "bloom", settings.bloom);
-    readField(json, "bloomIntensity", settings.bloomIntensity);
-    readField(json, "exposure", settings.exposure);
-    readField(json, "tonemapper", settings.tonemapper);
-    readField(json, "contrast", settings.contrast);
-    readField(json, "saturation", settings.saturation);
-    readField(json, "vignette", settings.vignette);
-    readField(json, "background", settings.background);
-    readField(json, "backgroundColor", settings.backgroundColor);
-    readField(json, "sun", settings.sun);
-    readField(json, "sunAzimuth", settings.sunAzimuth);
-    readField(json, "sunElevation", settings.sunElevation);
-    readField(json, "sunIntensity", settings.sunIntensity);
-    readField(json, "sunColor", settings.sunColor);
-    readField(json, "haze", settings.haze);
-    readField(json, "fog", settings.fog);
-    readField(json, "fogDensity", settings.fogDensity);
     readField(json, "viewDistance", settings.viewDistance);
     readField(json, "masterVolume", settings.masterVolume);
     readField(json, "musicVolume", settings.musicVolume);
@@ -208,26 +214,9 @@ bool saveGraphicsSettings(const GraphicsSettings& settings, const std::string& p
         { "shadowDistance", settings.shadowDistance },
         { "softShadows", settings.softShadows },
         { "contactShadows", settings.contactShadows },
+        { "lightShadows", settings.lightShadows },
         { "ambientOcclusion", settings.ambientOcclusion },
-        { "aoRadius", settings.aoRadius },
-        { "aoIntensity", settings.aoIntensity },
         { "bloom", settings.bloom },
-        { "bloomIntensity", settings.bloomIntensity },
-        { "exposure", settings.exposure },
-        { "tonemapper", settings.tonemapper },
-        { "contrast", settings.contrast },
-        { "saturation", settings.saturation },
-        { "vignette", settings.vignette },
-        { "background", settings.background },
-        { "backgroundColor", toJson(settings.backgroundColor) },
-        { "sun", settings.sun },
-        { "sunAzimuth", settings.sunAzimuth },
-        { "sunElevation", settings.sunElevation },
-        { "sunIntensity", settings.sunIntensity },
-        { "sunColor", toJson(settings.sunColor) },
-        { "haze", settings.haze },
-        { "fog", settings.fog },
-        { "fogDensity", settings.fogDensity },
         { "viewDistance", settings.viewDistance },
         { "masterVolume", settings.masterVolume },
         { "musicVolume", settings.musicVolume },
@@ -239,4 +228,58 @@ bool saveGraphicsSettings(const GraphicsSettings& settings, const std::string& p
     }
     file << json.dump(4) << "\n";
     return static_cast<bool>(file);
+}
+
+std::string sceneSettingsToJson(const SceneSettings& settings)
+{
+    const nlohmann::json json = {
+        { "background", settings.background },
+        { "backgroundColor", toJson(settings.backgroundColor) },
+        { "sun", settings.sun },
+        { "sunAzimuth", settings.sunAzimuth },
+        { "sunElevation", settings.sunElevation },
+        { "sunIntensity", settings.sunIntensity },
+        { "sunColor", toJson(settings.sunColor) },
+        { "haze", settings.haze },
+        { "fog", settings.fog },
+        { "fogDensity", settings.fogDensity },
+        { "aoRadius", settings.aoRadius },
+        { "aoIntensity", settings.aoIntensity },
+        { "bloomIntensity", settings.bloomIntensity },
+        { "exposure", settings.exposure },
+        { "tonemapper", settings.tonemapper },
+        { "contrast", settings.contrast },
+        { "saturation", settings.saturation },
+        { "vignette", settings.vignette },
+    };
+    return json.dump();
+}
+
+SceneSettings sceneSettingsFromJson(const std::string& text)
+{
+    SceneSettings settings;
+    const nlohmann::json json = nlohmann::json::parse(text, nullptr, false);
+    if (json.is_discarded() || !json.is_object()) {
+        LOG_ERROR("[SETTINGS] Scene settings are not valid JSON; using defaults\n");
+        return settings;
+    }
+    readField(json, "background", settings.background);
+    readField(json, "backgroundColor", settings.backgroundColor);
+    readField(json, "sun", settings.sun);
+    readField(json, "sunAzimuth", settings.sunAzimuth);
+    readField(json, "sunElevation", settings.sunElevation);
+    readField(json, "sunIntensity", settings.sunIntensity);
+    readField(json, "sunColor", settings.sunColor);
+    readField(json, "haze", settings.haze);
+    readField(json, "fog", settings.fog);
+    readField(json, "fogDensity", settings.fogDensity);
+    readField(json, "aoRadius", settings.aoRadius);
+    readField(json, "aoIntensity", settings.aoIntensity);
+    readField(json, "bloomIntensity", settings.bloomIntensity);
+    readField(json, "exposure", settings.exposure);
+    readField(json, "tonemapper", settings.tonemapper);
+    readField(json, "contrast", settings.contrast);
+    readField(json, "saturation", settings.saturation);
+    readField(json, "vignette", settings.vignette);
+    return sanitizeSceneSettings(settings);
 }

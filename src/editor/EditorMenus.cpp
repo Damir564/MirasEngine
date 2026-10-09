@@ -27,6 +27,7 @@ void Editor::drawMainMenuBar()
     if (ImGui::BeginMenu("Settings")) {
         ImGui::MenuItem("Preferences...", nullptr, &m_showPreferences);
         ImGui::MenuItem("Graphics...", nullptr, &m_showGraphicsSettings);
+        ImGui::MenuItem("Scene Settings...", nullptr, &m_showSceneSettings);
         ImGui::MenuItem("Keyboard Shortcuts...", m_keymap.shortcutLabel(EditorAction::ShowKeymap).c_str(), &m_showKeymap);
         ImGui::EndMenu();
     }
@@ -565,7 +566,20 @@ void Editor::drawFileDialogs()
 void Editor::drawGraphicsSettingsWindow()
 {
     ImGui::SetNextWindowSize(ImVec2(380, 0), ImGuiCond_FirstUseEver);
-    if (ImGui::Begin("Graphics Settings", &m_showGraphicsSettings))
+    if (ImGui::Begin("Graphics Settings", &m_showGraphicsSettings)) {
+        ImGui::TextDisabled("Quality and display, for every scene. Saved to %s", graphicsSettingsPath().c_str());
         drawGraphicsSettings(m_settings, m_renderer.capabilities());
+    }
+    ImGui::End();
+}
+
+void Editor::drawSceneSettingsWindow()
+{
+    ImGui::SetNextWindowSize(ImVec2(380, 0), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Scene Settings", &m_showSceneSettings)) {
+        ImGui::TextDisabled("The look of this scene; saved with it.");
+        // Not undoable; the scene counts as changed until it is saved (sceneDirty()).
+        drawSceneSettings(m_scenes.settings(), m_settings);
+    }
     ImGui::End();
 }

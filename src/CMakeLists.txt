@@ -54,6 +54,8 @@
   engine/Audio.cpp
   engine/EntityTypes.h
   engine/EntityTypes.cpp
+  engine/ConfigPaths.cpp
+  engine/Lights.cpp
   app/AppMode.h
   app/AppOptions.h
   app/AppOptions.cpp
@@ -98,6 +100,11 @@
   game/GameSounds.cpp
   game/GameWorld.h
   game/GameWorld.cpp
+  game/GameArms.cpp
+  game/Arms.h
+  game/Arms.cpp
+  game/WeaponTuning.h
+  game/WeaponTuning.cpp
   game/GameHud.cpp
 )
 
@@ -149,5 +156,11 @@ target_link_libraries(engine PRIVATE
 if (WIN32)
   target_link_libraries(engine PRIVATE ws2_32)
 endif()
+
+# Tests of the hands/guns logic (pure C++, no engine). Not built by default:
+#   cmake --build out/build/x64-debug --target arms_tests
+add_executable(arms_tests EXCLUDE_FROM_ALL game/Arms.cpp game/ArmsTests.cpp)
+set_property(TARGET arms_tests PROPERTY CXX_STANDARD 20)
+target_include_directories(arms_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 
 

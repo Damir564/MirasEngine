@@ -11,6 +11,7 @@
 #include "editor/Editor.h"
 #include "editor/EditorStyle.h"
 #include "game/Game.h"
+#include "engine/ConfigPaths.h"
 #include "engine/ModelManager.h"
 #include "engine/SceneManager.h"
 #include "engine/Log.h"
@@ -51,10 +52,11 @@ bool Application::init(const AppOptions& options)
         return false;
     if (!m_vulkan.init(m_window, options.validation, options.firstVulkanBackend))
         return false;
+    // Settings are shared by every build in the user's config folder; older builds kept them next to the exe.
+    migrateLocalConfig();
     // The renderer initializes the ImGui Vulkan backend, so the ImGui context must exist first.
     initImGui();
-    if (!options.settingsPath.empty())
-        m_settingsPath = options.settingsPath;
+    m_settingsPath = options.settingsPath.empty() ? graphicsSettingsPath() : options.settingsPath;
     std::error_code error;
     const bool firstRun = !std::filesystem::exists(m_settingsPath, error);
     m_settings = loadGraphicsSettings(m_settingsPath);
@@ -106,6 +108,9 @@ void Application::initImGui()
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
+    // ImGui keeps the pointer.
+    static const std::string iniPath = configPath("imgui.ini");
+    io.IniFilename = iniPath.c_str();
     EditorStyle::loadFonts(io);
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
@@ -260,12 +265,16 @@ int Application::mainLoop(int exitAfterFrames)
 
 void Application::applyChangedSettings()
 {
+    // The open scene decides the look; the modes only edit the global part of m_settings.
+    m_settings.scene() = m_scenes->settings();
     if (m_settings == m_appliedSettings)
         return;
     m_settings = sanitizeGraphicsSettings(m_settings);
+    m_scenes->settings() = m_settings.scene();
     m_audio.setVolumes(m_muted ? 0.0f : m_settings.masterVolume, m_settings.musicVolume);
     m_renderer.applySettings(m_settings);
-    saveGraphicsSettings(m_settings, m_settingsPath);
+    if (!m_settings.sameGlobal(m_appliedSettings))
+        saveGraphicsSettings(m_settings, m_settingsPath);
     m_appliedSettings = m_settings;
 }
 

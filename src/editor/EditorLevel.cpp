@@ -2019,6 +2019,10 @@ void Editor::drawLevelPanel()
         ImGui::SetItemTooltip("%s", withShortcut("Draw shapes in the viewport: drag a footprint on the ground or a "
             "floor, move the mouse to set the height, click. A click places this size. Esc stops",
             EditorAction::DrawShape).c_str());
+        ImGui::Checkbox("Edit after drawing", &m_editAfterDraw);
+        ImGui::SetItemTooltip("A drawn shape goes straight into editing (faces, edges, vertices) as one object; "
+            "%s or Esc finishes. Off: the Draw tool stays on for the next shape.",
+            m_keymap.shortcutLabel(EditorAction::EditShape).c_str());
 
         ImGui::SeparatorText("Place entities");
         drawEntityPalette();
@@ -2060,6 +2064,18 @@ void Editor::drawLevelPanel()
             drawLevelMaterials(*mesh);
 
             ImGui::SeparatorText("Edit");
+            const bool editing = m_levelMode != LevelEditMode::Object;
+            if (editing) {
+                ImGui::PushStyleColor(ImGuiCol_Button, EditorStyle::kAccent);
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, EditorStyle::kAccentHover);
+            }
+            if (ImGui::Button(editing ? "Done editing" : "Edit shape", ImVec2(-FLT_MIN, 0.0f)))
+                toggleShapeEdit();
+            if (editing)
+                ImGui::PopStyleColor(2);
+            ImGui::SetItemTooltip("%s", withShortcut(editing ? "Back to moving whole objects (Esc also does this once "
+                "nothing is picked)" : "Edit this shape's faces, edges and vertices; it stays one object",
+                EditorAction::EditShape).c_str());
             int mode = static_cast<int>(m_levelMode);
             // One row while it fits the panel, wrapping otherwise.
             const float rowRight = ImGui::GetCursorScreenPos().x + ImGui::GetContentRegionAvail().x;
@@ -2076,7 +2092,11 @@ void Editor::drawLevelPanel()
             modeButton("Edges", LevelEditMode::Edge, EditorAction::EdgeMode, false);
             modeButton("Vertices", LevelEditMode::Vertex, EditorAction::VertexMode, false);
             modeButton("Parts", LevelEditMode::Part, EditorAction::PartMode, false);
+            if (mode != static_cast<int>(m_levelMode) && mode == static_cast<int>(LevelEditMode::Object))
+                finishShapeEdit();
             m_levelMode = static_cast<LevelEditMode>(mode);
+            if (m_levelMode != LevelEditMode::Object)
+                m_lastShapeEditMode = m_levelMode;
 
             if (m_levelMode == LevelEditMode::Part)
                 drawPartControls(*mesh);

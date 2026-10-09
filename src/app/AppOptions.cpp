@@ -118,7 +118,7 @@ void showUsage(const char* executableName)
         "  --mute                   No sound\n"
         "  --scene <path>           Editor: open this .scn at startup; game: use it as the level\n"
         "  --script <path>          Editor: run this command script once the scene has loaded\n"
-        "  --settings <path>       Load and save graphics settings here instead of settings.json\n"
+        "  --settings <path>        Load and save graphics settings here instead of %APPDATA%\\MirasEngine\\settings.json\n"
         "  --mcp-port <N>           Editor: MCP server port on 127.0.0.1 (default 47800, 0 = off)\n"
         "  --validation             Enable the Vulkan validation layers\n"
         "  --vulkan <mode>          auto (default): the GPU driver, then emulation layers, then the CPU\n"

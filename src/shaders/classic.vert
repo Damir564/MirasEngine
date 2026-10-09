@@ -4,6 +4,7 @@
 #include "frame_ubo.glsl"
 #include "draw_data.glsl"
 #include "classic.glsl"
+#include "lights.glsl"
 
 // Classic pipeline: lighting and fog are computed per vertex, the fragment shader only samples the base
 // color texture.
@@ -39,6 +40,14 @@ void main() {
     // sunColor is irradiance; dividing by PI gives the radiance of a white Lambertian surface.
     vec3 sun = ubo.sunColor.rgb / PI * max(dot(N, L), 0.0);
     fragLight = classicAmbient(N) + sun;
+    // Point and spot lights, per vertex and without shadows.
+    uint count = lightCount();
+    for (uint i = 0u; i < count; ++i) {
+        vec3 toLight;
+        float lightDistance;
+        vec3 irradiance = lightIrradiance(lights[i], worldPosition.xyz, toLight, lightDistance);
+        fragLight += irradiance / PI * max(dot(N, toLight), 0.0);
+    }
 
     vec3 V = toCamera / max(distance, 1e-6);
     vec3 fogDir = normalize(vec3(-V.x, max(-V.y, 0.02), -V.z));

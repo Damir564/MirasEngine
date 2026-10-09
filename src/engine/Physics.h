@@ -14,7 +14,8 @@ public:
     PhysicsWorld(const PhysicsWorld&) = delete;
     PhysicsWorld& operator=(const PhysicsWorld&) = delete;
 
-    // Replaces all static colliders with the visible instances of the scene (not game entity markers).
+    // Replaces all static colliders with the visible instances of the scene (not game entity markers), each
+    // shaped by its ModelInstance::collision.
     void buildStaticScene(ModelManager& models);
     // Removes the colliders and every character.
     void clear();

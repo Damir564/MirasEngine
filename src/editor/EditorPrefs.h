@@ -4,6 +4,7 @@
 #include <vector>
 #include <glm/glm.hpp>
 #include "EditorStyle.h"
+#include "engine/ConfigPaths.h"
 
 // Per-user editor preferences (not part of a scene). Panel visibility is kept with the dock layout in
 // imgui.ini instead, so saved layouts restore it too.
@@ -35,8 +36,9 @@ struct EditorPrefs {
     }
 };
 
-inline constexpr const char* kEditorPrefsPath = "editor_prefs.json";
-inline constexpr const char* kAutosavePath = "autosave.scn";
+// In the shared config folder, so every build uses them.
+inline std::string editorPrefsPath() { return configPath("editor_prefs.json"); }
+inline std::string autosavePath() { return configPath("autosave.scn"); }
 inline constexpr size_t kMaxRecentScenes = 10;
 
 // Puts `path` at the front of the recent scenes list.
@@ -45,5 +47,5 @@ void addRecentScene(EditorPrefs& prefs, const std::string& path);
 // Clamps every field into its valid range.
 EditorPrefs sanitizeEditorPrefs(EditorPrefs prefs);
 // A missing or unreadable file yields defaults; missing keys keep their default value.
-EditorPrefs loadEditorPrefs(const std::string& path = kEditorPrefsPath);
-bool saveEditorPrefs(const EditorPrefs& prefs, const std::string& path = kEditorPrefsPath);
+EditorPrefs loadEditorPrefs(const std::string& path = editorPrefsPath());
+bool saveEditorPrefs(const EditorPrefs& prefs, const std::string& path = editorPrefsPath());

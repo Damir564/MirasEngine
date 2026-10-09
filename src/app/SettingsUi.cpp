@@ -97,10 +97,13 @@ bool drawShadows(GraphicsSettings& settings)
     ImGui::EndDisabled();
     changed |= ImGui::Checkbox("Contact shadows", &settings.contactShadows);
     ImGui::SetItemTooltip("Screen-space shadows for small details the shadow map is too coarse for.");
+    changed |= ImGui::Checkbox("Light shadows", &settings.lightShadows);
+    ImGui::SetItemTooltip("Shadows of point and spot lights that have Shadows on (up to 16 shadow views\n"
+        "near the camera; a point light takes 6). Uses 64 MB of video memory once a light needs it.");
     return changed;
 }
 
-bool drawLighting(GraphicsSettings& settings)
+bool drawEffects(GraphicsSettings& settings)
 {
     bool changed = false;
     {
@@ -108,13 +111,19 @@ bool drawLighting(GraphicsSettings& settings)
         static const char* const names[] = { "Off", "Low", "Medium", "High" };
         changed |= comboInt("Ambient occlusion", settings.ambientOcclusion, values, names, IM_ARRAYSIZE(values), 3);
     }
-    ImGui::BeginDisabled(settings.ambientOcclusion == 0);
+    changed |= ImGui::Checkbox("Bloom", &settings.bloom);
+    ImGui::TextDisabled("Their strength, the sky, sun and fog are scene settings.");
+    return changed;
+}
+
+bool drawSceneLook(SceneSettings& settings, const GraphicsSettings& global)
+{
+    bool changed = false;
+    ImGui::BeginDisabled(global.ambientOcclusion == 0);
     changed |= ImGui::SliderFloat("AO radius", &settings.aoRadius, 0.1f, 5.0f, "%.2f m", kLogClamp);
     changed |= ImGui::SliderFloat("AO intensity", &settings.aoIntensity, 0.0f, 4.0f, "%.2f", kClamp);
     ImGui::EndDisabled();
-
-    changed |= ImGui::Checkbox("Bloom", &settings.bloom);
-    ImGui::BeginDisabled(!settings.bloom);
+    ImGui::BeginDisabled(!global.bloom);
     changed |= ImGui::SliderFloat("Bloom strength", &settings.bloomIntensity, 0.0f, 1.0f, "%.2f", kClamp);
     ImGui::EndDisabled();
 
@@ -130,7 +139,7 @@ bool drawLighting(GraphicsSettings& settings)
     return changed;
 }
 
-bool drawEnvironment(GraphicsSettings& settings)
+bool drawEnvironment(SceneSettings& settings)
 {
     bool changed = false;
     {
@@ -159,7 +168,6 @@ bool drawEnvironment(GraphicsSettings& settings)
     ImGui::BeginDisabled(!settings.fog);
     changed |= ImGui::SliderFloat("Fog density", &settings.fogDensity, 0.0f, 100.0f, "%.2f", kLogClamp);
     ImGui::EndDisabled();
-    changed |= ImGui::SliderFloat("View distance", &settings.viewDistance, 100.0f, 20000.0f, "%.0f m", kLogClamp);
     return changed;
 }
 
@@ -198,25 +206,47 @@ bool drawGraphicsSettings(GraphicsSettings& settings, const RenderCapabilities& 
             ImGui::SetItemTooltip("Classic pipeline at 75%% resolution: for integrated graphics.");
     }
 
-    if (ImGui::CollapsingHeader("Display", ImGuiTreeNodeFlags_DefaultOpen))
+    if (ImGui::CollapsingHeader("Display", ImGuiTreeNodeFlags_DefaultOpen)) {
         changed |= drawDisplay(settings, caps);
+        changed |= ImGui::SliderFloat("View distance", &settings.viewDistance, 100.0f, 20000.0f, "%.0f m", kLogClamp);
+    }
     // The Classic pipeline has no shadows or post-processing.
     ImGui::BeginDisabled(settings.pipeline == RenderPipeline::Classic);
     if (ImGui::CollapsingHeader("Shadows", ImGuiTreeNodeFlags_DefaultOpen))
         changed |= drawShadows(settings);
-    if (ImGui::CollapsingHeader("Lighting and effects", ImGuiTreeNodeFlags_DefaultOpen))
-        changed |= drawLighting(settings);
+    if (ImGui::CollapsingHeader("Effects", ImGuiTreeNodeFlags_DefaultOpen))
+        changed |= drawEffects(settings);
     ImGui::EndDisabled();
-    if (ImGui::CollapsingHeader("Environment", ImGuiTreeNodeFlags_DefaultOpen))
-        changed |= drawEnvironment(settings);
     if (ImGui::CollapsingHeader("Audio", ImGuiTreeNodeFlags_DefaultOpen))
         changed |= drawAudio(settings);
 
     ImGui::PopItemWidth();
     ImGui::Spacing();
-    if (ImGui::Button("Reset to defaults") && !(settings == GraphicsSettings{})) {
-        settings = GraphicsSettings{};
-        if (settings.msaaSamples > caps.maxMsaaSamples) settings.msaaSamples = caps.maxMsaaSamples;
+    GraphicsSettings defaults;
+    defaults.scene() = settings.scene();
+    if (defaults.msaaSamples > caps.maxMsaaSamples) defaults.msaaSamples = caps.maxMsaaSamples;
+    if (ImGui::Button("Reset to defaults") && !(settings == defaults)) {
+        settings = defaults;
+        changed = true;
+    }
+    return changed;
+}
+
+bool drawSceneSettings(SceneSettings& settings, const GraphicsSettings& global)
+{
+    bool changed = false;
+    ImGui::PushItemWidth(ImGui::GetContentRegionAvail().x * 0.55f);
+    if (ImGui::CollapsingHeader("Sky, sun and fog", ImGuiTreeNodeFlags_DefaultOpen))
+        changed |= drawEnvironment(settings);
+    // The Classic pipeline has no post-processing.
+    ImGui::BeginDisabled(global.pipeline == RenderPipeline::Classic);
+    if (ImGui::CollapsingHeader("Look", ImGuiTreeNodeFlags_DefaultOpen))
+        changed |= drawSceneLook(settings, global);
+    ImGui::EndDisabled();
+    ImGui::PopItemWidth();
+    ImGui::Spacing();
+    if (ImGui::Button("Reset to defaults") && !(settings == SceneSettings{})) {
+        settings = SceneSettings{};
         changed = true;
     }
     return changed;

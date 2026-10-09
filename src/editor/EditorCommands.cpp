@@ -351,6 +351,7 @@ json Editor::CommandApi::describe(Editor& e, size_t index)
     }
     if (!instance.group.empty())
         out["group"] = instance.group;
+    out["collision"] = kCollisionModeIds[static_cast<int>(instance.collision)];
     const GPUModel* model = e.m_models.getModel(instance.modelIndex);
     if (!model)
         return out;
@@ -866,11 +867,22 @@ const std::vector<Editor::CommandApi::Command>& Editor::CommandApi::table()
                 { "visible", "boolean", "Shown in the scene" }, { "locked", "boolean", "Geometry protected from edits" },
                 { "entity", "string", "Game entity type (see create_entity), or \"\" for plain scenery" },
                 { "entity_params", "string", "Entity parameters, \"key=value\" pairs separated by spaces" },
-                { "group", "string", "Group name: objects sharing one are selected, moved and copied together; \"\" for none" } },
+                { "group", "string", "Group name: objects sharing one are selected, moved and copied together; \"\" for none" },
+                { "collision", "string", "What the game collides with: mesh (exact triangles), box (bounding box), "
+                    "convex (convex hull) or none (walk and shoot through)" } },
             [](Editor& e, const Args& a) -> json {
                 const int index = instanceArg(e, a);
                 if (a.has("name"))
                     checkNameFree(e, a.string("name"), index);
+                std::optional<CollisionMode> collision;
+                if (a.has("collision")) {
+                    const std::string id = a.string("collision");
+                    for (int m = 0; m < static_cast<int>(CollisionMode::Count); ++m)
+                        if (id == kCollisionModeIds[m])
+                            collision = static_cast<CollisionMode>(m);
+                    if (!collision)
+                        fail("collision must be mesh, box, convex or none");
+                }
                 if (a.has("entity") && !a.string("entity").empty() && !findEntityType(a.string("entity")))
                     fail("unknown entity type " + a.string("entity"));
                 ModelInstance& instance = e.m_models.getInstances()[index];
@@ -884,6 +896,8 @@ const std::vector<Editor::CommandApi::Command>& Editor::CommandApi::table()
                 instance.entity = a.string("entity", instance.entity);
                 instance.entityParams = a.string("entity_params", instance.entityParams);
                 instance.group = a.string("group", instance.group);
+                if (collision)
+                    instance.collision = *collision;
                 e.markSceneChanged();
                 return describe(e, index);
             } },
@@ -891,7 +905,9 @@ const std::vector<Editor::CommandApi::Command>& Editor::CommandApi::table()
             "(where the player begins, looking along the entity's +Z), enemy (params health, speed, damage, cooldown, sight, "
             "hearing, size, alert=1 for a hunter that always knows where the player is), health "
             "(param amount), ammo (shotgun shells; param amount), exit (ends the level once every enemy is dead; param "
-            "next = the .scn to load after it). Entities face +Z turned by rotation Y and stand on `position`.",
+            "next = the .scn to load after it), light (point or spot light colored by the object's color; params "
+            "intensity, range, spot=1, cone (degrees), softness, shadows=1; a spot shines along the object's -Y). "
+            "Entities face +Z turned by rotation Y and stand on `position`.",
             { { "type", "enum:player_start|enemy|health|ammo|exit", "Entity type", true }, position,
                 { "yaw", "number", "Degrees about Y; 0 faces +Z, 90 faces +X" }, name,
                 { "params", "string", "\"key=value\" pairs; default: the type's defaults" } },
@@ -995,6 +1011,22 @@ const std::vector<Editor::CommandApi::Command>& Editor::CommandApi::table()
             [](Editor& e, const Args& a) -> json {
                 e.focusOnInstance(instanceArg(e, a));
                 return { { "position", vecJson(e.m_camera.position) } };
+            } },
+        { "scene_settings", "Returns the open scene's look, saved with the scene, after applying `set`. Fields: "
+            "background (realistic|solid), backgroundColor [r,g,b], sun (bool), sunAzimuth (0-360, 0 = north/-Z), "
+            "sunElevation (-10..90), sunIntensity, sunColor, haze, fog (bool), fogDensity, aoRadius, aoIntensity, "
+            "bloomIntensity, exposure (EV), tonemapper (aces|agx|neutral|reinhard), contrast, saturation, vignette.",
+            { { "set", "dict", "Fields to change, e.g. {\"sunElevation\": 10, \"fog\": false}" } },
+            [](Editor& e, const Args& a) -> json {
+                if (a.has("set")) {
+                    const json& patch = a.at("set");
+                    if (!patch.is_object())
+                        fail("set must be an object");
+                    json current = json::parse(sceneSettingsToJson(e.m_scenes.settings()));
+                    current.merge_patch(patch);
+                    e.m_scenes.settings() = sceneSettingsFromJson(current.dump());
+                }
+                return json::parse(sceneSettingsToJson(e.m_scenes.settings()));
             } },
         { "get_camera", "Returns the editor camera: position, yaw and pitch in degrees, and the view direction.", {},
             [](Editor& e, const Args&) -> json {
@@ -1207,6 +1239,8 @@ json Editor::CommandApi::schema(const Param& param)
     }
     else if (type == "strings")
         out = { { "type", "array" }, { "items", { { "type", "string" } } } };
+    else if (type == "dict")
+        out = { { "type", "object" } };
     else if (type == "objects")
         out = { { "type", "array" }, { "items", { { "type", json::array({ "integer", "string" }) } } } };
     else if (type == "mouse")

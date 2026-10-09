@@ -34,6 +34,11 @@ public:
     const std::string& currentPath() const { return m_currentPath; }
     void setCurrentPath(std::string path) { m_currentPath = std::move(path); }
 
+    // The open scene's look (sky, sun, fog, grading), saved with it. open() replaces it; a new scene
+    // resets it to the defaults. Application applies it over the global graphics settings every frame.
+    SceneSettings& settings() { return m_settings; }
+    const SceneSettings& settings() const { return m_settings; }
+
 private:
     void instantiatePendingScene();
 
@@ -42,4 +47,5 @@ private:
     std::string m_currentPath;
     bool m_pendingLoad = false;
     SceneSerializer::LoadedScene m_pendingScene;
+    SceneSettings m_settings;
 };

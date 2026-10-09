@@ -1,7 +1,9 @@
 #include "GameWorld.h"
 #include <algorithm>
 #include <cmath>
+#include <optional>
 #include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtc/quaternion.hpp>
 #include "engine/EntityTypes.h"
 #include "engine/Log.h"
 #include "engine/ModelManager.h"
@@ -23,14 +25,15 @@ constexpr float kAttackRange = 1.9f;  // starts a swing
 constexpr float kHitRange = 2.5f;     // the swing still lands
 constexpr float kTurnSpeed = 6.0f;    // radians per second
 
-// Shotgun
-constexpr int kPellets = 9;
-constexpr float kSpreadDegrees = 5.0f;
-constexpr float kShotRange = 70.0f;
-constexpr float kFireInterval = 0.85f;
-constexpr float kShellReloadTime = 0.5f;
-constexpr float kPelletDamageNear = 13.0f;
-constexpr float kPelletDamageFar = 4.0f;
+
+// The player dies in a few hits, like everyone else: an enemy's `damage` parameter (made for 100 health)
+// becomes whole wounds, and the player has kWounds of them.
+constexpr int kWounds = 3;
+float woundDamage(float damage)
+{
+    const int wounds = damage <= 0.0f ? 0 : damage >= 50.0f ? 3 : damage >= 25.0f ? 2 : 1;
+    return wounds * GameWorld::kMaxHealth / kWounds;
+}
 
 // Pickups and the exit
 constexpr float kPickupRadius = 1.1f;
@@ -58,6 +61,7 @@ glm::vec3 flat(const glm::vec3& v)
     return glm::vec3(v.x, 0.0f, v.z);
 }
 
+
 } // namespace
 
 GameWorld::GameWorld(ModelManager& models, PhysicsWorld& physics, AudioSystem& audio, const GameAssets& assets)
@@ -72,6 +76,8 @@ GameWorld::GameWorld(ModelManager& models, PhysicsWorld& physics, AudioSystem& a
         world.spawnPickup(info, Entity::Kind::AmmoPack);
     });
     registerEntity(kExitEntity, [](GameWorld& world, const SpawnInfo& info) { world.spawnExit(info); });
+    // The renderer lights the scene with light objects itself; there is nothing to spawn.
+    registerEntity(kLightEntity, [](GameWorld&, const SpawnInfo&) {});
 }
 
 void GameWorld::registerEntity(const std::string& type, SpawnFunction function)
@@ -189,10 +195,9 @@ void GameWorld::clear()
     m_completeTimer = 0.0f;
     m_hasExit = false;
 
-    m_weapon = {};
-    const GameModel& shotgun = m_assets.model(GameModelId::Shotgun);
-    m_weapon.animator.reset(shotgun.valid() ? &shotgun.data : nullptr);
-    m_weapon.animator.play("idle");
+    m_debris.clear();
+    m_tracers.clear();
+    resetArms();
 
     if (m_ambience)
         m_audio.stop(m_ambience);
@@ -268,7 +273,7 @@ void GameWorld::damagePlayer(float amount)
     m_player.health -= amount;
     m_player.damageFlash = 1.0f;
     play("player_hurt", 0.9f, random(0.95f, 1.05f));
-    if (m_player.health <= 0.0f) {
+    if (m_player.health <= 0.5f) { // wounds are thirds; don't let rounding leave a sliver
         m_player.health = 0.0f;
         m_player.alive = false;
         LOG_INFO("[GAME] The player died after " << m_levelTime << " s\n");
@@ -380,8 +385,10 @@ void GameWorld::updateEnemy(Entity& enemy, const Input& input)
         if (!enemy.attackLanded && enemy.animator.normalizedTime() >= 0.5f) {
             enemy.attackLanded = true;
             const bool facing = glm::dot(forwardFromYaw(enemy.yaw), flat(toPlayer) / std::max(playerDistance, 1e-3f)) > 0.3f;
-            if (playerDistance < hitRange && std::abs(toPlayer.y) < 1.5f * std::max(enemy.size, 1.0f) && facing)
-                damagePlayer(enemy.damage);
+            if (playerDistance < hitRange && std::abs(toPlayer.y) < 1.5f * std::max(enemy.size, 1.0f) && facing) {
+                m_player.hitFrom = enemy.position;
+                damagePlayer(woundDamage(enemy.damage));
+            }
         }
         if (enemy.animator.finished()) {
             enemy.attackCooldown = enemy.attackDelay;
@@ -526,153 +533,6 @@ float GameWorld::rayHitsEnemy(const glm::vec3& origin, const glm::vec3& dir, con
 }
 
 // ---------------------------------------------------------------------------------------------
-// Weapon
-// ---------------------------------------------------------------------------------------------
-
-void GameWorld::updateWeapon(const Input& input)
-{
-    const float dt = input.dt;
-    Weapon& weapon = m_weapon;
-    weapon.animator.update(dt);
-    weapon.cooldown -= dt;
-    weapon.emptyClickCooldown -= dt;
-    const float targetBob = input.moving ? (input.sprinting ? 1.4f : 1.0f) : 0.0f;
-    weapon.bobAmount += (targetBob - weapon.bobAmount) * std::min(dt * 8.0f, 1.0f);
-    weapon.bobPhase += dt * (input.sprinting ? 11.0f : 8.0f) * (input.moving ? 1.0f : 0.0f);
-    if (input.reload)
-        weapon.reloadRequested = true;
-
-    const auto startReload = [&] {
-        weapon.action = WeaponAction::Reloading;
-        weapon.actionTime = 0.0f;
-        weapon.reloadRequested = false;
-        weapon.animator.play("reload", false, 0.08f, 1.0f, true);
-    };
-
-    switch (weapon.action) {
-    case WeaponAction::Firing:
-        weapon.actionTime += dt;
-        if (weapon.animator.finished()) {
-            weapon.action = WeaponAction::Idle;
-            weapon.animator.play("idle", true, 0.1f);
-        }
-        break;
-    case WeaponAction::Reloading:
-        weapon.actionTime += dt;
-        if (weapon.actionTime >= kShellReloadTime) {
-            ++m_player.shells;
-            --m_player.reserve;
-            play("shell_insert", 0.8f, random(0.95f, 1.05f));
-            weapon.actionTime = 0.0f;
-            // Holding the trigger stops reloading after this shell.
-            if (m_player.shells >= kMagazineSize || m_player.reserve <= 0 || input.fire) {
-                weapon.action = WeaponAction::Idle;
-                weapon.cooldown = 0.0f;
-                weapon.animator.play("idle", true, 0.1f);
-            }
-            else {
-                weapon.animator.play("reload", false, 0.05f, 1.0f, true);
-            }
-        }
-        break;
-    case WeaponAction::Idle:
-        break;
-    }
-
-    if (weapon.action == WeaponAction::Reloading || weapon.cooldown > 0.0f)
-        return;
-    if (input.fire) {
-        if (m_player.shells > 0) {
-            fire(input);
-        }
-        else if (m_player.reserve > 0) {
-            startReload();
-        }
-        else if (weapon.emptyClickCooldown <= 0.0f) {
-            play("shotgun_empty", 0.8f);
-            weapon.emptyClickCooldown = 0.45f;
-            showMessage("Out of shells");
-        }
-    }
-    else if (weapon.reloadRequested || (m_player.shells == 0 && m_player.reserve > 0)) {
-        if (m_player.shells < kMagazineSize && m_player.reserve > 0)
-            startReload();
-        else
-            weapon.reloadRequested = false;
-    }
-}
-
-void GameWorld::fire(const Input& input)
-{
-    Weapon& weapon = m_weapon;
-    --m_player.shells;
-    weapon.cooldown = kFireInterval;
-    weapon.action = WeaponAction::Firing;
-    weapon.actionTime = 0.0f;
-    weapon.animator.play("fire", false, 0.0f, 1.0f, true);
-    play("shotgun_fire", 1.0f, random(0.96f, 1.04f));
-    m_delayedSounds.push_back({ 0.32f, "shotgun_pump", 0.75f });
-    m_recoil += 4.5f;
-    // Everyone nearby hears it.
-    alertNearby(input.eye, kHearingRange);
-
-    const glm::vec3 forward = glm::normalize(input.forward);
-    const glm::vec3 right = glm::normalize(glm::cross(forward, std::abs(forward.y) > 0.99f ? glm::vec3(1, 0, 0) : kUp));
-    const glm::vec3 up = glm::cross(right, forward);
-    const float spread = std::tan(glm::radians(kSpreadDegrees));
-    std::vector<float> damage(m_entities.size(), 0.0f);
-    bool impactPlayed = false;
-    for (int pellet = 0; pellet < kPellets; ++pellet) {
-        // Uniform over the cone's cross-section.
-        const float radius = spread * std::sqrt(random(0.0f, 1.0f));
-        const float angle = random(0.0f, 2.0f * kPi);
-        const glm::vec3 dir = glm::normalize(forward + right * (radius * std::cos(angle)) + up * (radius * std::sin(angle)));
-
-        float wallDistance = kShotRange;
-        glm::vec3 normal(0.0f, 1.0f, 0.0f);
-        const bool wall = m_physics.castRay(input.eye, dir, kShotRange, wallDistance, &normal);
-        int target = -1;
-        float targetDistance = wallDistance;
-        for (size_t i = 0; i < m_entities.size(); ++i) {
-            const Entity& entity = m_entities[i];
-            if (entity.kind != Entity::Kind::Enemy || entity.state == EnemyState::Dead)
-                continue;
-            const float t = rayHitsEnemy(input.eye, dir, entity);
-            if (t >= 0.0f && t < targetDistance) {
-                target = static_cast<int>(i);
-                targetDistance = t;
-            }
-        }
-        if (target >= 0) {
-            const Entity& enemy = m_entities[target];
-            const glm::vec3 point = input.eye + dir * targetDistance;
-            const float falloff = std::clamp((targetDistance - 6.0f) / 24.0f, 0.0f, 1.0f);
-            float amount = kPelletDamageNear + (kPelletDamageFar - kPelletDamageNear) * falloff;
-            if (point.y > enemy.position.y + 1.55f)
-                amount *= 1.6f; // head
-            damage[target] += amount;
-            spawnParticles(point, -dir, glm::vec3(0.45f, 0.03f, 0.02f), 4, 2.5f, 0.06f, 0.5f, true);
-        }
-        else if (wall) {
-            const glm::vec3 point = input.eye + dir * wallDistance + normal * 0.02f;
-            spawnParticles(point, normal, glm::vec3(1.0f, 0.72f, 0.3f), 3, 4.0f, 0.025f, 0.25f, true);
-            spawnParticles(point, normal, glm::vec3(0.5f, 0.48f, 0.45f), 2, 1.0f, 0.07f, 0.6f, false);
-            if (!impactPlayed) {
-                playAt("impact", point, 0.6f, random(0.8f, 1.2f));
-                impactPlayed = true;
-            }
-        }
-    }
-    for (size_t i = 0; i < damage.size(); ++i) {
-        if (damage[i] <= 0.0f)
-            continue;
-        m_player.hitMarker = 1.0f;
-        playAt("flesh_hit", m_entities[i].position + glm::vec3(0.0f, 1.2f, 0.0f), 0.9f, random(0.9f, 1.1f));
-        damageEnemy(m_entities[i], damage[i]);
-    }
-}
-
-// ---------------------------------------------------------------------------------------------
 // Pickups and the exit
 // ---------------------------------------------------------------------------------------------
 
@@ -695,21 +555,24 @@ void GameWorld::updatePickups(const Input& input)
                 }
                 continue;
             }
-            m_player.health = std::min(kMaxHealth, m_player.health + pickup.amount);
+            // Patches up whole wounds: one per 25 of the medkit's amount.
+            const int wounds = std::max(1, static_cast<int>(std::lround(pickup.amount / 25.0f)));
+            m_player.health = std::min(kMaxHealth, m_player.health + wounds * kMaxHealth / kWounds + 0.01f);
             play("pickup_health", 0.8f);
-            showMessage("+" + std::to_string(static_cast<int>(pickup.amount)) + " health");
+            showMessage(wounds == 1 ? "Patched up a wound" : "Patched up " + std::to_string(wounds) + " wounds");
         }
         else {
-            if (m_player.reserve >= kMaxReserve) {
+            int added = 0;
+            addShells(static_cast<int>(pickup.amount), added);
+            if (added == 0) {
                 if (m_pickupMessageCooldown <= 0.0f) {
                     showMessage("Can't carry more shells");
                     m_pickupMessageCooldown = 3.0f;
                 }
                 continue;
             }
-            m_player.reserve = std::min(kMaxReserve, m_player.reserve + static_cast<int>(pickup.amount));
             play("pickup_ammo", 0.8f);
-            showMessage("+" + std::to_string(static_cast<int>(pickup.amount)) + " shells");
+            showMessage("+" + std::to_string(added) + " shells");
         }
         pickup.active = false;
     }
@@ -812,6 +675,11 @@ void GameWorld::updateParticles(float dt)
         particle.life -= dt;
     }
     std::erase_if(m_particles, [](const Particle& p) { return p.life <= 0.0f; });
+
+    updateDebris(dt);
+    for (Tracer& tracer : m_tracers)
+        tracer.life -= dt;
+    std::erase_if(m_tracers, [](const Tracer& t) { return t.life <= 0.0f; });
 }
 
 void GameWorld::playAt(const std::string& sound, const glm::vec3& position, float volume, float pitch)
@@ -847,11 +715,17 @@ void GameWorld::addModel(const GameModel& model, Animator& animator, const glm::
     bool castShadow, std::vector<DynamicInstance>& out, int tintedNode)
 {
     animator.evaluate(m_nodeMatrices);
-    for (size_t n = 0; n < model.data.nodes.size() && n < m_nodeMatrices.size(); ++n) {
+    emitNodes(model, m_nodeMatrices, world, tint, castShadow, out, tintedNode);
+}
+
+void GameWorld::emitNodes(const GameModel& model, const std::vector<glm::mat4>& nodeMatrices, const glm::mat4& world,
+    const glm::vec3& tint, bool castShadow, std::vector<DynamicInstance>& out, int tintedNode)
+{
+    for (size_t n = 0; n < model.data.nodes.size() && n < nodeMatrices.size(); ++n) {
         const int mesh = model.data.nodes[n].mesh;
         if (mesh < 0 || mesh >= static_cast<int>(model.meshModels.size()))
             continue;
-        const glm::mat4 matrix = world * m_nodeMatrices[n];
+        const glm::mat4 matrix = world * nodeMatrices[n];
         // Parts scaled away (the muzzle flash between shots) are not drawn.
         const float size = std::max({ glm::length(glm::vec3(matrix[0])), glm::length(glm::vec3(matrix[1])),
             glm::length(glm::vec3(matrix[2])) });
@@ -903,12 +777,24 @@ void GameWorld::collectDrawables(const glm::mat4& cameraWorld, std::vector<Dynam
         }
     }
 
-    const GameModel& shotgun = m_assets.model(GameModelId::Shotgun);
-    if (m_player.alive && shotgun.valid()) {
-        const Weapon& weapon = m_weapon;
-        const glm::vec3 bob(std::sin(weapon.bobPhase) * 0.012f * weapon.bobAmount,
-            -std::abs(std::cos(weapon.bobPhase)) * 0.014f * weapon.bobAmount, 0.0f);
-        addModel(shotgun, m_weapon.animator, cameraWorld * glm::translate(glm::mat4(1.0f), bob), glm::vec3(1.0f),
-            false, out);
+    if (const std::optional<size_t> cube = m_assets.cube()) {
+        for (const Tracer& tracer : m_tracers) {
+            const glm::vec3 delta = tracer.to - tracer.from;
+            const float length = glm::length(delta);
+            if (length < 0.05f)
+                continue;
+            const glm::vec3 z = delta / length;
+            const glm::vec3 x = glm::normalize(glm::cross(std::abs(z.y) > 0.99f ? glm::vec3(1, 0, 0) : kUp, z));
+            const glm::vec3 y = glm::cross(z, x);
+            DynamicInstance& part = out.emplace_back();
+            part.instance.modelIndex = *cube;
+            part.instance.position = (tracer.from + tracer.to) * 0.5f;
+            part.instance.color = glm::vec3(1.0f, 0.85f, 0.45f);
+            part.transform = glm::mat4(glm::vec4(x * 0.008f, 0.0f), glm::vec4(y * 0.008f, 0.0f), glm::vec4(delta, 0.0f),
+                glm::vec4(part.instance.position, 1.0f));
+            part.castShadow = false;
+        }
     }
+
+    collectArms(cameraWorld, out);
 }
