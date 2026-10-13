@@ -106,7 +106,7 @@ struct Editor::CommandApi {
     struct Param {
         const char* name;
         // vec3, vec2or3, number, integer, string, strings, boolean, object, points2, points3, faces, materials,
-        // slots, mouse (view_mouse steps), or enum:a|b|c
+        // slots, mouse (view_mouse steps), connections (entity outputs), or enum:a|b|c
         const char* type;
         const char* description;
         bool required = false;

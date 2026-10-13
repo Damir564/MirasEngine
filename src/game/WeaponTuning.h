@@ -1,7 +1,7 @@
 #pragma once
 #include "Arms.h"
 
-// Weapon feel and handling, editable in weapon_tuning.json in the config folder (%APPDATA%\MirasEngine).
+// Weapon feel and handling, editable in data/weapon_tuning.json (source: assets/data/).
 // The file is read at every level start and restart, so changes show after "Restart Level"; missing keys
 // are written back with these defaults. Sections: "sway", "pistol", "shotgun", "hands", "zones",
 // "cancelWindows" (see ArmsConfig in Arms.h for the handling values).

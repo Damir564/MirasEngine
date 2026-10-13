@@ -525,10 +525,10 @@ void Editor::drawArmsPosesPanel()
     if (ImGui::Button("Save")) {
         if (saveArmsPoses(m_armsPoses)) {
             m_armsPosesSaved = m_armsPoses;
-            setStatus("Saved " + configPath("arms_poses.json"));
+            setStatus("Saved " + dataPath("arms_poses.json"));
         }
         else {
-            setStatus("Can't write " + configPath("arms_poses.json"), true);
+            setStatus("Can't write " + dataPath("arms_poses.json"), true);
         }
     }
     ImGui::SameLine();

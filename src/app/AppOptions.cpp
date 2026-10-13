@@ -82,6 +82,10 @@ AppOptions parseAppOptions(int argc, char** argv)
             if (const char* value = takeValue(argc, argv, i, arg, "a script path"))
                 options.scriptPath = value;
         }
+        else if (arg == "--test") {
+            if (const char* value = takeValue(argc, argv, i, arg, "a test script path"))
+                options.testPath = value;
+        }
         else if (arg == "--settings") {
             if (const char* value = takeValue(argc, argv, i, arg, "a settings path"))
                 options.settingsPath = value;
@@ -118,6 +122,7 @@ void showUsage(const char* executableName)
         "  --mute                   No sound\n"
         "  --scene <path>           Editor: open this .scn at startup; game: use it as the level\n"
         "  --script <path>          Editor: run this command script once the scene has loaded\n"
+        "  --test <path>            Editor: run a test script (commands + expect lines), print PASS/FAIL, quit\n"
         "  --settings <path>        Load and save graphics settings here instead of %APPDATA%\\MirasEngine\\settings.json\n"
         "  --mcp-port <N>           Editor: MCP server port on 127.0.0.1 (default 47800, 0 = off)\n"
         "  --validation             Enable the Vulkan validation layers\n"

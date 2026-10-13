@@ -165,8 +165,11 @@ void Game::failLoading(const std::string& message)
     m_scenes.clear();
     m_error = message;
     setState(State::MainMenu);
-    if (m_bot.enabled)
+    if (m_bot.enabled) {
+        LOG_ERROR("[AUTOPLAY] RESULT: FAIL (" << message << ")\n");
+        m_exitCode = 1;
         m_quitRequested = true;
+    }
 }
 
 void Game::startLevel()
@@ -251,6 +254,8 @@ void Game::spawnPlayer(const SpawnInfo* start)
     m_camera.pitch = 0.0f;
     m_eyeHeight = kEyeHeight;
     m_camera.position = eyePosition();
+    m_eyeFrom = m_eyeTo = m_camera.position;
+    m_tickTime = 0.0f;
     m_jumpRequested = false;
     m_presses = {};
     m_jacket = 0.0f;
@@ -424,13 +429,32 @@ void Game::updateReloadKey(float dt)
 
 void Game::update(float dt)
 {
-    // Long hitches (loading, window drags) must not turn into one huge simulation step.
+    // Long hitches (loading, window drags) must not turn into a long burst of ticks.
     dt = std::min(dt, 0.1f);
     m_stateTime += dt;
-    switch (m_state) {
-    case State::Loading:
+    const auto simulating = [this] {
+        return m_state == State::Playing || m_state == State::Dead || m_state == State::Complete;
+    };
+    if (m_state == State::Loading)
         updateLoading(dt);
-        break;
+    if (!simulating()) {
+        m_jumpRequested = false;
+        m_presses = {};
+        return;
+    }
+    if (m_bot.enabled)
+        ++m_bot.frames;
+    // Presses wait for the next tick when a frame runs none (frame rates above 60).
+    m_tickTime += dt;
+    while (m_tickTime >= kTickSeconds && simulating() && !m_quitRequested) {
+        m_tickTime -= kTickSeconds;
+        tick(kTickSeconds);
+    }
+}
+
+void Game::tick(float dt)
+{
+    switch (m_state) {
     case State::Playing:
         if (m_bot.enabled)
             updateBot(dt);
@@ -457,6 +481,8 @@ void Game::update(float dt)
     }
     m_jumpRequested = false;
     m_presses = {};
+    m_eyeFrom = m_eyeTo;
+    m_eyeTo = m_camera.position;
 }
 
 void Game::movePlayer(float dt)
@@ -544,7 +570,10 @@ void Game::updateWorld(float dt, bool controls)
 
 void Game::fillFrame(FrameInput& frame)
 {
-    const Camera view = viewCamera();
+    Camera view = viewCamera();
+    const float blend = tickBlend();
+    if (m_levelActive)
+        view.position = glm::mix(m_eyeFrom, m_eyeTo, blend);
     frame.models = &m_models;
     frame.view = getView(view);
     frame.proj = getProjection(frame.windowWidth, frame.windowHeight, kCameraNearPlane, m_settings.viewDistance,
@@ -557,7 +586,7 @@ void Game::fillFrame(FrameInput& frame)
     frame.hideEntities = true;
     m_drawables.clear();
     if (m_levelActive)
-        m_world.collectDrawables(glm::inverse(frame.view), m_drawables);
+        m_world.collectDrawables(glm::inverse(frame.view), blend, m_drawables);
     frame.dynamicInstances = m_drawables;
 }
 
@@ -569,7 +598,6 @@ void Game::updateBot(float dt)
 {
     Bot& bot = m_bot;
     bot.time += dt;
-    ++bot.frames;
     bot.move = glm::vec3(0.0f);
     bot.fire = false;
     bot.pump = false;
@@ -592,7 +620,8 @@ void Game::updateBot(float dt)
             restartLevel();
         }
         else {
-            LOG_INFO("[AUTOPLAY] RESULT: failed (died 3 times)\n");
+            LOG_INFO("[AUTOPLAY] RESULT: FAIL (died 3 times)\n");
+            m_exitCode = 1;
             m_quitRequested = true;
         }
         return;
@@ -600,7 +629,9 @@ void Game::updateBot(float dt)
     if (m_state == State::Complete) {
         if (m_stateTime < 1.0f)
             return;
-        LOG_INFO("[AUTOPLAY] RESULT: level complete in " << m_world.levelTime() << " s, " << m_world.enemiesKilled()
+        const bool allKilled = m_world.enemiesKilled() == m_world.enemiesTotal();
+        m_exitCode = allKilled ? 0 : 1;
+        LOG_INFO("[AUTOPLAY] RESULT: " << (allKilled ? "PASS" : "FAIL") << " level complete in " << m_world.levelTime() << " s, " << m_world.enemiesKilled()
             << "/" << m_world.enemiesTotal() << " enemies, health " << m_world.player().health << ", "
             << bot.teleports << " teleports, " << bot.restarts << " restarts, " << bot.shots << " shots, "
             << bot.pumps << " pumps, " << arms.shotgun.tube << " in the tube + " << shellsCarried
@@ -609,7 +640,8 @@ void Game::updateBot(float dt)
         return;
     }
     if (bot.time > kBotTimeLimit) {
-        LOG_INFO("[AUTOPLAY] RESULT: failed (time limit, " << m_world.enemiesKilled() << "/" << m_world.enemiesTotal()
+        m_exitCode = 1;
+        LOG_INFO("[AUTOPLAY] RESULT: FAIL (time limit, " << m_world.enemiesKilled() << "/" << m_world.enemiesTotal()
             << " enemies killed)\n");
         m_quitRequested = true;
         return;

@@ -106,6 +106,7 @@
   game/GameSounds.cpp
   game/GameWorld.h
   game/GameWorld.cpp
+  game/GameLogic.cpp
   game/GameArms.cpp
   game/Arms.h
   game/Arms.cpp
@@ -139,7 +140,9 @@ if (POLICY CMP0141 AND MSVC)
 endif()
 
 target_compile_definitions(engine PRIVATE
-    VK_NO_PROTOTYPES    
+    # Game data edited in the editor is also saved here (engine/ConfigPaths.cpp), so builds don't overwrite it.
+    MIRAS_SOURCE_ASSETS_DIR="${CMAKE_SOURCE_DIR}/assets"
+    VK_NO_PROTOTYPES
     VULKAN_HPP_NO_EXCEPTIONS
     VULKAN_HPP_DISPATCH_LOADER_DYNAMIC
     IMGUI_IMPL_VULKAN_NO_PROTOTYPES

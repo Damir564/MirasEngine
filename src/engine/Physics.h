@@ -1,6 +1,9 @@
 #pragma once
+#include <cstdint>
 #include <memory>
+#include <span>
 #include <glm/glm.hpp>
+#include <glm/gtc/quaternion.hpp>
 
 class ModelManager;
 namespace JPH { class CharacterVirtual; }
@@ -15,8 +18,11 @@ public:
     PhysicsWorld& operator=(const PhysicsWorld&) = delete;
 
     // Replaces all static colliders with the visible instances of the scene (not game entity markers), each
-    // shaped by its ModelInstance::collision.
-    void buildStaticScene(ModelManager& models);
+    // shaped by its ModelInstance::collision. Instances whose ModelInstance::id is in `movable` (sorted) get a
+    // kinematic body instead, placed with moveBody().
+    void buildStaticScene(ModelManager& models, std::span<const uint64_t> movable = {});
+    // Places a movable instance's body (its ModelInstance position and rotation as the game moves it).
+    void moveBody(uint64_t instanceId, const glm::vec3& position, const glm::quat& rotation);
     // Removes the colliders and every character.
     void clear();
 

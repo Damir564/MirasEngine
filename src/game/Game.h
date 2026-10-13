@@ -1,4 +1,5 @@
 #pragma once
+#include <algorithm>
 #include <memory>
 #include <string>
 #include <vector>
@@ -23,6 +24,9 @@ public:
     struct PlayInEditor {};
 
     static constexpr const char* kDefaultLevel = "lvl01.scn";
+    // The level simulates in fixed steps of this length, whatever the frame rate; frames draw between the
+    // last two steps.
+    static constexpr float kTickSeconds = 1.0f / 60.0f;
 
     explicit Game(const EngineContext& engine, std::string levelPath = kDefaultLevel);
     Game(const EngineContext& engine, PlayInEditor);
@@ -38,6 +42,8 @@ public:
     void drawUi() override;
     void fillFrame(FrameInput& frame) override;
     bool quitRequested() const override { return m_quitRequested; }
+    // --autoplay: 1 when the bot failed the level (died, time limit, not every enemy killed, load error).
+    int exitCode() const override { return m_exitCode; }
     ModeRequest takeModeRequest() override;
 
 private:
@@ -69,6 +75,10 @@ private:
     void onReloadKey(bool down);
     void updateReloadKey(float dt);
     void updateWorld(float dt, bool controls);
+    // One fixed step of the level (Playing, Dead, Complete): bot, player, world. Consumes the key presses.
+    void tick(float dt);
+    // How far the frame is between the last two ticks, 0..1.
+    float tickBlend() const { return std::clamp(m_tickTime / kTickSeconds, 0.0f, 1.0f); }
     void returnToMainMenu();
     void stopPlayInEditor();
     glm::vec3 eyePosition() const;
@@ -109,6 +119,7 @@ private:
     std::string m_error;
     float m_loadingStallTime = 0.0f;
     bool m_quitRequested = false;
+    int m_exitCode = 0;
     bool m_playInEditor = false;
     bool m_levelActive = false; // startLevel() ran and endLevel() didn't yet
     ModeRequest m_modeRequest = ModeRequest::None;
@@ -124,6 +135,9 @@ private:
     // Falling below this (off the edge of the level) kills.
     float m_killHeight = -100.0f;
     float m_eyeHeight = 1.65f;
+    float m_tickTime = 0.0f;       // frame time not simulated yet (< kTickSeconds)
+    glm::vec3 m_eyeFrom{ 0.0f };   // camera position after the second-to-last and the last tick
+    glm::vec3 m_eyeTo{ 0.0f };
     bool m_jumpRequested = false;
     // Weapon and inventory key presses since the last update (only the pressed-this-frame fields are used).
     GameWorld::Input m_presses;

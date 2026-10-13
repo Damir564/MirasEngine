@@ -1,0 +1,110 @@
+{
+    "bobSide": 0.012000000104308128,
+    "bobUp": 0.014000000432133675,
+    "cancelWindows": [
+        {
+            "beforeEvent": true,
+            "by": "Swap",
+            "task": "MagInsert"
+        },
+        {
+            "beforeEvent": false,
+            "by": "Pump",
+            "task": "Fetch"
+        },
+        {
+            "beforeEvent": true,
+            "by": "Pump",
+            "task": "InsertShell"
+        },
+        {
+            "beforeEvent": false,
+            "by": "Pump",
+            "task": "Restock"
+        },
+        {
+            "beforeEvent": false,
+            "by": "Swap",
+            "task": "PushRound"
+        }
+    ],
+    "hands": {
+        "forceReloadDropsGun": true,
+        "headMultiplier": 1.600000023841858,
+        "pickUpFrame": 0.6000000238418579,
+        "pickUpTime": 0.5,
+        "restockTime": 0.44999998807907104,
+        "roundsInHand": 6,
+        "shellsInHand": 4
+    },
+    "maxSwayDegrees": 11.5,
+    "moveTurnSway": 0.3499999940395355,
+    "pistol": {
+        "autoRack": false,
+        "autoRackDelay": 0.20000000298023224,
+        "damageFar": 22.0,
+        "damageNear": 35.0,
+        "drawTime": 0.3499999940395355,
+        "ejectFrame": 0.4000000059604645,
+        "ejectTime": 0.25,
+        "fireRate": 360.0,
+        "handoffTime": 0.25,
+        "insertFrame": 0.699999988079071,
+        "insertTime": 0.44999998807907104,
+        "magazineCapacity": 8,
+        "quickEjectTime": 0.11999999731779099,
+        "rackFrame": 0.5,
+        "rackTime": 0.3499999940395355,
+        "recoilDegrees": 3.0,
+        "roundInsertFrame": 0.6000000238418579,
+        "roundInsertTime": 0.30000001192092896,
+        "stowTime": 0.30000001192092896
+    },
+    "shotgun": {
+        "pelletDamageFar": 4.0,
+        "pelletDamageNear": 13.0,
+        "pumpEjectFrame": 0.5,
+        "pumpTime": 0.4000000059604645,
+        "pumpWhileDualWielding": false,
+        "recoilDegrees": 3.0,
+        "shellInsertFrame": 0.6700000166893005,
+        "shellInsertTime": 0.30000001192092896,
+        "tubeSize": 5
+    },
+    "sprintBob": 2.200000047683716,
+    "stepSwayPitchDegrees": 0.9200000166893005,
+    "stepSwayYawDegrees": 1.2599999904632568,
+    "sway": {
+        "bobSide": 0.012000000104308128,
+        "bobUp": 0.014000000432133675,
+        "maxSwayDegrees": 11.5,
+        "moveTurnSway": 0.3499999940395355,
+        "sprintBob": 2.200000047683716,
+        "stepSwayPitchDegrees": 0.9200000166893005,
+        "stepSwayYawDegrees": 1.2599999904632568,
+        "swayRecovery": 7.0,
+        "turnSway": 0.699999988079071
+    },
+    "swayRecovery": 7.0,
+    "turnSway": 0.699999988079071,
+    "zones": {
+        "bandolier": {
+            "accessTime": 0.30000001192092896,
+            "magazines": 2,
+            "rounds": 0,
+            "shells": 8
+        },
+        "jacketPocket": {
+            "accessTime": 0.800000011920929,
+            "magazines": 2,
+            "rounds": 0,
+            "shells": 16
+        },
+        "rightPocket": {
+            "accessTime": 0.6000000238418579,
+            "magazines": 1,
+            "rounds": 30,
+            "shells": 0
+        }
+    }
+}

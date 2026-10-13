@@ -3,12 +3,15 @@
 #include <cstdint>
 #include <functional>
 #include <random>
+#include <span>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 #include <glm/glm.hpp>
 #include "engine/Animation.h"
 #include "engine/Audio.h"
+#include "engine/EntityTypes.h"
 #include "ArmsPoses.h"
 #include "GameAssets.h"
 #include "WeaponTuning.h"
@@ -26,17 +29,21 @@ struct SpawnInfo {
     float yaw = 0.0f;   // radians; the entity faces (sin yaw, 0, cos yaw)
     std::string params; // "key=value" pairs
     glm::vec3 color{ 1.0f }; // the scene object's tint
+    std::string outputs; // EntityConnection text (ModelInstance::entityOutputs)
 };
 
 enum class EnemyState { Idle, Chase, Attack, Hurt, Dead };
 
 struct Entity {
-    enum class Kind { Enemy, HealthPack, AmmoPack, RoundsPack, Exit };
+    enum class Kind { Enemy, HealthPack, AmmoPack, RoundsPack, Exit, Trigger, Relay, Timer, Counter, Door };
     uint32_t id = 0;
     Kind kind = Kind::Enemy;
     std::string name;
     glm::vec3 position{ 0.0f };
     float yaw = 0.0f;
+    // Where it was before the last tick: frames draw it between that and the current pose.
+    glm::vec3 previousPosition{ 0.0f };
+    float previousYaw = 0.0f;
     const GameModel* model = nullptr;
     Animator animator;
     bool active = true; // pickups: not taken yet
@@ -71,6 +78,30 @@ struct Entity {
     // Pickups and the exit
     float amount = 0.0f;
     std::string nextLevel;
+
+    // Inputs and outputs (GameLogic.cpp)
+    std::vector<EntityConnection> outputs;
+    bool enabled = true;          // trigger, relay; timer: running
+    bool once = false;            // trigger: disables itself after on_enter; timer: not repeating
+    bool inside = false;          // trigger: the player was inside last tick
+    glm::vec3 halfSize{ 1.0f };   // trigger: half extents in its own frame (y measured from its center)
+    float interval = 1.0f;        // timer
+    float timeLeft = 0.0f;        // timer: until the next on_timer
+    int count = 0;                // counter
+    int target = 1;               // counter
+
+    // Door: the scene objects of its group (indices into the scene's instances, stable while playing) and how
+    // far it is open, 0..1.
+    std::string group;
+    std::vector<size_t> parts;
+    float openness = 0.0f;
+    float previousOpenness = 0.0f;
+    bool opening = false;
+    bool locked = false;          // the player can't open it (inputs still can)
+    bool usable = true;           // the player opens it with the use key
+    float moveTime = 1.0f;
+    float swing = 0.0f;           // radians about the vertical through its position; 0 = it slides
+    glm::vec3 slide{ 0.0f };      // when open, in its own frame
 };
 
 struct PlayerState {
@@ -98,6 +129,10 @@ public:
     void spawn(const SpawnInfo& info);
     // Spawns every entity object of the scene; the player start (if any) is returned instead of spawned.
     bool spawnFromScene(const std::vector<ModelInstance>& instances, SpawnInfo& playerStart);
+    // Scene objects the game moves (door groups), sorted ModelInstance ids: PhysicsWorld gives them kinematic
+    // bodies, and the renderer skips them (hiddenInstanceIds()) while the world draws them where they are.
+    static std::vector<uint64_t> movableInstanceIds(const std::vector<ModelInstance>& instances);
+    std::span<const uint64_t> hiddenInstanceIds() const { return m_movableIds; }
     // Removes every entity and effect and resets the player.
     void clear();
 
@@ -133,8 +168,9 @@ public:
         bool restockHeld = false;   // ...and it goes on while R stays down
     };
     void update(const Input& input);
-    // Entities, effects and the weapon (in front of the camera) for this frame.
-    void collectDrawables(const glm::mat4& cameraWorld, std::vector<DynamicInstance>& out);
+    // Entities, effects and the weapon (in front of the camera) for this frame; blend (0..1) places
+    // entities between their pose before and after the last update.
+    void collectDrawables(const glm::mat4& cameraWorld, float blend, std::vector<DynamicInstance>& out);
 
     const PlayerState& player() const { return m_player; }
     // Upward camera kick from firing, in degrees; Game adds it to the pitch and it recovers by itself.
@@ -181,14 +217,52 @@ public:
 private:
     using SpawnFunction = std::function<void(GameWorld&, const SpawnInfo&)>;
     void registerEntity(const std::string& type, SpawnFunction function);
+    // GameModelId::Count: no model (logic entities).
     Entity& addEntity(Entity::Kind kind, const SpawnInfo& info, GameModelId model);
     void spawnEnemy(const SpawnInfo& info);
     void spawnPickup(const SpawnInfo& info, Entity::Kind kind);
     void spawnExit(const SpawnInfo& info);
 
+    // GameLogic.cpp: logic entities and the I/O between entities. Outputs queue their connections' inputs;
+    // updateLogic() delivers the due ones in the order they were fired, every tick.
+    void spawnLogic(const SpawnInfo& info, Entity::Kind kind);
+    void fireOutput(const Entity& source, std::string_view output);
+    void updateLogic(const Input& input);
+    void receiveInput(Entity& entity, std::string_view input);
+    void spawnDoor(const SpawnInfo& info);
+    // Finds each door's parts among the scene's instances and places their bodies.
+    void attachDoorParts(const std::vector<ModelInstance>& instances);
+    // Starts the door moving towards open or closed (nothing when it already is or is heading there).
+    void moveDoor(Entity& door, bool open);
+    void updateDoor(Entity& door, float dt);
+    // Door motion at `openness`, applied on top of a part's own transform.
+    glm::mat4 doorMotion(const Entity& door, float openness) const;
+    void placeDoorParts(const Entity& door);
+    // The usable door the player stands at and faces, -1 when none.
+    int doorInReach() const;
+    // The use key on a door: opens or closes it, unless it is locked.
+    void useDoor(Entity& door);
+    // Door parts where they are this frame, drawn instead of the hidden scene objects.
+    void collectDoors(float blend, std::vector<DynamicInstance>& out) const;
+    // Opens every exit (an unlock input, or the last enemy dying when the exit needs a clear level).
+    void unlockExit();
+    bool m_exitNeedsClear = true;
+    std::vector<uint64_t> m_movableIds;
+    glm::vec3 m_lastEye{ 0.0f };
+    glm::vec3 m_lastForward{ 0.0f, 0.0f, -1.0f };
+    struct PendingInput {
+        float delay = 0.0f;
+        std::string source; // for the log
+        std::string target;
+        std::string input;
+    };
+    std::vector<PendingInput> m_pendingInputs;
+
     void updateEnemy(Entity& enemy, const Input& input);
     void setEnemyState(Entity& enemy, EnemyState state);
     void damageEnemy(Entity& enemy, float amount);
+    // The enemy comes for the player (at their last known feet); fires on_alert the first time.
+    void alertEnemy(Entity& enemy);
     bool lineOfSight(const glm::vec3& from, const glm::vec3& to) const;
     void alertNearby(const glm::vec3& position, float radius);
     void updatePickups(const Input& input);

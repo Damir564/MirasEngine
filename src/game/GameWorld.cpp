@@ -81,6 +81,11 @@ GameWorld::GameWorld(ModelManager& models, PhysicsWorld& physics, AudioSystem& a
     registerEntity(kExitEntity, [](GameWorld& world, const SpawnInfo& info) { world.spawnExit(info); });
     // The renderer lights the scene with light objects itself; there is nothing to spawn.
     registerEntity(kLightEntity, [](GameWorld&, const SpawnInfo&) {});
+    const std::pair<const char*, Entity::Kind> logic[] = { { kTriggerEntity, Entity::Kind::Trigger },
+        { kRelayEntity, Entity::Kind::Relay }, { kTimerEntity, Entity::Kind::Timer },
+        { kCounterEntity, Entity::Kind::Counter } };
+    for (const auto& [type, kind] : logic)
+        registerEntity(type, [kind](GameWorld& world, const SpawnInfo& info) { world.spawnLogic(info, kind); });
 }
 
 void GameWorld::registerEntity(const std::string& type, SpawnFunction function)
@@ -109,7 +114,7 @@ bool GameWorld::spawnFromScene(const std::vector<ModelInstance>& instances, Spaw
         if (instance.entity.empty())
             continue;
         SpawnInfo info{ instance.entity, instance.name, instance.position, glm::radians(instance.rotation.y),
-            instance.entityParams, instance.color };
+            instance.entityParams, instance.color, instance.entityOutputs };
         if (instance.entity == kPlayerStartEntity) {
             if (!foundStart)
                 playerStart = info;
@@ -129,10 +134,13 @@ Entity& GameWorld::addEntity(Entity::Kind kind, const SpawnInfo& info, GameModel
     entity.id = m_nextEntityId++;
     entity.kind = kind;
     entity.name = info.name;
-    entity.position = info.position;
-    entity.yaw = info.yaw;
-    const GameModel& gameModel = m_assets.model(model);
-    entity.model = gameModel.valid() ? &gameModel : nullptr;
+    entity.position = entity.previousPosition = info.position;
+    entity.yaw = entity.previousYaw = info.yaw;
+    entity.outputs = parseEntityConnections(info.outputs);
+    if (model != GameModelId::Count) {
+        const GameModel& gameModel = m_assets.model(model);
+        entity.model = gameModel.valid() ? &gameModel : nullptr;
+    }
     entity.animator.reset(entity.model ? &entity.model->data : nullptr);
     m_entities.push_back(std::move(entity));
     return m_entities.back();
@@ -187,6 +195,7 @@ void GameWorld::clear()
     m_particles.clear();
     m_messages.clear();
     m_delayedSounds.clear();
+    m_pendingInputs.clear();
     m_player = {};
     m_enemiesTotal = 0;
     m_enemiesKilled = 0;
@@ -215,6 +224,10 @@ void GameWorld::clear()
 void GameWorld::update(const Input& input)
 {
     const float dt = input.dt;
+    for (Entity& entity : m_entities) {
+        entity.previousPosition = entity.position;
+        entity.previousYaw = entity.yaw;
+    }
     m_lastPlayerFeet = input.playerFeet;
     if (m_player.alive && !m_levelComplete)
         m_levelTime += dt;
@@ -260,6 +273,7 @@ void GameWorld::update(const Input& input)
         updatePickups(input);
         updateExit(input);
     }
+    updateLogic(input);
     updateParticles(dt);
 }
 
@@ -326,11 +340,20 @@ void GameWorld::alertNearby(const glm::vec3& position, float radius)
     for (Entity& enemy : m_entities) {
         if (enemy.kind != Entity::Kind::Enemy || enemy.state == EnemyState::Dead || enemy.alerted)
             continue;
-        if (glm::distance(enemy.position, position) < std::min(radius, enemy.hearingRange)) {
-            enemy.alerted = true;
-            enemy.lastSeen = m_lastPlayerFeet;
-        }
+        if (glm::distance(enemy.position, position) < std::min(radius, enemy.hearingRange))
+            alertEnemy(enemy);
     }
+}
+
+void GameWorld::alertEnemy(Entity& enemy)
+{
+    if (enemy.state == EnemyState::Dead)
+        return;
+    enemy.lastSeen = m_lastPlayerFeet;
+    if (enemy.alerted)
+        return;
+    enemy.alerted = true;
+    fireOutput(enemy, "on_alert");
 }
 
 void GameWorld::updateEnemy(Entity& enemy, const Input& input)
@@ -356,20 +379,17 @@ void GameWorld::updateEnemy(Entity& enemy, const Input& input)
     enemy.thinkTimer -= dt;
     if (enemy.thinkTimer <= 0.0f && m_player.alive) {
         enemy.thinkTimer = 0.2f;
-        if (enemy.hunter) {
-            enemy.alerted = true;
-            enemy.lastSeen = input.playerFeet;
-        }
+        if (enemy.hunter)
+            alertEnemy(enemy);
         const glm::vec3 facing = forwardFromYaw(enemy.yaw);
         const bool inView = playerDistance < 5.0f ||
             glm::dot(facing, flat(toPlayer) / std::max(playerDistance, 1e-3f)) > -0.1f;
         if (glm::length(toPlayer) < enemy.sightRange && (enemy.alerted || inView) && lineOfSight(eye, input.eye)) {
-            enemy.lastSeen = input.playerFeet;
             if (!enemy.alerted) {
-                enemy.alerted = true;
                 playAt("enemy_alert", eye, 1.0f, random(0.9f, 1.1f));
                 enemy.soundCooldown = 1.0f;
             }
+            alertEnemy(enemy);
         }
     }
 
@@ -470,8 +490,7 @@ void GameWorld::damageEnemy(Entity& enemy, float amount)
         return;
     enemy.health -= amount;
     enemy.hurtFlash = 1.0f;
-    enemy.alerted = true;
-    enemy.lastSeen = m_lastPlayerFeet;
+    alertEnemy(enemy);
     const glm::vec3 chest = enemy.position + glm::vec3(0.0f, 1.3f, 0.0f);
     if (enemy.health > 0.0f) {
         if (enemy.soundCooldown <= 0.0f) {
@@ -493,6 +512,7 @@ void GameWorld::damageEnemy(Entity& enemy, float amount)
     spawnParticles(chest, kUp, glm::vec3(0.4f, 0.02f, 0.02f), 14, 3.0f, 0.07f, 0.8f, true);
     ++m_enemiesKilled;
     LOG_INFO("[GAME] Killed " << enemy.name << " (" << m_enemiesKilled << "/" << m_enemiesTotal << ")\n");
+    fireOutput(enemy, "on_death");
     if (m_enemiesKilled >= m_enemiesTotal && !m_exitUnlocked) {
         m_exitUnlocked = true;
         play("exit_unlock", 0.8f);
@@ -610,6 +630,7 @@ bool GameWorld::collectPickup(Entity& pickup)
             return true;
     }
     pickup.active = false;
+    fireOutput(pickup, "on_pickup");
     return true;
 }
 
@@ -782,12 +803,15 @@ void GameWorld::addModel(const GameModel& model, Animator& animator, const glm::
     emitModelNodes(model, m_nodeMatrices, world, tint, castShadow, out, tintedNode);
 }
 
-void GameWorld::collectDrawables(const glm::mat4& cameraWorld, std::vector<DynamicInstance>& out)
+void GameWorld::collectDrawables(const glm::mat4& cameraWorld, float blend, std::vector<DynamicInstance>& out)
 {
     for (Entity& entity : m_entities) {
         if (!entity.model || !entity.active)
             continue;
-        const glm::mat4 world = glm::rotate(glm::translate(glm::mat4(1.0f), entity.position), entity.yaw, kUp);
+        const glm::vec3 position = glm::mix(entity.previousPosition, entity.position, blend);
+        const float yaw = approachAngle(entity.previousYaw, entity.yaw, kPi) * blend +
+            entity.previousYaw * (1.0f - blend);
+        const glm::mat4 world = glm::rotate(glm::translate(glm::mat4(1.0f), position), yaw, kUp);
         switch (entity.kind) {
         case Entity::Kind::Enemy: {
             const glm::vec3 flash = glm::mix(entity.tint, glm::vec3(1.0f, 0.35f, 0.3f), entity.hurtFlash);

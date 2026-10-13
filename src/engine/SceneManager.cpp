@@ -123,6 +123,7 @@ void SceneManager::instantiatePendingScene()
         newInst.locked = inst.locked;
         newInst.entity = inst.entity;
         newInst.entityParams = inst.entityParams;
+        newInst.entityOutputs = inst.entityOutputs;
         newInst.group = inst.group;
         newInst.collision = inst.collision;
     }

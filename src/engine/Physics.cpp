@@ -210,6 +210,7 @@ struct PhysicsWorld::Impl {
             bodies.DestroyBodies(staticBodies.data(), static_cast<int>(staticBodies.size()));
             staticBodies.clear();
         }
+        movableBodies.clear();
     }
 
     BroadPhaseLayerMap broadPhaseLayers;
@@ -217,7 +218,8 @@ struct PhysicsWorld::Impl {
     ObjectPairFilter objectPairs;
     std::unique_ptr<JPH::TempAllocatorImpl> tempAllocator;
     std::unique_ptr<JPH::PhysicsSystem> system;
-    std::vector<JPH::BodyID> staticBodies;
+    std::vector<JPH::BodyID> staticBodies;               // every scene body, the movable ones too
+    std::unordered_map<uint64_t, JPH::BodyID> movableBodies; // by ModelInstance::id
     JPH::Ref<JPH::CharacterVirtual> character;
     std::vector<JPH::Ref<JPH::CharacterVirtual>> characters; // by id; null = removed
 };
@@ -230,7 +232,7 @@ void PhysicsWorld::clear()
     m_impl->clear();
 }
 
-void PhysicsWorld::buildStaticScene(ModelManager& models)
+void PhysicsWorld::buildStaticScene(ModelManager& models, std::span<const uint64_t> movable)
 {
     clear();
     JPH::BodyInterface& bodies = m_impl->system->GetBodyInterface();
@@ -256,16 +258,19 @@ void PhysicsWorld::buildStaticScene(ModelManager& models)
         if (instance.scale != glm::vec3(1.0f))
             shape = new JPH::ScaledShape(shape, toJolt(instance.scale));
 
+        const bool moves = std::binary_search(movable.begin(), movable.end(), instance.id);
         const glm::quat rotation = glm::quat(glm::radians(instance.rotation));
         JPH::BodyCreationSettings settings(shape, JPH::RVec3(toJolt(instance.position)),
             JPH::Quat(rotation.x, rotation.y, rotation.z, rotation.w).Normalized(),
-            JPH::EMotionType::Static, Layers::NonMoving);
+            moves ? JPH::EMotionType::Kinematic : JPH::EMotionType::Static, moves ? Layers::Moving : Layers::NonMoving);
         JPH::Body* body = bodies.CreateBody(settings);
         if (!body) {
             std::cerr << "[Physics] Body limit reached; remaining instances have no collision\n";
             break;
         }
         m_impl->staticBodies.push_back(body->GetID());
+        if (moves)
+            m_impl->movableBodies[instance.id] = body->GetID();
     }
 
     if (!m_impl->staticBodies.empty()) {
@@ -274,6 +279,17 @@ void PhysicsWorld::buildStaticScene(ModelManager& models)
         bodies.AddBodiesFinalize(m_impl->staticBodies.data(), count, state, JPH::EActivation::DontActivate);
     }
     m_impl->system->OptimizeBroadPhase();
+}
+
+void PhysicsWorld::moveBody(uint64_t instanceId, const glm::vec3& position, const glm::quat& rotation)
+{
+    const auto found = m_impl->movableBodies.find(instanceId);
+    if (found == m_impl->movableBodies.end())
+        return;
+    // Placed, not simulated: nothing steps the physics system. Characters walking into it are pushed out by
+    // their own update.
+    m_impl->system->GetBodyInterface().SetPositionAndRotation(found->second, JPH::RVec3(toJolt(position)),
+        JPH::Quat(rotation.x, rotation.y, rotation.z, rotation.w).Normalized(), JPH::EActivation::DontActivate);
 }
 
 namespace {

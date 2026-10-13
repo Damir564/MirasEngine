@@ -103,6 +103,8 @@ struct ModelInstance {
     // ("key=value" pairs separated by spaces).
     std::string entity;
     std::string entityParams;
+    // Wires from this entity's outputs to other entities' inputs (EntityConnection, EntityTypes.h), as text.
+    std::string entityOutputs;
     // Objects with the same non-empty group name are selected, moved and copied together in the editor.
     std::string group;
     CollisionMode collision = CollisionMode::Mesh;

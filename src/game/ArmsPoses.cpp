@@ -207,13 +207,7 @@ void readSection(nlohmann::json& root, const char* name, std::span<const Field> 
 
 bool writeFile(const std::string& path, const nlohmann::json& root)
 {
-    std::ofstream out(path);
-    if (!out) {
-        LOG_ERROR("[GAME] Can't write " << path << "\n");
-        return false;
-    }
-    out << root.dump(4) << "\n";
-    return true;
+    return writeDataFile(path, root.dump(4) + "\n");
 }
 
 } // namespace
@@ -274,7 +268,7 @@ std::span<const ArmsNumberField> armsNumberFields() { return kNumbers; }
 ArmsPoses loadArmsPoses()
 {
     ArmsPoses poses;
-    const std::string path = configPath(kFileName);
+    const std::string path = dataPath(kFileName);
     nlohmann::json root = nlohmann::json::object();
     if (std::ifstream file(path); file) {
         root = nlohmann::json::parse(file, nullptr, false);
@@ -320,7 +314,7 @@ ArmsPoses loadArmsPoses()
 
 bool saveArmsPoses(const ArmsPoses& poses)
 {
-    return writeFile(configPath(kFileName), toJson(poses));
+    return writeFile(dataPath(kFileName), toJson(poses));
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -419,6 +419,7 @@ void Editor::lateUpdate(float dt)
     }
     pollMcpServer();
     pollScript();
+    pollTest();
     pumpSimulatedKeys();
     pumpSimulatedMouse();
 }
@@ -783,6 +784,7 @@ std::optional<size_t> Editor::copyInstance(int index, const glm::vec3& offset)
     created.locked = source.locked;
     created.entity = source.entity;
     created.entityParams = source.entityParams;
+    created.entityOutputs = source.entityOutputs;
     created.group = source.group;
     created.collision = source.collision;
     markSceneChanged();

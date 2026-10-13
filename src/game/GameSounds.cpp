@@ -306,6 +306,41 @@ std::vector<float> heavyDrop(float pitch, float ringLevel, uint32_t seed)
     return out;
 }
 
+// A heavy door moving: a low grinding rumble with a slow wobble, about as long as a door takes.
+std::vector<float> doorMove()
+{
+    auto out = buffer(1.0f);
+    Noise noise(301);
+    LowPass grind;
+    BandPass body;
+    for (size_t i = 0; i < out.size(); ++i) {
+        const float t = i / kRate;
+        const float wobble = 1.0f + 0.3f * std::sin(2.0f * kPi * 3.0f * t);
+        const float shape = std::min(t / 0.08f, 1.0f) * std::min((1.0f - t) / 0.2f, 1.0f);
+        out[i] = (grind.process(noise.next(), 260.0f) * 2.5f + body.process(noise.next(), 120.0f, 6.0f) * 0.6f) *
+            wobble * shape;
+    }
+    normalize(out, 0.55f);
+    return out;
+}
+
+// A door reaching its end: a dull thud with a short rattle.
+std::vector<float> doorStop()
+{
+    auto out = buffer(0.4f);
+    Noise noise(311);
+    LowPass thud;
+    Sweep body;
+    for (size_t i = 0; i < out.size(); ++i) {
+        const float t = i / kRate;
+        out[i] = thud.process(noise.next(), 600.0f) * env(t, 0.001f, 0.04f) * 2.0f +
+            body.next(95.0f, 55.0f, t / 0.15f) * env(t, 0.002f, 0.08f) * 0.8f;
+    }
+    click(out, 0.03f, 0.7f, 0.25f, 312);
+    normalize(out, 0.7f);
+    return out;
+}
+
 // A refused action: a dull, muted knock.
 std::vector<float> reject()
 {
@@ -546,6 +581,8 @@ void registerGameSounds(AudioSystem& audio)
         { "impact", impact },
         { "flesh_hit", fleshHit },
         { "exit_unlock", unlock },
+        { "door_move", doorMove },
+        { "door_stop", doorStop },
         { "level_complete", [] { return chime({ 392.0f, 523.25f, 659.25f, 783.99f, 1046.5f }, 0.13f, 0.35f, 0.4f); } },
         { "ambience", ambience },
     };

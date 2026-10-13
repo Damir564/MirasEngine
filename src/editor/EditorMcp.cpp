@@ -107,7 +107,80 @@ ScriptLine parseScriptLine(const std::string& line, int number)
     return out;
 }
 
+// Test values: numbers within 1e-3 (relative above 1), arrays element by element, objects by the expected
+// keys only (extra actual keys are fine), everything else exactly.
+bool matches(const json& actual, const json& expected)
+{
+    if (expected.is_number() && actual.is_number()) {
+        const double want = expected.get<double>();
+        return std::abs(actual.get<double>() - want) <= 1e-3 * std::max(1.0, std::abs(want));
+    }
+    if (expected.is_array() && actual.is_array()) {
+        if (expected.size() != actual.size())
+            return false;
+        for (size_t i = 0; i < expected.size(); ++i) {
+            if (!matches(actual[i], expected[i]))
+                return false;
+        }
+        return true;
+    }
+    if (expected.is_object() && actual.is_object()) {
+        for (const auto& [key, value] : expected.items()) {
+            if (!actual.contains(key) || !matches(actual[key], value))
+                return false;
+        }
+        return true;
+    }
+    return actual == expected;
+}
+
+// `a.b.2.c` into a command result; a final `size` on an array or object gives its element count.
+const json* lookup(const json& root, const std::string& path, json& scratch)
+{
+    const json* node = &root;
+    size_t start = 0;
+    while (start <= path.size()) {
+        const size_t dot = std::min(path.find('.', start), path.size());
+        const std::string part = path.substr(start, dot - start);
+        start = dot + 1;
+        if (node->is_object() && node->contains(part)) {
+            node = &(*node)[part];
+        }
+        else if (node->is_array() && !part.empty() && std::isdigit(static_cast<unsigned char>(part[0]))) {
+            const size_t index = std::stoul(part);
+            if (index >= node->size())
+                return nullptr;
+            node = &(*node)[index];
+        }
+        else if (part == "size" && start > path.size() && (node->is_array() || node->is_object())) {
+            scratch = node->size();
+            return &scratch;
+        }
+        else {
+            return nullptr;
+        }
+    }
+    return node;
+}
+
 } // namespace
+
+struct Editor::TestRun {
+    std::string name;
+    std::vector<ScriptLine> lines;
+    size_t next = 0;
+    json result;        // of the last command
+    std::string error;  // of the last command, when an `expect error=...` line follows it
+    int blockedFrames = 0;
+    int commands = 0;
+    int checks = 0;
+    int waitFrames = 0;
+};
+
+void Editor::TestRunDeleter::operator()(TestRun* test) const
+{
+    delete test;
+}
 
 const Editor::CommandApi::Command* Editor::CommandApi::find(const std::string& name)
 {
@@ -146,6 +219,11 @@ json Editor::CommandApi::schema(const Param& param)
     }
     else if (type == "strings")
         out = { { "type", "array" }, { "items", { { "type", "string" } } } };
+    else if (type == "connections")
+        out = { { "type", "array" }, { "items", { { "type", "object" }, { "properties", {
+            { "output", { { "type", "string" } } }, { "target", { { "type", "string" } } },
+            { "input", { { "type", "string" } } }, { "delay", number } } },
+            { "required", json::array({ "output", "target", "input" }) } } } };
     else if (type == "dict")
         out = { { "type", "object" } };
     else if (type == "objects")
@@ -321,6 +399,139 @@ void Editor::pollScript()
     }
     LOG_INFO("[SCRIPT] " << fileName << ": ran " << done << " commands\n");
     setStatus("Ran " + fileName + ": " + std::to_string(done) + " commands");
+}
+
+void Editor::runTest(const std::string& path)
+{
+    m_test.reset(new TestRun());
+    m_test->name = std::filesystem::path(path).filename().string();
+    const auto finish = [this](const std::string& message) {
+        LOG_ERROR("[TEST] FAIL " << m_test->name << ": " << message << "\n");
+        m_exitCode = 1;
+        m_quitRequested = true;
+        m_test.reset();
+    };
+    std::ifstream file(path);
+    if (!file) {
+        finish("cannot open the file");
+        return;
+    }
+    std::string text;
+    for (int number = 1; std::getline(file, text); ++number) {
+        try {
+            ScriptLine line = parseScriptLine(text, number);
+            if (line.command.empty())
+                continue;
+            if (line.command != "expect" && line.command != "wait" && !CommandApi::find(line.command))
+                fail("unknown command " + line.command);
+            m_test->lines.push_back(std::move(line));
+        }
+        catch (const std::exception& e) {
+            finish("line " + std::to_string(number) + ": " + e.what());
+            return;
+        }
+    }
+}
+
+void Editor::pollTest()
+{
+    if (!m_test)
+        return;
+    TestRun& test = *m_test;
+    const auto finish = [&](const std::string& failure) {
+        if (failure.empty()) {
+            LOG_INFO("[TEST] PASS " << test.name << ": " << test.commands << " commands, " << test.checks
+                << " checks\n");
+        }
+        else {
+            LOG_ERROR("[TEST] FAIL " << test.name << " " << failure << "\n");
+            m_exitCode = 1;
+        }
+        m_quitRequested = true;
+        m_test.reset();
+    };
+
+    // Commands run back to back until one needs frames to take effect (scene loading, queued keys or
+    // mouse steps, a drag in progress) or a `wait` line.
+    while (test.next < test.lines.size()) {
+        const bool blocked = editInProgress() || m_scenes.isLoading() ||
+            m_simulatedKeys.next < m_simulatedKeys.queue.size() || m_simulatedKeys.down != ImGuiKey_None ||
+            m_nextMouseStep < m_mouseSteps.size();
+        if (test.waitFrames > 0 || blocked) {
+            test.waitFrames = std::max(test.waitFrames - 1, 0);
+            if (blocked && ++test.blockedFrames > 3000)
+                finish("timed out waiting for loading or queued input");
+            return;
+        }
+        test.blockedFrames = 0;
+
+        const ScriptLine& line = test.lines[test.next++];
+        const std::string where = "line " + std::to_string(line.number) + ": ";
+        if (line.command == "wait") {
+            test.waitFrames = line.args.value("frames", 1);
+            continue;
+        }
+        if (line.command == "expect") {
+            for (const auto& [key, expected] : line.args.items()) {
+                ++test.checks;
+                if (key == "error") {
+                    if (test.error.empty()) {
+                        finish(where + "expected an error, the command succeeded");
+                        return;
+                    }
+                    if (test.error.find(expected.is_string() ? expected.get<std::string>() : expected.dump())
+                        == std::string::npos) {
+                        finish(where + "error '" + test.error + "' does not contain " + expected.dump());
+                        return;
+                    }
+                    continue;
+                }
+                json scratch;
+                const json* actual = lookup(test.result, key, scratch);
+                if (!actual && expected.is_null())
+                    continue;
+                if (!actual) {
+                    finish(where + key + " missing in " + test.result.dump().substr(0, 200));
+                    return;
+                }
+                if (!matches(*actual, expected)) {
+                    finish(where + key + " = " + actual->dump().substr(0, 200) + ", expected " + expected.dump());
+                    return;
+                }
+            }
+            continue;
+        }
+
+        const CommandApi::Command* command = CommandApi::find(line.command);
+        ++test.commands;
+        test.result = json();
+        test.error.clear();
+        updateObjectHistory();
+        try {
+            if (command->scriptable)
+                beginCommandBatch();
+            try {
+                test.result = command->run(*this, Args(line.args));
+            }
+            catch (...) {
+                if (command->scriptable)
+                    endCommandBatch(line.command);
+                throw;
+            }
+            if (command->scriptable)
+                endCommandBatch(line.command);
+        }
+        catch (const std::exception& e) {
+            const bool expected = test.next < test.lines.size() && test.lines[test.next].command == "expect" &&
+                test.lines[test.next].args.contains("error");
+            if (!expected) {
+                finish(where + line.command + ": " + e.what());
+                return;
+            }
+            test.error = e.what();
+        }
+    }
+    finish("");
 }
 
 void Editor::beginCommandBatch()

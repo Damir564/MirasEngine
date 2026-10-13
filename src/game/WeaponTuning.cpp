@@ -86,7 +86,7 @@ void readCancelWindows(nlohmann::json& root, std::vector<CancelWindow>& windows,
 WeaponTuning loadWeaponTuning()
 {
     WeaponTuning tuning;
-    const std::string path = configPath(kFileName);
+    const std::string path = dataPath(kFileName);
     nlohmann::json root = nlohmann::json::object();
     if (std::ifstream file(path); file) {
         root = nlohmann::json::parse(file, nullptr, false);
@@ -158,13 +158,8 @@ WeaponTuning loadWeaponTuning()
 
     readCancelWindows(root, arms.cancelWindows, changed);
 
-    if (changed) {
-        std::ofstream out(path);
-        if (out)
-            out << root.dump(4) << "\n";
-        else
-            LOG_ERROR("[GAME] Can't write " << path << "\n");
-    }
+    if (changed)
+        writeDataFile(path, root.dump(4) + "\n");
     return tuning;
 }
 

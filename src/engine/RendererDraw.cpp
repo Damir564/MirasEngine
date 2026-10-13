@@ -188,6 +188,8 @@ void Renderer::cullAndBatch(const FrameInput& input, const glm::mat4& viewProj, 
         res.shadowMask = 0;
 
         if (!inst.visible || (input.hideEntities && !dynamic && !inst.entity.empty())) return;
+        if (!dynamic && !input.hiddenInstanceIds.empty() &&
+            std::binary_search(input.hiddenInstanceIds.begin(), input.hiddenInstanceIds.end(), inst.id)) return;
 
         GPUModel* gpuModel = models.getModel(inst.modelIndex);
         if (!gpuModel || !gpuModel->isValid()) return;

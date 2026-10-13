@@ -51,6 +51,7 @@ const EntityParamInfo kRoundsParams[] = {
 };
 const EntityParamInfo kExitParams[] = {
     { "next", "Next level", Kind::Text, 0.0f, 0.0f, 0.0f, "", "The .scn file to play after this one (next to the executable); empty ends the game" },
+    { "needs_clear", "Needs clear", Kind::Toggle, 1.0f, 0.0f, 1.0f, "", "Opens once every enemy is dead; off: only an unlock input opens it" },
 };
 const EntityParamInfo kLightParams[] = {
     { "intensity", "Intensity", Kind::Number, 15.0f, 0.0f, 500.0f, "%.1f", "Brightness; it falls off with the square of the distance. The object's color is the light's color" },
@@ -61,23 +62,88 @@ const EntityParamInfo kLightParams[] = {
     { "shadows", "Shadows", Kind::Toggle, 0.0f, 0.0f, 1.0f, "", "Casts shadows. The lights nearest the camera get them first: 16 shadow views, a point light takes 6, a spotlight 1" },
 };
 
+const EntityParamInfo kTriggerParams[] = {
+    { "size_x", "Width", Kind::Number, 2.0f, 0.1f, 100.0f, "%.2f m", "Size along the object's X axis" },
+    { "size_y", "Height", Kind::Number, 2.0f, 0.1f, 100.0f, "%.2f m", "Height above the object's position" },
+    { "size_z", "Depth", Kind::Number, 2.0f, 0.1f, 100.0f, "%.2f m", "Size along the object's Z axis" },
+    { "once", "Once", Kind::Toggle, 1.0f, 0.0f, 1.0f, "", "Disables itself after the first on_enter" },
+    { "enabled", "Enabled", Kind::Toggle, 1.0f, 0.0f, 1.0f, "", "Starts enabled; the enable / disable inputs change it" },
+};
+const EntityParamInfo kRelayParams[] = {
+    { "enabled", "Enabled", Kind::Toggle, 1.0f, 0.0f, 1.0f, "", "A disabled relay ignores trigger" },
+};
+const EntityParamInfo kTimerParams[] = {
+    { "interval", "Interval", Kind::Number, 1.0f, 0.05f, 600.0f, "%.2f s", "Time between on_timer outputs" },
+    { "repeat", "Repeat", Kind::Toggle, 1.0f, 0.0f, 1.0f, "", "Keeps firing; off: fires once, then stops" },
+    { "running", "Running", Kind::Toggle, 0.0f, 0.0f, 1.0f, "", "Runs from the level start, without a start input" },
+};
+const EntityParamInfo kCounterParams[] = {
+    { "target", "Target", Kind::Number, 3.0f, 1.0f, 1000.0f, "%.0f", "Fires on_reached when the count gets here" },
+};
+
+const EntityParamInfo kDoorParams[] = {
+    { "group", "Group", Kind::Text, 0.0f, 0.0f, 0.0f, "", "The group of level objects that move (Ctrl+G groups the selection)" },
+    { "angle", "Swing angle", Kind::Number, 0.0f, -180.0f, 180.0f, "%.0f\xC2\xB0", "Swings this far about the door object's position (the hinge, a vertical axis); 0 slides instead" },
+    { "move_x", "Slide X", Kind::Number, 0.0f, -20.0f, 20.0f, "%.2f m", "Slide along the door object's X axis when open (with swing angle 0)" },
+    { "move_y", "Slide Y", Kind::Number, 3.0f, -20.0f, 20.0f, "%.2f m", "Slide up (or down) when open" },
+    { "move_z", "Slide Z", Kind::Number, 0.0f, -20.0f, 20.0f, "%.2f m", "Slide along the door object's Z axis when open" },
+    { "time", "Open time", Kind::Number, 1.0f, 0.05f, 20.0f, "%.2f s", "Seconds to open or close fully" },
+    { "use", "Player opens", Kind::Toggle, 1.0f, 0.0f, 1.0f, "", "The player opens and closes it with the use key when close" },
+    { "locked", "Locked", Kind::Toggle, 0.0f, 0.0f, 1.0f, "", "Starts locked: the player can't open it until an unlock input" },
+    { "open", "Starts open", Kind::Toggle, 0.0f, 0.0f, 1.0f, "", "Open at the level start" },
+};
+const char* const kEnemyOutputs[] = { "on_alert", "on_death" };
+const char* const kDoorOutputs[] = { "on_opened", "on_closed" };
+const char* const kDoorInputs[] = { "open", "close", "toggle", "lock", "unlock" };
+const char* const kExitOutputs[] = { "on_unlock" };
+const char* const kExitInputs[] = { "unlock", "lock" };
+const char* const kEnemyInputs[] = { "alert", "kill" };
+const char* const kPickupOutputs[] = { "on_pickup" };
+const char* const kTriggerOutputs[] = { "on_enter", "on_exit" };
+const char* const kToggleInputs[] = { "enable", "disable", "toggle" };
+const char* const kRelayOutputs[] = { "on_trigger" };
+const char* const kRelayInputs[] = { "trigger", "enable", "disable" };
+const char* const kTimerOutputs[] = { "on_timer" };
+const char* const kTimerInputs[] = { "start", "stop", "toggle", "fire" };
+const char* const kCounterOutputs[] = { "on_reached" };
+const char* const kCounterInputs[] = { "add", "subtract", "reset" };
+
 // Presets are filled in by Registry from the built-ins and the presets file.
 EntityTypeInfo kEntityTypes[] = {
     { kPlayerStartEntity, "Player start", "models/player_start.glb", "",
         "Where the player spawns, looking where the arrow points.", {}, {} },
     { kEnemyEntity, "Enemy", "models/enemy_grunt.glb", "health=60 speed=3.4 damage=12",
-        "Chases and hits the player once it sees them, is shot or hears a shot nearby.", kEnemyParams, {} },
+        "Chases and hits the player once it sees them, is shot or hears a shot nearby.", kEnemyParams, {},
+        kEnemyOutputs, kEnemyInputs },
     { kHealthEntity, "Health pack", "models/medkit.glb", "amount=25",
-        "Restores health when the player picks it up (not above 100).", kHealthParams, {} },
+        "Restores health when the player picks it up (not above 100).", kHealthParams, {}, kPickupOutputs },
     { kAmmoEntity, "Shotgun shells", "models/shells.glb", "amount=8",
-        "Adds shells to the player's reserve when picked up.", kAmmoParams, {} },
+        "Adds shells to the player's reserve when picked up.", kAmmoParams, {}, kPickupOutputs },
     { kRoundsEntity, "Pistol rounds", "models/rounds_box.glb", "amount=16",
-        "Adds loose pistol rounds (loaded into magazines by hand) when picked up.", kRoundsParams, {} },
+        "Adds loose pistol rounds (loaded into magazines by hand) when picked up.", kRoundsParams, {},
+        kPickupOutputs },
     { kExitEntity, "Level exit", "models/exit_portal.glb", "next=",
-        "Ends the level when touched, once every enemy is dead.", kExitParams, {} },
+        "Ends the level when touched, once open: when every enemy is dead, or by an unlock input.", kExitParams, {},
+        kExitOutputs, kExitInputs },
     { kLightEntity, "Light", "models/light.glb", "intensity=15 range=12",
         "Lights its surroundings in the object's color. A spotlight shines along the object's -Y axis; rotate it to aim.",
         kLightParams, {} },
+    { kTriggerEntity, "Trigger", "models/trigger.glb", "size_x=2 size_y=2 size_z=2 once=1",
+        "A box volume standing on the object's position, turned by rotation Y: fires on_enter when the player walks in "
+        "and on_exit when they leave.", kTriggerParams, {}, kTriggerOutputs, kToggleInputs },
+    { kRelayEntity, "Relay", "models/relay.glb", "",
+        "Passes a trigger input on as on_trigger: one place to fan out to many targets, or to add a delay.",
+        kRelayParams, {}, kRelayOutputs, kRelayInputs },
+    { kTimerEntity, "Timer", "models/timer.glb", "interval=1 repeat=1 running=0",
+        "Fires on_timer every interval while running (start / stop / toggle; fire fires now).", kTimerParams, {},
+        kTimerOutputs, kTimerInputs },
+    { kCounterEntity, "Counter", "models/counter.glb", "target=3",
+        "Counts add / subtract inputs and fires on_reached when the count reaches the target (once, until reset).",
+        kCounterParams, {}, kCounterOutputs, kCounterInputs },
+    { kDoorEntity, "Door", "models/door.glb", "group= angle=0 move_y=3 time=1 use=1",
+        "Moves the level objects of a group: swings them about this object's position (a vertical hinge) by the swing "
+        "angle, or slides them by the slide offset (in this object's frame). The game hides this marker.",
+        kDoorParams, {}, kDoorOutputs, kDoorInputs },
 };
 constexpr size_t kTypeCount = std::size(kEntityTypes);
 
@@ -132,13 +198,7 @@ struct Registry {
                 list.push_back({ { "label", preset.label }, { "params", preset.params },
                     { "color", { preset.color[0], preset.color[1], preset.color[2] } } });
         }
-        std::ofstream file(path);
-        if (!file) {
-            LOG_ERROR("[ENTITY] Failed to write " << path << "\n");
-            return false;
-        }
-        file << json.dump(4) << "\n";
-        return static_cast<bool>(file);
+        return writeDataFile(path, json.dump(4) + "\n");
     }
 };
 
@@ -182,7 +242,7 @@ const EntityTypeInfo* findEntityType(std::string_view id)
 
 std::string entityPresetsPath()
 {
-    return configPath("entity_presets.json");
+    return dataPath("entity_presets.json");
 }
 
 bool loadEntityPresets(const std::string& path)
@@ -321,4 +381,44 @@ std::string formatEntityNumber(float value)
     if (!result.empty() && result.back() == '.')
         result.pop_back();
     return result == "-0" ? "0" : result;
+}
+
+std::vector<EntityConnection> parseEntityConnections(std::string_view text)
+{
+    std::vector<EntityConnection> out;
+    while (!text.empty()) {
+        const size_t end = std::min(text.find('\n'), text.size());
+        std::string_view line = text.substr(0, end);
+        text.remove_prefix(std::min(end + 1, text.size()));
+        std::string_view fields[4];
+        size_t count = 0;
+        while (count < 4) {
+            const size_t tab = std::min(line.find('\t'), line.size());
+            fields[count++] = line.substr(0, tab);
+            if (tab == line.size())
+                break;
+            line.remove_prefix(tab + 1);
+        }
+        if (count < 3 || fields[0].empty() || fields[1].empty() || fields[2].empty())
+            continue;
+        EntityConnection& connection = out.emplace_back();
+        connection.output = fields[0];
+        connection.target = fields[1];
+        connection.input = fields[2];
+        if (count == 4)
+            std::from_chars(fields[3].data(), fields[3].data() + fields[3].size(), connection.delay);
+        connection.delay = std::max(connection.delay, 0.0f);
+    }
+    return out;
+}
+
+std::string formatEntityConnections(std::span<const EntityConnection> connections)
+{
+    std::string out;
+    for (const EntityConnection& c : connections) {
+        if (c.output.empty() || c.target.empty() || c.input.empty())
+            continue;
+        out += c.output + '\t' + c.target + '\t' + c.input + '\t' + formatEntityNumber(c.delay) + '\n';
+    }
+    return out;
 }

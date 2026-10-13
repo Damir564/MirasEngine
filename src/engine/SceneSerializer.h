@@ -41,15 +41,16 @@ struct SceneInstanceEntry {
     // followed by (version 2+): float color[3]; then (version 5+): uint8_t locked; then: char name[nameLength];
     // then (version 8+): uint32_t entityLength, char entity[entityLength], uint32_t paramsLength,
     // char entityParams[paramsLength]; then (version 9+): uint32_t groupLength, char group[groupLength];
-    // then (version 10+): uint8_t collision (CollisionMode)
+    // then (version 10+): uint8_t collision (CollisionMode); then (version 12+): uint32_t outputsLength,
+    // char entityOutputs[outputsLength]
 };
 
 // Version 1 files have no per-instance color, version 2 files no level geometry, version 3 files no
 // level materials, version 4 files no prefabs, version 5 files no level grid sizes, version 6 files no
 // shared materials, version 7 files no game entities, version 8 files no object groups, version 9 files
-// no collision modes, version 10 files no scene settings. Version 11+ files end with uint32_t length and
-// the SceneSettings as JSON text (sceneSettingsToJson()).
-inline constexpr uint32_t kSceneFileVersion = 11;
+// no collision modes, version 10 files no scene settings, version 11 files no entity outputs. Version 11+
+// files end with uint32_t length and the SceneSettings as JSON text (sceneSettingsToJson()).
+inline constexpr uint32_t kSceneFileVersion = 12;
 inline constexpr uint32_t kMaxSceneSettingsLength = 1u << 20;
 inline constexpr uint32_t kMaxSceneEntityTextLength = 4096;
 inline constexpr uint32_t kMaxSceneMaterialOverrides = 4096;
@@ -176,6 +177,9 @@ public:
             }
             const uint8_t collision = static_cast<uint8_t>(inst.collision);
             file.write(reinterpret_cast<const char*>(&collision), sizeof(collision));
+            const uint32_t outputsLength = static_cast<uint32_t>(inst.entityOutputs.size());
+            file.write(reinterpret_cast<const char*>(&outputsLength), sizeof(outputsLength));
+            file.write(inst.entityOutputs.data(), outputsLength);
         }
 
         const std::string settingsJson = sceneSettingsToJson(settings);
@@ -214,6 +218,7 @@ public:
             std::string entityParams;
             std::string group;
             CollisionMode collision = CollisionMode::Mesh;
+            std::string entityOutputs;
         };
 
         std::vector<LoadedModel> models;
@@ -344,6 +349,17 @@ public:
                 file.read(reinterpret_cast<char*>(&collision), sizeof(collision));
                 if (collision < static_cast<uint8_t>(CollisionMode::Count))
                     scene.instances[i].collision = static_cast<CollisionMode>(collision);
+            }
+            if (header.version >= 12) {
+                std::string& outputs = scene.instances[i].entityOutputs;
+                uint32_t length = 0;
+                file.read(reinterpret_cast<char*>(&length), sizeof(length));
+                if (!file || length > kMaxSceneEntityTextLength) {
+                    LOG_ERROR("[SCENE] Corrupt entity outputs for '" << scene.instances[i].name << "' in " << filepath << "\n");
+                    return scene;
+                }
+                outputs.resize(length);
+                file.read(outputs.data(), length);
             }
         }
 

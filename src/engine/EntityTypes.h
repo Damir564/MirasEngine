@@ -2,6 +2,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <vector>
 
 // One setting of an entity type, stored as key=value in ModelInstance::entityParams. The editor shows a
 // widget per setting; the game reads them with entityParam()/entityParamText().
@@ -37,7 +38,24 @@ struct EntityTypeInfo {
     const char* description;
     std::span<const EntityParamInfo> params;
     std::span<const EntityPreset> presets; // built-ins merged with the presets file; changes when it is reloaded
+    std::span<const char* const> outputs;  // events it fires (EntityConnection::output)
+    std::span<const char* const> inputs;   // what it does when an input reaches it (EntityConnection::input)
 };
+
+// A wire from one entity's output to another entity's input (the Half-Life I/O model): when the entity fires
+// `output`, every object named `target` receives `input` after `delay` seconds. Stored in
+// ModelInstance::entityOutputs as text, see formatEntityConnections().
+struct EntityConnection {
+    std::string output;
+    std::string target;
+    std::string input;
+    float delay = 0.0f;
+
+    bool operator==(const EntityConnection&) const = default;
+};
+// One connection per line, fields separated by tabs: output, target, input, delay. Malformed lines are skipped.
+std::vector<EntityConnection> parseEntityConnections(std::string_view text);
+std::string formatEntityConnections(std::span<const EntityConnection> connections);
 
 inline constexpr const char* kPlayerStartEntity = "player_start";
 inline constexpr const char* kEnemyEntity = "enemy";
@@ -47,6 +65,14 @@ inline constexpr const char* kRoundsEntity = "rounds";
 inline constexpr const char* kExitEntity = "exit";
 // A point or spot light (Lights.h); the renderer lights the scene with it, the game has nothing to spawn.
 inline constexpr const char* kLightEntity = "light";
+// Logic (inputs and outputs only, nothing drawn in the game): a box volume the player walks into, a relay
+// passing an input on, a timer firing at intervals, a counter firing at a target count.
+inline constexpr const char* kTriggerEntity = "trigger";
+inline constexpr const char* kRelayEntity = "relay";
+inline constexpr const char* kTimerEntity = "timer";
+inline constexpr const char* kCounterEntity = "counter";
+// Moves the level objects of one group (ModelInstance::group): slides them or swings them about its position.
+inline constexpr const char* kDoorEntity = "door";
 
 std::span<const EntityTypeInfo> entityTypes();
 const EntityTypeInfo* findEntityType(std::string_view id);

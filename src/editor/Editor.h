@@ -49,6 +49,7 @@ public:
     void drawUi() override;
     void fillFrame(FrameInput& frame) override;
     bool quitRequested() const override { return m_quitRequested; }
+    int exitCode() const override { return m_exitCode; }
     // With unsaved changes: asks to save them first and returns false.
     bool confirmQuit() override;
     ModeRequest takeModeRequest() override;
@@ -61,6 +62,9 @@ public:
     // Runs a command script (one MCP command per line, see EditorCommands.cpp) as one undo step, once
     // no edit is in progress and the scene has loaded.
     void runScript(const std::string& path);
+    // Runs a test script (EditorMcp.cpp): commands one at a time, each its own undo step, checked by
+    // `expect` lines; logs one PASS/FAIL line and quits with exit code 0/1.
+    void runTest(const std::string& path);
 
 private:
     // Hierarchy actions are applied after the tree is drawn so the instance list is stable while drawing.
@@ -179,7 +183,8 @@ private:
     // Where a click puts an entity: on the floor under the mouse; a wall hit stands it in front of the wall.
     bool entityPlacementPoint(float mouseX, float mouseY, glm::vec3& out) const;
     void drawEntityPlaceOverlay();
-    // Range sphere or cone of the selected lights.
+    // Range sphere or cone of the selected lights, every trigger's volume and the selected entities' output
+    // wires.
     void drawLightOverlay();
     // Level panel: a button per entity type and enemy preset.
     void drawEntityPalette();
@@ -189,6 +194,9 @@ private:
     static bool entityDefaultPlaceable(const EntityTypeInfo& type);
     // Inspector: "Save as preset..." for the entity's current values, and its name popup.
     void drawSaveEntityPreset(const ModelInstance& instance);
+    // Inspector: the entity's output connections (EntityConnection) as editable rows, and the entities
+    // whose outputs reach it.
+    void drawEntityOutputs(int instanceIndex);
 
     // ---- EditorGroups.cpp ----
     // Groups are objects sharing a ModelInstance::group name. A click in the viewport selects the whole
@@ -760,6 +768,8 @@ private:
     void pollMcpServer();
     // Runs the script queued by runScript(). In lateUpdate().
     void pollScript();
+    // Runs the next step of the test queued by runTest(). In lateUpdate().
+    void pollTest();
     // Commands between these become one undo step named `action`.
     void beginCommandBatch();
     void endCommandBatch(const std::string& action);
@@ -1160,4 +1170,11 @@ private:
     };
     CommandBatch m_batch;
     std::string m_pendingScript;
+    // Defined in EditorMcp.cpp only; the deleter keeps the type incomplete everywhere else.
+    struct TestRun;
+    struct TestRunDeleter {
+        void operator()(TestRun* test) const;
+    };
+    std::unique_ptr<TestRun, TestRunDeleter> m_test;
+    int m_exitCode = 0;
 };

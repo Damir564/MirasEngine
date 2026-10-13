@@ -93,6 +93,39 @@ PolyMesh makePrism(const std::vector<glm::vec2>& points, float height)
     return mesh;
 }
 
+json connectionsJson(const std::string& text)
+{
+    json out = json::array();
+    for (const EntityConnection& c : parseEntityConnections(text))
+        out.push_back({ { "output", c.output }, { "target", c.target }, { "input", c.input }, { "delay", num(c.delay) } });
+    return out;
+}
+
+// [{output, target, input, delay?}, ...] checked against the entity type's outputs, as entityOutputs text.
+// Targets are names and may not exist yet (scripts create them later).
+std::string connectionsIn(const json& value, const std::string& entity)
+{
+    const EntityTypeInfo* type = findEntityType(entity);
+    if (!value.is_array())
+        fail("outputs must be an array of {output, target, input, delay}");
+    std::vector<EntityConnection> connections;
+    for (const json& item : value) {
+        if (!item.is_object() || !item.contains("output") || !item.contains("target") || !item.contains("input") ||
+            !item["output"].is_string() || !item["target"].is_string() || !item["input"].is_string())
+            fail("each output needs output, target and input strings");
+        EntityConnection& c = connections.emplace_back();
+        c.output = item["output"].get<std::string>();
+        c.target = item["target"].get<std::string>();
+        c.input = item["input"].get<std::string>();
+        c.delay = item.contains("delay") ? std::max(numberIn(item["delay"], "delay"), 0.0f) : 0.0f;
+        if (!type || std::none_of(type->outputs.begin(), type->outputs.end(), [&](const char* o) { return c.output == o; }))
+            fail("entity type '" + entity + "' has no output " + c.output);
+        if (c.target.empty() || c.input.empty() || c.target.find_first_of("\t\n") != std::string::npos)
+            fail("output target and input must be non-empty single-line names");
+    }
+    return formatEntityConnections(connections);
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------------------------
@@ -139,6 +172,8 @@ json Editor::CommandApi::describe(Editor& e, size_t index)
     if (!instance.entity.empty()) {
         out["entity"] = instance.entity;
         out["entityParams"] = instance.entityParams;
+        if (!instance.entityOutputs.empty())
+            out["outputs"] = connectionsJson(instance.entityOutputs);
     }
     if (!instance.group.empty())
         out["group"] = instance.group;
@@ -291,6 +326,11 @@ const std::vector<Editor::CommandApi::Command>& Editor::CommandApi::table()
     const P object{ "object", "object", "Object id (number) or name (string)", true };
     const P position{ "position", "vec3", "World position [x, y, z]; for level shapes the bottom center. Default [0, 0, 0]" };
     const P rotation{ "rotation", "vec3", "Euler angles in degrees [x, y, z]" };
+    const P outputs{ "outputs", "connections", "Entity output wires, replacing the current ones: [{output, target, input, "
+        "delay}] - when the entity fires `output` (enemy: on_alert, on_death; pickups: on_pickup), every entity named "
+        "`target` gets `input` after `delay` seconds. Outputs/inputs: enemy on_alert, on_death / alert, kill; pickups "
+        "on_pickup; trigger on_enter, on_exit / enable, disable, toggle; relay on_trigger / trigger, enable, disable; "
+        "timer on_timer / start, stop, toggle, fire; counter on_reached / add, subtract, reset" };
     const P scale{ "scale", "vec3", "Scale [x, y, z], default [1, 1, 1]" };
     const P name{ "name", "string", "Object name; must be unused. Default: a unique name" };
     const P material{ "material", "string", "Shared material for every face, e.g. materials/Brick.mat (see list_assets)" };
@@ -658,6 +698,7 @@ const std::vector<Editor::CommandApi::Command>& Editor::CommandApi::table()
                 { "visible", "boolean", "Shown in the scene" }, { "locked", "boolean", "Geometry protected from edits" },
                 { "entity", "string", "Game entity type (see create_entity), or \"\" for plain scenery" },
                 { "entity_params", "string", "Entity parameters, \"key=value\" pairs separated by spaces" },
+                outputs,
                 { "group", "string", "Group name: objects sharing one are selected, moved and copied together; \"\" for none" },
                 { "collision", "string", "What the game collides with: mesh (exact triangles), box (bounding box), "
                     "convex (convex hull) or none (walk and shoot through)" } },
@@ -677,6 +718,8 @@ const std::vector<Editor::CommandApi::Command>& Editor::CommandApi::table()
                 if (a.has("entity") && !a.string("entity").empty() && !findEntityType(a.string("entity")))
                     fail("unknown entity type " + a.string("entity"));
                 ModelInstance& instance = e.m_models.getInstances()[index];
+                const std::string entityOutputs = a.has("outputs")
+                    ? connectionsIn(a.at("outputs"), a.string("entity", instance.entity)) : instance.entityOutputs;
                 if (a.has("name")) instance.name = a.string("name");
                 instance.position = a.vec3("position", instance.position);
                 instance.rotation = a.vec3("rotation", instance.rotation);
@@ -686,6 +729,7 @@ const std::vector<Editor::CommandApi::Command>& Editor::CommandApi::table()
                 instance.locked = a.boolean("locked", instance.locked);
                 instance.entity = a.string("entity", instance.entity);
                 instance.entityParams = a.string("entity_params", instance.entityParams);
+                instance.entityOutputs = entityOutputs;
                 instance.group = a.string("group", instance.group);
                 if (collision)
                     instance.collision = *collision;
@@ -697,14 +741,19 @@ const std::vector<Editor::CommandApi::Command>& Editor::CommandApi::table()
             "hearing, size, alert=1 for a hunter that always knows where the player is), health "
             "(param amount), ammo (shotgun shells; param amount), exit (ends the level once every enemy is dead; param "
             "next = the .scn to load after it), light (point or spot light colored by the object's color; params "
-            "intensity, range, spot=1, cone (degrees), softness, shadows=1; a spot shines along the object's -Y). "
-            "Entities face +Z turned by rotation Y and stand on `position`.",
-            { { "type", "enum:player_start|enemy|health|ammo|exit", "Entity type", true }, position,
+            "intensity, range, spot=1, cone (degrees), softness, shadows=1; a spot shines along the object's -Y), "
+            "rounds (pistol rounds; param amount), logic (not drawn in the game, wired with `outputs`): trigger (box "
+            "volume on `position`; params size_x, size_y, size_z, once, enabled), relay (param enabled), timer (params "
+            "interval, repeat, running), counter (param target). Entities face +Z turned by rotation Y and stand on "
+            "`position`.",
+            { { "type", "enum:player_start|enemy|health|ammo|rounds|exit|light|trigger|relay|timer|counter",
+                "Entity type", true }, position,
                 { "yaw", "number", "Degrees about Y; 0 faces +Z, 90 faces +X" }, name,
-                { "params", "string", "\"key=value\" pairs; default: the type's defaults" } },
+                { "params", "string", "\"key=value\" pairs; default: the type's defaults" }, outputs },
             [](Editor& e, const Args& a) -> json {
                 const std::string type = a.string("type");
                 const std::string instanceName = a.has("name") ? newName(e, a, "") : std::string();
+                const std::string entityOutputs = a.has("outputs") ? connectionsIn(a.at("outputs"), type) : std::string();
                 const auto index = e.addEntity(type);
                 if (!index)
                     fail(e.m_statusMessage);
@@ -715,6 +764,7 @@ const std::vector<Editor::CommandApi::Command>& Editor::CommandApi::table()
                     instance.name = instanceName;
                 if (a.has("params"))
                     instance.entityParams = a.string("params");
+                instance.entityOutputs = entityOutputs;
                 e.markSceneChanged();
                 return describe(e, *index);
             } },

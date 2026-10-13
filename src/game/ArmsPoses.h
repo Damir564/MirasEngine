@@ -63,7 +63,7 @@ const char* armsAnchorName(ArmsAnchor anchor);
 const char* armsTimeBaseName(ArmsTimeBase base);
 
 // Where the player's hands and items are held and how they move: the first-person "animation" GameArms
-// builds from the Arms tasks. Editable in arms_poses.json in the config folder (%APPDATA%\MirasEngine), read
+// builds from the Arms tasks. Editable in data/arms_poses.json (source: assets/data/), read
 // at every level start and restart; missing keys are written back with these defaults. Camera space is
 // +X right, +Y up, looking along -Z; body space is the same at the eyes, turned with the view's yaw only.
 struct ArmsPoses {

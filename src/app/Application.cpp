@@ -54,6 +54,7 @@ bool Application::init(const AppOptions& options)
         return false;
     // Settings are shared by every build in the user's config folder; older builds kept them next to the exe.
     migrateLocalConfig();
+    migrateDataFiles();
     // The renderer initializes the ImGui Vulkan backend, so the ImGui context must exist first.
     initImGui();
     m_settingsPath = options.settingsPath.empty() ? graphicsSettingsPath() : options.settingsPath;
@@ -157,6 +158,8 @@ void Application::createMode(const AppOptions& options)
         editor->openScene(options.scenePath);
     if (!options.scriptPath.empty())
         editor->runScript(options.scriptPath);
+    if (!options.testPath.empty())
+        editor->runTest(options.testPath);
     m_mode = std::move(editor);
 }
 
@@ -260,7 +263,7 @@ int Application::mainLoop(int exitAfterFrames)
             m_quit = true;
         time += 0.001f;
     }
-    return 0;
+    return m_mode->exitCode();
 }
 
 void Application::applyChangedSettings()

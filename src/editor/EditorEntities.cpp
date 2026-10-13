@@ -13,6 +13,9 @@ namespace {
 
 constexpr ImU32 kPlaceColor = IM_COL32(255, 210, 90, 255);
 constexpr ImU32 kLightRangeColor = IM_COL32(255, 230, 140, 110);
+constexpr ImU32 kTriggerColor = IM_COL32(255, 150, 40, 220);
+constexpr ImU32 kTriggerFaintColor = IM_COL32(255, 150, 40, 90);
+constexpr ImU32 kWireColor = IM_COL32(120, 200, 255, 220);
 constexpr float kLightPlaceHeight = 2.5f;
 // Floors face up more than this (normal.y); anything steeper counts as a wall.
 constexpr float kFloorFacing = 0.7f;
@@ -95,6 +98,139 @@ void Editor::drawSaveEntityPreset(const ModelInstance& instance)
     if (ImGui::Button("Cancel"))
         ImGui::CloseCurrentPopup();
     ImGui::EndPopup();
+}
+
+void Editor::drawEntityOutputs(int instanceIndex)
+{
+    const auto& instances = m_models.getInstances();
+    const ModelInstance& instance = instances[instanceIndex];
+    const EntityTypeInfo* type = findEntityType(instance.entity);
+    std::vector<EntityConnection> connections = parseEntityConnections(instance.entityOutputs);
+    bool changed = false;
+
+    // Objects that can be targets: named entities with inputs, each name once.
+    std::vector<const ModelInstance*> targets;
+    for (const ModelInstance& other : instances) {
+        const EntityTypeInfo* otherType = findEntityType(other.entity);
+        if (otherType && !otherType->inputs.empty() && !other.name.empty() &&
+            std::none_of(targets.begin(), targets.end(), [&](const ModelInstance* t) { return t->name == other.name; }))
+            targets.push_back(&other);
+    }
+    const auto findTarget = [&](const std::string& name) -> const EntityTypeInfo* {
+        for (const ModelInstance* target : targets)
+            if (target->name == name)
+                return findEntityType(target->entity);
+        return nullptr;
+    };
+
+    if (!type->outputs.empty() && ImGui::TreeNodeEx("Outputs", ImGuiTreeNodeFlags_DefaultOpen)) {
+        int removeIndex = -1;
+        constexpr ImGuiTableFlags kTableFlags = ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_BordersInnerV;
+        if (!connections.empty() && ImGui::BeginTable("outputs", 5, kTableFlags)) {
+            ImGui::TableSetupColumn("Output", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+            ImGui::TableSetupColumn("Target", ImGuiTableColumnFlags_WidthStretch, 1.2f);
+            ImGui::TableSetupColumn("Input", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+            ImGui::TableSetupColumn("Delay", ImGuiTableColumnFlags_WidthStretch, 0.6f);
+            ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed);
+            ImGui::TableHeadersRow();
+            for (size_t i = 0; i < connections.size(); ++i) {
+                EntityConnection& connection = connections[i];
+                const EntityTypeInfo* targetType = findTarget(connection.target);
+                ImGui::PushID(static_cast<int>(i));
+                ImGui::TableNextColumn();
+                ImGui::SetNextItemWidth(-FLT_MIN);
+                if (ImGui::BeginCombo("##output", connection.output.c_str())) {
+                    for (const char* output : type->outputs)
+                        if (ImGui::Selectable(output, connection.output == output)) {
+                            connection.output = output;
+                            changed = true;
+                        }
+                    ImGui::EndCombo();
+                }
+                ImGui::TableNextColumn();
+                ImGui::SetNextItemWidth(-FLT_MIN);
+                if (!targetType)
+                    ImGui::PushStyleColor(ImGuiCol_Text, EditorStyle::kError);
+                const bool targetOpen = ImGui::BeginCombo("##target", connection.target.c_str());
+                if (!targetType) {
+                    ImGui::PopStyleColor();
+                    ImGui::SetItemTooltip("No entity named '%s' has inputs", connection.target.c_str());
+                }
+                if (targetOpen) {
+                    for (const ModelInstance* target : targets)
+                        if (ImGui::Selectable(target->name.c_str(), connection.target == target->name)) {
+                            connection.target = target->name;
+                            changed = true;
+                        }
+                    ImGui::EndCombo();
+                }
+                ImGui::TableNextColumn();
+                ImGui::SetNextItemWidth(-FLT_MIN);
+                const bool knownInput = targetType && std::any_of(targetType->inputs.begin(), targetType->inputs.end(),
+                    [&](const char* input) { return connection.input == input; });
+                if (!knownInput)
+                    ImGui::PushStyleColor(ImGuiCol_Text, EditorStyle::kError);
+                const bool inputOpen = ImGui::BeginCombo("##input", connection.input.c_str());
+                if (!knownInput)
+                    ImGui::PopStyleColor();
+                if (inputOpen) {
+                    if (targetType)
+                        for (const char* input : targetType->inputs)
+                            if (ImGui::Selectable(input, connection.input == input)) {
+                                connection.input = input;
+                                changed = true;
+                            }
+                    ImGui::EndCombo();
+                }
+                ImGui::TableNextColumn();
+                ImGui::SetNextItemWidth(-FLT_MIN);
+                if (ImGui::DragFloat("##delay", &connection.delay, 0.05f, 0.0f, 600.0f, "%.2f s", ImGuiSliderFlags_AlwaysClamp))
+                    changed = true;
+                ImGui::TableNextColumn();
+                if (ImGui::SmallButton("x"))
+                    removeIndex = static_cast<int>(i);
+                ImGui::SetItemTooltip("Remove this connection");
+                ImGui::PopID();
+            }
+            ImGui::EndTable();
+        }
+        if (removeIndex >= 0) {
+            connections.erase(connections.begin() + removeIndex);
+            changed = true;
+        }
+        if (ImGui::SmallButton("Add output")) {
+            EntityConnection& added = connections.emplace_back();
+            added.output = type->outputs.front();
+            added.target = targets.empty() ? std::string("?") : targets.front()->name;
+            const EntityTypeInfo* targetType = findTarget(added.target);
+            added.input = targetType ? targetType->inputs.front() : "?";
+            changed = true;
+        }
+        ImGui::SetItemTooltip("When this entity fires the output, the target (every entity with that name) gets the "
+            "input after the delay");
+        ImGui::TreePop();
+    }
+
+    if (!type->inputs.empty() && ImGui::TreeNode("Inputs")) {
+        // Read-only: which outputs reach this entity.
+        bool any = false;
+        for (const ModelInstance& other : instances) {
+            for (const EntityConnection& c : parseEntityConnections(other.entityOutputs)) {
+                if (c.target != instance.name)
+                    continue;
+                ImGui::BulletText("%s.%s -> %s (%.2f s)", other.name.c_str(), c.output.c_str(), c.input.c_str(), c.delay);
+                any = true;
+            }
+        }
+        if (!any)
+            ImGui::TextDisabled("Nothing sends inputs to %s", instance.name.c_str());
+        ImGui::TreePop();
+    }
+
+    if (changed) {
+        m_models.getInstances()[instanceIndex].entityOutputs = formatEntityConnections(connections);
+        markSceneChanged();
+    }
 }
 
 void Editor::beginEntityPlacement(const std::string& type, int preset)
@@ -299,6 +435,54 @@ void Editor::drawLightOverlay()
         circle(baseCenter, u, v, baseRadius);
         for (const glm::vec3& side : { u, -u, v, -v })
             line(light.position, baseCenter + side * baseRadius);
+    }
+
+    // Trigger volumes are invisible in the game, so every one is outlined; the selected ones brighter.
+    const std::vector<int> selected = selectedIndices();
+    const auto& instances = m_models.getInstances();
+    for (size_t i = 0; i < instances.size(); ++i) {
+        const ModelInstance& instance = instances[i];
+        if (instance.entity != kTriggerEntity || !instance.visible)
+            continue;
+        const bool isSelected = std::find(selected.begin(), selected.end(), static_cast<int>(i)) != selected.end();
+        const ImU32 color = isSelected ? kTriggerColor : kTriggerFaintColor;
+        const glm::vec3 half = 0.5f * glm::vec3(entityParam(instance.entityParams, "size_x", 2.0f),
+            entityParam(instance.entityParams, "size_y", 2.0f), entityParam(instance.entityParams, "size_z", 2.0f));
+        const float yaw = glm::radians(instance.rotation.y);
+        const glm::vec3 x(std::cos(yaw), 0.0f, -std::sin(yaw)), z(std::sin(yaw), 0.0f, std::cos(yaw));
+        const glm::vec3 center = instance.position + glm::vec3(0.0f, half.y, 0.0f);
+        glm::vec3 corners[8];
+        for (int c = 0; c < 8; ++c)
+            corners[c] = center + x * (c & 1 ? half.x : -half.x) + glm::vec3(0.0f, c & 2 ? half.y : -half.y, 0.0f) +
+                z * (c & 4 ? half.z : -half.z);
+        for (int c = 0; c < 8; ++c)
+            for (int bit : { 1, 2, 4 })
+                if (!(c & bit)) {
+                    ImVec2 sa, sb;
+                    if (toScreen(corners[c], sa) && toScreen(corners[c | bit], sb))
+                        drawList->AddLine(sa, sb, color, isSelected ? 2.0f : 1.0f);
+                }
+    }
+
+    // Wires from the selected entities to the targets of their outputs.
+    for (int index : selected) {
+        const ModelInstance& source = instances[index];
+        if (source.entityOutputs.empty())
+            continue;
+        for (const EntityConnection& connection : parseEntityConnections(source.entityOutputs)) {
+            for (const ModelInstance& target : instances) {
+                if (target.name != connection.target || target.entity.empty())
+                    continue;
+                ImVec2 sa, sb;
+                const glm::vec3 lift(0.0f, 0.3f, 0.0f);
+                if (!toScreen(source.position + lift, sa) || !toScreen(target.position + lift, sb))
+                    continue;
+                drawList->AddLine(sa, sb, kWireColor, 1.5f);
+                drawList->AddCircleFilled(sb, 4.0f, kWireColor);
+                const std::string label = connection.output + " > " + connection.input;
+                drawList->AddText(ImVec2((sa.x + sb.x) * 0.5f + 4.0f, (sa.y + sb.y) * 0.5f), kWireColor, label.c_str());
+            }
+        }
     }
     drawList->PopClipRect();
 }

@@ -54,6 +54,8 @@ public:
     // Application has already set the window size, ImGui draw data and time.
     virtual void fillFrame(FrameInput& frame) = 0;
     virtual bool quitRequested() const = 0;
+    // Process exit code once the mode quits (non-zero: an automated test failed).
+    virtual int exitCode() const { return 0; }
     // The window is being closed: true to quit now; false when the mode asks the user first (and then
     // reports quitRequested() itself).
     virtual bool confirmQuit() { return true; }

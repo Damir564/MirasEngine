@@ -15,6 +15,7 @@ struct AppOptions {
     int exitAfterFrames = -1; // -1 = run until the window is closed
     std::string scenePath;
     std::string scriptPath;   // editor: command script run at startup
+    std::string testPath;     // editor: test script; the process exits with 0 on PASS, 1 on FAIL
     std::string settingsPath; // empty = settings.json in the shared config folder (%APPDATA%\MirasEngine)
     int mcpPort = 47800;      // editor's MCP server on 127.0.0.1; 0 = off
     bool mute = false;        // no sound (audio still runs)

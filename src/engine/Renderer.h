@@ -73,6 +73,8 @@ struct FrameInput {
     std::span<const DynamicInstance> dynamicInstances;
     // Scene objects standing for game entities (ModelInstance::entity) are not drawn.
     bool hideEntities = false;
+    // Scene objects (ModelInstance::id, sorted) not drawn, e.g. door parts the game draws moved as dynamic instances.
+    std::span<const uint64_t> hiddenInstanceIds;
 };
 
 // Owns every GPU resource used to draw a frame and records/submits/presents it. The sun, sky and

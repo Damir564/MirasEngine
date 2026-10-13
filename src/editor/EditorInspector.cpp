@@ -188,6 +188,9 @@ void Editor::drawEntitySection(int instanceIndex)
         }
     }
 
+    if (type && (!type->outputs.empty() || !type->inputs.empty()))
+        drawEntityOutputs(instanceIndex);
+
     // Every value as text, for keys the widgets don't know.
     if (ImGui::TreeNode("Parameter text")) {
         char params[256];
