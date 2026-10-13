@@ -22,25 +22,11 @@ constexpr glm::vec3 kZAxis(0.0f, 0.0f, 1.0f);
 constexpr int kPellets = 9;
 constexpr float kSpreadDegrees = 5.0f;
 constexpr float kShotRange = 70.0f;
-constexpr float kPelletDamageNear = 13.0f;
-constexpr float kPelletDamageFar = 4.0f;
 constexpr float kPistolSpreadDegrees = 0.6f;
-constexpr float kPistolDamageNear = 35.0f;
-constexpr float kPistolDamageFar = 22.0f;
 constexpr float kGunshotHearing = 24.0f;
 constexpr float kPickUpReach = 2.2f; // meters from the feet
 
-// Where things are held, camera space (+X right, +Y up, looking along -Z). The guns are held low and to
-// the side; their barrels cross the middle of the view this far away, and the shots follow the barrels.
-constexpr float kConvergence = 9.0f;
-constexpr glm::vec3 kGunRest(0.2f, -0.22f, -0.34f);
-constexpr glm::vec3 kPistolRest(0.15f, -0.19f, -0.38f);
-constexpr glm::vec3 kPumpRest(0.0f, -0.022f, -0.3f);
-constexpr glm::vec3 kPalmBelowPump(0.0f, -0.04f, 0.0f);
-constexpr float kPumpTravel = 0.11f;
-constexpr float kSlideTravel = 0.05f;
-constexpr float kSlideLocked = 0.7f; // of kSlideTravel
-constexpr float kJacketOpenDegrees = 72.0f; // opened this far, the panels' insides face the eyes
+// Where things are held and how they move: ArmsPoses (arms_poses.json).
 const glm::vec3 kFlapLRest(-0.21f, -0.55f, -0.16f); // where the panels hang if the body model is missing
 const glm::vec3 kFlapRRest(0.21f, -0.55f, -0.16f);
 
@@ -49,100 +35,8 @@ glm::vec3 flat(const glm::vec3& v)
     return glm::vec3(v.x, 0.0f, v.z);
 }
 
-NodePose makePose(const glm::vec3& translation, float pitchDegrees, float yawDegrees, float rollDegrees)
-{
-    NodePose pose;
-    pose.translation = translation;
-    pose.rotation = glm::angleAxis(glm::radians(yawDegrees), kUp) * glm::angleAxis(glm::radians(pitchDegrees), kXAxis) *
-        glm::angleAxis(glm::radians(rollDegrees), kZAxis);
-    return pose;
-}
-
-NodePose poseOf(const glm::mat4& matrix)
-{
-    NodePose pose;
-    pose.translation = glm::vec3(matrix[3]);
-    pose.rotation = glm::quat_cast(glm::mat3(matrix));
-    return pose;
-}
-
-glm::mat4 matrixOf(const NodePose& pose)
-{
-    return glm::translate(glm::mat4(1.0f), pose.translation) * glm::mat4_cast(pose.rotation) *
-        glm::scale(glm::mat4(1.0f), pose.scale);
-}
-
-glm::mat4 offset(const glm::vec3& translation, float pitchDegrees = 0.0f, float yawDegrees = 0.0f, float rollDegrees = 0.0f)
-{
-    return matrixOf(makePose(translation, pitchDegrees, yawDegrees, rollDegrees));
-}
-
-// Eased move from a to b, t in 0..1.
-NodePose blend(const NodePose& a, const NodePose& b, float t)
-{
-    t = std::clamp(t, 0.0f, 1.0f);
-    t = t * t * (3.0f - 2.0f * t);
-    NodePose pose;
-    pose.translation = glm::mix(a.translation, b.translation, t);
-    pose.rotation = glm::slerp(a.rotation, b.rotation, t);
-    return pose;
-}
-
-// Support hand poses: ready below the guns holding something (camera space); at the bandolier and in the
-// pouch (the left panel's space, player_body.glb `flap_l`), in the right pocket (`flap_r`), so the hand
-// follows the panels when the jacket opens.
-const NodePose kHandReady = makePose(glm::vec3(0.06f, -0.27f, -0.4f), 25.0f, 15.0f, -10.0f);
-const NodePose kHandLow = makePose(glm::vec3(-0.15f, -0.42f, -0.3f), 10.0f, 0.0f, 0.0f);
-const NodePose kHandBandolier = makePose(glm::vec3(0.11f, 0.06f, -0.09f), -35.0f, 0.0f, 25.0f);
-const NodePose kHandPocket = makePose(glm::vec3(0.1f, 0.17f, 0.03f), -60.0f, 0.0f, 10.0f);
-const NodePose kHandRightPocket = makePose(glm::vec3(-0.11f, 0.12f, 0.03f), -60.0f, 0.0f, -10.0f);
-// Body space (eyes, facing -Z): reaching down to the floor, the hips (holster / sling).
-const NodePose kHandGround = makePose(glm::vec3(0.0f, -1.45f, -0.5f), -80.0f, 0.0f, 0.0f);
-const NodePose kHandHolster = makePose(glm::vec3(0.22f, -0.8f, -0.05f), -70.0f, 0.0f, 0.0f);
-const NodePose kHandSling = makePose(glm::vec3(-0.25f, -0.45f, 0.1f), -30.0f, 0.0f, 0.0f);
-// The held magazine: its slotted side (+X) turned towards the eyes so the rounds show.
-const NodePose kMagazineHeld = makePose(glm::vec3(0.07f, -0.2f, -0.34f), 10.0f, -70.0f, 0.0f);
-
-// Small items in the support hand, relative to the palm.
-const glm::mat4 kShellInHand = offset(glm::vec3(0.0f, 0.022f, -0.01f));
-const glm::mat4 kRoundInHand = offset(glm::vec3(0.0f, 0.02f, -0.01f));
-const glm::mat4 kMagazineInHand = offset(glm::vec3(0.0f, 0.115f, -0.005f));
-// Hands on the guns and the magazine, relative to the item.
-const glm::mat4 kRightOnShotgun = offset(glm::vec3(0.0f, -0.085f, 0.065f), -18.0f);
-const glm::mat4 kRightOnPistol = offset(glm::vec3(0.0f), -15.0f);
-const glm::mat4 kRightOnMagazine = offset(glm::vec3(0.0f, -0.105f, 0.0f));
-const glm::mat4 kLeftSupportsPistol = offset(glm::vec3(-0.026f, -0.03f, 0.01f), -15.0f, 0.0f, 70.0f);
-const glm::mat4 kLeftAtMagazine = offset(glm::vec3(-0.03f, -0.02f, 0.0f));
-const glm::mat4 kLeftOnShotgunGrip = offset(glm::vec3(0.0f, -0.085f, 0.065f), -18.0f);
-
-// A gun in a hand: aimed to cross the view's center at kConvergence, kicked up by a shot (kick 0..1),
-// lagging behind turns (sway), lowered out of the way while the jacket is open (lower 0..1). side = 1 for
-// the right hand, -1 mirrors it to the left.
-NodePose shotgunPose(float kick, float pumpAmount, float tilt, const glm::vec2& sway, float lower, float side)
-{
-    const glm::vec3 rest(kGunRest.x * side, kGunRest.y, kGunRest.z);
-    const float yaw = side * std::atan(kGunRest.x / kConvergence) + sway.x;
-    const float pitch = std::atan((-kGunRest.y - 0.022f) / kConvergence) + sway.y + glm::radians(12.0f) * kick -
-        glm::radians(30.0f) * lower;
-    const float roll = side * (glm::radians(-4.0f) * pumpAmount + glm::radians(28.0f) * tilt);
-    NodePose pose;
-    pose.translation = rest + glm::vec3(0.0f, 0.02f, 0.07f) * kick + glm::vec3(-0.03f * side, -0.03f, 0.04f) * tilt +
-        glm::vec3(0.0f, -0.006f, 0.01f) * pumpAmount + glm::vec3(0.08f * side, -0.1f, 0.08f) * lower;
-    pose.rotation = glm::angleAxis(yaw, kUp) * glm::angleAxis(pitch, kXAxis) * glm::angleAxis(roll, kZAxis);
-    return pose;
-}
-
-NodePose pistolPose(float kick, const glm::vec2& sway, float lower, float side)
-{
-    const glm::vec3 rest(kPistolRest.x * side, kPistolRest.y, kPistolRest.z);
-    const float yaw = side * std::atan(kPistolRest.x / kConvergence) + sway.x;
-    const float pitch = std::atan((-kPistolRest.y - 0.07f) / kConvergence) + sway.y + glm::radians(10.0f) * kick -
-        glm::radians(30.0f) * lower;
-    NodePose pose;
-    pose.translation = rest + glm::vec3(0.0f, 0.012f, 0.04f) * kick + glm::vec3(0.06f * side, -0.1f, 0.08f) * lower;
-    pose.rotation = glm::angleAxis(yaw, kUp) * glm::angleAxis(pitch, kXAxis);
-    return pose;
-}
+// Where looking down points at things to bind them (body space), for what has no node of its own.
+const glm::vec3 kShotgunBindPoint(-0.3f, -0.8f, 0.0f);
 
 float kickCurve(float shotTime)
 {
@@ -153,16 +47,6 @@ glm::mat4 cameraWorldFrom(const glm::vec3& eye, const glm::vec3& forward)
 {
     const glm::vec3 up = std::abs(glm::normalize(forward).y) > 0.999f ? glm::vec3(0.0f, 0.0f, 1.0f) : kUp;
     return glm::inverse(glm::lookAt(eye, eye + forward, up));
-}
-
-// The body's space: at the eyes, turned with the view's yaw only (facing -Z like the camera).
-glm::mat4 bodyWorldFrom(const glm::mat4& cameraWorld)
-{
-    glm::vec3 forward = -glm::vec3(cameraWorld[2]);
-    if (glm::length(flat(forward)) < 0.1f)
-        forward = glm::vec3(cameraWorld[1]); // looking straight down: the view's up points ahead
-    forward = glm::normalize(flat(forward));
-    return glm::rotate(glm::translate(glm::mat4(1.0f), glm::vec3(cameraWorld[3])), std::atan2(-forward.x, -forward.z), kUp);
 }
 
 // How far each kind sits above the floor lying down, and the axis it lies along.
@@ -198,41 +82,13 @@ void GameWorld::resetArms()
 {
     // Read on every (re)start, so edits to the file show after "Restart Level".
     m_tuning = loadWeaponTuning();
+    m_poses = loadArmsPoses();
     m_arms.setConfig(m_tuning.arms);
     m_arms.reset();
     m_view = {};
 
-    m_rigs = {};
-    m_rigs.magazineRounds.fill(-1);
-    const auto nodeTranslation = [](const GameModel& model, int node, glm::vec3 fallback) {
-        return node >= 0 ? model.data.nodes[node].translation : fallback;
-    };
-    if (const GameModel& shotgun = m_assets.model(GameModelId::Shotgun); shotgun.valid()) {
-        m_rigs.shotgunGun = shotgun.data.findNode("gun");
-        m_rigs.shotgunPump = shotgun.data.findNode("pump");
-        m_rigs.shotgunFlash = shotgun.data.findNode("flash");
-        m_rigs.shotgunMuzzle = nodeTranslation(shotgun, shotgun.data.findNode("muzzle"), m_rigs.shotgunMuzzle);
-    }
-    if (const GameModel& pistol = m_assets.model(GameModelId::Pistol); pistol.valid()) {
-        m_rigs.pistolSlide = pistol.data.findNode("slide");
-        m_rigs.pistolFlash = pistol.data.findNode("flash");
-        m_rigs.pistolMuzzle = nodeTranslation(pistol, pistol.data.findNode("muzzle"), m_rigs.pistolMuzzle);
-        if (const int seat = pistol.data.findNode("magseat"); seat >= 0) {
-            NodePose pose;
-            pose.translation = pistol.data.nodes[seat].translation;
-            pose.rotation = pistol.data.nodes[seat].rotation;
-            m_rigs.pistolMagSeat = matrixOf(pose);
-        }
-    }
-    if (const GameModel& magazine = m_assets.model(GameModelId::Magazine); magazine.valid()) {
-        m_rigs.magazineFollower = magazine.data.findNode("follower");
-        for (size_t i = 0; i < m_rigs.magazineRounds.size(); ++i)
-            m_rigs.magazineRounds[i] = magazine.data.findNode("round" + std::to_string(i));
-    }
-    if (const GameModel& hands = m_assets.model(GameModelId::Hands); hands.valid()) {
-        m_rigs.handR = hands.data.findNode("hand_r");
-        m_rigs.handL = hands.data.findNode("hand_l");
-    }
+    m_rigs.find(&m_assets.model(GameModelId::Shotgun).data, &m_assets.model(GameModelId::Pistol).data,
+        &m_assets.model(GameModelId::Magazine).data, &m_assets.model(GameModelId::Hands).data);
 
     m_body = {};
     m_body.band.fill(-1);
@@ -274,6 +130,19 @@ void GameWorld::addShells(int amount, int& added)
     }
 }
 
+void GameWorld::addRounds(int amount, int& added)
+{
+    // Loose, into every zone that takes rounds (the right pocket), quickest first.
+    added = 0;
+    ArmsState& state = m_arms.mutableState();
+    for (int z = 0; z < kZoneCount; ++z) {
+        const int room = std::max(m_arms.config().zones[z].rounds - state.zones[z].rounds, 0);
+        const int n = std::min(room, amount - added);
+        state.zones[z].rounds += n;
+        added += n;
+    }
+}
+
 glm::vec3 GameWorld::weaponBob() const
 {
     return glm::vec3(std::sin(m_view.bobPhase) * m_tuning.bobSide,
@@ -302,7 +171,9 @@ void GameWorld::updateWeapon(const Input& input)
     view.bobPhase += dt * (input.sprinting ? 11.0f : 8.0f) * (input.moving ? 1.0f : 0.0f);
     const glm::mat4 steadyCamera = cameraWorldFrom(input.eye, input.forward);
     const glm::mat4 cameraWorld = steadyCamera * glm::translate(glm::mat4(1.0f), weaponBob());
-    view.bodyToCamera = glm::inverse(cameraWorld) * bodyWorldFrom(steadyCamera);
+    view.bodyWorld = bodyWorldFrom(steadyCamera);
+    view.cameraWorld = cameraWorld;
+    view.bodyToCamera = glm::inverse(cameraWorld) * view.bodyWorld;
     m_jacket = input.jacket;
 
     // The guns lag behind turns, and the shots go where they point.
@@ -320,7 +191,8 @@ void GameWorld::updateWeapon(const Input& input)
     const float maxSway = glm::radians(std::max(m_tuning.maxSwayDegrees, 0.0f));
     view.sway = glm::clamp(view.sway * std::exp(-dt * m_tuning.swayRecovery), glm::vec2(-maxSway), glm::vec2(maxSway));
 
-    m_arms.setRestockHeld(input.restock && input.jacket > 0.5f);
+    m_arms.setRestockHeld(input.restockHeld && input.jacket > 0.5f);
+    m_arms.setReloadHeld(input.reloadHeld && input.jacket <= 0.5f);
     requestFromInput(input);
     m_arms.update(dt);
     const float tiltTarget = m_arms.state().hand(Hand::Off).task == Task::InsertShell ? 1.0f : 0.0f;
@@ -341,37 +213,98 @@ void GameWorld::requestFromInput(const Input& input)
         action.ground = ground;
         m_arms.request(action);
     };
-    // The trigger: one shot per pull.
+    // The left mouse button fires the left hand's gun, or the right hand's when the left has none; the right
+    // button only matters with a gun in each hand (the right one). One shot per pull. Pumping and racking
+    // are on R.
+    const ArmsState& s = m_arms.state();
+    const bool leftArmed = isGun(s.hand(Hand::Off).item.kind);
+    const bool rightArmed = isGun(s.hand(Hand::Main).item.kind);
     const bool pulled = input.fire && !m_view.triggerHeld;
     m_view.triggerHeld = input.fire;
     if (pulled)
+        request(leftArmed ? ActionKind::FireOff : ActionKind::FireMain);
+    if (input.secondary && leftArmed && rightArmed)
         request(ActionKind::FireMain);
-    if (input.secondary)
-        request(m_arms.secondaryAction());
-    if (input.swapTo != ItemKind::Empty)
-        request(ActionKind::Swap, Zone::Bandolier, input.swapTo);
-    if (input.toggleOffGun)
-        request(ActionKind::ToggleOffGun);
-    if (input.unload)
-        request(ActionKind::Unload);
-    if (input.reload)
-        request(ActionKind::Reload);
-    if (input.forceReload)
-        request(ActionKind::ForceReload);
-    if (input.zone >= 0 && input.zone < kZoneCount) {
-        // With the jacket open, the bandolier's button refills it from the pocket.
-        if (input.jacket > 0.5f && input.zone == static_cast<int>(Zone::Bandolier))
-            request(ActionKind::Restock);
-        else
-            request(ActionKind::ZoneButton, static_cast<Zone>(input.zone));
+    // Slot keys and clicks in the jacket view. A press does one thing; held, taking (or putting away) goes on.
+    using Repeat = ArmsView::Repeat;
+    const ArmsConfig& config = m_arms.config();
+    const auto repeatOf = [&](const Action& action) {
+        const Verdict verdict = CanPerformAction(s, config, action);
+        return !verdict.ok ? Repeat::None
+            : verdict.resolved.kind == ActionKind::Fetch ? Repeat::Take
+            : verdict.resolved.kind == ActionKind::Store ? Repeat::Put : Repeat::None;
+    };
+    const auto press = [&](ActionKind kind, const SlotBind& bind) {
+        Action action;
+        action.kind = kind;
+        action.zone = bind.zone;
+        action.item = kind == ActionKind::Store ? s.hand(Hand::Off).item.kind : bind.item;
+        m_view.repeat = repeatOf(action);
+        m_view.repeatBind = bind;
+        request(action.kind, action.zone, action.item);
+    };
+    if (input.use.item != ItemKind::Empty)
+        press(ActionKind::Slot, input.use);
+    if (input.take.item != ItemKind::Empty) {
+        // A gun is drawn (or put away) like with its key; a magazine goes into the empty right hand like with
+        // its key; everything else into the left hand, onto what it already holds of the same.
+        const bool emptyHands = s.hand(Hand::Main).item.kind == ItemKind::Empty && s.hand(Hand::Off).item.kind == ItemKind::Empty;
+        const bool slotLike = isGun(input.take.item) || (input.take.item == ItemKind::Magazine && emptyHands);
+        press(slotLike ? ActionKind::Slot : ActionKind::Fetch, input.take);
     }
-    if (input.putBack)
-        request(ActionKind::PutBack);
-    if (input.pickUp)
-        request(ActionKind::PickUp, Zone::Bandolier, ItemKind::Empty, nearestGroundItem());
+    if (input.put.item != ItemKind::Empty && !isGun(input.put.item))
+        press(ActionKind::Store, input.put);
+    // Still held: another one, once the hand is free, as long as it fits / there is some left. (Checked first,
+    // so running out ends it quietly.) A mouse button follows the cursor to another target.
+    const SlotBind& held = input.useHeld.item != ItemKind::Empty ? input.useHeld
+        : input.takeHeld.item != ItemKind::Empty ? input.takeHeld : input.putHeld;
+    if (held.item == ItemKind::Empty || isGun(held.item)) {
+        m_view.repeat = Repeat::None;
+    }
+    else if (m_view.repeat != Repeat::None && !s.hand(Hand::Off).busy()) {
+        if (input.useHeld.item == ItemKind::Empty)
+            m_view.repeatBind = held;
+        const SlotBind& bind = m_view.repeatBind;
+        const ZoneState& zone = s.zones[static_cast<int>(bind.zone)];
+        Action action;
+        action.zone = bind.zone;
+        if (m_view.repeat == Repeat::Take) {
+            const int left = bind.item == ItemKind::Shell ? zone.shells : bind.item == ItemKind::Round ? zone.rounds : 0;
+            action.kind = ActionKind::Fetch;
+            action.item = bind.item;
+            if (stackable(bind.item) && left > 0 && m_arms.offHandRoom(bind.item) > 0 &&
+                CanPerformAction(s, config, action).ok)
+                m_arms.request(action);
+        }
+        else {
+            action.kind = ActionKind::Store;
+            action.item = s.hand(Hand::Off).item.kind;
+            if ((stackable(action.item) || action.item == ItemKind::Magazine) && CanPerformAction(s, config, action).ok)
+                m_arms.request(action);
+        }
+    }
+    // R: tap, double tap or hold (Game tells them apart); with the jacket open it refills the bandolier.
+    if (input.restock)
+        request(ActionKind::Restock);
+    if (input.reloadTap)
+        request(ActionKind::ReloadTap);
+    if (input.reloadDoubleTap)
+        request(ActionKind::QuickEject);
+    if (input.reloadHold)
+        request(ActionKind::ReloadHold);
+    if (input.interact) {
+        // The nearer of a pickup (taken at once) and a dropped item (the left hand picks it up).
+        float pickupDistance = 0.0f, groundDistance = 0.0f;
+        const int pickup = nearestPickup(&pickupDistance);
+        const int ground = nearestGroundItem(&groundDistance);
+        if (pickup >= 0 && (ground < 0 || pickupDistance <= groundDistance))
+            collectPickup(m_entities[pickup]);
+        else
+            request(ActionKind::PickUp, Zone::Bandolier, ItemKind::Empty, ground);
+    }
 }
 
-int GameWorld::nearestGroundItem() const
+int GameWorld::nearestGroundItem(float* distance) const
 {
     int best = -1;
     float bestDistance = kPickUpReach;
@@ -379,12 +312,14 @@ int GameWorld::nearestGroundItem() const
         if (debris.ground < 0 || !m_arms.state().groundItem(debris.ground))
             continue;
         const glm::vec3 offset = debris.position - m_lastPlayerFeet;
-        const float distance = glm::length(flat(offset));
-        if (distance < bestDistance && std::abs(offset.y) < 1.6f) {
+        const float d = glm::length(flat(offset));
+        if (d < bestDistance && std::abs(offset.y) < 1.6f) {
             best = debris.ground;
-            bestDistance = distance;
+            bestDistance = d;
         }
     }
+    if (distance)
+        *distance = bestDistance;
     return best;
 }
 
@@ -422,17 +357,15 @@ void GameWorld::handleArmsEvents(const glm::mat4& cameraWorld)
         case EventType::DryClick: {
             play(event.item == ItemKind::Pistol ? "pistol_dry" : "shotgun_empty", 0.8f);
             if (event.item == ItemKind::Shotgun) {
-                message(s.shotgun.tube > 0 ? "Click. Pump it (right mouse)"
-                    : "Click. Take a shell (Q / E), push it in (R)");
+                message(s.shotgun.tube > 0 ? "Click. Pump it (tap R)"
+                    : "Click. Take a shell (Z X C V), hold R to push it in");
             }
             else {
                 const Magazine* magazine = s.magazine(s.pistol.magazine);
-                if (s.pistol.slideLocked && magazine && magazine->rounds > 0)
-                    message("Click. Rack the slide (right mouse)");
-                else if (!magazine || magazine->rounds == 0)
-                    message("Click. Empty: R swaps the magazine");
+                if (!magazine || magazine->rounds == 0)
+                    message("Click. Empty: double-tap R drops the magazine, hold R takes it out");
                 else
-                    message("Click. Rack the slide (right mouse)");
+                    message("Click. Rack the slide (tap R)");
             }
             break;
         }
@@ -469,8 +402,10 @@ void GameWorld::handleArmsEvents(const glm::mat4& cameraWorld)
         case EventType::Dropped: {
             // Where it falls from depends on what dropped it.
             glm::vec3 position, velocity;
-            if (event.item == ItemKind::Magazine && event.hand == Hand::Main) {
-                position = worldPoint(mainItem * m_rigs.pistolMagSeat, glm::vec3(0.0f, -0.06f, 0.0f));
+            if (event.item == ItemKind::Magazine && (event.hand == Hand::Main || shownItem(event.hand) == ItemKind::Pistol)) {
+                // Out of the pistol's grip, in whichever hand it is.
+                const glm::mat4 gun = event.hand == Hand::Main ? mainItem : offItem;
+                position = worldPoint(gun * m_rigs.pistolMagSeat, glm::vec3(0.0f, -0.06f, 0.0f));
                 velocity = worldDirection(glm::vec3(0.0f, -0.5f, 0.0f));
             }
             else if (event.item == ItemKind::Round && event.hand == Hand::Main) {
@@ -535,8 +470,8 @@ void GameWorld::shoot(Hand hand, ItemKind gun, const glm::mat4& cameraWorld)
     const glm::vec3 up = glm::cross(right, forward);
     const float spread = std::tan(glm::radians(shotgun ? kSpreadDegrees : kPistolSpreadDegrees));
     const int pellets = shotgun ? kPellets : 1;
-    const float damageNear = shotgun ? kPelletDamageNear : kPistolDamageNear;
-    const float damageFar = shotgun ? kPelletDamageFar : kPistolDamageFar;
+    const float damageNear = shotgun ? m_tuning.pelletDamageNear : m_tuning.pistolDamageNear;
+    const float damageFar = shotgun ? m_tuning.pelletDamageFar : m_tuning.pistolDamageFar;
     std::vector<float> damage(m_entities.size(), 0.0f);
     bool impactPlayed = false;
     for (int pellet = 0; pellet < pellets; ++pellet) {
@@ -568,7 +503,7 @@ void GameWorld::shoot(Hand hand, ItemKind gun, const glm::mat4& cameraWorld)
             const float falloff = std::clamp((targetDistance - 6.0f) / 24.0f, 0.0f, 1.0f);
             float amount = damageNear + (damageFar - damageNear) * falloff;
             if (point.y > enemy.position.y + 1.55f)
-                amount *= 1.6f; // head
+                amount *= m_tuning.headMultiplier;
             damage[target] += amount;
             spawnParticles(point, -dir, glm::vec3(0.45f, 0.03f, 0.02f), 4, 2.5f, 0.06f, 0.5f, true);
         }
@@ -680,7 +615,7 @@ void GameWorld::poseBody()
     const ArmsState& s = m_arms.state();
     restPose(body.data.nodes, m_bodyPose);
     const float open = m_jacket * m_jacket * (3.0f - 2.0f * m_jacket);
-    const float angle = glm::radians(kJacketOpenDegrees) * open;
+    const float angle = glm::radians(m_poses.jacketOpenDegrees) * open;
     if (m_body.flapL >= 0)
         m_bodyPose[m_body.flapL].rotation = glm::angleAxis(angle, kUp);
     if (m_body.flapR >= 0)
@@ -720,36 +655,29 @@ NodePose GameWorld::offHandTarget(int& key, float& phaseLeft) const
                                                                                      : offset(kFlapRRest));
     const glm::mat4 mainItem = matrixOf(m_view.items[0]);
     const ItemKind mainKind = shownItem(Hand::Main);
-    const float t = off.time;
-    phaseLeft = off.duration - t;
+    phaseLeft = off.duration - off.time;
 
-    const auto zoneAnchor = [&](Zone zone) {
-        switch (zone) {
-        case Zone::Bandolier: return poseOf(flapL * matrixOf(kHandBandolier));
-        case Zone::JacketPocket: return poseOf(flapL * matrixOf(kHandPocket));
-        default: return poseOf(flapR * matrixOf(kHandRightPocket));
-        }
-    };
     // Where the hand rests when it isn't doing anything: on what the main hand holds.
+    ArmsAnchors anchors;
+    anchors.restKey = static_cast<int>(mainKind);
+    switch (mainKind) {
+    case ItemKind::Shotgun: {
+        float pump = 0.0f;
+        if (off.task == Task::Pump) {
+            const float p = off.progress(), f = std::clamp(config.pumpEjectFrame, 0.05f, 0.95f);
+            pump = p < f ? p / f : (1.0f - p) / (1.0f - f);
+        }
+        anchors.rest = mainItem * offset(m_poses.pumpRest + glm::vec3(0.0f, 0.0f, m_poses.pumpTravel * pump) +
+            m_poses.palmBelowPump);
+        break;
+    }
+    case ItemKind::Pistol: anchors.rest = mainItem * m_poses.leftSupportsPistol.matrix(); break;
+    case ItemKind::Magazine: anchors.rest = mainItem * m_poses.leftAtMagazine.matrix(); break;
+    default: anchors.rest = m_poses.handLow.matrix(); break;
+    }
     const auto rest = [&]() {
-        key = 100 + static_cast<int>(mainKind);
-        switch (mainKind) {
-        case ItemKind::Shotgun: {
-            float pump = 0.0f;
-            if (off.task == Task::Pump) {
-                const float p = off.progress(), f = std::clamp(config.pumpEjectFrame, 0.05f, 0.95f);
-                pump = p < f ? p / f : (1.0f - p) / (1.0f - f);
-            }
-            return poseOf(mainItem * offset(kPumpRest + glm::vec3(0.0f, 0.0f, kPumpTravel * pump) + kPalmBelowPump));
-        }
-        case ItemKind::Pistol: return poseOf(mainItem * kLeftSupportsPistol);
-        case ItemKind::Magazine: return poseOf(mainItem * kLeftAtMagazine);
-        default: return kHandLow;
-        }
-    };
-    const auto phase = [&](float end, int phaseKey) {
-        key = phaseKey;
-        phaseLeft = end - t;
+        key = 100 + anchors.restKey;
+        return poseOf(anchors.rest);
     };
 
     switch (off.task) {
@@ -759,120 +687,27 @@ NodePose GameWorld::offHandTarget(int& key, float& phaseLeft) const
             return rest();
         key = 1;
         phaseLeft = 0.15f;
-        return kHandReady;
-
-    case Task::Fetch:
-        if (t < off.eventAt) {
-            phase(off.eventAt, 20 + static_cast<int>(off.zone));
-            return zoneAnchor(off.zone);
-        }
-        key = 1;
-        return kHandReady;
-
-    case Task::Store:
-        if (t < off.eventAt) {
-            phase(off.eventAt, 20 + static_cast<int>(off.zone));
-            return zoneAnchor(off.zone);
-        }
-        return rest();
-
-    case Task::InsertShell: {
-        const glm::mat4 port = mainItem * offset(glm::vec3(0.0f, -0.08f, -0.06f));
-        if (t < off.eventAt * 0.55f) {
-            phase(off.eventAt * 0.55f, 30);
-            return poseOf(port);
-        }
-        if (t < off.eventAt) {
-            phase(off.eventAt, 31);
-            return poseOf(mainItem * offset(glm::vec3(0.0f, -0.064f, -0.075f)));
-        }
-        return rest();
-    }
-
-    case Task::PushRound: {
-        const glm::mat4 lips = mainItem * offset(glm::vec3(-0.01f, 0.02f, 0.01f));
-        if (off.zoneUsed && t < off.eventAt) {
-            phase(off.eventAt, 20 + static_cast<int>(off.zone));
-            return zoneAnchor(off.zone);
-        }
-        const float insertAt = off.zoneUsed ? off.event2At : off.eventAt;
-        if (t < insertAt) {
-            phase(insertAt, 47);
-            return poseOf(lips);
-        }
-        return rest();
-    }
-
-    case Task::Restock:
-        if (t < off.eventAt) {
-            phase(off.eventAt, 21);
-            return zoneAnchor(Zone::JacketPocket);
-        }
-        phase(off.event2At, 20);
-        return zoneAnchor(Zone::Bandolier);
-
-    case Task::PickUp:
-        if (t < off.eventAt) {
-            phase(off.eventAt, 40);
-            return poseOf(toCamera * matrixOf(kHandGround));
-        }
-        key = 1;
-        return kHandReady;
-
-    case Task::MagInsert: {
-        // The magazine lines up under the grip, then goes up into it; the hand holds its base.
-        const glm::mat4 seat = mainItem * m_rigs.pistolMagSeat;
-        const glm::mat4 handFromMagazine = glm::inverse(kMagazineInHand);
-        const float lineUp = off.eventAt * 0.45f;
-        if (t < lineUp) {
-            phase(lineUp, 42);
-            return poseOf(seat * offset(glm::vec3(0.0f, -0.16f, 0.0f)) * handFromMagazine);
-        }
-        if (t < off.eventAt) {
-            phase(off.eventAt, 43);
-            const float depth = 0.16f * (1.0f - (t - lineUp) / std::max(off.eventAt - lineUp, 1e-3f));
-            return poseOf(seat * offset(glm::vec3(0.0f, -depth, 0.0f)) * handFromMagazine);
-        }
-        return rest();
-    }
-
-    case Task::Rack: {
-        // Grab the slide's rear and pull it back with it.
-        const float grab = off.eventAt * 0.4f;
-        const float slide = off.eventAt > 0.0f ? std::clamp((t - grab) / std::max(off.eventAt - grab, 1e-3f), 0.0f, 1.0f) : 1.0f;
-        const glm::mat4 rear = mainItem * offset(glm::vec3(0.0f, 0.072f, 0.03f + kSlideTravel * slide), 0.0f, 0.0f, 90.0f);
-        if (t < grab) {
-            phase(grab, 44);
-            return poseOf(rear);
-        }
-        if (t < off.eventAt) {
-            phase(off.eventAt, 45);
-            return poseOf(rear);
-        }
-        return rest();
-    }
-
-    case Task::DrawOffGun:
-    case Task::StowOffGun: {
-        const ItemKind gun = off.task == Task::DrawOffGun ? off.target : off.item.kind;
-        const NodePose& hip = gun == ItemKind::Pistol ? kHandHolster : kHandSling;
-        if (off.task == Task::DrawOffGun && t >= off.duration * 0.5f) {
-            key = 50 + static_cast<int>(gun); // up to the side; poseArms puts the gun there
-            return kHandLow;
-        }
-        phase(off.task == Task::DrawOffGun ? off.duration * 0.5f : off.duration, 41);
-        return poseOf(toCamera * matrixOf(hip));
-    }
-
-    case Task::Swap:
-        // Handing the magazine over to the main hand.
-        key = 48;
-        return poseOf(matrixOf(m_view.hands[0].pose) * offset(glm::vec3(-0.06f, 0.0f, 0.0f)));
-
+        return m_poses.handReady.pose();
     case Task::MagEject:
         return rest();
+    default:
+        break;
     }
-    return rest();
+
+    const ArmsTrackId track = armsTrackOf(off.task);
+    if (track == ArmsTrackId::Count)
+        return rest();
+    const ArmsTaskTimes times = ArmsTaskTimes::of(off);
+    anchors.mainItem = mainItem;
+    anchors.mainHand = matrixOf(m_view.hands[0].pose);
+    anchors.flapL = flapL;
+    anchors.flapR = flapR;
+    anchors.bodyToCamera = toCamera;
+    anchors.magSeat = m_rigs.pistolMagSeat;
+    anchors.slide = off.task == Task::Rack ? armsRackPull(m_poses, times, off.time) : 0.0f;
+    anchors.zone = off.zone;
+    anchors.hipPistol = (off.task == Task::DrawOffGun ? off.target : off.item.kind) == ItemKind::Pistol;
+    return armsTrackTarget(m_poses, track, times, off.time, anchors, key, phaseLeft);
 }
 
 void GameWorld::poseArms(float dt, const glm::mat4& cameraWorld)
@@ -902,13 +737,13 @@ void GameWorld::poseArms(float dt, const glm::mat4& cameraWorld)
     const float mainKick = kickCurve(view.shotTime[0]);
     NodePose mainPose;
     switch (mainKind) {
-    case ItemKind::Shotgun: mainPose = shotgunPose(mainKick, pumpAmount(), view.tilt, view.sway, m_jacket, 1.0f); break;
-    case ItemKind::Pistol: mainPose = pistolPose(mainKick, view.sway, m_jacket, 1.0f); break;
+    case ItemKind::Shotgun: mainPose = shotgunPose(m_poses, mainKick, pumpAmount(), view.tilt, view.sway, m_jacket, 1.0f); break;
+    case ItemKind::Pistol: mainPose = pistolPose(m_poses, mainKick, view.sway, m_jacket, 1.0f); break;
     case ItemKind::Magazine:
-        mainPose = kMagazineHeld;
+        mainPose = m_poses.magazineHeld.pose();
         mainPose.rotation = glm::angleAxis(view.sway.x, kUp) * glm::angleAxis(view.sway.y, kXAxis) * mainPose.rotation;
         break;
-    default: mainPose = kHandLow; break;
+    default: mainPose = m_poses.rightHandLow.pose(); break;
     }
     // Swapping: down out of view with the old item, up with the new one.
     if (main.task == Task::Swap) {
@@ -916,19 +751,20 @@ void GameWorld::poseArms(float dt, const glm::mat4& cameraWorld)
         const float lower = main.time < main.eventAt ? main.time / e
                                                      : 1.0f - (main.time - main.eventAt) / std::max(main.duration - main.eventAt, 1e-3f);
         const float l = std::clamp(lower, 0.0f, 1.0f);
-        mainPose.translation += glm::vec3(0.05f, -0.28f, 0.12f) * l;
-        mainPose.rotation = mainPose.rotation * glm::angleAxis(glm::radians(-50.0f) * l, kXAxis);
+        mainPose.translation += m_poses.swapLower * l;
+        mainPose.rotation = mainPose.rotation * glm::angleAxis(glm::radians(m_poses.swapLowerDegrees) * l, kXAxis);
     }
     // A slight turn of the pistol while the magazine drops.
     if (main.task == Task::MagEject)
-        mainPose.rotation = mainPose.rotation * glm::angleAxis(glm::radians(15.0f) * std::sin(kPi * main.progress()), kZAxis);
+        mainPose.rotation = mainPose.rotation *
+            glm::angleAxis(glm::radians(m_poses.magEjectRollDegrees) * std::sin(kPi * main.progress()), kZAxis);
     mainPose.translation += shake(main);
     view.items[0] = mainPose;
     const glm::mat4 mainItem = matrixOf(mainPose);
     switch (mainKind) {
-    case ItemKind::Shotgun: view.hands[0].pose = poseOf(mainItem * kRightOnShotgun); break;
-    case ItemKind::Pistol: view.hands[0].pose = poseOf(mainItem * kRightOnPistol); break;
-    case ItemKind::Magazine: view.hands[0].pose = poseOf(mainItem * kRightOnMagazine); break;
+    case ItemKind::Shotgun: view.hands[0].pose = poseOf(mainItem * m_poses.rightOnShotgun.matrix()); break;
+    case ItemKind::Pistol: view.hands[0].pose = poseOf(mainItem * m_poses.rightOnPistol.matrix()); break;
+    case ItemKind::Magazine: view.hands[0].pose = poseOf(mainItem * m_poses.rightOnMagazine.matrix()); break;
     default: view.hands[0].pose = mainPose; break;
     }
 
@@ -937,16 +773,16 @@ void GameWorld::poseArms(float dt, const glm::mat4& cameraWorld)
     HandView& offView = view.hands[1];
     if (isGun(offKind) && off.task != Task::StowOffGun) {
         const float kick = kickCurve(view.shotTime[1]);
-        NodePose gun = offKind == ItemKind::Shotgun ? shotgunPose(kick, 0.0f, 0.0f, view.sway, m_jacket, -1.0f)
-                                                    : pistolPose(kick, view.sway, m_jacket, -1.0f);
+        NodePose gun = offKind == ItemKind::Shotgun ? shotgunPose(m_poses, kick, 0.0f, 0.0f, view.sway, m_jacket, -1.0f)
+                                                    : pistolPose(m_poses, kick, view.sway, m_jacket, -1.0f);
         if (off.task == Task::DrawOffGun) {
             // Coming up from the hip.
             const float rise = 1.0f - std::clamp((off.time - off.duration * 0.5f) / std::max(off.duration * 0.5f, 1e-3f), 0.0f, 1.0f);
-            gun.translation += glm::vec3(-0.05f, -0.28f, 0.12f) * rise;
+            gun.translation += m_poses.drawRise * rise;
         }
         gun.translation += shake(off);
         view.items[1] = gun;
-        const glm::mat4 grip = offKind == ItemKind::Shotgun ? kLeftOnShotgunGrip : kRightOnPistol;
+        const glm::mat4 grip = (offKind == ItemKind::Shotgun ? m_poses.leftOnShotgunGrip : m_poses.rightOnPistol).matrix();
         const NodePose target = poseOf(matrixOf(gun) * grip);
         if (offView.key != 50 + static_cast<int>(offKind)) {
             offView.from = offView.key < 0 ? target : offView.pose;
@@ -955,7 +791,7 @@ void GameWorld::poseArms(float dt, const glm::mat4& cameraWorld)
             offView.duration = 0.12f;
         }
         offView.time += dt;
-        offView.pose = blend(offView.from, target, offView.time / offView.duration);
+        offView.pose = easePose(offView.from, target, offView.time / offView.duration);
     }
     else {
         int key = 0;
@@ -968,14 +804,14 @@ void GameWorld::poseArms(float dt, const glm::mat4& cameraWorld)
             offView.duration = std::max(phaseLeft, 0.06f);
         }
         offView.time += dt;
-        offView.pose = blend(offView.from, target, offView.time / offView.duration);
+        offView.pose = easePose(offView.from, target, offView.time / offView.duration);
         offView.pose.translation += shake(off);
         // What it holds sits in the palm.
         const glm::mat4 hand = matrixOf(offView.pose);
         switch (offKind) {
-        case ItemKind::Shell: view.items[1] = poseOf(hand * kShellInHand); break;
-        case ItemKind::Round: view.items[1] = poseOf(hand * kRoundInHand); break;
-        case ItemKind::Magazine: view.items[1] = poseOf(hand * kMagazineInHand); break;
+        case ItemKind::Shell: view.items[1] = poseOf(hand * m_poses.shellInHand.matrix()); break;
+        case ItemKind::Round: view.items[1] = poseOf(hand * m_poses.roundInHand.matrix()); break;
+        case ItemKind::Magazine: view.items[1] = poseOf(hand * m_poses.magazineInHand.matrix()); break;
         default: view.items[1] = offView.pose; break; // a gun on its way to the hip
         }
     }
@@ -1010,7 +846,7 @@ void GameWorld::drawItem(GameModelId id, const glm::mat4& world, const glm::vec3
         return;
     restPose(model.data.nodes, m_scratchPose);
     poseToMatrices(model.data.nodes, m_scratchPose, m_scratchMatrices);
-    emitNodes(model, m_scratchMatrices, world, tint, false, out);
+    emitModelNodes(model, m_scratchMatrices, world, tint, false, out);
 }
 
 void GameWorld::drawShotgun(const glm::mat4& world, float pump, float flash, std::vector<DynamicInstance>& out)
@@ -1019,17 +855,9 @@ void GameWorld::drawShotgun(const glm::mat4& world, float pump, float flash, std
     const GameModel& model = m_assets.model(GameModelId::Shotgun);
     if (!model.valid())
         return;
-    restPose(model.data.nodes, m_scratchPose);
-    if (m_rigs.shotgunGun >= 0)
-        m_scratchPose[m_rigs.shotgunGun] = NodePose{};
-    if (m_rigs.shotgunPump >= 0)
-        m_scratchPose[m_rigs.shotgunPump].translation = kPumpRest + glm::vec3(0.0f, 0.0f, kPumpTravel * pump);
-    if (m_rigs.shotgunFlash >= 0) {
-        m_scratchPose[m_rigs.shotgunFlash].scale = flash > 0.0f ? glm::vec3(1.2f * flash, 1.2f * flash, 1.4f) : glm::vec3(0.0001f);
-        m_scratchPose[m_rigs.shotgunFlash].rotation = glm::angleAxis(m_levelTime * 50.0f, kZAxis);
-    }
+    poseShotgun(model.data, m_rigs, m_poses, pump, flash, m_levelTime * 50.0f, m_scratchPose);
     poseToMatrices(model.data.nodes, m_scratchPose, m_scratchMatrices);
-    emitNodes(model, m_scratchMatrices, world, glm::vec3(1.0f), false, out);
+    emitModelNodes(model, m_scratchMatrices, world, glm::vec3(1.0f), false, out);
 }
 
 void GameWorld::drawPistol(const glm::mat4& world, float slide, float flash, bool withMagazine,
@@ -1038,24 +866,18 @@ void GameWorld::drawPistol(const glm::mat4& world, float slide, float flash, boo
     const GameModel& model = m_assets.model(GameModelId::Pistol);
     if (!model.valid())
         return;
-    restPose(model.data.nodes, m_scratchPose);
-    if (m_rigs.pistolSlide >= 0)
-        m_scratchPose[m_rigs.pistolSlide].translation += glm::vec3(0.0f, 0.0f, kSlideTravel * slide);
-    if (m_rigs.pistolFlash >= 0) {
-        m_scratchPose[m_rigs.pistolFlash].scale = flash > 0.0f ? glm::vec3(0.6f * flash, 0.6f * flash, 0.7f) : glm::vec3(0.0001f);
-        m_scratchPose[m_rigs.pistolFlash].rotation = glm::angleAxis(m_levelTime * 50.0f, kZAxis);
-    }
+    posePistol(model.data, m_rigs, m_poses, slide, flash, m_levelTime * 50.0f, m_scratchPose);
     poseToMatrices(model.data.nodes, m_scratchPose, m_scratchMatrices);
-    emitNodes(model, m_scratchMatrices, world, glm::vec3(1.0f), false, out);
+    emitModelNodes(model, m_scratchMatrices, world, glm::vec3(1.0f), false, out);
 
     const ArmsState& s = m_arms.state();
     if (!withMagazine || s.pistol.magazine < 0)
         return;
     // Sliding out while the release is pressed.
     float drop = 0.0f;
-    const HandState& main = s.hand(Hand::Main);
-    if (main.task == Task::MagEject && main.item.kind == ItemKind::Pistol)
-        drop = 0.03f * std::clamp(main.time / std::max(main.eventAt, 1e-3f), 0.0f, 1.0f);
+    for (const HandState& hand : s.hands)
+        if (hand.task == Task::MagEject && hand.item.kind == ItemKind::Pistol)
+            drop = m_poses.magazineDrop * std::clamp(hand.time / std::max(hand.eventAt, 1e-3f), 0.0f, 1.0f);
     drawMagazine(world * m_rigs.pistolMagSeat * offset(glm::vec3(0.0f, -drop, 0.0f)), s.pistol.magazine, out);
 }
 
@@ -1065,16 +887,9 @@ void GameWorld::drawMagazine(const glm::mat4& world, int magazineId, std::vector
     const Magazine* magazine = m_arms.state().magazine(magazineId);
     if (!model.valid() || !magazine)
         return;
-    restPose(model.data.nodes, m_scratchPose);
-    // The rounds stack from the top; the follower sits under the last one.
-    const int rounds = std::clamp(magazine->rounds, 0, static_cast<int>(m_rigs.magazineRounds.size()));
-    for (size_t i = 0; i < m_rigs.magazineRounds.size(); ++i)
-        if (m_rigs.magazineRounds[i] >= 0)
-            m_scratchPose[m_rigs.magazineRounds[i]].scale = glm::vec3(static_cast<int>(i) < rounds ? 1.0f : 0.0001f);
-    if (m_rigs.magazineFollower >= 0)
-        m_scratchPose[m_rigs.magazineFollower].translation.y = -0.004f - 0.012f * rounds;
+    poseMagazine(model.data, m_rigs, magazine->rounds, m_scratchPose);
     poseToMatrices(model.data.nodes, m_scratchPose, m_scratchMatrices);
-    emitNodes(model, m_scratchMatrices, world, glm::vec3(1.0f), false, out);
+    emitModelNodes(model, m_scratchMatrices, world, glm::vec3(1.0f), false, out);
 }
 
 void GameWorld::collectArms(const glm::mat4& cameraWorld, std::vector<DynamicInstance>& out)
@@ -1083,16 +898,15 @@ void GameWorld::collectArms(const glm::mat4& cameraWorld, std::vector<DynamicIns
     const float open = m_jacket * m_jacket * (3.0f - 2.0f * m_jacket);
     const auto slideOf = [&](Hand hand) {
         // Kicked back by a shot, pulled by the off hand, or locked open.
-        float slide = s.pistol.slideLocked ? kSlideLocked : 0.0f;
+        float slide = s.pistol.slideLocked ? m_poses.slideLocked : 0.0f;
         const float shot = m_view.shotTime[static_cast<int>(hand)];
         if (shot < 0.07f)
             slide = std::max(slide, 1.0f - shot / 0.07f);
         const HandState& off = s.hand(Hand::Off);
         if (off.task == Task::Rack && hand == Hand::Main) {
-            const float grab = off.eventAt * 0.4f;
             slide = off.time < off.eventAt
-                ? std::max(slide, std::clamp((off.time - grab) / std::max(off.eventAt - grab, 1e-3f), 0.0f, 1.0f))
-                : (s.pistol.slideLocked ? kSlideLocked : 1.0f - (off.time - off.eventAt) / std::max(off.duration - off.eventAt, 1e-3f));
+                ? std::max(slide, armsRackPull(m_poses, ArmsTaskTimes::of(off), off.time))
+                : (s.pistol.slideLocked ? m_poses.slideLocked : 1.0f - (off.time - off.eventAt) / std::max(off.duration - off.eventAt, 1e-3f));
         }
         return std::clamp(slide, 0.0f, 1.0f);
     };
@@ -1111,7 +925,7 @@ void GameWorld::collectArms(const glm::mat4& cameraWorld, std::vector<DynamicIns
             if (const GroundItem* item = s.groundItem(debris.ground))
                 drawMagazine(world, item->item.magazine, out);
             break;
-        case ItemKind::Pistol: drawPistol(world, s.pistol.slideLocked ? kSlideLocked : 0.0f, 0.0f, true, out); break;
+        case ItemKind::Pistol: drawPistol(world, s.pistol.slideLocked ? m_poses.slideLocked : 0.0f, 0.0f, true, out); break;
         case ItemKind::Shotgun: drawShotgun(world, 0.0f, 0.0f, out); break;
         default: break;
         }
@@ -1123,7 +937,7 @@ void GameWorld::collectArms(const glm::mat4& cameraWorld, std::vector<DynamicIns
     const glm::mat4 bodyWorld = bodyWorldFrom(cameraWorld);
     const GameModel& body = m_assets.model(GameModelId::PlayerBody);
     if (body.valid() && !m_bodyMatrices.empty()) {
-        emitNodes(body, m_bodyMatrices, bodyWorld, glm::vec3(1.0f), false, out);
+        emitModelNodes(body, m_bodyMatrices, bodyWorld, glm::vec3(1.0f), false, out);
         const auto magazinesAt = [&](Zone zone, const int* anchors, int count, bool visible) {
             const std::vector<int>& magazines = s.zones[static_cast<int>(zone)].magazines;
             for (int i = 0; i < count && i < static_cast<int>(magazines.size()); ++i)
@@ -1139,19 +953,20 @@ void GameWorld::collectArms(const glm::mat4& cameraWorld, std::vector<DynamicIns
         const bool beingDrawn = (main.task == Task::Swap && main.target == ItemKind::Pistol && main.eventDone) ||
             (off.task == Task::DrawOffGun && off.target == ItemKind::Pistol && off.time >= off.duration * 0.5f);
         if (s.handHolding(ItemKind::Pistol) < 0 && !s.onGround(ItemKind::Pistol) && !beingDrawn && m_body.holsterGun >= 0)
-            drawPistol(bodyWorld * bodyNode(m_body.holsterGun), s.pistol.slideLocked ? kSlideLocked : 0.0f, 0.0f, true, out);
+            drawPistol(bodyWorld * bodyNode(m_body.holsterGun), s.pistol.slideLocked ? m_poses.slideLocked : 0.0f, 0.0f, true, out);
+        // The same for the shotgun on its sling.
+        const bool shotgunDrawn = (main.task == Task::Swap && main.target == ItemKind::Shotgun && main.eventDone) ||
+            (off.task == Task::DrawOffGun && off.target == ItemKind::Shotgun && off.time >= off.duration * 0.5f);
+        if (s.handHolding(ItemKind::Shotgun) < 0 && !s.onGround(ItemKind::Shotgun) && !shotgunDrawn)
+            drawShotgun(bodyWorld * m_poses.shotgunSlung.matrix(), 0.0f, 0.0f, out);
     }
 
     // The hands and what they hold, with the camera.
     const glm::mat4 view = cameraWorld * glm::translate(glm::mat4(1.0f), weaponBob());
     if (const GameModel& hands = m_assets.model(GameModelId::Hands); hands.valid()) {
-        restPose(hands.data.nodes, m_scratchPose);
-        if (m_rigs.handR >= 0)
-            m_scratchPose[m_rigs.handR] = m_view.hands[0].pose;
-        if (m_rigs.handL >= 0)
-            m_scratchPose[m_rigs.handL] = m_view.hands[1].pose;
+        poseHands(hands.data, m_rigs, m_view.hands[0].pose, m_view.hands[1].pose, m_scratchPose);
         poseToMatrices(hands.data.nodes, m_scratchPose, m_scratchMatrices);
-        emitNodes(hands, m_scratchMatrices, view, glm::vec3(1.0f), false, out);
+        emitModelNodes(hands, m_scratchMatrices, view, glm::vec3(1.0f), false, out);
     }
     for (Hand hand : { Hand::Main, Hand::Off }) {
         const int h = static_cast<int>(hand);
@@ -1184,9 +999,72 @@ void GameWorld::collectArms(const glm::mat4& cameraWorld, std::vector<DynamicIns
             drawMagazine(world, id, out);
             break;
         }
-        case ItemKind::Shell: drawItem(GameModelId::ShellItem, world, glm::vec3(1.0f), out); break;
-        case ItemKind::Round: drawItem(GameModelId::RoundItem, world, glm::vec3(1.0f), out); break;
+        case ItemKind::Shell:
+        case ItemKind::Round: {
+            // A handful: side by side in the palm (shells lie along X, rounds along Z).
+            const bool shell = shownItem(hand) == ItemKind::Shell;
+            const glm::vec3 step = shell ? glm::vec3(0.0f, 0.004f, 0.024f) : glm::vec3(0.012f, 0.002f, 0.0f);
+            const int count = std::max(state.item.count, 1);
+            for (int i = 0; i < count; ++i)
+                drawItem(shell ? GameModelId::ShellItem : GameModelId::RoundItem,
+                    world * offset(step * (static_cast<float>(i) - 0.5f * static_cast<float>(count - 1))), glm::vec3(1.0f), out);
+            break;
+        }
         default: break;
         }
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Slot binding
+// ---------------------------------------------------------------------------------------------
+
+void GameWorld::bindTargets(std::vector<BindTarget>& out) const
+{
+    out.clear();
+    if (!m_player.alive)
+        return;
+    const ArmsState& s = m_arms.state();
+    const bool open = m_jacket > 0.5f;
+    const auto bodyPoint = [&](const glm::vec3& point) { return glm::vec3(m_view.bodyWorld * glm::vec4(point, 1.0f)); };
+    // The middle of a group of body nodes (shell loops, the cartridge box); false when the model lacks them.
+    const auto nodesCenter = [&](const int* nodes, int count, glm::vec3& center) {
+        glm::vec3 sum(0.0f);
+        int found = 0;
+        for (int i = 0; i < count; ++i) {
+            if (nodes[i] < 0 || m_bodyMatrices.empty())
+                continue;
+            sum += glm::vec3(bodyNode(nodes[i])[3]);
+            ++found;
+        }
+        if (found > 0)
+            center = bodyPoint(sum / static_cast<float>(found));
+        return found > 0;
+    };
+    const auto add = [&](ItemKind item, Zone zone, const glm::vec3& position) {
+        out.push_back({ { item, zone }, position });
+    };
+    // The guns: in a hand, holstered / slung.
+    for (ItemKind gun : { ItemKind::Shotgun, ItemKind::Pistol }) {
+        if (const int h = s.handHolding(gun); h >= 0)
+            add(gun, Zone::Bandolier, glm::vec3(m_view.cameraWorld * glm::vec4(m_view.items[h].translation, 1.0f)));
+        else if (!s.onGround(gun))
+            add(gun, Zone::Bandolier, gun == ItemKind::Shotgun || m_body.holsterGun < 0 || m_bodyMatrices.empty()
+                ? bodyPoint(kShotgunBindPoint) : bodyPoint(glm::vec3(bodyNode(m_body.holsterGun)[3])));
+    }
+    glm::vec3 center;
+    if (nodesCenter(m_body.band.data(), kBandolierLoops, center))
+        add(ItemKind::Shell, Zone::Bandolier, center);
+    if (nodesCenter(m_body.bandMags.data(), 2, center))
+        add(ItemKind::Magazine, Zone::Bandolier, center);
+    if (!open)
+        return; // the rest is inside the jacket
+    if (nodesCenter(m_body.pocket.data(), kPocketSlots, center))
+        add(ItemKind::Shell, Zone::JacketPocket, center);
+    if (nodesCenter(m_body.pocketMags.data(), 2, center))
+        add(ItemKind::Magazine, Zone::JacketPocket, center);
+    if (nodesCenter(m_body.boxRounds.data(), kBoxRounds, center))
+        add(ItemKind::Round, Zone::RightPocket, center);
+    if (nodesCenter(&m_body.rightPocketMag, 1, center))
+        add(ItemKind::Magazine, Zone::RightPocket, center);
 }

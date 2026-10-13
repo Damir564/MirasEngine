@@ -8,6 +8,7 @@
 
 class AudioSystem;
 class ModelManager;
+struct DynamicInstance;
 
 // An animated model the game draws itself: the node hierarchy and clips, with one ModelManager model per mesh.
 struct GameModel {
@@ -18,7 +19,9 @@ struct GameModel {
     bool valid() const { return !data.nodes.empty(); }
 };
 
-enum class GameModelId { Enemy, Shotgun, Medkit, Shells, Exit, PlayerStart, Count };
+enum class GameModelId {
+    Enemy, Shotgun, Pistol, Magazine, Hands, ShellItem, RoundItem, PlayerBody, Medkit, Shells, RoundsBox, Exit, PlayerStart, Count
+};
 
 // The game's own models (weapon, enemies, pickups) and sounds. The models are added to the shared
 // ModelManager after the level has loaded and are released before it is closed, so they never end up in
@@ -27,6 +30,10 @@ class GameAssets {
 public:
     // Loads whatever is missing; a model that fails to load is logged and left invalid.
     void load(ModelManager& models, AudioSystem& audio);
+    // Loads one model if missing (for previews: no sounds, no particle cube). release() unloads it.
+    void loadModel(ModelManager& models, GameModelId id);
+    // Every model this added is still where it was (false once e.g. a scene load unloaded them).
+    bool intact(ModelManager& models) const;
     // Unloads the models this added. Must run before the scene's models are cleared.
     void release(ModelManager& models);
 
@@ -42,6 +49,11 @@ private:
     std::vector<std::pair<size_t, std::string>> m_owned;
     bool m_loaded = false;
 };
+
+// Draws a model posed by model-space node matrices (poseToMatrices()): one DynamicInstance per mesh node,
+// tinted entirely, or only the node `tintedNode` when it is set.
+void emitModelNodes(const GameModel& model, const std::vector<glm::mat4>& nodeMatrices, const glm::mat4& world,
+    const glm::vec3& tint, bool castShadow, std::vector<DynamicInstance>& out, int tintedNode = -1);
 
 // Path of each GameModelId, next to the executable.
 const char* gameModelPath(GameModelId id);

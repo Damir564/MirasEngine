@@ -43,6 +43,7 @@ inline constexpr const char* kPlayerStartEntity = "player_start";
 inline constexpr const char* kEnemyEntity = "enemy";
 inline constexpr const char* kHealthEntity = "health";
 inline constexpr const char* kAmmoEntity = "ammo";
+inline constexpr const char* kRoundsEntity = "rounds";
 inline constexpr const char* kExitEntity = "exit";
 // A point or spot light (Lights.h); the renderer lights the scene with it, the game has nothing to spawn.
 inline constexpr const char* kLightEntity = "light";

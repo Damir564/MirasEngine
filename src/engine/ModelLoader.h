@@ -8,6 +8,8 @@
 // Paths with this prefix name procedurally generated models instead of files.
 inline constexpr const char* kBuiltinCubePath = "builtin:cube";
 bool isBuiltinModelPath(const std::string& path);
+// Source paths of models added at runtime (the game's own models, editor previews): never saved in a scene.
+inline constexpr const char* kRuntimeModelPrefix = "game:";
 
 // Loads a glTF/GLB model from disk via fastgltf (other formats are rejected), going through the
 // .cache file next to the source when it is up to date.

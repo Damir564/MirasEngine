@@ -71,6 +71,7 @@ struct ArmsConfig {
     float stowTime = 0.3f;              // and back
     float ejectTime = 0.25f;
     float ejectFrame = 0.4f;            // fraction of ejectTime where the magazine leaves the grip
+    float quickEjectTime = 0.12f;       // double-tapped R: the magazine just falls (ejectFrame applies too)
     float insertTime = 0.45f;
     float insertFrame = 0.7f;           // the magazine clicks in
     float rackTime = 0.35f;
@@ -91,6 +92,8 @@ struct ArmsConfig {
     float pickUpTime = 0.5f;
     float pickUpFrame = 0.6f;
     float restockTime = 0.45f;
+    int shellsInHand = 4;               // how many shells / rounds one hand holds at once
+    int roundsInHand = 6;
     bool pumpWhileDualWielding = false; // the pump needs the hand that holds the other gun
     bool forceReloadDropsGun = true;    // the force-reload key drops the off hand's gun to free it
     std::array<ZoneConfig, kZoneCount> zones{ {
@@ -116,7 +119,10 @@ struct Magazine {
 struct HeldItem {
     ItemKind kind = ItemKind::Empty;
     int magazine = -1; // Magazine id when kind == Magazine
+    int count = 1;     // shells / rounds held together in one hand (ArmsConfig::shellsInHand / roundsInHand)
 };
+// Shells and rounds stack in a hand; guns and magazines don't.
+bool stackable(ItemKind item);
 
 struct HandState {
     HeldItem item;
@@ -131,9 +137,10 @@ struct HandState {
     bool event2Done = false;
     Zone zone = Zone::Bandolier; // Fetch / Store / PushRound / Swap source or target zone
     bool zoneUsed = false;       // Swap: the zone is involved (a magazine to or from storage)
-    ItemKind target = ItemKind::Empty; // Swap: what comes into the hand; Fetch: what to take
+    ItemKind target = ItemKind::Empty; // Swap: what comes into the hand (Empty: only put away); Fetch: what to take
+    bool exact = false;          // Fetch: only `target`, nothing else the zone holds
     int ground = -1;             // PickUp: the ground item
-    bool drop = false;           // Swap: the magazine being put away had no room and falls
+    bool drop = false;           // Swap: the magazine being put away had no room and falls; MagEject: to the floor
     float rejected = 0.0f;       // seconds since the last refused action involving this hand (for a shake)
 
     bool busy() const { return task != Task::None; }
@@ -180,10 +187,14 @@ enum class ActionKind {
     PutBack,      // the held item back where it came from
     InsertShell,
     PushRound,
-    Swap,         // main hand takes `item`
-    ToggleOffGun, // the other gun into / out of the off hand
+    Swap,         // main hand takes `item` (Empty: puts away what it holds); fromZone: a magazine from `zone`
+    ToggleOffGun, // the other gun (or `item`) into / out of the off hand
     PickUp,
     Restock,
+    Slot,         // a slot key bound to `item` (and `zone`): takes it, or puts it away when a hand has it
+    ReloadTap,    // R tapped: pump the shotgun / rack the pistol
+    ReloadHold,   // R held: put in what the off hand holds (shell, magazine, round), or the pistol's magazine out into it
+    QuickEject,   // R double-tapped: the pistol's magazine (in either hand) drops straight to the floor, quickly
 };
 const char* actionName(ActionKind action);
 
@@ -192,7 +203,25 @@ struct Action {
     Zone zone = Zone::Bandolier;
     ItemKind item = ItemKind::Empty;
     int ground = -1;
+    bool fromZone = false; // Swap: take the magazine from `zone` rather than the emptiest stored one
 };
+
+// What a slot key is bound to: a gun, or shells / rounds / magazines from one zone.
+struct SlotBind {
+    ItemKind item = ItemKind::Empty;
+    Zone zone = Zone::Bandolier;
+};
+// Slots 0-3 are the keys 1-4 and take guns; slots 4-7 are Z X C V and take ammunition and magazines.
+constexpr int kSlotCount = 8;
+constexpr int kGunSlots = 4;
+inline bool slotTakesGuns(int slot) { return slot < kGunSlots; }
+const char* slotKeyName(int slot); // "1".."4", "Z", "X", "C", "V"
+// Whether `bind` may go on `slot`.
+bool slotAccepts(int slot, const SlotBind& bind);
+// 1 shotgun, 2 pistol; Z bandolier shells, X bandolier magazines, C right pocket rounds, V pocket shells.
+std::array<SlotBind, kSlotCount> defaultSlotBinds();
+// "Shotgun", "Bandolier shells", ...
+std::string slotBindName(const SlotBind& bind);
 
 struct Verdict {
     bool ok = false;
@@ -243,6 +272,7 @@ struct ArmsState {
     int shellsFired = 0;
     bool pendingShellInsert = false; // R while the shell is still on its way
     bool restockHeld = false;
+    bool reloadHeld = false;         // inserting shells / pressing rounds in goes on while this is held
 
     HandState& hand(Hand h) { return hands[static_cast<int>(h)]; }
     const HandState& hand(Hand h) const { return hands[static_cast<int>(h)]; }
@@ -277,6 +307,10 @@ public:
     void animationEvent(Hand hand);
     // Restocking continues while this is held.
     void setRestockHeld(bool held) { m_state.restockHeld = held; }
+    // Shell after shell into the tube / round after round into the held magazine while this is held.
+    void setReloadHeld(bool held) { m_state.reloadHeld = held; }
+    // How many more of `item` the off hand could take now (0 when it holds something else).
+    int offHandRoom(ItemKind item) const;
 
     // Contextual buttons as they would resolve now: the secondary button fires the off hand's gun, or
     // pumps / racks the main hand's.
@@ -290,7 +324,6 @@ public:
     // Bookkeeping, for tests: everything currently in the world.
     int totalRounds() const;  // in magazines, chambered, loose in zones, in hands, on the ground
     int totalShells() const;  // tube, chamber (loaded), zones, hands, ground
-    int magazineCount() const; // distinct magazines found in the world (each must be exactly one place)
     bool magazinesAccountedFor() const;
 
 private:

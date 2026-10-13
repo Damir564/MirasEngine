@@ -12,6 +12,7 @@
 class ModelManager;
 class SceneManager;
 struct GraphicsSettings;
+struct ImDrawList;
 
 // Player mode: main menu, then the level (lvl01.scn by default) as a first-person shooter: the scene's
 // entity objects become enemies, pickups and the exit (GameWorld), the player walks with physics and
@@ -64,6 +65,9 @@ private:
     // At the player start, or above the middle of the scene when there is none.
     void spawnPlayer(const SpawnInfo* start);
     void movePlayer(float dt);
+    // R pressed / released (onEvent), and the hold and double-tap timers (update).
+    void onReloadKey(bool down);
+    void updateReloadKey(float dt);
     void updateWorld(float dt, bool controls);
     void returnToMainMenu();
     void stopPlayInEditor();
@@ -86,6 +90,8 @@ private:
     // GameHud.cpp
     void drawHud();
     void drawDebugOverlay();
+    // Jacket open: the cursor, what it points at and the slot keys' bindings.
+    void drawBindView(ImDrawList* draw, float scale);
     // Full-window ImGui window for a menu screen; returns the result of Begin().
     bool beginScreen(const char* id, float backgroundAlpha);
     bool menuButton(const char* label);
@@ -121,9 +127,22 @@ private:
     bool m_jumpRequested = false;
     // Weapon and inventory key presses since the last update (only the pressed-this-frame fields are used).
     GameWorld::Input m_presses;
+    struct ReloadKey {
+        bool down = false;
+        bool used = false;      // this press already did something (a hold, a double tap, restocking)
+        float held = 0.0f;
+        bool tapPending = false; // a pistol tap waiting to see whether a second one follows
+        float sinceTap = 0.0f;
+    };
+    ReloadKey m_reloadKey;
     bool m_debugOverlay = false; // F3 in debug builds: hands, pistol and storage state
     // 0..1: Tab held opens the jacket, tilting the view down to the body and slowing the player.
     float m_jacket = 0.0f;
+    // While it is open the mouse moves a cursor (pixels from the screen's center) instead of the view; a slot
+    // key binds what the cursor points at (GameHud.cpp picks it).
+    glm::vec2 m_bindCursor{ 0.0f };
+    std::vector<GameWorld::BindTarget> m_bindTargets;
+    int m_hoveredBind = -1; // index into m_bindTargets
     float m_stateTime = 0.0f;
 
     struct Bot {
@@ -138,7 +157,8 @@ private:
         bool pump = false;
         bool reload = false;
         bool reloadWasHeld = false;
-        int zone = -1;
+        SlotBind use; // a slot key's action (item Empty = none)
+        bool interact = false;
         int frames = 0;
         int shots = 0;
         int pumps = 0;

@@ -41,7 +41,6 @@ public:
     bool init(SDL_Window* window, bool enableValidation, VulkanBackend firstBackend = VulkanBackend::Native);
     void shutdown();
 
-    const vkb::Instance& vkbInstance() const { return m_vkbInstance; }
     vk::Instance instance() const { return m_instance; }
     vk::SurfaceKHR surface() const { return m_surface; }
     const vkb::PhysicalDevice& vkbPhysicalDevice() const { return m_vkbPhysicalDevice; }

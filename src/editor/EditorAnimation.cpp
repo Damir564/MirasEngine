@@ -221,7 +221,7 @@ void Editor::drawAnimationFileRow()
     ImGui::InputTextWithHint("##animFile", "camera_path.cmap", m_cameraPathFile, sizeof(m_cameraPathFile));
     ImGui::SameLine();
     if (ImGui::Button("Open..."))
-        openFileDialog("BrowseAnimDlg", "Open Camera Path", ".cmap", kCameraPathsRoot, nullptr, false);
+        openFileDialog("BrowseAnimDlg", "Open Camera Path", "Camera Paths", "cmap", kCameraPathsRoot, nullptr, false);
     ImGui::SameLine();
     if (ImGui::Button("Save")) {
         m_cameraAnimator.savePath(m_cameraPathFile);
@@ -242,11 +242,11 @@ void Editor::drawAnimationFileRow()
 
 void Editor::drawAnimationFileDialog()
 {
-    ImGuiFileDialog* dialog = ImGuiFileDialog::Instance();
-    if (!dialog->Display("BrowseAnimDlg", ImGuiWindowFlags_NoCollapse, kDialogSize))
+    std::string chosen;
+    if (!m_fileDialog.take("BrowseAnimDlg", chosen))
         return;
-    if (dialog->IsOk()) {
-        const auto rel = makeRelativeIfInside(dialog->GetFilePathName(), kCameraPathsRoot);
+    if (!chosen.empty()) {
+        const auto rel = makeRelativeIfInside(chosen, kCameraPathsRoot);
         if (rel.has_value()) {
             strncpy(m_cameraPathFile, rel.value().c_str(), sizeof(m_cameraPathFile) - 1);
             m_cameraPathFile[sizeof(m_cameraPathFile) - 1] = '\0';
@@ -256,5 +256,4 @@ void Editor::drawAnimationFileDialog()
             setStatus("Camera paths must be inside the application folder", true);
         }
     }
-    dialog->Close();
 }

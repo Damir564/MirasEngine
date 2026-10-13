@@ -46,6 +46,9 @@ const EntityParamInfo kHealthParams[] = {
 const EntityParamInfo kAmmoParams[] = {
     { "amount", "Shells", Kind::Number, 8.0f, 1.0f, 100.0f, "%.0f", "Shells added to the reserve" },
 };
+const EntityParamInfo kRoundsParams[] = {
+    { "amount", "Rounds", Kind::Number, 16.0f, 1.0f, 100.0f, "%.0f", "Loose pistol rounds added to the right pocket" },
+};
 const EntityParamInfo kExitParams[] = {
     { "next", "Next level", Kind::Text, 0.0f, 0.0f, 0.0f, "", "The .scn file to play after this one (next to the executable); empty ends the game" },
 };
@@ -65,9 +68,11 @@ EntityTypeInfo kEntityTypes[] = {
     { kEnemyEntity, "Enemy", "models/enemy_grunt.glb", "health=60 speed=3.4 damage=12",
         "Chases and hits the player once it sees them, is shot or hears a shot nearby.", kEnemyParams, {} },
     { kHealthEntity, "Health pack", "models/medkit.glb", "amount=25",
-        "Restores health when the player walks over it (not above 100).", kHealthParams, {} },
+        "Restores health when the player picks it up (not above 100).", kHealthParams, {} },
     { kAmmoEntity, "Shotgun shells", "models/shells.glb", "amount=8",
-        "Adds shells to the player's reserve.", kAmmoParams, {} },
+        "Adds shells to the player's reserve when picked up.", kAmmoParams, {} },
+    { kRoundsEntity, "Pistol rounds", "models/rounds_box.glb", "amount=16",
+        "Adds loose pistol rounds (loaded into magazines by hand) when picked up.", kRoundsParams, {} },
     { kExitEntity, "Level exit", "models/exit_portal.glb", "next=",
         "Ends the level when touched, once every enemy is dead.", kExitParams, {} },
     { kLightEntity, "Light", "models/light.glb", "intensity=15 range=12",

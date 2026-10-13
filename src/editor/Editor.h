@@ -14,6 +14,7 @@
 #include "app/AppMode.h"
 #include "EditorKeymap.h"
 #include "EditorPrefs.h"
+#include "FileDialog.h"
 #include "engine/Camera.h"
 #include "engine/CameraAnimation.h"
 #include "engine/Gizmo.h"
@@ -22,6 +23,8 @@
 #include "engine/ModelManager.h"
 #include "engine/PolyMesh.h"
 #include "engine/Renderer.h"
+#include "game/ArmsPoses.h"
+#include "game/GameAssets.h"
 
 class McpServer;
 struct EntityPreset;
@@ -75,7 +78,6 @@ private:
     static constexpr const char* kModelsRoot = "models";
     static constexpr const char* kCameraPathsRoot = ".";
     static constexpr const char* kPrefabsRoot = "prefabs";
-    static constexpr ImVec2 kDialogSize{ 760.0f, 480.0f };
     static constexpr float kGizmoPickRadius = 12.0f;
 
     // One end of the scene orientation gizmo, in scene-view coordinates.
@@ -318,8 +320,9 @@ private:
     void drawSceneSettingsWindow();
     void drawControlsPopup();
     void drawAboutPopup();
-    void openFileDialog(const char* key, const char* title, const char* filters, const std::string& root,
-        const char* defaultFileName, bool confirmOverwrite);
+    // patterns: "gltf;glb". Save dialogs start at root/defaultFileName and confirm overwriting.
+    void openFileDialog(const char* key, const char* title, const char* filterName, const char* patterns,
+        const std::string& root, const char* defaultFileName, bool save);
     void openSceneDialog();
     void saveSceneAsDialog();
     void importModelDialog();
@@ -405,15 +408,29 @@ private:
     bool loadCameraPath();
     void rebuildPathLines();
 
+    // ---- EditorArmsPoses.cpp ----
+    // The player's hands and guns (arms_poses.json): edited here, previewed at the editor camera.
+    void drawArmsPosesPanel();
+    void drawArmsPoseList();
+    void drawArmsMotion();
+    void drawArmsPreviewControls();
+    void drawArmsTasks();
+    void drawArmsTimeline(const ArmsTaskTimes& times);
+    void applyArmsPreset(const char* poseName);
+    void selectArmsTask(int track);
+    // The previewed task's timing from weapon_tuning.json, like Arms gives it.
+    ArmsTaskTimes armsTaskTimes() const;
+    void updateArmsTask(float dt);
+    // Loads the preview models while the panel shows them and releases them otherwise (in update()).
+    void updateArmsPreviewAssets();
+    void releaseArmsPreview();
+    // The posed hands and items for this frame, camera space -> world at the editor camera.
+    void buildArmsPreview();
+
     // ---- EditorStatistics.cpp ----
     void drawStatisticsPanel();
 
-    // ---- EditorLevel.cpp ----
-    void drawLevelPanel();
-    void drawShapeMenuItems();
-    void addLevelShape(PolyShape shape);
-    // Uploads the mesh as a new model and returns its index, or nothing on failure.
-    std::optional<size_t> createLevelModel(PolyMesh mesh, const std::string& name);
+    // ---- EditorLevel.cpp ---- (picking, selection, drags, face drawing, overlay)
     // Editable geometry of the selected instance's model, or null when it is not a level model or is locked.
     PolyMesh* selectedLevelMesh();
     // The active selected face, or null when face editing is off or the face belongs to another instance.
@@ -463,20 +480,10 @@ private:
     // Selects the vertices inside the box, or picks an object when the mouse barely moved.
     void finishVertexMarquee(float mouseX, float mouseY);
     void drawLevelFaceOverlay();
+
+    // ---- EditorLevelOps.cpp ---- (properties, topology edits, clip/mirror/hollow/subtract, level models)
     void drawFaceProperties(PolyMesh& mesh, PolyFace& face);
     void drawVertexProperties(PolyMesh& mesh);
-    // Push/pull and extrude; by index, because extruding adds faces and moves the face storage.
-    void drawFaceGeometry(PolyMesh& mesh, uint32_t faceIndex);
-    void drawEdgeGeometry(PolyMesh& mesh, uint32_t a, uint32_t b);
-    void drawLevelMaterials(PolyMesh& mesh);
-    // What the open texture dialog sets: an inline slot of the selected shape, or a shared material.
-    struct TextureDialogTarget {
-        int slot = -1;
-        std::string sharedPath;
-        bool normal = false; // shared materials only
-    };
-    void openTextureDialog(TextureDialogTarget target);
-    void drawLevelTextureDialog();
     // Uploads the selected shape after an edit and marks the edit for the undo history.
     void rebuildSelectedLevelModel(const char* action);
     // Replaces the selected shape with an edited copy, unless the edit removed every face.
@@ -504,11 +511,29 @@ private:
     // Del in face or vertex mode deletes the selected face or vertices. False in object mode, where
     // Del deletes the object instead.
     bool deleteLevelSelection();
-
+    // Uploads the mesh as a new model and returns its index, or nothing on failure.
+    std::optional<size_t> createLevelModel(PolyMesh mesh, const std::string& name);
     // Level models belong to their instances, so they are unloaded once no instance uses them.
     void releaseUnusedLevelModels();
+
+    // ---- EditorLevelPanel.cpp ---- (Level panel, shape creation, geometry and material UI)
+    void drawLevelPanel();
+    void drawShapeMenuItems();
+    void addLevelShape(PolyShape shape);
     // Where Create puts a new shape: on the surface under the middle of the view, snapped to the grid.
     glm::vec3 placementPoint() const;
+    // Push/pull and extrude; by index, because extruding adds faces and moves the face storage.
+    void drawFaceGeometry(PolyMesh& mesh, uint32_t faceIndex);
+    void drawEdgeGeometry(PolyMesh& mesh, uint32_t a, uint32_t b);
+    void drawLevelMaterials(PolyMesh& mesh);
+    // What the open texture dialog sets: an inline slot of the selected shape, or a shared material.
+    struct TextureDialogTarget {
+        int slot = -1;
+        std::string sharedPath;
+        bool normal = false; // shared materials only
+    };
+    void openTextureDialog(TextureDialogTarget target);
+    void drawLevelTextureDialog();
 
     // ---- EditorLevelDraw.cpp ----
     // Shape drawing: drag a footprint on the ground or the top of any object (snapped to the world grid),
@@ -729,6 +754,8 @@ private:
     // The commands MCP clients call: a table of handlers taking JSON arguments. A nested type, so they
     // can use the editor's internals.
     struct CommandApi;
+
+    // ---- EditorMcp.cpp ----
     // Runs queued MCP calls once no edit is in progress; each call is one undo step. In lateUpdate().
     void pollMcpServer();
     // Runs the script queued by runScript(). In lateUpdate().
@@ -736,11 +763,9 @@ private:
     // Commands between these become one undo step named `action`.
     void beginCommandBatch();
     void endCommandBatch(const std::string& action);
-    // The mesh of a level model, for a command to edit in place: remembered for the undo step and
-    // re-uploaded once at endCommandBatch().
-    PolyMesh& batchEditMesh(size_t modelIndex);
 
     SDL_Window* m_window;
+    FileDialog m_fileDialog;
     const VulkanContext& m_vulkan;
     Renderer& m_renderer;
     ModelManager& m_models;
@@ -805,6 +830,45 @@ private:
     bool m_showMaterialsPanel = true;
     bool m_showGraphicsSettings = false;
     bool m_showSceneSettings = false;
+    bool m_showArmsPoses = false;
+
+    // Arms poses panel
+    struct ArmsPreviewState {
+        int main = 2;   // ArmsMain in EditorArmsPoses.cpp
+        int off = 0;    // ArmsOff
+        int held = 0;   // ArmsHeld, in the off hand
+        float kick = 0.0f, pump = 0.0f, slide = 0.0f, tilt = 0.0f, jacket = 0.0f, swap = 0.0f, rise = 0.0f, flash = 0.0f;
+        bool body = true;
+    };
+    ArmsPoses m_armsPoses;
+    ArmsPoses m_armsPosesSaved; // as in the file
+    bool m_armsPosesRead = false;
+    bool m_armsPreview = true;
+    int m_armsSelected = 0;     // index into armsPoseFields()
+    ArmsPreviewState m_armsState;
+    // The Tasks tab: one task of the support hand played along its track.
+    struct ArmsTaskPreview {
+        int track = 0;      // ArmsTrackId
+        int key = -1;       // selected key
+        float time = 0.0f;
+        bool playing = false;
+        bool loop = true;
+        float speed = 1.0f;
+        int zone = 0;       // Zone, for the zone tasks
+        bool fromStorage = true; // PushRound: fetches the round first
+        int gun = 0;        // Draw/Stow: 0 pistol, 1 shotgun
+    };
+    ArmsTaskPreview m_armsTask;
+    bool m_armsTaskMode = false; // the Tasks tab is open: the preview plays the task
+    ArmsConfig m_armsConfig;     // task timing (weapon_tuning.json)
+    GameAssets m_armsAssets;
+    bool m_armsAssetsLoaded = false;
+    ArmsRigs m_armsRigs;
+    int m_armsFlapL = -1, m_armsFlapR = -1, m_armsHolster = -1; // player_body.glb nodes
+    std::vector<NodePose> m_armsScratchPose;
+    std::vector<glm::mat4> m_armsScratchMatrices;
+    std::vector<glm::mat4> m_armsBodyMatrices;
+    std::vector<DynamicInstance> m_armsDrawables;
     SceneSettings m_savedSceneSettings; // as in the scene's file, for sceneDirty()
     bool m_showKeymap = false;
     bool m_showPreferences = false;

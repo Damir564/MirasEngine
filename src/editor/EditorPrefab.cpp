@@ -30,20 +30,20 @@ void Editor::savePrefabDialog(int instanceIndex)
     m_prefabSaveIds.clear();
     m_prefabSaveName = m_models.getInstances()[instanceIndex].name;
     const std::string fileName = m_prefabSaveName + kPrefabExtension;
-    openFileDialog("SavePrefabDlg", "Save as Prefab", kPrefabExtension, kPrefabsRoot, fileName.c_str(), true);
+    openFileDialog("SavePrefabDlg", "Save as Prefab", "Prefabs", kPrefabExtension + 1, kPrefabsRoot, fileName.c_str(), true);
 }
 
 void Editor::loadPrefabDialog()
 {
-    openFileDialog("LoadPrefabDlg", "Load Prefab", kPrefabExtension, kPrefabsRoot, nullptr, false);
+    openFileDialog("LoadPrefabDlg", "Load Prefab", "Prefabs", kPrefabExtension + 1, kPrefabsRoot, nullptr, false);
 }
 
 void Editor::drawPrefabDialogs()
 {
-    ImGuiFileDialog* dialog = ImGuiFileDialog::Instance();
-    if (dialog->Display("SavePrefabDlg", ImGuiWindowFlags_NoCollapse, kDialogSize)) {
-        if (dialog->IsOk()) {
-            std::filesystem::path path(dialog->GetFilePathName());
+    std::string chosen;
+    if (m_fileDialog.take("SavePrefabDlg", chosen)) {
+        if (!chosen.empty()) {
+            std::filesystem::path path(chosen);
             if (path.extension() != kPrefabExtension)
                 path.replace_extension(kPrefabExtension);
             if (!m_prefabSaveIds.empty())
@@ -55,13 +55,9 @@ void Editor::drawPrefabDialogs()
         }
         m_prefabSaveInstance = -1;
         m_prefabSaveIds.clear();
-        dialog->Close();
     }
-    if (dialog->Display("LoadPrefabDlg", ImGuiWindowFlags_NoCollapse, kDialogSize)) {
-        if (dialog->IsOk())
-            addPrefab(toStoredPath(dialog->GetFilePathName()));
-        dialog->Close();
-    }
+    if (m_fileDialog.take("LoadPrefabDlg", chosen) && !chosen.empty())
+        addPrefab(toStoredPath(chosen));
 }
 
 void Editor::saveAsPrefab(int instanceIndex, const std::string& path)

@@ -21,8 +21,21 @@ struct WeaponTuning {
     // Sprinting scales the step swing, the bob and the move lag by this (walking = 1).
     float sprintBob = 2.2f;
 
+    // Damage per hit (per pellet for the shotgun): full up to 6 m, falling to the far value at 30 m; head
+    // hits x headMultiplier. Enemies have 35-180 health.
+    float pistolDamageNear = 35.0f;
+    float pistolDamageFar = 22.0f;
+    float pelletDamageNear = 13.0f;
+    float pelletDamageFar = 4.0f;
+    float headMultiplier = 1.6f;
+
     ArmsConfig arms;
 };
 
 // Reads the file (writing it with the defaults when it doesn't exist or lacks keys).
 WeaponTuning loadWeaponTuning();
+
+// The slot keys' bindings (1-4, then Z X C V), slot_binds.json in the config folder; the defaults when it is
+// missing or broken.
+std::array<SlotBind, kSlotCount> loadSlotBinds();
+void saveSlotBinds(const std::array<SlotBind, kSlotCount>& binds);

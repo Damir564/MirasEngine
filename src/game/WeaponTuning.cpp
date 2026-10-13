@@ -1,6 +1,7 @@
 #include "WeaponTuning.h"
 #include <nlohmann/json.hpp>
 #include <fstream>
+#include <iterator>
 #include "engine/ConfigPaths.h"
 #include "engine/Log.h"
 
@@ -117,6 +118,7 @@ WeaponTuning loadWeaponTuning()
     pistol.number("stowTime", arms.stowTime);
     pistol.number("ejectTime", arms.ejectTime);
     pistol.number("ejectFrame", arms.ejectFrame);
+    pistol.number("quickEjectTime", arms.quickEjectTime);
     pistol.number("insertTime", arms.insertTime);
     pistol.number("insertFrame", arms.insertFrame);
     pistol.number("rackTime", arms.rackTime);
@@ -126,6 +128,8 @@ WeaponTuning loadWeaponTuning()
     pistol.number("roundInsertTime", arms.roundInsertTime);
     pistol.number("roundInsertFrame", arms.roundInsertFrame);
     pistol.number("handoffTime", arms.handoffTime);
+    pistol.number("damageNear", tuning.pistolDamageNear);
+    pistol.number("damageFar", tuning.pistolDamageFar);
 
     Section shotgun(root, "shotgun", changed);
     shotgun.integer("tubeSize", arms.tubeSize);
@@ -135,12 +139,17 @@ WeaponTuning loadWeaponTuning()
     shotgun.number("shellInsertFrame", arms.shellInsertFrame);
     shotgun.number("recoilDegrees", arms.shotgunRecoilDegrees);
     shotgun.flag("pumpWhileDualWielding", arms.pumpWhileDualWielding);
+    shotgun.number("pelletDamageNear", tuning.pelletDamageNear);
+    shotgun.number("pelletDamageFar", tuning.pelletDamageFar);
 
     Section hands(root, "hands", changed);
     hands.number("pickUpTime", arms.pickUpTime);
     hands.number("pickUpFrame", arms.pickUpFrame);
     hands.number("restockTime", arms.restockTime);
+    hands.integer("shellsInHand", arms.shellsInHand);
+    hands.integer("roundsInHand", arms.roundsInHand);
     hands.flag("forceReloadDropsGun", arms.forceReloadDropsGun);
+    hands.number("headMultiplier", tuning.headMultiplier);
 
     Section zones(root, "zones", changed);
     readZone(zones, "bandolier", arms.zones[static_cast<int>(Zone::Bandolier)], changed);
@@ -157,4 +166,62 @@ WeaponTuning loadWeaponTuning()
             LOG_ERROR("[GAME] Can't write " << path << "\n");
     }
     return tuning;
+}
+
+namespace {
+
+constexpr const char* kBindsFileName = "slot_binds.json";
+constexpr ItemKind kBindable[] = { ItemKind::Shotgun, ItemKind::Pistol, ItemKind::Magazine, ItemKind::Shell, ItemKind::Round };
+constexpr const char* kItemKeys[] = { "shotgun", "pistol", "magazine", "shell", "round" };
+constexpr const char* kZoneKeys[] = { "bandolier", "jacketPocket", "rightPocket" };
+
+} // namespace
+
+std::array<SlotBind, kSlotCount> loadSlotBinds()
+{
+    std::array<SlotBind, kSlotCount> binds = defaultSlotBinds();
+    std::ifstream file(configPath(kBindsFileName));
+    if (!file)
+        return binds;
+    const nlohmann::json root = nlohmann::json::parse(file, nullptr, false);
+    if (!root.is_array()) {
+        LOG_ERROR("[GAME] " << kBindsFileName << " is not a JSON array; using the default slot keys\n");
+        return binds;
+    }
+    for (size_t slot = 0; slot < binds.size() && slot < root.size(); ++slot) {
+        const nlohmann::json& entry = root[slot];
+        if (!entry.is_object())
+            continue;
+        const std::string item = entry.value("item", "");
+        const std::string zone = entry.value("zone", "");
+        SlotBind bind;
+        for (size_t i = 0; i < std::size(kItemKeys); ++i)
+            if (item == kItemKeys[i])
+                bind.item = kBindable[i];
+        for (size_t i = 0; i < std::size(kZoneKeys); ++i)
+            if (zone == kZoneKeys[i])
+                bind.zone = static_cast<Zone>(i);
+        // An unknown item leaves the key unbound; a gun on an ammo key (or the other way) keeps the default.
+        if (slotAccepts(static_cast<int>(slot), bind))
+            binds[slot] = bind;
+    }
+    return binds;
+}
+
+void saveSlotBinds(const std::array<SlotBind, kSlotCount>& binds)
+{
+    nlohmann::json root = nlohmann::json::array();
+    for (const SlotBind& bind : binds) {
+        const char* item = "";
+        for (size_t i = 0; i < std::size(kBindable); ++i)
+            if (bind.item == kBindable[i])
+                item = kItemKeys[i];
+        root.push_back({ { "item", item }, { "zone", kZoneKeys[static_cast<int>(bind.zone)] } });
+    }
+    const std::string path = configPath(kBindsFileName);
+    std::ofstream out(path);
+    if (out)
+        out << root.dump(4) << "\n";
+    else
+        LOG_ERROR("[GAME] Can't write " << path << "\n");
 }

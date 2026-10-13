@@ -73,7 +73,6 @@ void MaterialLibrary::scan()
 {
     m_materials.clear();
     m_missing.clear();
-    ++m_revision;
     std::error_code ec;
     if (!std::filesystem::is_directory(m_root, ec))
         return;
@@ -109,7 +108,6 @@ bool MaterialLibrary::save(const MaterialAsset& material)
         return false;
     m_materials[material.path] = material;
     std::erase(m_missing, material.path);
-    ++m_revision;
     return true;
 }
 
@@ -150,7 +148,6 @@ bool MaterialLibrary::remove(const std::string& path)
         return false;
     }
     m_materials.erase(path);
-    ++m_revision;
     return true;
 }
 
@@ -171,7 +168,6 @@ std::optional<std::string> MaterialLibrary::rename(const std::string& path, cons
     material.path = newPath;
     material.name = std::filesystem::path(newPath).stem().string();
     m_materials[newPath] = std::move(material);
-    ++m_revision;
     return newPath;
 }
 

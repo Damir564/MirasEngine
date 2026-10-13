@@ -2,9 +2,6 @@
   vma.cpp
   main.cpp
   vk_globals.cpp
-  external/ImGuiFileDialog.h
-  external/ImGuiFileDialogConfig.h
-  external/ImGuiFileDialog.cpp
   engine/VulkanContext.h
   engine/VulkanContext.cpp
   engine/Swapchain.h
@@ -16,6 +13,8 @@
   engine/ShaderUtils.cpp
   engine/Renderer.h
   engine/Renderer.cpp
+  engine/RendererDraw.cpp
+  engine/RendererPasses.cpp
   engine/RendererEffects.cpp
   engine/RenderUtils.h
   engine/Atmosphere.h
@@ -35,6 +34,8 @@
   engine/ModelManager.cpp
   engine/PolyMesh.h
   engine/PolyMesh.cpp
+  engine/PolyMeshUv.cpp
+  engine/PolyMeshShapes.cpp
   engine/PolyMeshCsg.cpp
   engine/MaterialLibrary.h
   engine/MaterialLibrary.cpp
@@ -79,9 +80,12 @@
   editor/EditorEntities.cpp
   editor/EditorGroups.cpp
   editor/EditorAnimation.cpp
+  editor/EditorArmsPoses.cpp
   editor/EditorStatistics.cpp
   editor/EditorGizmo.cpp
   editor/EditorLevel.cpp
+  editor/EditorLevelOps.cpp
+  editor/EditorLevelPanel.cpp
   editor/EditorLevelDraw.cpp
   editor/EditorLevelUnite.cpp
   editor/EditorMaterials.cpp
@@ -89,10 +93,12 @@
   editor/EditorPrefab.cpp
   editor/EditorHistory.cpp
   editor/EditorCommands.cpp
+  editor/EditorMcp.cpp
   editor/McpServer.h
   editor/McpServer.cpp
   editor/EditorStyle.h
   editor/FileDialog.h
+  editor/FileDialog.cpp
   game/Game.h
   game/Game.cpp
   game/GameAssets.h
@@ -105,6 +111,8 @@
   game/Arms.cpp
   game/WeaponTuning.h
   game/WeaponTuning.cpp
+  game/ArmsPoses.h
+  game/ArmsPoses.cpp
   game/GameHud.cpp
 )
 
@@ -162,5 +170,3 @@ endif()
 add_executable(arms_tests EXCLUDE_FROM_ALL game/Arms.cpp game/ArmsTests.cpp)
 set_property(TARGET arms_tests PROPERTY CXX_STANDARD 20)
 target_include_directories(arms_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-
-

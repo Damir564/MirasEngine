@@ -51,8 +51,6 @@ public:
     bool remove(const std::string& path);
     // Renames the file; returns the new path. Objects using the old path keep it, so callers relink them.
     std::optional<std::string> rename(const std::string& path, const std::string& newName);
-    // Increases whenever a material is created, saved, renamed or removed.
-    uint64_t revision() const { return m_revision; }
 
     static std::optional<MaterialAsset> loadFile(const std::string& path);
     static bool saveFile(const MaterialAsset& material);
@@ -62,5 +60,4 @@ private:
     std::map<std::string, MaterialAsset> m_materials;
     // Paths find() failed on, so it does not hit the disk for them every frame; cleared by scan().
     std::vector<std::string> m_missing;
-    uint64_t m_revision = 1;
 };

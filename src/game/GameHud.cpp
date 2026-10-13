@@ -3,7 +3,10 @@
 #include <cfloat>
 #include <cmath>
 #include <cstdio>
+#include <string>
+#include <vector>
 #include "imgui.h"
+#include "engine/GraphicsSettings.h"
 
 namespace {
 
@@ -38,6 +41,8 @@ void Game::drawDebugOverlay()
     if (ImGui::Begin("Arms (F3)", nullptr, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoFocusOnAppearing)) {
         const auto describe = [&](const HeldItem& item) {
             std::string text = itemName(item.kind);
+            if (stackable(item.kind))
+                text += " x" + std::to_string(item.count);
             if (const Magazine* magazine = s.magazine(item.magazine))
                 text += " #" + std::to_string(magazine->id) + " (" + std::to_string(magazine->rounds) + "/" +
                     std::to_string(magazine->capacity) + ")";
@@ -76,6 +81,82 @@ void Game::drawDebugOverlay()
         ImGui::Text("Last refused: %s", arms.lastRejection().empty() ? "-" : arms.lastRejection().c_str());
     }
     ImGui::End();
+}
+
+void Game::drawBindView(ImDrawList* draw, float scale)
+{
+    m_hoveredBind = -1;
+    m_bindTargets.clear();
+    if (m_jacket < 0.5f)
+        return;
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    const ImVec2 origin = viewport->Pos;
+    const ImVec2 size = viewport->Size;
+    if (size.x < 1.0f || size.y < 1.0f)
+        return;
+    m_bindCursor = glm::clamp(m_bindCursor, -glm::vec2(size.x, size.y) * 0.5f, glm::vec2(size.x, size.y) * 0.5f);
+    const ImVec2 cursor(origin.x + size.x * 0.5f + m_bindCursor.x, origin.y + size.y * 0.5f + m_bindCursor.y);
+    const float small = 18.0f * scale;
+    const auto& binds = m_world.slotBinds();
+
+    // The targets on screen (the same camera fillFrame() renders with); the one nearest the cursor is hovered.
+    m_world.bindTargets(m_bindTargets);
+    const glm::mat4 viewProj = getProjection(size.x, size.y, kCameraNearPlane, m_settings.viewDistance, m_fieldOfView) *
+        getView(viewCamera());
+    std::vector<ImVec2> screen(m_bindTargets.size());
+    std::vector<bool> onScreen(m_bindTargets.size(), false);
+    float best = 80.0f * scale;
+    for (size_t i = 0; i < m_bindTargets.size(); ++i) {
+        const glm::vec4 clip = viewProj * glm::vec4(m_bindTargets[i].position, 1.0f);
+        if (clip.w < 0.05f)
+            continue;
+        const glm::vec2 ndc = glm::vec2(clip) / clip.w;
+        screen[i] = ImVec2(origin.x + (ndc.x * 0.5f + 0.5f) * size.x, origin.y + (ndc.y * 0.5f + 0.5f) * size.y);
+        onScreen[i] = true;
+        const float distance = std::hypot(screen[i].x - cursor.x, screen[i].y - cursor.y);
+        if (distance < best) {
+            best = distance;
+            m_hoveredBind = static_cast<int>(i);
+        }
+    }
+
+    // Every target with the keys bound to it; the hovered one with its name.
+    for (size_t i = 0; i < m_bindTargets.size(); ++i) {
+        if (!onScreen[i])
+            continue;
+        const SlotBind& target = m_bindTargets[i].bind;
+        std::string keys;
+        for (int slot = 0; slot < kSlotCount; ++slot)
+            if (binds[slot].item == target.item && (isGun(target.item) || binds[slot].zone == target.zone))
+                keys += std::string(keys.empty() ? "" : " ") + slotKeyName(slot);
+        const bool hovered = static_cast<int>(i) == m_hoveredBind;
+        draw->AddCircle(screen[i], (hovered ? 16.0f : 9.0f) * scale, hovered ? rgba(1.0f, 0.85f, 0.3f, 1.0f) : rgba(1, 1, 1, 0.5f),
+            24, (hovered ? 3.0f : 1.5f) * scale);
+        if (!keys.empty())
+            shadowText(draw, small, ImVec2(screen[i].x + 12.0f * scale, screen[i].y - 26.0f * scale),
+                rgba(0.6f, 0.9f, 1.0f, 1.0f), keys.c_str());
+        if (hovered) {
+            const std::string label = slotBindName(target) + (isGun(target.item) ? "   (1 - 4: bind, left click: take)"
+                                                                                  : "   (Z X C V: bind, left click: take, right click: put)");
+            shadowText(draw, small, ImVec2(screen[i].x + 20.0f * scale, screen[i].y - 4.0f * scale),
+                rgba(1.0f, 0.92f, 0.6f, 1.0f), label.c_str());
+        }
+    }
+    draw->AddCircleFilled(cursor, 3.5f * scale, rgba(1, 1, 1, 0.9f));
+    draw->AddCircle(cursor, 7.0f * scale, rgba(0, 0, 0, 0.6f), 16, 1.5f * scale);
+
+    // The keys' bindings along the bottom: the gun keys, then the ammunition keys. Unbound keys are left out.
+    for (int row = 0; row < 2; ++row) {
+        std::string list;
+        for (int slot = row * kGunSlots; slot < (row + 1) * kGunSlots && slot < kSlotCount; ++slot) {
+            if (binds[slot].item == ItemKind::Empty)
+                continue;
+            list += std::string(list.empty() ? "" : "     ") + slotKeyName(slot) + " " + slotBindName(binds[slot]);
+        }
+        const ImVec2 sz = textSize(small, list.c_str());
+        shadowText(draw, small, ImVec2(origin.x + (size.x - sz.x) * 0.5f, origin.y + size.y - (3.6f - 1.4f * row) * small),
+            rgba(0.85f, 0.9f, 1.0f, 0.95f), list.c_str());
+    }
 }
 
 void Game::drawHud()
@@ -153,6 +234,14 @@ void Game::drawHud()
     const ImVec2 timeSize = textSize(small, text);
     shadowText(draw, small, ImVec2(origin.x + size.x - margin - timeSize.x, origin.y + margin * 0.6f),
         rgba(0.85f, 0.85f, 0.9f, 0.8f), text);
+
+    // What the pick-up key would take.
+    if (const std::string prompt = m_world.interactPrompt(); !prompt.empty() && m_jacket < 0.5f) {
+        const std::string line = "F  " + prompt;
+        const ImVec2 sz = textSize(small, line.c_str());
+        shadowText(draw, small, ImVec2(center.x - sz.x * 0.5f, center.y + size.y * 0.24f), rgba(1, 1, 1, 0.9f), line.c_str());
+    }
+    drawBindView(draw, scale);
 
     // Messages, above the crosshair's lower half, newest at the bottom.
     float messageY = center.y + size.y * 0.18f;

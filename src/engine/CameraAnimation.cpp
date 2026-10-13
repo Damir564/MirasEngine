@@ -37,13 +37,6 @@ void CameraAnimator::addKeyframe(const CameraKeyframe& kf) {
     m_path.recalculateDuration();
 }
 
-void CameraAnimator::insertKeyframe(size_t index, const CameraKeyframe& kf) {
-    if (index <= m_path.keyframes.size()) {
-        m_path.keyframes.insert(m_path.keyframes.begin() + index, kf);
-        m_path.recalculateDuration();
-    }
-}
-
 void CameraAnimator::removeKeyframe(size_t index) {
     if (index < m_path.keyframes.size()) {
         m_path.keyframes.erase(m_path.keyframes.begin() + index);

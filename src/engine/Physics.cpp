@@ -300,11 +300,6 @@ void PhysicsWorld::spawnPlayer(const glm::vec3& feetPosition)
         2.0f * (kCapsuleHalfHeight + kCapsuleRadius));
 }
 
-bool PhysicsWorld::hasPlayer() const
-{
-    return m_impl->character != nullptr;
-}
-
 int PhysicsWorld::addCharacter(const glm::vec3& feetPosition, float radius, float height)
 {
     m_impl->characters.push_back(createCharacter(m_impl->system.get(), feetPosition, radius, height));
@@ -328,12 +323,6 @@ glm::vec3 PhysicsWorld::characterPosition(int id) const
     if (id < 0 || id >= static_cast<int>(m_impl->characters.size()) || !m_impl->characters[id])
         return glm::vec3(0.0f);
     return toGlm(JPH::Vec3(m_impl->characters[id]->GetPosition()));
-}
-
-bool PhysicsWorld::characterOnGround(int id) const
-{
-    return id >= 0 && id < static_cast<int>(m_impl->characters.size()) && m_impl->characters[id] &&
-        m_impl->characters[id]->GetGroundState() == JPH::CharacterVirtual::EGroundState::OnGround;
 }
 
 bool PhysicsWorld::castRay(const glm::vec3& origin, const glm::vec3& direction, float maxDistance,

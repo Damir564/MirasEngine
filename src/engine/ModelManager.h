@@ -166,12 +166,10 @@ public:
 
     // Shared materials for level slots and overrides; must outlive the manager. May stay null.
     void setMaterialLibrary(MaterialLibrary* library) { m_materialLibrary = library; }
-    MaterialLibrary* materialLibrary() const { return m_materialLibrary; }
 
     size_t createInstance(size_t modelIndex, const glm::vec3& position = glm::vec3(0.0f), const glm::vec3& rotation = glm::vec3(0.0f), const glm::vec3& scale = glm::vec3(1.0f));
     void removeInstance(size_t instanceIndex);
     void reserveInstances(size_t additional) { m_instances.reserve(m_instances.size() + additional); }
-    ModelInstance* getInstance(size_t instanceIndex);
 
     const std::vector<std::unique_ptr<GPUModel>>& getModels() const { return m_models; }
     std::vector<ModelInstance>& getInstances() { return m_instances; }
@@ -182,7 +180,6 @@ public:
 
     void update();
 
-    bool hasActiveTasks() const { return !m_loadingTasks.empty(); }
     const std::vector<LoadingTask>& getLoadingTasks() const { return m_loadingTasks; }
 
     // Small copy of a texture file (or kCheckerTexturePath) for UI previews such as material thumbnails.

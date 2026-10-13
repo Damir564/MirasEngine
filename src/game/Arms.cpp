@@ -127,6 +127,49 @@ bool pistolIdle(PistolState state)
     return state == PistolState::Ready || state == PistolState::SlideBack || state == PistolState::AwaitingMag;
 }
 
+int handCapacity(const ArmsConfig& config, ItemKind kind)
+{
+    switch (kind) {
+    case ItemKind::Shell: return std::max(config.shellsInHand, 1);
+    case ItemKind::Round: return std::max(config.roundsInHand, 1);
+    default: return 1;
+    }
+}
+
+// Room for more of `kind` in the hand: all of it when empty, the rest of the stack when it holds the same.
+int roomInHand(const ArmsConfig& config, const HandState& hand, ItemKind kind)
+{
+    if (hand.item.kind == ItemKind::Empty)
+        return handCapacity(config, kind);
+    if (hand.item.kind == kind && stackable(kind))
+        return std::max(handCapacity(config, kind) - hand.item.count, 0);
+    return 0;
+}
+
+// One shell / round leaves the hand (inserted, stored); the hand is empty after the last.
+HeldItem takeOne(HandState& hand)
+{
+    HeldItem one = hand.item;
+    one.count = 1;
+    if (hand.item.count > 1) {
+        --hand.item.count;
+    }
+    else {
+        hand.item = {};
+        hand.hasOrigin = false;
+    }
+    return one;
+}
+
+// Adds a grabbed shell / round / magazine to what the hand holds.
+void addToHand(HandState& hand, const HeldItem& item)
+{
+    if (hand.item.kind == item.kind && stackable(item.kind))
+        hand.item.count += item.count;
+    else
+        hand.item = item;
+}
+
 } // namespace
 
 const char* itemName(ItemKind item)
@@ -210,8 +253,53 @@ const char* actionName(ActionKind action)
     case ActionKind::ToggleOffGun: return "ToggleOffGun";
     case ActionKind::PickUp: return "PickUp";
     case ActionKind::Restock: return "Restock";
+    case ActionKind::Slot: return "Slot";
+    case ActionKind::ReloadTap: return "ReloadTap";
+    case ActionKind::ReloadHold: return "ReloadHold";
+    case ActionKind::QuickEject: return "QuickEject";
     }
     return "?";
+}
+
+const char* slotKeyName(int slot)
+{
+    static constexpr const char* kNames[kSlotCount] = { "1", "2", "3", "4", "Z", "X", "C", "V" };
+    return slot >= 0 && slot < kSlotCount ? kNames[slot] : "?";
+}
+
+bool slotAccepts(int slot, const SlotBind& bind)
+{
+    return bind.item == ItemKind::Empty || isGun(bind.item) == slotTakesGuns(slot);
+}
+
+std::array<SlotBind, kSlotCount> defaultSlotBinds()
+{
+    std::array<SlotBind, kSlotCount> binds{};
+    binds[0] = { ItemKind::Shotgun, Zone::Bandolier };
+    binds[1] = { ItemKind::Pistol, Zone::Bandolier };
+    binds[kGunSlots + 0] = { ItemKind::Shell, Zone::Bandolier };
+    binds[kGunSlots + 1] = { ItemKind::Magazine, Zone::Bandolier };
+    binds[kGunSlots + 2] = { ItemKind::Round, Zone::RightPocket };
+    binds[kGunSlots + 3] = { ItemKind::Shell, Zone::JacketPocket };
+    return binds;
+}
+
+std::string slotBindName(const SlotBind& bind)
+{
+    switch (bind.item) {
+    case ItemKind::Shotgun: return "Shotgun";
+    case ItemKind::Pistol: return "Pistol";
+    case ItemKind::Empty: return "Nothing";
+    default: break;
+    }
+    std::string zone = zoneName(bind.zone);
+    zone[0] = static_cast<char>(zone[0] - 'a' + 'A');
+    return zone + " " + plural(bind.item);
+}
+
+bool stackable(ItemKind item)
+{
+    return item == ItemKind::Shell || item == ItemKind::Round;
 }
 
 bool isGun(ItemKind item)
@@ -422,8 +510,11 @@ Verdict CanPerformAction(const ArmsState& s, const ArmsConfig& c, const Action& 
     case ActionKind::Fetch:
         if (isGun(off.item.kind))
             return no(the(itemName(off.item.kind)) + " is in the other hand");
-        if (off.item.kind != ItemKind::Empty)
+        // Another shell / round onto those already held, up to what the hand can hold.
+        if (off.item.kind != ItemKind::Empty && !(a.item == off.item.kind && stackable(a.item)))
             return no("The other hand is full");
+        if (off.item.kind != ItemKind::Empty && roomInHand(c, off, a.item) <= 0)
+            return no(std::string("The hand can't hold more ") + plural(a.item));
         if (off.busy())
             return no(busy);
         return yes(a); // an empty zone: the hand comes back empty, which is the signal
@@ -469,7 +560,7 @@ Verdict CanPerformAction(const ArmsState& s, const ArmsConfig& c, const Action& 
         if (off.task == Task::Fetch && off.target == ItemKind::Shell && !off.eventDone)
             return yes(a); // goes in when it arrives
         if (off.item.kind != ItemKind::Shell)
-            return no("No shell in hand: take one with Q / E");
+            return no("No shell in hand: take one first");
         if (off.busy() || main.busy())
             return no(busy);
         return yes(a);
@@ -497,12 +588,14 @@ Verdict CanPerformAction(const ArmsState& s, const ArmsConfig& c, const Action& 
     case ActionKind::Swap: {
         if (a.item == main.item.kind)
             return no("");
-        if (!isGun(a.item) && a.item != ItemKind::Magazine)
+        if (!isGun(a.item) && a.item != ItemKind::Magazine && a.item != ItemKind::Empty)
             return no("");
         if (main.busy())
             return no("The hand is busy");
         if (off.busy() && assistsMainHand(off.task) && !cancelAllowed(c, off, a.kind))
             return no(busy);
+        if (a.item == ItemKind::Empty)
+            return yes(a); // only putting away (a magazine with no room falls)
         if (isGun(a.item)) {
             if (s.onGround(a.item))
                 return no(the(itemName(a.item)) + " is on the ground");
@@ -515,6 +608,12 @@ Verdict CanPerformAction(const ArmsState& s, const ArmsConfig& c, const Action& 
         // A magazine: the one in the other hand, or a stored one.
         if (off.item.kind == ItemKind::Magazine && (!off.busy() || off.task == Task::MagInsert))
             return yes(a);
+        if (a.fromZone) {
+            // An empty zone is fine: the hand comes back empty, which is the signal.
+            if (c.zones[static_cast<int>(a.zone)].magazines <= 0)
+                return no(the(zoneName(a.zone)) + " doesn't take magazines");
+            return yes(a);
+        }
         if (zoneWithEmptiestMagazine(s, c) < 0)
             return no("No spare magazine");
         return yes(a);
@@ -527,7 +626,8 @@ Verdict CanPerformAction(const ArmsState& s, const ArmsConfig& c, const Action& 
             return yes(a);
         if (off.item.kind != ItemKind::Empty)
             return no("The other hand is full");
-        const ItemKind other = main.item.kind == ItemKind::Pistol ? ItemKind::Shotgun : ItemKind::Pistol;
+        const ItemKind other = isGun(a.item) ? a.item
+            : main.item.kind == ItemKind::Pistol ? ItemKind::Shotgun : ItemKind::Pistol;
         if (s.onGround(other))
             return no(the(itemName(other)) + " is on the ground");
         if (main.item.kind == other || (main.task == Task::Swap && main.target == other))
@@ -537,14 +637,16 @@ Verdict CanPerformAction(const ArmsState& s, const ArmsConfig& c, const Action& 
         return yes(draw);
     }
 
-    case ActionKind::PickUp:
-        if (!s.groundItem(a.ground))
+    case ActionKind::PickUp: {
+        const GroundItem* item = s.groundItem(a.ground);
+        if (!item)
             return no("Nothing to pick up");
-        if (off.item.kind != ItemKind::Empty)
+        if (roomInHand(c, off, item->item.kind) < item->item.count)
             return no("The other hand is full");
         if (off.busy())
             return no(busy);
         return yes(a);
+    }
 
     case ActionKind::Restock:
         if (off.item.kind != ItemKind::Empty || off.busy())
@@ -554,6 +656,91 @@ Verdict CanPerformAction(const ArmsState& s, const ArmsConfig& c, const Action& 
         if (s.zones[static_cast<int>(Zone::JacketPocket)].shells <= 0)
             return no("The jacket pocket has no shells");
         return yes(a);
+
+    case ActionKind::Slot: {
+        const auto as = [&](ActionKind kind, ItemKind item, bool fromZone = false) {
+            Action resolved = a;
+            resolved.kind = kind;
+            resolved.item = item;
+            resolved.fromZone = fromZone;
+            return CanPerformAction(s, c, resolved);
+        };
+        const ItemKind item = a.item;
+        if (isGun(item)) {
+            // In a hand: back into the holster / sling (no gun in that hand afterwards).
+            if (main.item.kind == item)
+                return as(ActionKind::Swap, ItemKind::Empty);
+            if (off.item.kind == item)
+                return as(ActionKind::ToggleOffGun, item);
+            if (s.onGround(item))
+                return no(the(itemName(item)) + " is on the ground");
+            // The other gun already in the main hand: this one goes into the off hand.
+            if (isGun(main.item.kind) || (main.task == Task::Swap && isGun(main.target)))
+                return as(ActionKind::ToggleOffGun, item);
+            return as(ActionKind::Swap, item);
+        }
+        if (!storable(item))
+            return no("Nothing bound to this key");
+        // Something in the off hand (a magazine just taken out, a shell...) goes into this key's zone.
+        if (storable(off.item.kind))
+            return as(ActionKind::Store, off.item.kind);
+        if (item == ItemKind::Magazine) {
+            if (main.item.kind == ItemKind::Magazine)
+                return as(ActionKind::Swap, ItemKind::Empty);
+            // No gun in the main hand: it takes the magazine (to load rounds into); otherwise the off hand
+            // brings one for the pistol.
+            if (main.item.kind == ItemKind::Empty)
+                return as(ActionKind::Swap, ItemKind::Magazine, true);
+            return as(ActionKind::Fetch, ItemKind::Magazine);
+        }
+        if (capacityFor(c.zones[static_cast<int>(a.zone)], item) <= 0)
+            return no(the(zoneName(a.zone)) + " doesn't hold " + plural(item));
+        return as(ActionKind::Fetch, item);
+    }
+
+    case ActionKind::ReloadTap:
+        switch (main.item.kind) {
+        case ItemKind::Shotgun: return with(ActionKind::Pump);
+        case ItemKind::Pistol: return with(ActionKind::Rack);
+        default: return no(isGun(off.item.kind) ? "Only the right hand's gun is worked with R" : "No gun in hand");
+        }
+
+    case ActionKind::ReloadHold: {
+        if (bothGuns)
+            return no("Both hands hold guns");
+        switch (main.item.kind) {
+        case ItemKind::Shotgun:
+            return with(ActionKind::InsertShell);
+        case ItemKind::Magazine:
+            return with(ActionKind::PushRound);
+        case ItemKind::Pistol:
+            if (off.item.kind == ItemKind::Magazine)
+                return with(ActionKind::Load);
+            if (pistol.magazine < 0)
+                return no("No magazine in the pistol or in hand");
+            // Out into the free other hand.
+            if (off.item.kind != ItemKind::Empty)
+                return no("The other hand is full");
+            if (off.busy())
+                return no(busy);
+            return with(ActionKind::Unload);
+        default:
+            return no("Nothing to reload");
+        }
+    }
+
+    case ActionKind::QuickEject: {
+        // The magazine just falls, so whatever the other hand holds or does doesn't matter, and the pistol
+        // may be in either hand.
+        const int h = s.handHolding(ItemKind::Pistol);
+        if (h < 0)
+            return no(""); // the shotgun has nothing to drop: quietly nothing
+        if (pistol.magazine < 0)
+            return no("No magazine in the pistol");
+        if (s.hands[h].busy() || !pistolIdle(pistol.state))
+            return no("The pistol is busy");
+        return yes(a);
+    }
     }
     return no("");
 }
@@ -619,7 +806,8 @@ bool Arms::request(const Action& action)
                 action.kind == ActionKind::Store || action.kind == ActionKind::ZoneButton ||
                 action.kind == ActionKind::PutBack || action.kind == ActionKind::PickUp ||
                 action.kind == ActionKind::ToggleOffGun || action.kind == ActionKind::Restock ||
-                action.kind == ActionKind::Pump || action.kind == ActionKind::Rack;
+                action.kind == ActionKind::Pump || action.kind == ActionKind::Rack || action.kind == ActionKind::ReloadTap ||
+                (action.kind == ActionKind::Slot && (action.item == ItemKind::Shell || action.item == ItemKind::Round));
             const Hand hand = offHand ? Hand::Off : Hand::Main;
             m_state.hand(hand).rejected = 0.0f;
             m_lastRejection = std::string(actionName(action.kind)) + ": " + verdict.reason;
@@ -663,6 +851,15 @@ void Arms::startTask(Hand hand, Task task, float duration, float eventFraction)
 
 int Arms::drop(Hand hand, HeldItem item)
 {
+    // A handful falls apart: every shell / round is its own ground item.
+    if (item.count > 1) {
+        HeldItem one = item;
+        one.count = 1;
+        int id = -1;
+        for (int i = 0; i < item.count; ++i)
+            id = drop(hand, one);
+        return id;
+    }
     GroundItem ground;
     ground.id = m_state.nextGroundId++;
     ground.item = item;
@@ -736,7 +933,7 @@ void Arms::perform(const Action& action)
             const HeldItem held = off.item;
             off.item = {};
             off.hasOrigin = false;
-            drop(Hand::Off, held);
+            drop(Hand::Off, held); // each one of a handful lands on its own
         }
         startTask(Hand::Off, Task::Pump, m_config.pumpTime, m_config.pumpEjectFrame);
         emit(EventType::Pumped, Hand::Off, ItemKind::Shotgun);
@@ -747,10 +944,16 @@ void Arms::perform(const Action& action)
         break;
 
     case ActionKind::Unload:
-        startTask(Hand::Main, Task::MagEject, m_config.ejectTime, m_config.ejectFrame);
+    case ActionKind::QuickEject: {
+        const bool quick = action.kind == ActionKind::QuickEject;
+        // A quick eject works on the pistol in either hand.
+        const Hand hand = quick && s.handHolding(ItemKind::Pistol) == static_cast<int>(Hand::Off) ? Hand::Off : Hand::Main;
+        startTask(hand, Task::MagEject, quick ? m_config.quickEjectTime : m_config.ejectTime, m_config.ejectFrame);
+        s.hand(hand).drop = quick;
         s.pistol.state = PistolState::MagEjecting;
         s.pistol.rackDelay = -1.0f;
         break;
+    }
 
     case ActionKind::Load:
         startTask(Hand::Off, Task::MagInsert, m_config.insertTime, m_config.insertFrame);
@@ -771,7 +974,9 @@ void Arms::perform(const Action& action)
     case ActionKind::Fetch:
         startTask(Hand::Off, Task::Fetch, accessTime(action.zone), 0.5f);
         off.zone = action.zone;
-        // What the hand looks for first; it takes something else from the zone if that's all there is.
+        // What the hand looks for: the asked-for item only, or (asked for nothing) what the main hand's
+        // gun needs first, and something else from the zone if that's all there is.
+        off.exact = action.item != ItemKind::Empty;
         off.target = action.item != ItemKind::Empty ? action.item
             : main.item.kind == ItemKind::Pistol ? ItemKind::Magazine
             : main.item.kind == ItemKind::Magazine ? ItemKind::Round
@@ -832,10 +1037,13 @@ void Arms::perform(const Action& action)
                 handoff = true;
             }
             else {
-                main.zone = static_cast<Zone>(zoneWithEmptiestMagazine(s, m_config));
+                main.zone = action.fromZone ? action.zone : static_cast<Zone>(zoneWithEmptiestMagazine(s, m_config));
                 main.zoneUsed = true;
                 take = accessTime(main.zone);
             }
+        }
+        else if (action.item == ItemKind::Empty) {
+            take = 0.0f; // nothing to take: the hand stays empty
         }
         const float duration = putAway + take;
         startTask(Hand::Main, Task::Swap, duration, duration > 0.0f ? putAway / duration : 0.0f);
@@ -871,6 +1079,9 @@ void Arms::perform(const Action& action)
 
     case ActionKind::Reload:
     case ActionKind::ZoneButton:
+    case ActionKind::Slot:
+    case ActionKind::ReloadTap:
+    case ActionKind::ReloadHold:
         break; // always resolved to something concrete
     }
 }
@@ -973,6 +1184,8 @@ void Arms::runEvent(Hand hand)
         const ZoneConfig& capacity = m_config.zones[static_cast<int>(h.zone)];
         ItemKind order[4] = { h.target, ItemKind::Shell, ItemKind::Magazine, ItemKind::Round };
         for (ItemKind kind : order) {
+            if (h.exact && kind != h.target)
+                break;
             if (countIn(zone, kind) <= 0)
                 continue;
             if (kind == ItemKind::Magazine) {
@@ -982,12 +1195,12 @@ void Arms::runEvent(Hand hand)
                     const Magazine* mb = s.magazine(b);
                     return (ma ? ma->rounds : 0) < (mb ? mb->rounds : 0);
                 });
-                h.item = { ItemKind::Magazine, *best };
+                addToHand(h, { ItemKind::Magazine, *best });
                 zone.magazines.erase(best);
             }
             else {
                 (kind == ItemKind::Shell ? zone.shells : zone.rounds) -= 1;
-                h.item = { kind, -1 };
+                addToHand(h, { kind, -1 });
             }
             h.hasOrigin = true;
             h.origin = h.zone;
@@ -1011,9 +1224,8 @@ void Arms::runEvent(Hand hand)
     }
 
     case Task::Store: {
-        const HeldItem item = h.item;
-        h.item = {};
-        h.hasOrigin = false;
+        // One at a time: the rest of a handful stays in the hand.
+        const HeldItem item = takeOne(h);
         if (storeInto(h.zone, item)) {
             ArmsEvent event;
             event.type = EventType::Stored;
@@ -1030,8 +1242,7 @@ void Arms::runEvent(Hand hand)
 
     case Task::InsertShell:
         if (h.item.kind == ItemKind::Shell && s.shotgun.tube < m_config.tubeSize) {
-            h.item = {};
-            h.hasOrigin = false;
+            takeOne(h);
             ++s.shotgun.tube;
             emit(EventType::ShellInsert, hand, ItemKind::Shell);
         }
@@ -1079,9 +1290,10 @@ void Arms::runEvent(Hand hand)
 
     case Task::PickUp: {
         auto it = std::find_if(s.ground.begin(), s.ground.end(), [&](const GroundItem& g) { return g.id == h.ground; });
-        if (it != s.ground.end() && h.item.kind == ItemKind::Empty) {
-            h.item = it->item;
-            h.hasOrigin = false;
+        if (it != s.ground.end() && roomInHand(m_config, h, it->item.kind) >= it->item.count) {
+            if (h.item.kind == ItemKind::Empty)
+                h.hasOrigin = false;
+            addToHand(h, it->item);
             ArmsEvent event;
             event.type = EventType::PickedUp;
             event.hand = hand;
@@ -1112,13 +1324,13 @@ void Arms::runEvent(Hand hand)
         emit(EventType::MagEject, hand, ItemKind::Magazine);
         if (id < 0)
             break;
-        // Into the free other hand, or onto the ground.
-        if (off.item.kind == ItemKind::Empty && !off.busy()) {
+        // Into the free other hand, or onto the ground (always, when double-tapped).
+        if (!h.drop && hand == Hand::Main && off.item.kind == ItemKind::Empty && !off.busy()) {
             off.item = { ItemKind::Magazine, id };
             off.hasOrigin = false;
         }
         else {
-            drop(Hand::Main, { ItemKind::Magazine, id });
+            drop(hand, { ItemKind::Magazine, id });
         }
         break;
     }
@@ -1218,8 +1430,7 @@ void Arms::runEvent2(Hand hand)
         if (h.item.kind == ItemKind::Round && magazine && s.hand(Hand::Main).item.kind == ItemKind::Magazine &&
             magazine->rounds < magazine->capacity) {
             ++magazine->rounds;
-            h.item = {};
-            h.hasOrigin = false;
+            takeOne(h);
             emit(EventType::RoundInsert, hand, ItemKind::Round);
         }
     }
@@ -1272,6 +1483,21 @@ void Arms::finishTask(Hand hand)
     case Task::Restock:
         if (s.restockHeld && CanPerformAction(s, m_config, { ActionKind::Restock }).ok)
             perform({ ActionKind::Restock });
+        break;
+
+    case Task::InsertShell:
+        // R still held: the next shell from the handful.
+        if (s.reloadHeld && h.item.kind == ItemKind::Shell && CanPerformAction(s, m_config, { ActionKind::InsertShell }).ok)
+            perform({ ActionKind::InsertShell });
+        break;
+
+    case Task::PushRound:
+        // R still held: the next round (from the hand, or from the pocket) into the magazine.
+        if (s.reloadHeld) {
+            const Verdict next = CanPerformAction(s, m_config, { ActionKind::PushRound });
+            if (next.ok)
+                perform(next.resolved);
+        }
         break;
 
     case Task::Swap:
@@ -1338,6 +1564,11 @@ void Arms::abortTask(Hand hand)
 // Bookkeeping
 // ---------------------------------------------------------------------------------------------
 
+int Arms::offHandRoom(ItemKind item) const
+{
+    return roomInHand(m_config, m_state.hand(Hand::Off), item);
+}
+
 int Arms::totalRounds() const
 {
     const ArmsState& s = m_state;
@@ -1347,9 +1578,9 @@ int Arms::totalRounds() const
     for (const ZoneState& zone : s.zones)
         total += zone.rounds;
     for (const HandState& hand : s.hands)
-        total += hand.item.kind == ItemKind::Round ? 1 : 0;
+        total += hand.item.kind == ItemKind::Round ? hand.item.count : 0;
     for (const GroundItem& item : s.ground)
-        total += item.item.kind == ItemKind::Round ? 1 : 0;
+        total += item.item.kind == ItemKind::Round ? item.item.count : 0;
     return total;
 }
 
@@ -1360,9 +1591,9 @@ int Arms::totalShells() const
     for (const ZoneState& zone : s.zones)
         total += zone.shells;
     for (const HandState& hand : s.hands)
-        total += hand.item.kind == ItemKind::Shell ? 1 : 0;
+        total += hand.item.kind == ItemKind::Shell ? hand.item.count : 0;
     for (const GroundItem& item : s.ground)
-        total += item.item.kind == ItemKind::Shell ? 1 : 0;
+        total += item.item.kind == ItemKind::Shell ? item.item.count : 0;
     return total;
 }
 
@@ -1385,11 +1616,6 @@ std::vector<int> magazinePlaces(const ArmsState& s)
 }
 
 } // namespace
-
-int Arms::magazineCount() const
-{
-    return static_cast<int>(magazinePlaces(m_state).size());
-}
 
 bool Arms::magazinesAccountedFor() const
 {

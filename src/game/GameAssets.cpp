@@ -6,6 +6,7 @@
 #include "engine/Log.h"
 #include "engine/ModelLoader.h"
 #include "engine/ModelManager.h"
+#include "engine/Renderer.h"
 
 const char* gameModelPath(GameModelId id)
 {
@@ -20,6 +21,7 @@ const char* gameModelPath(GameModelId id)
     case GameModelId::PlayerBody: return "models/player_body.glb";
     case GameModelId::Medkit: return "models/medkit.glb";
     case GameModelId::Shells: return "models/shells.glb";
+    case GameModelId::RoundsBox: return "models/rounds_box.glb";
     case GameModelId::Exit: return "models/exit_portal.glb";
     case GameModelId::PlayerStart: return "models/player_start.glb";
     default: return "";
@@ -31,29 +33,8 @@ void GameAssets::load(ModelManager& models, AudioSystem& audio)
     if (audio.findSound("shotgun_fire") < 0)
         registerGameSounds(audio);
 
-    for (size_t i = 0; i < m_models.size(); ++i) {
-        GameModel& model = m_models[i];
-        if (model.valid())
-            continue;
-        model = {};
-        model.path = gameModelPath(static_cast<GameModelId>(i));
-        try {
-            model.data = loadAnimatedModel(model.path);
-            const std::string stem = std::filesystem::path(model.path).stem().string();
-            for (size_t m = 0; m < model.data.meshes.size(); ++m) {
-                // A source path no scene or file uses, so they are never confused with scene models.
-                const std::string source = "game:" + model.path + "#" + std::to_string(m);
-                const size_t index = models.addMesh(std::move(model.data.meshes[m]), stem + "/" + std::to_string(m), source);
-                model.meshModels.push_back(index);
-                m_owned.emplace_back(index, source);
-            }
-            model.data.meshes.clear();
-        }
-        catch (const std::exception& e) {
-            LOG_ERROR("[GAME] Can't load " << model.path << ": " << e.what() << "\n");
-            model = {};
-        }
-    }
+    for (size_t i = 0; i < m_models.size(); ++i)
+        loadModel(models, static_cast<GameModelId>(i));
 
     if (!m_cube) {
         if (const auto found = models.findModelByPath(kBuiltinCubePath)) {
@@ -70,6 +51,63 @@ void GameAssets::load(ModelManager& models, AudioSystem& audio)
         }
     }
     m_loaded = true;
+}
+
+void emitModelNodes(const GameModel& model, const std::vector<glm::mat4>& nodeMatrices, const glm::mat4& world,
+    const glm::vec3& tint, bool castShadow, std::vector<DynamicInstance>& out, int tintedNode)
+{
+    for (size_t n = 0; n < model.data.nodes.size() && n < nodeMatrices.size(); ++n) {
+        const int mesh = model.data.nodes[n].mesh;
+        if (mesh < 0 || mesh >= static_cast<int>(model.meshModels.size()))
+            continue;
+        const glm::mat4 matrix = world * nodeMatrices[n];
+        // Parts scaled away (the muzzle flash between shots) are not drawn.
+        const float size = std::max({ glm::length(glm::vec3(matrix[0])), glm::length(glm::vec3(matrix[1])),
+            glm::length(glm::vec3(matrix[2])) });
+        if (size < 0.01f)
+            continue;
+        DynamicInstance& part = out.emplace_back();
+        part.instance.modelIndex = model.meshModels[mesh];
+        part.instance.position = glm::vec3(matrix[3]);
+        part.instance.color = tintedNode < 0 || tintedNode == static_cast<int>(n) ? tint : glm::vec3(1.0f);
+        part.transform = matrix;
+        part.castShadow = castShadow;
+    }
+}
+
+bool GameAssets::intact(ModelManager& models) const
+{
+    for (const auto& [index, source] : m_owned) {
+        const GPUModel* model = models.getModel(index);
+        if (!model || model->sourcePath != source)
+            return false;
+    }
+    return true;
+}
+
+void GameAssets::loadModel(ModelManager& models, GameModelId id)
+{
+    GameModel& model = m_models[static_cast<size_t>(id)];
+    if (model.valid())
+        return;
+    model = {};
+    model.path = gameModelPath(id);
+    try {
+        model.data = loadAnimatedModel(model.path);
+        const std::string stem = std::filesystem::path(model.path).stem().string();
+        for (size_t m = 0; m < model.data.meshes.size(); ++m) {
+            // A source path no scene or file uses, so they are never confused with scene models.
+            const std::string source = kRuntimeModelPrefix + model.path + "#" + std::to_string(m);
+            const size_t index = models.addMesh(std::move(model.data.meshes[m]), stem + "/" + std::to_string(m), source);
+            model.meshModels.push_back(index);
+            m_owned.emplace_back(index, source);
+        }
+        model.data.meshes.clear();
+    }
+    catch (const std::exception& e) {
+        LOG_ERROR("[GAME] Can't load " << model.path << ": " << e.what() << "\n");
+        model = {};
+    }
 }
 
 void GameAssets::release(ModelManager& models)

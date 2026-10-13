@@ -10,6 +10,7 @@
 #include <glm/glm.hpp>
 
 // Forward declarations - adjust these includes to match your project
+#include "ModelLoader.h"  // kRuntimeModelPrefix
 #include "ModelManager.h" // For ModelManager, ModelInstance, GPUModel
 #include "GraphicsSettings.h"
 #include "Log.h"
@@ -85,7 +86,7 @@ public:
         std::vector<uint32_t> modelIndexMap(models.size(), 0);
 
         for (size_t i = 0; i < models.size(); ++i) {
-            if (!models[i] || !models[i]->isValid()) continue;
+            if (!models[i] || !models[i]->isValid() || models[i]->sourcePath.starts_with(kRuntimeModelPrefix)) continue;
 
             bool found = false;
             for (size_t j = 0; j < uniqueModels.size(); ++j) {

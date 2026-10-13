@@ -13,16 +13,13 @@ struct ShaderPair {
     vk::ShaderEXT frag;
 };
 
-// Creates a vertex + fragment shader object pair. Throws std::runtime_error on failure.
-// Linked pairs may optimize across stages but must always be bound together; an unlinked vertex
-// shader can also be bound without a fragment shader (see bindVertexShaderOnly).
+// Creates a linked vertex + fragment shader object pair (may optimize across stages; always bind both).
+// Throws std::runtime_error on failure.
 ShaderPair createShaderPair(vk::Device device,
     const std::filesystem::path& vertSpv,
     const std::filesystem::path& fragSpv,
     std::span<const vk::DescriptorSetLayout> setLayouts,
-    std::span<const vk::PushConstantRange> pushConstants = {},
-    const vk::SpecializationInfo* fragSpecialization = nullptr,
-    bool linked = true);
+    std::span<const vk::PushConstantRange> pushConstants = {});
 
 // Creates a compute shader object. Throws std::runtime_error on failure.
 vk::ShaderEXT createComputeShader(vk::Device device,
@@ -36,16 +33,4 @@ inline void bindShaderPair(vk::CommandBuffer cmd, const ShaderPair& pair) {
     const vk::ShaderStageFlagBits stages[] = { vk::ShaderStageFlagBits::eVertex, vk::ShaderStageFlagBits::eFragment };
     const vk::ShaderEXT shaders[] = { pair.vert, pair.frag };
     cmd.bindShadersEXT(2, stages, shaders);
-}
-
-// Depth-only rendering: with no fragment shader bound, fragments are only depth tested and written.
-inline void bindVertexShaderOnly(vk::CommandBuffer cmd, vk::ShaderEXT vert) {
-    const vk::ShaderStageFlagBits stages[] = { vk::ShaderStageFlagBits::eVertex, vk::ShaderStageFlagBits::eFragment };
-    const vk::ShaderEXT shaders[] = { vert, nullptr };
-    cmd.bindShadersEXT(2, stages, shaders);
-}
-
-inline void bindComputeShader(vk::CommandBuffer cmd, vk::ShaderEXT shader) {
-    const vk::ShaderStageFlagBits stage = vk::ShaderStageFlagBits::eCompute;
-    cmd.bindShadersEXT(1, &stage, &shader);
 }

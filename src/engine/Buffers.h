@@ -39,7 +39,6 @@ public:
     DeviceBuffer& operator=(const DeviceBuffer&) = delete;
 
     vk::Buffer getBuffer() const { return m_buffer; }
-    vk::DeviceSize getSize() const { return m_size; }
 
 private:
     VmaAllocator m_allocator;

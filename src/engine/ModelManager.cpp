@@ -791,13 +791,6 @@ void ModelManager::removeInstance(size_t instanceIndex) {
     }
 }
 
-ModelInstance* ModelManager::getInstance(size_t instanceIndex) {
-    if (instanceIndex < m_instances.size()) {
-        return &m_instances[instanceIndex];
-    }
-    return nullptr;
-}
-
 GPUModel* ModelManager::getModel(size_t index) {
     if (index < m_models.size()) {
         return m_models[index].get();

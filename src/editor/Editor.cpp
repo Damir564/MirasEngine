@@ -93,6 +93,8 @@ void Editor::requestPlay()
     if (m_flyMode)
         setFlyMode(false);
     m_rightMouseHeld = false;
+    // The game loads its own copies; update() loads these again after play.
+    releaseArmsPreview();
     m_modeRequest = ModeRequest::PlayScene;
 }
 
@@ -403,6 +405,8 @@ void Editor::update(float dt)
     }
     moveCamera(dt);
     updateViewTurn(dt);
+    updateArmsPreviewAssets();
+    updateArmsTask(dt);
 }
 
 void Editor::lateUpdate(float dt)
@@ -448,6 +452,7 @@ void Editor::drawUi()
     if (m_showMaterialsPanel) drawMaterialsPanel();
     drawMaterialDropTarget();
     if (m_showAnimationPanel) drawAnimationPanel();
+    if (m_showArmsPoses) drawArmsPosesPanel();
     if (m_showGraphicsSettings) drawGraphicsSettingsWindow();
     if (m_showSceneSettings) drawSceneSettingsWindow();
     if (m_showKeymap) drawKeymapWindow();
@@ -474,6 +479,9 @@ void Editor::fillFrame(FrameInput& frame)
     frame.showGrid = !m_flyMode && m_showGrid && !levelGrid;
     frame.levelGrid = levelGrid;
     frame.gridCellSize = activeGridSize();
+    // After the camera's last move this frame, so the hands stay put in the view.
+    buildArmsPreview();
+    frame.dynamicInstances = m_armsDrawables;
 }
 
 bool Editor::snapActive() const

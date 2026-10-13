@@ -84,7 +84,7 @@ install(CODE "
 install(SCRIPT ${CMAKE_CURRENT_LIST_DIR}/PackageScenes.cmake COMPONENT ${MIRAS_COMPONENT})
 
 # --- Third-party licenses -----------------------------------------------------------------------------
-foreach(dep vulkanhpp volk vma vk_bootstrap sdl3 glm stb fastgltf imgui nlohmann_json)
+foreach(dep vulkanhpp volk vma vk_bootstrap sdl3 glm stb fastgltf imgui nlohmann_json joltphysics)
     FetchContent_GetProperties(${dep})
     if (NOT ${dep}_SOURCE_DIR)
         continue()
@@ -95,16 +95,6 @@ foreach(dep vulkanhpp volk vma vk_bootstrap sdl3 glm stb fastgltf imgui nlohmann
         install(FILES ${licenses} DESTINATION licenses/${dep} COMPONENT ${MIRAS_COMPONENT})
     endif()
 endforeach()
-# ImGuiFileDialog is vendored without a license file; its license is the header comment.
-file(READ ${CMAKE_SOURCE_DIR}/src/external/ImGuiFileDialog.h header LIMIT 4096)
-string(FIND "${header}" "MIT License" licenseBegin)
-string(FIND "${header}" "*/" licenseEnd)
-if (licenseBegin GREATER_EQUAL 0 AND licenseEnd GREATER licenseBegin)
-    math(EXPR licenseLength "${licenseEnd} - ${licenseBegin}")
-    string(SUBSTRING "${header}" ${licenseBegin} ${licenseLength} license)
-    file(WRITE ${CMAKE_BINARY_DIR}/licenses/ImGuiFileDialog.txt "${license}")
-    install(FILES ${CMAKE_BINARY_DIR}/licenses/ImGuiFileDialog.txt DESTINATION licenses COMPONENT ${MIRAS_COMPONENT})
-endif()
 
 # --- Zip ----------------------------------------------------------------------------------------------
 # Not CPack: its ZIP writer stores names in CP437 and fails on non-ASCII (e.g. Cyrillic) model names. Windows'

@@ -4,6 +4,7 @@
 #include <cfloat>
 #include <cmath>
 #include <filesystem>
+#include <iterator>
 #include <limits>
 #include <utility>
 #include "imgui.h"
@@ -24,6 +25,8 @@ constexpr float kEyeHeight = 1.65f;
 constexpr float kJacketPitch = -62.0f;     // looking down at the open jacket
 constexpr float kJacketOpenSeconds = 0.25f;
 constexpr float kJacketSpeed = 0.45f;      // walking speed with the jacket fully open
+constexpr float kReloadHoldSeconds = 0.35f; // R held this long is a hold, not a tap
+constexpr float kDoubleTapSeconds = 0.25f;  // a second R within this after a tap is a double tap
 constexpr float kRestartDelay = 0.3f;      // after dying, so a key still held from the fight doesn't restart
 // Scene loads that make no progress this long (e.g. every model file missing) are reported as failed.
 constexpr float kLoadingStallSeconds = 1.0f;
@@ -94,6 +97,7 @@ void Game::setState(State state)
     const bool wasPlaying = m_state == State::Playing;
     m_state = state;
     m_stateTime = 0.0f;
+    m_reloadKey = {}; // a release while paused would never arrive
     const bool playing = state == State::Playing;
     SDL_SetWindowRelativeMouseMode(m_window, playing);
     ImGuiIO& io = ImGui::GetIO();
@@ -299,30 +303,122 @@ void Game::onEvent(const SDL_Event& event)
         m_jumpRequested = true;
     if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat) {
         GameWorld::Input& press = m_presses;
+        int slot = -1;
         switch (event.key.scancode) {
-        case SDL_SCANCODE_Q: press.zone = static_cast<int>(Zone::Bandolier); break;
-        case SDL_SCANCODE_E: press.zone = static_cast<int>(Zone::JacketPocket); break;
-        case SDL_SCANCODE_C: press.zone = static_cast<int>(Zone::RightPocket); break;
-        case SDL_SCANCODE_R: press.reload = true; break;
-        case SDL_SCANCODE_V: press.forceReload = true; break;
-        case SDL_SCANCODE_X: press.unload = true; break;
-        case SDL_SCANCODE_F: press.putBack = true; break;
-        case SDL_SCANCODE_T: press.pickUp = true; break;
-        case SDL_SCANCODE_G: press.toggleOffGun = true; break;
-        case SDL_SCANCODE_1: press.swapTo = ItemKind::Shotgun; break;
-        case SDL_SCANCODE_2: press.swapTo = ItemKind::Pistol; break;
-        case SDL_SCANCODE_3: press.swapTo = ItemKind::Magazine; break;
+        case SDL_SCANCODE_R: onReloadKey(true); break;
+        case SDL_SCANCODE_F: press.interact = true; break;
+        case SDL_SCANCODE_1: slot = 0; break;
+        case SDL_SCANCODE_2: slot = 1; break;
+        case SDL_SCANCODE_3: slot = 2; break;
+        case SDL_SCANCODE_4: slot = 3; break;
+        case SDL_SCANCODE_Z: slot = kGunSlots + 0; break;
+        case SDL_SCANCODE_X: slot = kGunSlots + 1; break;
+        case SDL_SCANCODE_C: slot = kGunSlots + 2; break;
+        case SDL_SCANCODE_V: slot = kGunSlots + 3; break;
 #ifndef NDEBUG
         case SDL_SCANCODE_F3: m_debugOverlay = !m_debugOverlay; break;
 #endif
         default: break;
         }
+        if (slot >= 0) {
+            // With the jacket open and the cursor on something, the key is bound to it (guns on 1-4,
+            // ammunition and magazines on Z X C V); otherwise it is used.
+            if (m_jacket > 0.5f && m_hoveredBind >= 0 && m_hoveredBind < static_cast<int>(m_bindTargets.size())) {
+                const SlotBind bind = m_bindTargets[m_hoveredBind].bind;
+                if (slotAccepts(slot, bind)) {
+                    m_world.setSlotBind(slot, bind);
+                    m_world.showMessage(std::string(slotKeyName(slot)) + ": " + slotBindName(bind));
+                }
+                else {
+                    m_world.showMessage(isGun(bind.item) ? "Guns go on 1 - 4" : "Ammunition and magazines go on Z X C V");
+                }
+            }
+            else {
+                press.use = m_world.slotBinds()[slot];
+            }
+        }
     }
-    if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN && event.button.button == SDL_BUTTON_RIGHT)
-        m_presses.secondary = true;
+    if (event.type == SDL_EVENT_KEY_UP && event.key.scancode == SDL_SCANCODE_R)
+        onReloadKey(false);
+    if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN) {
+        const bool hovering = m_hoveredBind >= 0 && m_hoveredBind < static_cast<int>(m_bindTargets.size());
+        if (m_jacket > 0.5f) {
+            // The jacket view: left click takes what the cursor is on, right click puts away what the left
+            // hand holds there.
+            if (hovering && event.button.button == SDL_BUTTON_LEFT)
+                m_presses.take = m_bindTargets[m_hoveredBind].bind;
+            if (hovering && event.button.button == SDL_BUTTON_RIGHT)
+                m_presses.put = m_bindTargets[m_hoveredBind].bind;
+        }
+        else if (event.button.button == SDL_BUTTON_RIGHT) {
+            // Only fires the right hand's gun with a gun in each hand (pumping and racking are on R).
+            m_presses.secondary = true;
+        }
+    }
     if (event.type == SDL_EVENT_MOUSE_MOTION && !m_bot.enabled) {
-        m_camera.yaw += event.motion.xrel * m_camera.sensitivity;
-        m_camera.pitch = glm::clamp(m_camera.pitch - event.motion.yrel * m_camera.sensitivity, -89.0f, 89.0f);
+        if (m_jacket > 0.0f) {
+            // The jacket is open: the mouse points at things on the body instead of turning.
+            m_bindCursor += glm::vec2(event.motion.xrel, event.motion.yrel);
+        }
+        else {
+            m_camera.yaw += event.motion.xrel * m_camera.sensitivity;
+            m_camera.pitch = glm::clamp(m_camera.pitch - event.motion.yrel * m_camera.sensitivity, -89.0f, 89.0f);
+        }
+    }
+}
+
+// R is three keys in one: a tap (pump / rack), two taps (the pistol's magazine drops) and a hold (insert,
+// or the magazine out into the hand). A tap on the pistol waits out the double-tap window first, so a
+// double tap never racks; with the shotgun (nothing to double-tap) it acts at once.
+void Game::onReloadKey(bool down)
+{
+    ReloadKey& key = m_reloadKey;
+    if (down) {
+        if (m_jacket > 0.5f) {
+            // The jacket is open: R refills the bandolier instead, while held.
+            m_presses.restock = true;
+            key = {};
+            key.down = key.used = true;
+        }
+        else if (key.tapPending) {
+            m_presses.reloadDoubleTap = true;
+            key = {};
+            key.down = key.used = true;
+        }
+        else {
+            key = {};
+            key.down = true;
+        }
+        return;
+    }
+    if (key.down && !key.used) {
+        if (m_world.arms().state().handHolding(ItemKind::Pistol) >= 0) {
+            key.tapPending = true;
+            key.sinceTap = 0.0f;
+        }
+        else {
+            m_presses.reloadTap = true;
+        }
+    }
+    key.down = false;
+}
+
+void Game::updateReloadKey(float dt)
+{
+    ReloadKey& key = m_reloadKey;
+    if (key.down && !key.used) {
+        key.held += dt;
+        if (key.held >= kReloadHoldSeconds) {
+            m_presses.reloadHold = true;
+            key.used = true;
+        }
+    }
+    if (key.tapPending) {
+        key.sinceTap += dt;
+        if (key.sinceTap >= kDoubleTapSeconds) {
+            m_presses.reloadTap = true;
+            key.tapPending = false;
+        }
     }
 }
 
@@ -338,6 +434,7 @@ void Game::update(float dt)
     case State::Playing:
         if (m_bot.enabled)
             updateBot(dt);
+        updateReloadKey(dt);
         movePlayer(dt);
         updateWorld(dt, true);
         if (!m_world.player().alive)
@@ -400,8 +497,10 @@ void Game::updateWorld(float dt, bool controls)
     const bool* keys = SDL_GetKeyboardState(nullptr);
     const bool jacketHeld = controls && keys[SDL_SCANCODE_TAB];
     m_jacket = std::clamp(m_jacket + (jacketHeld ? dt : -dt) / kJacketOpenSeconds, 0.0f, 1.0f);
+    if (m_jacket <= 0.0f)
+        m_bindCursor = glm::vec2(0.0f); // opens with the cursor in the middle
     input.jacket = m_jacket;
-    input.restock = controls && keys[SDL_SCANCODE_Q];
+    input.restockHeld = controls && keys[SDL_SCANCODE_R];
     input.forward = getFront(viewCamera());
     input.playerFeet = m_physics.playerPosition();
     if (controls) {
@@ -412,12 +511,31 @@ void Game::updateWorld(float dt, bool controls)
         const SDL_MouseButtonFlags buttons = SDL_GetMouseState(nullptr, nullptr);
         if (m_bot.enabled) {
             input.fire = m_bot.fire;
-            input.secondary = m_bot.pump;
-            input.reload = m_bot.reload;
-            input.zone = m_bot.zone;
+            input.reloadTap = m_bot.pump;    // a tap of R pumps
+            input.reloadHold = m_bot.reload; // holding R pushes the shell in
+            input.use = m_bot.use;
+            input.interact = m_bot.interact;
         }
         else {
-            input.fire = (buttons & SDL_BUTTON_LMASK) != 0;
+            // With the jacket open the mouse buttons work on what the cursor points at, not the triggers.
+            const bool jacketOpen = m_jacket > 0.5f;
+            input.fire = !jacketOpen && (buttons & SDL_BUTTON_LMASK) != 0;
+            input.reloadHeld = keys[SDL_SCANCODE_R];
+            if (jacketOpen && m_hoveredBind >= 0 && m_hoveredBind < static_cast<int>(m_bindTargets.size())) {
+                const SlotBind& hovered = m_bindTargets[m_hoveredBind].bind;
+                if (buttons & SDL_BUTTON_LMASK)
+                    input.takeHeld = hovered;
+                if (buttons & SDL_BUTTON_RMASK)
+                    input.putHeld = hovered;
+            }
+            // An ammunition key held down (the first one, if several are).
+            static constexpr SDL_Scancode kAmmoKeys[] = { SDL_SCANCODE_Z, SDL_SCANCODE_X, SDL_SCANCODE_C, SDL_SCANCODE_V };
+            for (int i = 0; i < static_cast<int>(std::size(kAmmoKeys)); ++i) {
+                if (keys[kAmmoKeys[i]]) {
+                    input.useHeld = m_world.slotBinds()[kGunSlots + i];
+                    break;
+                }
+            }
         }
     }
     m_world.update(input);
@@ -456,7 +574,8 @@ void Game::updateBot(float dt)
     bot.fire = false;
     bot.pump = false;
     bot.reload = false;
-    bot.zone = -1;
+    bot.use = {};
+    bot.interact = false;
     const ArmsState& arms = m_world.arms().state();
     const int shellsCarried = arms.zones[static_cast<int>(Zone::Bandolier)].shells +
         arms.zones[static_cast<int>(Zone::JacketPocket)].shells;
@@ -595,11 +714,15 @@ void Game::updateBot(float dt)
         bot.reload = !bot.reloadWasHeld;
     }
     else if (wantLoad && handFree) {
-        // Take a shell (Q / E), then R pushes it in.
-        bot.zone = static_cast<int>(arms.zones[static_cast<int>(Zone::Bandolier)].shells > 0 ? Zone::Bandolier
-                                                                                            : Zone::JacketPocket);
+        // Take a shell (a slot key bound to the bandolier's or the pocket's shells), then R pushes it in.
+        bot.use = { ItemKind::Shell, arms.zones[static_cast<int>(Zone::Bandolier)].shells > 0 ? Zone::Bandolier
+                                                                                             : Zone::JacketPocket };
     }
     bot.reloadWasHeld = bot.reload;
+    // Takes the pickups it passes by (a few times a second, so a full medkit isn't refused every frame), not
+    // dropped items: a round in the left hand would keep it from pumping.
+    if (handFree && !bot.pump && bot.use.item == ItemKind::Empty && bot.frames % 20 == 0)
+        bot.interact = m_world.interactPrompt().rfind("Take", 0) == 0;
 
     if (enemyLeft && visible) {
         bot.lostSight = 0.0f;
@@ -887,26 +1010,28 @@ void Game::drawControlsScreen()
         { "Shift", "Sprint" },
         { "Space", "Jump" },
         { "Mouse", "Look; the gun follows, a little behind" },
+        { nullptr, "Gun keys 1 - 4" },
+        { "1 - 4", "Draw the bound gun (at first 1 shotgun, 2 pistol); again: put it away (empty hands)" },
+        { "Other gun's key", "With one gun out: the other goes into the left hand (a gun in each hand)" },
+        { nullptr, "Ammunition keys Z X C V" },
+        { "Z X C V", "Take one from the bound place (at first bandolier shells / magazines, right pocket rounds, pocket shells)" },
+        { "Z X C V (hold)", "Keep taking: a handful of shells (up to 4) or rounds (up to 6) in the left hand" },
+        { "Holding something", "Z X C V puts what the left hand holds into that key's place (held: one after another)" },
+        { "Tab + left click", "Take what the cursor is on (held: keep taking)" },
+        { "Tab + right click", "Put what the left hand holds where the cursor is (held: one after another)" },
+        { "Magazine key", "With no gun out the right hand takes the magazine, to load rounds into" },
+        { "Tab + mouse + key", "Bind: open the jacket, point at a gun (1 - 4) or ammunition (Z X C V), press the key" },
         { nullptr, "Hands" },
-        { "1 / 2 / 3", "Right hand takes the shotgun / the pistol / a magazine (to load rounds into)" },
-        { "G", "Left hand takes the other gun, or puts it away (a gun in each hand: no reloading)" },
-        { "Left click", "Fire the gun in the right hand" },
-        { "Right click", "Fire the gun in the left hand; otherwise pump the shotgun / rack the pistol" },
-        { "T", "Pick up the nearest dropped item" },
-        { nullptr, "Shotgun" },
-        { "Q / E", "Take a shell from the bandolier (quick) / the jacket pocket (slow)" },
-        { "R", "Push the shell in your left hand into the tube" },
-        { nullptr, "Pistol" },
-        { "X", "Drop the magazine out: into the free left hand, or onto the floor" },
-        { "R", "Reload step by step: magazine out, put an empty one away, fetch the fullest, push it in, rack" },
-        { "V", "Reload even with a gun in each hand: the left hand drops its gun first" },
-        { "Holding a magazine", "R presses one loose round in (from the right pocket)" },
-        { nullptr, "Inventory" },
-        { "Q / E / C", "With the left hand empty: take from the bandolier / jacket pocket / right pocket" },
-        { "Q / E / C", "With something in the left hand: put it there" },
-        { "F", "Put what the left hand holds back where it came from" },
+        { "Left click", "Fire the gun in the left hand (or the right hand's gun when the left has none)" },
+        { "Right click", "Only with a gun in each hand: fire the right one" },
+        { "F", "Pick up: ammunition, medkits, dropped items" },
+        { nullptr, "R" },
+        { "Tap", "Pump the shotgun / rack the pistol's slide" },
+        { "Double tap", "Pistol (either hand, whatever the other holds): the magazine drops straight to the floor (fast)" },
+        { "Hold", "Put in what the left hand holds: shells into the tube, a magazine into the pistol, rounds into the held magazine; one after another while held" },
+        { "Hold (pistol)", "Left hand empty: the magazine comes out into it" },
+        { "Tab + R (hold)", "Move shells from the jacket pocket to the bandolier" },
         { "Tab (hold)", "Open the jacket and look at what you carry" },
-        { "Tab + Q (hold)", "Move shells from the pocket to the bandolier" },
         { nullptr, "Game" },
         { "Esc", "Pause" },
         { "R / Space", "Try again after dying" },
@@ -922,7 +1047,7 @@ void Game::drawControlsScreen()
         if (ImGui::BeginChild("##controlsPanel", ImVec2(panelWidth, panelHeight), ImGuiChildFlags_Borders)) {
             ImGui::SetWindowFontScale(1.15f);
             if (ImGui::BeginTable("##controls", 2, ImGuiTableFlags_SizingFixedFit)) {
-                ImGui::TableSetupColumn("keys", ImGuiTableColumnFlags_WidthFixed, 170.0f);
+                ImGui::TableSetupColumn("keys", ImGuiTableColumnFlags_WidthFixed, 200.0f);
                 ImGui::TableSetupColumn("action", ImGuiTableColumnFlags_WidthStretch);
                 for (const Row& row : kRows) {
                     ImGui::TableNextRow();

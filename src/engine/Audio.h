@@ -39,28 +39,23 @@ public:
     // Opens the default playback device; false (logged) when there is none.
     bool init();
     void shutdown();
-    bool deviceOpen() const { return m_stream != nullptr; }
 
     // Adds the sound, or replaces the one with the same name (voices playing it keep the old samples).
     SoundId addSound(const std::string& name, std::vector<float> samples);
     // A WAV file converted to mono at kSampleRate; -1 (logged) when it can't be read.
     SoundId loadSound(const std::string& name, const std::string& path);
     SoundId findSound(const std::string& name) const;
-    float soundDuration(SoundId sound) const;
 
     VoiceId play(SoundId sound, const PlayParams& params);
     VoiceId play(const std::string& name, const PlayParams& params);
     void stop(VoiceId voice);
     void stopAll();
     bool isPlaying(VoiceId voice) const;
-    void setVoicePosition(VoiceId voice, const glm::vec3& position);
-    void setVoiceVolume(VoiceId voice, float volume);
 
     void setListener(const glm::vec3& position, const glm::vec3& forward, const glm::vec3& up);
     void setVolumes(float master, float music);
     // Paused voices keep their place and resume where they were.
     void setPaused(bool paused);
-    size_t activeVoices() const;
 
     // Mixes the next `frames` stereo frames (interleaved) and advances the voices; the device thread
     // calls this, and it can be called directly when there is no device.

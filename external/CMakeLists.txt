@@ -5,6 +5,43 @@ include(FetchContent)
 set(FETCHCONTENT_QUIET OFF)
 set(FETCHCONTENT_UPDATES_DISCONNECTED ON)
 
+# Sources are downloaded once into out/deps/<name> and shared by every preset, generator and Visual
+# Studio version, so a new or wiped build dir doesn't clone again (only the <name>-build dirs are per
+# build). <name>.stamp holds a hash of the declaration; changing the tag/URL downloads again.
+set(MIRAS_DEPS_DIR "${CMAKE_SOURCE_DIR}/out/deps" CACHE PATH "Shared download cache for FetchContent sources")
+
+macro(FetchContent_Declare name)
+    string(TOLOWER "${name}" _miras_lower)
+    string(TOUPPER "${name}" _miras_upper)
+    string(SHA1 _miras_key "${ARGN}")
+    set(_miras_src "${MIRAS_DEPS_DIR}/${_miras_lower}")
+    set(_miras_stamp "${MIRAS_DEPS_DIR}/${_miras_lower}.stamp")
+    # FetchContent keeps an empty FETCHCONTENT_SOURCE_DIR_<NAME> cache entry; the normal variable overrides it.
+    set(FETCHCONTENT_SOURCE_DIR_${_miras_upper} "")
+    if (EXISTS "${_miras_stamp}" AND IS_DIRECTORY "${_miras_src}")
+        file(READ "${_miras_stamp}" _miras_have)
+        if (_miras_have STREQUAL _miras_key)
+            set(FETCHCONTENT_SOURCE_DIR_${_miras_upper} "${_miras_src}")
+        endif()
+    endif()
+    if (NOT FETCHCONTENT_SOURCE_DIR_${_miras_upper})
+        set_property(GLOBAL APPEND PROPERTY MIRAS_DEPS_TO_STAMP "${_miras_stamp}|${_miras_key}")
+    endif()
+    _FetchContent_Declare(${name} ${ARGN} SOURCE_DIR "${_miras_src}")
+endmacro()
+
+# Called after FetchContent_MakeAvailable: marks the fresh downloads as complete.
+function(miras_stamp_deps)
+    get_property(entries GLOBAL PROPERTY MIRAS_DEPS_TO_STAMP)
+    foreach(entry IN LISTS entries)
+        string(REPLACE "|" ";" parts "${entry}")
+        list(GET parts 0 stamp)
+        list(GET parts 1 key)
+        file(WRITE "${stamp}" "${key}")
+    endforeach()
+    set_property(GLOBAL PROPERTY MIRAS_DEPS_TO_STAMP "")
+endfunction()
+
 FetchContent_Declare(
   VulkanHpp
   GIT_REPOSITORY https://github.com/KhronosGroup/Vulkan-Hpp.git
@@ -49,13 +86,15 @@ FetchContent_Declare(
   GIT_SHALLOW TRUE
 )
 
-# Windowing, events, Vulkan surfaces and audio are used; drop the other subsystems and renderers.
+# Windowing, events, Vulkan surfaces, audio and the editor's file dialogs are used; drop the other
+# subsystems and renderers.
 foreach(SDL_UNUSED_OPTION
     SDL_GPU SDL_RENDER SDL_CAMERA SDL_JOYSTICK SDL_HAPTIC SDL_HIDAPI SDL_POWER SDL_SENSOR
-    SDL_DIALOG SDL_TRAY SDL_OPENGL SDL_OPENGLES SDL_TEST_LIBRARY)
+    SDL_TRAY SDL_OPENGL SDL_OPENGLES SDL_TEST_LIBRARY)
   set(${SDL_UNUSED_OPTION} OFF CACHE BOOL "" FORCE)
 endforeach()
 set(SDL_AUDIO ON CACHE BOOL "" FORCE)
+set(SDL_DIALOG ON CACHE BOOL "" FORCE)
 
 FetchContent_Declare(
   glm
@@ -132,6 +171,7 @@ if (MIRAS_BUNDLE_VULKAN_RUNTIME)
         DOWNLOAD_NO_EXTRACT TRUE
         SOURCE_SUBDIR none)
     FetchContent_MakeAvailable(vulkan_runtime mesa_dist mesa_license)
+    miras_stamp_deps()
 endif()
 
 set(FASTGLTF_COMPILE_AS_CPP20 ON CACHE BOOL "" FORCE)
@@ -153,6 +193,7 @@ FetchContent_MakeAvailable(
   nlohmann_json
   JoltPhysics
 )
+miras_stamp_deps()
 
 # SDL forces /GL- on SDL_mslibc.c, which conflicts with LTCG (D9025/C4652), so SDL is left out of it.
 set_target_properties(SDL3-static PROPERTIES INTERPROCEDURAL_OPTIMIZATION_RELEASE OFF)

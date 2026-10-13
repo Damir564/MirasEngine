@@ -35,8 +35,8 @@ float woundDamage(float damage)
     return wounds * GameWorld::kMaxHealth / kWounds;
 }
 
-// Pickups and the exit
-constexpr float kPickupRadius = 1.1f;
+// Pickups (taken with the pick-up key from this far) and the exit
+constexpr float kPickupRadius = 1.8f;
 constexpr float kExitRadius = 1.6f;
 
 glm::vec3 forwardFromYaw(float yaw)
@@ -74,6 +74,9 @@ GameWorld::GameWorld(ModelManager& models, PhysicsWorld& physics, AudioSystem& a
     });
     registerEntity(kAmmoEntity, [](GameWorld& world, const SpawnInfo& info) {
         world.spawnPickup(info, Entity::Kind::AmmoPack);
+    });
+    registerEntity(kRoundsEntity, [](GameWorld& world, const SpawnInfo& info) {
+        world.spawnPickup(info, Entity::Kind::RoundsPack);
     });
     registerEntity(kExitEntity, [](GameWorld& world, const SpawnInfo& info) { world.spawnExit(info); });
     // The renderer lights the scene with light objects itself; there is nothing to spawn.
@@ -160,8 +163,9 @@ void GameWorld::spawnEnemy(const SpawnInfo& info)
 void GameWorld::spawnPickup(const SpawnInfo& info, Entity::Kind kind)
 {
     const bool health = kind == Entity::Kind::HealthPack;
-    Entity& pickup = addEntity(kind, info, health ? GameModelId::Medkit : GameModelId::Shells);
-    pickup.amount = std::max(entityParam(info.params, "amount", health ? 25.0f : 8.0f), 1.0f);
+    const bool rounds = kind == Entity::Kind::RoundsPack;
+    Entity& pickup = addEntity(kind, info, health ? GameModelId::Medkit : rounds ? GameModelId::RoundsBox : GameModelId::Shells);
+    pickup.amount = std::max(entityParam(info.params, "amount", health ? 25.0f : rounds ? 16.0f : 8.0f), 1.0f);
     pickup.animator.play("idle");
     pickup.animator.update(random(0.0f, 3.0f));
 }
@@ -536,46 +540,106 @@ float GameWorld::rayHitsEnemy(const glm::vec3& origin, const glm::vec3& dir, con
 // Pickups and the exit
 // ---------------------------------------------------------------------------------------------
 
+static bool isPickup(const Entity& entity)
+{
+    return entity.kind == Entity::Kind::HealthPack || entity.kind == Entity::Kind::AmmoPack ||
+        entity.kind == Entity::Kind::RoundsPack;
+}
+
 void GameWorld::updatePickups(const Input& input)
 {
-    for (Entity& pickup : m_entities) {
-        if (pickup.kind != Entity::Kind::HealthPack && pickup.kind != Entity::Kind::AmmoPack)
+    // They are taken with the pick-up key (GameArms.cpp: requestFromInput), not by walking over them.
+    for (Entity& pickup : m_entities)
+        if (isPickup(pickup))
+            pickup.animator.update(input.dt);
+}
+
+int GameWorld::nearestPickup(float* distance) const
+{
+    int best = -1;
+    float bestDistance = kPickupRadius;
+    for (size_t i = 0; i < m_entities.size(); ++i) {
+        const Entity& pickup = m_entities[i];
+        if (!isPickup(pickup) || !pickup.active)
             continue;
-        pickup.animator.update(input.dt);
-        if (!pickup.active)
-            continue;
-        const glm::vec3 offset = input.playerFeet - pickup.position;
-        if (glm::length(flat(offset)) > kPickupRadius || std::abs(offset.y) > 1.5f)
-            continue;
-        if (pickup.kind == Entity::Kind::HealthPack) {
-            if (m_player.health >= kMaxHealth) {
-                if (m_pickupMessageCooldown <= 0.0f) {
-                    showMessage("Health is full");
-                    m_pickupMessageCooldown = 3.0f;
-                }
-                continue;
-            }
-            // Patches up whole wounds: one per 25 of the medkit's amount.
-            const int wounds = std::max(1, static_cast<int>(std::lround(pickup.amount / 25.0f)));
-            m_player.health = std::min(kMaxHealth, m_player.health + wounds * kMaxHealth / kWounds + 0.01f);
-            play("pickup_health", 0.8f);
-            showMessage(wounds == 1 ? "Patched up a wound" : "Patched up " + std::to_string(wounds) + " wounds");
+        const glm::vec3 offset = m_lastPlayerFeet - pickup.position;
+        const float d = glm::length(flat(offset));
+        if (d < bestDistance && std::abs(offset.y) < 1.5f) {
+            best = static_cast<int>(i);
+            bestDistance = d;
         }
-        else {
-            int added = 0;
-            addShells(static_cast<int>(pickup.amount), added);
-            if (added == 0) {
-                if (m_pickupMessageCooldown <= 0.0f) {
-                    showMessage("Can't carry more shells");
-                    m_pickupMessageCooldown = 3.0f;
-                }
-                continue;
-            }
-            play("pickup_ammo", 0.8f);
-            showMessage("+" + std::to_string(added) + " shells");
-        }
-        pickup.active = false;
     }
+    if (distance)
+        *distance = bestDistance;
+    return best;
+}
+
+bool GameWorld::collectPickup(Entity& pickup)
+{
+    const auto refuse = [&](const char* text) {
+        if (m_pickupMessageCooldown <= 0.0f) {
+            showMessage(text);
+            m_pickupMessageCooldown = 1.0f;
+        }
+        play("reject", 0.5f);
+        return false;
+    };
+    if (pickup.kind == Entity::Kind::HealthPack) {
+        if (m_player.health >= kMaxHealth)
+            return refuse("Health is full");
+        // Patches up whole wounds: one per 25 of the medkit's amount.
+        const int wounds = std::max(1, static_cast<int>(std::lround(pickup.amount / 25.0f)));
+        m_player.health = std::min(kMaxHealth, m_player.health + wounds * kMaxHealth / kWounds + 0.01f);
+        play("pickup_health", 0.8f);
+        showMessage(wounds == 1 ? "Patched up a wound" : "Patched up " + std::to_string(wounds) + " wounds");
+    }
+    else {
+        const bool rounds = pickup.kind == Entity::Kind::RoundsPack;
+        int added = 0;
+        if (rounds)
+            addRounds(static_cast<int>(pickup.amount), added);
+        else
+            addShells(static_cast<int>(pickup.amount), added);
+        if (added == 0)
+            return refuse(rounds ? "Can't carry more rounds" : "Can't carry more shells");
+        play("pickup_ammo", 0.8f);
+        showMessage("+" + std::to_string(added) + (rounds ? " rounds" : " shells"));
+        // A box that didn't fit stays with the rest in it.
+        pickup.amount -= static_cast<float>(added);
+        if (pickup.amount >= 1.0f)
+            return true;
+    }
+    pickup.active = false;
+    return true;
+}
+
+std::string GameWorld::interactPrompt() const
+{
+    if (!m_player.alive)
+        return {};
+    float pickupDistance = 0.0f, groundDistance = 0.0f;
+    const int pickup = nearestPickup(&pickupDistance);
+    const int ground = nearestGroundItem(&groundDistance);
+    if (pickup >= 0 && (ground < 0 || pickupDistance <= groundDistance)) {
+        const Entity& entity = m_entities[pickup];
+        const int amount = static_cast<int>(entity.amount);
+        switch (entity.kind) {
+        case Entity::Kind::HealthPack: return "Take the medkit";
+        case Entity::Kind::RoundsPack: return "Take " + std::to_string(amount) + " pistol rounds";
+        default: return "Take " + std::to_string(amount) + " shells";
+        }
+    }
+    if (const GroundItem* item = m_arms.state().groundItem(ground))
+        return std::string("Pick up the ") + itemName(item->item.kind);
+    return {};
+}
+
+void GameWorld::setSlotBind(int slot, const SlotBind& bind)
+{
+    if (slot < 0 || slot >= kSlotCount || !slotAccepts(slot, bind))
+        return;
+    m_slotBinds[slot] = bind;
+    saveSlotBinds(m_slotBinds);
 }
 
 void GameWorld::updateExit(const Input& input)
@@ -715,29 +779,7 @@ void GameWorld::addModel(const GameModel& model, Animator& animator, const glm::
     bool castShadow, std::vector<DynamicInstance>& out, int tintedNode)
 {
     animator.evaluate(m_nodeMatrices);
-    emitNodes(model, m_nodeMatrices, world, tint, castShadow, out, tintedNode);
-}
-
-void GameWorld::emitNodes(const GameModel& model, const std::vector<glm::mat4>& nodeMatrices, const glm::mat4& world,
-    const glm::vec3& tint, bool castShadow, std::vector<DynamicInstance>& out, int tintedNode)
-{
-    for (size_t n = 0; n < model.data.nodes.size() && n < nodeMatrices.size(); ++n) {
-        const int mesh = model.data.nodes[n].mesh;
-        if (mesh < 0 || mesh >= static_cast<int>(model.meshModels.size()))
-            continue;
-        const glm::mat4 matrix = world * nodeMatrices[n];
-        // Parts scaled away (the muzzle flash between shots) are not drawn.
-        const float size = std::max({ glm::length(glm::vec3(matrix[0])), glm::length(glm::vec3(matrix[1])),
-            glm::length(glm::vec3(matrix[2])) });
-        if (size < 0.01f)
-            continue;
-        DynamicInstance& part = out.emplace_back();
-        part.instance.modelIndex = model.meshModels[mesh];
-        part.instance.position = glm::vec3(matrix[3]);
-        part.instance.color = tintedNode < 0 || tintedNode == static_cast<int>(n) ? tint : glm::vec3(1.0f);
-        part.transform = matrix;
-        part.castShadow = castShadow;
-    }
+    emitModelNodes(model, m_nodeMatrices, world, tint, castShadow, out, tintedNode);
 }
 
 void GameWorld::collectDrawables(const glm::mat4& cameraWorld, std::vector<DynamicInstance>& out)

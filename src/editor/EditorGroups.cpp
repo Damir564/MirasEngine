@@ -293,7 +293,8 @@ void Editor::saveObjectPrefabDialog()
     m_prefabSaveInstance = -1;
     m_prefabSaveName = active.group.empty() ? active.name : active.group;
     const std::string fileName = m_prefabSaveName + kPrefabExtension;
-    openFileDialog("SavePrefabDlg", "Save Objects as Prefab", kPrefabExtension, kPrefabsRoot, fileName.c_str(), true);
+    openFileDialog("SavePrefabDlg", "Save Objects as Prefab", "Prefabs", kPrefabExtension + 1, kPrefabsRoot,
+        fileName.c_str(), true);
 }
 
 void Editor::saveObjectPrefab(const std::vector<uint64_t>& ids, const std::string& path)

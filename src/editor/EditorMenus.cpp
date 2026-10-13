@@ -143,6 +143,7 @@ void Editor::drawViewMenu()
     ImGui::MenuItem("Hierarchy", nullptr, &m_showHierarchy);
     ImGui::MenuItem("Inspector", nullptr, &m_showInspector);
     ImGui::MenuItem("Camera Animation", nullptr, &m_showAnimationPanel);
+    ImGui::MenuItem("Arms Poses", nullptr, &m_showArmsPoses);
     ImGui::MenuItem("Statistics", nullptr, &m_showStatisticsPanel);
     ImGui::MenuItem("Level", nullptr, &m_showLevelPanel);
     ImGui::MenuItem("Materials", nullptr, &m_showMaterialsPanel);
@@ -486,73 +487,57 @@ void Editor::drawAboutPopup()
 // File dialogs
 // ---------------------------------------------------------------------------------------------
 
-void Editor::openFileDialog(const char* key, const char* title, const char* filters, const std::string& root,
-    const char* defaultFileName, bool confirmOverwrite)
+void Editor::openFileDialog(const char* key, const char* title, const char* filterName, const char* patterns,
+    const std::string& root, const char* defaultFileName, bool save)
 {
-    namespace fs = std::filesystem;
-    fs::create_directories(root);
-    IGFD::FileDialogConfig config;
-    config.path = fs::weakly_canonical(fs::absolute(root)).string();
-    config.countSelectionMax = 1;
-    config.flags = ImGuiFileDialogFlags_Modal;
-    if (confirmOverwrite) config.flags |= ImGuiFileDialogFlags_ConfirmOverwrite;
-    if (defaultFileName) config.fileName = defaultFileName;
-    ImGuiFileDialog::Instance()->OpenDialog(key, title, filters, config);
+    if (m_fileDialog.isOpen()) {
+        setStatus("Close the open file dialog first", true);
+        return;
+    }
+    m_fileDialog.open(m_window, key, title, filterName, patterns, root, defaultFileName, save);
 }
 
 void Editor::openSceneDialog()
 {
-    openFileDialog("BrowseSceneDlg", "Open Scene", ".scn", kScenesRoot, nullptr, false);
+    openFileDialog("BrowseSceneDlg", "Open Scene", "Scenes", "scn", kScenesRoot, nullptr, false);
 }
 
 void Editor::saveSceneAsDialog()
 {
-    openFileDialog("SaveAsSceneDlg", "Save Scene As", ".scn", kScenesRoot, "untitled.scn", true);
+    openFileDialog("SaveAsSceneDlg", "Save Scene As", "Scenes", "scn", kScenesRoot, "untitled.scn", true);
 }
 
 void Editor::importModelDialog()
 {
-    openFileDialog("BrowseModelDlg", "Import 3D Model",
-        "3D Models{.gltf,.glb},.gltf,.glb", kModelsRoot, nullptr, false);
+    openFileDialog("BrowseModelDlg", "Import 3D Model", "3D Models", "gltf;glb", kModelsRoot, nullptr, false);
 }
 
 void Editor::runScriptDialog()
 {
-    openFileDialog("RunScriptDlg", "Run Script", "Scripts{.mscript,.txt},.mscript,.txt", "scripts", nullptr, false);
+    openFileDialog("RunScriptDlg", "Run Script", "Scripts", "mscript;txt", "scripts", nullptr, false);
 }
 
 void Editor::drawFileDialogs()
 {
-    ImGuiFileDialog* dialog = ImGuiFileDialog::Instance();
-    if (dialog->Display("RunScriptDlg", ImGuiWindowFlags_NoCollapse, kDialogSize)) {
-        if (dialog->IsOk())
-            runScript(toStoredPath(dialog->GetFilePathName()));
-        dialog->Close();
-    }
-    if (dialog->Display("BrowseSceneDlg", ImGuiWindowFlags_NoCollapse, kDialogSize)) {
-        if (dialog->IsOk()) {
-            openScene(toStoredPath(dialog->GetFilePathName()));
-        }
-        dialog->Close();
-    }
-    if (dialog->Display("SaveAsSceneDlg", ImGuiWindowFlags_NoCollapse, kDialogSize)) {
-        if (dialog->IsOk()) {
-            std::filesystem::path path(dialog->GetFilePathName());
+    std::string chosen;
+    if (m_fileDialog.take("RunScriptDlg", chosen) && !chosen.empty())
+        runScript(toStoredPath(chosen));
+    if (m_fileDialog.take("BrowseSceneDlg", chosen) && !chosen.empty())
+        openScene(toStoredPath(chosen));
+    if (m_fileDialog.take("SaveAsSceneDlg", chosen)) {
+        if (!chosen.empty()) {
+            std::filesystem::path path(chosen);
             if (!path.has_extension() || path.extension() != ".scn") path.replace_extension(".scn");
             m_scenes.setCurrentPath(toStoredPath(path.string()));
             saveSceneTo(m_scenes.currentPath());
         }
-        dialog->Close();
         finishPendingSceneAction();
     }
-    if (dialog->Display("BrowseModelDlg", ImGuiWindowFlags_NoCollapse, kDialogSize)) {
-        if (dialog->IsOk()) {
-            const std::string path = toStoredPath(dialog->GetFilePathName());
-            const std::string name = std::filesystem::path(path).stem().string();
-            m_models.loadModelAsync(path, name);
-            setStatus("Importing " + name + "...");
-        }
-        dialog->Close();
+    if (m_fileDialog.take("BrowseModelDlg", chosen) && !chosen.empty()) {
+        const std::string path = toStoredPath(chosen);
+        const std::string name = std::filesystem::path(path).stem().string();
+        m_models.loadModelAsync(path, name);
+        setStatus("Importing " + name + "...");
     }
     drawPrefabDialogs();
     // Also used by the Materials panel, so it is not tied to the Level panel being open.

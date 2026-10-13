@@ -221,7 +221,6 @@ Mesh polyMeshToMesh(const PolyMesh& mesh, MaterialLibrary* library);
 
 // Models built from a PolyMesh use "level:#<n>" as their source path; scene files store the mesh itself.
 inline constexpr const char* kLevelModelPathPrefix = "level:#";
-inline bool isLevelModelPath(const std::string& path) { return path.rfind(kLevelModelPathPrefix, 0) == 0; }
 
 // Binary form used inside scene and prefab files. What a file holds depends on its format:
 // 0 = geometry only (scene version 3), 1 = + materials (scene 4-5, prefab 1),

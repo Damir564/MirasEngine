@@ -129,14 +129,6 @@ AudioSystem::SoundId AudioSystem::findSound(const std::string& name) const
     return -1;
 }
 
-float AudioSystem::soundDuration(SoundId sound) const
-{
-    std::lock_guard lock(m_mutex);
-    if (sound < 0 || sound >= static_cast<SoundId>(m_sounds.size()))
-        return 0.0f;
-    return static_cast<float>(m_sounds[sound].samples->size()) / kSampleRate;
-}
-
 AudioSystem::VoiceId AudioSystem::play(SoundId sound, const PlayParams& params)
 {
     std::lock_guard lock(m_mutex);
@@ -184,22 +176,6 @@ bool AudioSystem::isPlaying(VoiceId voice) const
     return std::any_of(m_voices.begin(), m_voices.end(), [voice](const Voice& v) { return v.id == voice; });
 }
 
-void AudioSystem::setVoicePosition(VoiceId voice, const glm::vec3& position)
-{
-    std::lock_guard lock(m_mutex);
-    for (Voice& v : m_voices)
-        if (v.id == voice)
-            v.params.position = position;
-}
-
-void AudioSystem::setVoiceVolume(VoiceId voice, float volume)
-{
-    std::lock_guard lock(m_mutex);
-    for (Voice& v : m_voices)
-        if (v.id == voice)
-            v.params.volume = volume;
-}
-
 void AudioSystem::setListener(const glm::vec3& position, const glm::vec3& forward, const glm::vec3& up)
 {
     const glm::vec3 right = glm::cross(forward, up);
@@ -220,12 +196,6 @@ void AudioSystem::setPaused(bool paused)
 {
     std::lock_guard lock(m_mutex);
     m_paused = paused;
-}
-
-size_t AudioSystem::activeVoices() const
-{
-    std::lock_guard lock(m_mutex);
-    return m_voices.size();
 }
 
 glm::vec2 AudioSystem::voiceGains(const Voice& voice) const

@@ -51,12 +51,9 @@ public:
 
     // Path management
     void addKeyframe(const CameraKeyframe& kf);
-    void insertKeyframe(size_t index, const CameraKeyframe& kf);
     void removeKeyframe(size_t index);
     void clearKeyframes();
 
-    // Set current path
-    void setPath(const CameraAnimationPath& path) { m_path = path; }
     CameraAnimationPath& getPath() { return m_path; }
     const CameraAnimationPath& getPath() const { return m_path; }
 

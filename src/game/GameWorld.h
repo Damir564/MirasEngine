@@ -9,6 +9,7 @@
 #include <glm/glm.hpp>
 #include "engine/Animation.h"
 #include "engine/Audio.h"
+#include "ArmsPoses.h"
 #include "GameAssets.h"
 #include "WeaponTuning.h"
 
@@ -30,7 +31,7 @@ struct SpawnInfo {
 enum class EnemyState { Idle, Chase, Attack, Hurt, Dead };
 
 struct Entity {
-    enum class Kind { Enemy, HealthPack, AmmoPack, Exit };
+    enum class Kind { Enemy, HealthPack, AmmoPack, RoundsPack, Exit };
     uint32_t id = 0;
     Kind kind = Kind::Enemy;
     std::string name;
@@ -107,19 +108,29 @@ public:
         glm::vec3 playerFeet{ 0.0f };
         bool moving = false;        // walking on the ground (for footsteps and weapon bob)
         bool sprinting = false;
-        bool fire = false;          // main hand's trigger held; a shot needs a fresh pull
-        // Pressed this frame:
-        bool secondary = false;     // the off hand's gun fires, or the main hand's gun is pumped / racked
-        bool reload = false;        // context reload (Arms ActionKind::Reload)
-        bool forceReload = false;   // reload even with a gun in each hand (drops the off hand's)
-        bool unload = false;        // pistol magazine out
-        int zone = -1;              // a storage zone's button (Zone), -1 = none
-        bool putBack = false;       // the held item back where it came from
-        bool pickUp = false;        // the nearest dropped item
-        bool toggleOffGun = false;  // the other gun into / out of the off hand
-        ItemKind swapTo = ItemKind::Empty; // the main hand takes this
+        // Left mouse button held: the left (off) hand's gun, or the right hand's when the left has none. A
+        // shot needs a fresh pull.
+        bool fire = false;
+        // This frame:
+        bool secondary = false;     // right mouse button: the right hand's gun fires, only with a gun in each hand
+        bool reloadTap = false;     // R tapped: pump / rack
+        bool reloadDoubleTap = false; // R twice quickly: the pistol's magazine drops to the floor
+        bool reloadHold = false;    // R held long enough (once per press): insert / magazine out into the hand
+        SlotBind use;               // a slot key: what it is bound to (item Empty = none pressed)
+        // Jacket open, the cursor on something: left click takes one of it, right click puts what the left
+        // hand holds there.
+        SlotBind take;
+        SlotBind put;
+        // Held (item Empty = not): an ammunition key, or a mouse button on a target. Taking / putting away
+        // goes on one at a time while held.
+        SlotBind useHeld;
+        SlotBind takeHeld;
+        SlotBind putHeld;
+        bool reloadHeld = false;    // R down (inserting goes on shell after shell)
+        bool interact = false;      // pick up: the nearest pickup or dropped item
         float jacket = 0.0f;        // 0 closed .. 1 held open to look at what is carried
-        bool restock = false;       // held while the jacket is open: move shells from the pocket to the bandolier
+        bool restock = false;       // R pressed with the jacket open: move shells from the pocket to the bandolier
+        bool restockHeld = false;   // ...and it goes on while R stays down
     };
     void update(const Input& input);
     // Entities, effects and the weapon (in front of the camera) for this frame.
@@ -139,6 +150,18 @@ public:
     // Where the main hand's gun's shots leave and fly, in world space (along its barrel, not the view).
     const glm::vec3& barrelOrigin() const { return m_view.barrelOrigin[0]; }
     const glm::vec3& barrelDirection() const { return m_view.barrelDirection[0]; }
+
+    // Slot keys 1-4. Kept across levels and saved (slot_binds.json).
+    const std::array<SlotBind, kSlotCount>& slotBinds() const { return m_slotBinds; }
+    void setSlotBind(int slot, const SlotBind& bind);
+    // What can be bound while the jacket is open, where it is (world space) this frame.
+    struct BindTarget {
+        SlotBind bind;
+        glm::vec3 position{ 0.0f };
+    };
+    void bindTargets(std::vector<BindTarget>& out) const;
+    // What the pick-up key would take now ("Pick up shells (8)"); empty when nothing is in reach.
+    std::string interactPrompt() const;
 
     struct Message {
         std::string text;
@@ -169,6 +192,10 @@ private:
     bool lineOfSight(const glm::vec3& from, const glm::vec3& to) const;
     void alertNearby(const glm::vec3& position, float radius);
     void updatePickups(const Input& input);
+    // The nearest pickup entity in reach of the feet (index into m_entities), -1 when none.
+    int nearestPickup(float* distance = nullptr) const;
+    // Takes it; false (with a message) when it can't be carried.
+    bool collectPickup(Entity& pickup);
     void updateExit(const Input& input);
 
     // GameArms.cpp: input -> Arms requests, Arms events -> sounds, shots and dropped items, and the poses
@@ -191,9 +218,10 @@ private:
     void drawPistol(const glm::mat4& world, float slide, float flash, bool withMagazine, std::vector<DynamicInstance>& out);
     void drawMagazine(const glm::mat4& world, int magazineId, std::vector<DynamicInstance>& out);
     void drawItem(GameModelId id, const glm::mat4& world, const glm::vec3& tint, std::vector<DynamicInstance>& out);
-    // The nearest dropped item within reach of the player's feet, -1 when none.
-    int nearestGroundItem() const;
+    // The nearest dropped item (Arms ground item id) within reach of the player's feet, -1 when none.
+    int nearestGroundItem(float* distance = nullptr) const;
     void addShells(int amount, int& added);
+    void addRounds(int amount, int& added);
     // Distance along the ray to the enemy's body (a vertical capsule), or a negative value on a miss.
     static float rayHitsEnemy(const glm::vec3& origin, const glm::vec3& dir, const Entity& enemy);
 
@@ -208,9 +236,6 @@ private:
     // every part, or only to the node `tintedNode` when it is set.
     void addModel(const GameModel& model, Animator& animator, const glm::mat4& world, const glm::vec3& tint,
         bool castShadow, std::vector<DynamicInstance>& out, int tintedNode = -1);
-    // The same for model-space node matrices posed some other way.
-    void emitNodes(const GameModel& model, const std::vector<glm::mat4>& nodeMatrices, const glm::mat4& world,
-        const glm::vec3& tint, bool castShadow, std::vector<DynamicInstance>& out, int tintedNode = -1);
 
     ModelManager& m_models;
     PhysicsWorld& m_physics;
@@ -235,6 +260,8 @@ private:
 
     Arms m_arms;
     WeaponTuning m_tuning;
+    ArmsPoses m_poses;
+    std::array<SlotBind, kSlotCount> m_slotBinds = loadSlotBinds();
 
     // How the hands and guns look this frame (GameArms.cpp); the state itself is in m_arms.
     struct HandView {
@@ -249,6 +276,10 @@ private:
         std::array<NodePose, 2> items;       // the held items, camera space
         std::array<float, 2> shotTime{ 10.0f, 10.0f }; // since each hand last fired
         bool triggerHeld = false;
+        // A held ammunition key / mouse button repeating what its press started: taking from or putting
+        // into `repeatBind`'s place.
+        enum class Repeat { None, Take, Put } repeat = Repeat::None;
+        SlotBind repeatBind;
         float messageCooldown = 0.0f;
         std::string lastMessage;
         glm::vec2 sway{ 0.0f };              // radians the guns lag behind the view (yaw, pitch)
@@ -258,24 +289,15 @@ private:
         float tilt = 0.0f;                   // shotgun rolled to show the loading port
         float time = 0.0f;
         glm::mat4 bodyToCamera{ 1.0f };      // body space (eyes, yaw only) -> camera space
+        glm::mat4 bodyWorld{ 1.0f };         // body space -> world
+        glm::mat4 cameraWorld{ 1.0f };       // camera space (with the bob) -> world
         std::array<glm::vec3, 2> barrelOrigin{};
         std::array<glm::vec3, 2> barrelDirection{ glm::vec3(0, 0, -1), glm::vec3(0, 0, -1) };
     };
     ArmsView m_view;
     // The guns' step bob in camera space.
     glm::vec3 weaponBob() const;
-    // Node indices in the models GameArms.cpp poses (-1 when missing).
-    struct Rigs {
-        int shotgunGun = -1, shotgunPump = -1, shotgunFlash = -1;
-        int pistolSlide = -1, pistolFlash = -1;
-        int magazineFollower = -1;
-        std::array<int, 8> magazineRounds{};
-        int handR = -1, handL = -1;
-        glm::vec3 shotgunMuzzle{ 0.0f, 0.022f, -0.71f }; // in `gun` space
-        glm::vec3 pistolMuzzle{ 0.0f, 0.07f, -0.155f };
-        glm::mat4 pistolMagSeat{ 1.0f };
-    };
-    Rigs m_rigs;
+    ArmsRigs m_rigs;
     std::vector<NodePose> m_scratchPose;
     std::vector<glm::mat4> m_scratchMatrices;
 
